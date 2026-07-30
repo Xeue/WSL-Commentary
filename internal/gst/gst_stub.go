@@ -1,4 +1,4 @@
-//go:build !cgo
+//go:build !cgo || gststub
 
 // This file is the pure-Go stub twin. It compiles with CGO_ENABLED=0 and needs
 // no MinGW, no GStreamer and no audio hardware — that is Gate A.

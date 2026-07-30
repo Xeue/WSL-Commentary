@@ -3,10 +3,12 @@ module wslcomms
 go 1.25.0
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.43.2
 	github.com/aws/aws-sdk-go-v2/config v1.32.33
 	github.com/aws/aws-sdk-go-v2/service/cognitoidentity v1.36.2
 	github.com/danieljoos/wincred v1.2.3
 	github.com/datarhei/gosrt v0.11.0
+	github.com/go-gst/go-glib v0.0.2
 	github.com/go-gst/go-gst v0.0.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/wailsapp/wails/v2 v2.13.0
@@ -14,7 +16,6 @@ require (
 
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.43.2 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.32 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.33 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.33 // indirect
@@ -29,7 +30,6 @@ require (
 	github.com/aws/smithy-go v1.27.5 // indirect
 	github.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect
 	github.com/bep/debounce v1.2.1 // indirect
-	github.com/go-gst/go-glib v0.0.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect

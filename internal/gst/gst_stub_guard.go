@@ -1,4 +1,4 @@
-//go:build production && !cgo
+//go:build production && (!cgo || gststub)
 
 // This file exists to make one specific build combination fail, loudly, at
 // compile time. It contains no working code and is never linked into anything

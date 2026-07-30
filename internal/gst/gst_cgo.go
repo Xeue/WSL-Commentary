@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && !gststub
 
 // This file is the real, go-gst backed implementation. It compiles only with
 // CGO_ENABLED=1 and needs MinGW gcc, pkg-config and the GStreamer 1.28.5
@@ -637,12 +637,45 @@ var h264EncoderDenylist = map[string]bool{
 	"x264enc": true,
 }
 
-// h264EncoderPreference breaks ties between factories of equal rank, lower
-// index winning. It is a tie-break only: a higher-ranked encoder always beats a
-// preferred one, which is what "resolve by rank at runtime" in specification
-// open question 3 asks for. mfh264enc is preferred at equal rank because it is
-// the element the specification's property set was written against and the one
-// the 2 s GOP profile was measured on.
+// h264EncoderPreference is the order encoders are chosen in, lower index
+// winning, REGARDLESS of rank. Rank is used only to exclude factories GStreamer
+// has marked unusable.
+//
+// # This reverses specification open question 3, on measurement
+//
+// OQ3 asked "is the highest-ranked H.264 encoder called mfh264enc on the target
+// machine?" and instructed resolving by rank rather than hardcoding the name.
+// That was the right instinct before anyone could measure it. Measured at Gate B
+// on 2026-07-30, on a machine with an RTX 5070, GStreamer 1.28.5 ranks them:
+//
+//	nvh264enc    primary + 1 (257)
+//	x264enc      primary (256)      <- denylisted, GPL
+//	amfh264enc   primary (256)
+//	mfh264enc    secondary (128)
+//	openh264enc  marginal (64)
+//
+// So the answer to OQ3 is no: mfh264enc is NOT the highest-ranked encoder, and
+// resolving by rank selects whichever GPU vendor's element happens to be
+// installed. Three consequences make that the wrong choice here:
+//
+//  1. The property set in h264EncoderProps was written against mfh264enc, and
+//     the values are applied only where the chosen factory has a property of
+//     that name. On nvh264enc most of them are silently skipped, so the
+//     deliberate CBR-not-QVBR decision — taken because a static slate under
+//     variable rate collapses to 200-350 kbps and makes "is it flowing" hard to
+//     observe — quietly does not happen.
+//  2. It makes behaviour depend on the graphics card. Two commentary positions
+//     running the same build would encode differently, and a fault reproducible
+//     at one would not reproduce at the other. For a contribution path that has
+//     to behave identically everywhere, that is a bad trade for encoder
+//     efficiency that a 1920x1080 still frame cannot use.
+//  3. mfh264enc is Media Foundation, which is part of Windows. It is present on
+//     every target machine by definition, so preferring it costs no
+//     availability.
+//
+// The hardware encoders stay in the list below mfh264enc, so a machine whose
+// Media Foundation H.264 MFT is missing or broken still has somewhere to go
+// rather than failing to start twenty minutes before kick-off.
 var h264EncoderPreference = []string{
 	"mfh264enc",
 	"qsvh264enc",
@@ -724,14 +757,31 @@ func selectH264Encoder() (string, error) {
 		}
 		rank := f.GetRank()
 		pref := preferenceIndex(name)
-		if bestName == "" || rank > bestRank || (rank == bestRank && pref < bestPref) {
+
+		// Preference first, rank only as a tie-break between two factories we
+		// are equally happy with. See h264EncoderPreference for why this is
+		// deliberately not "highest rank wins": on measurement, rank selects
+		// whichever GPU vendor's encoder is installed, and the specification's
+		// property set only applies to mfh264enc.
+		//
+		// Anything not in the preference list scores len(list), so a known
+		// encoder always beats an unknown one, and among unknowns the highest
+		// rank still wins — which is the sensible answer when we have no
+		// opinion.
+		if bestName == "" || pref < bestPref || (pref == bestPref && rank > bestRank) {
 			bestName, bestRank, bestPref = name, rank, pref
 		}
 	}
 
 	if bestName != "" {
-		log.Printf("gst: H.264 encoder resolved by rank: %s (rank %d), from %d candidate video encoders",
-			bestName, bestRank, len(factories))
+		if bestPref < len(h264EncoderPreference) {
+			log.Printf("gst: H.264 encoder %s chosen by preference (rank %d), from %d candidates",
+				bestName, bestRank, len(factories))
+		} else {
+			log.Printf("gst: H.264 encoder %s chosen by rank %d - NOT in the preference list, so the "+
+				"specification's encoder settings may not all apply; check the property warnings below",
+				bestName, bestRank)
+		}
 		return bestName, nil
 	}
 

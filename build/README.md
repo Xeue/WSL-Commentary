@@ -159,6 +159,60 @@ it. GStreamer uses odd minor numbers for its development series, so 1.29 is
 pre-release and 1.28 is the stable line it leads to. If the stable line moves
 past 1.28.5, that is a specification change rather than a build decision.
 
+### 2.5a MANDATORY: `CGO_LDFLAGS`, or nothing will link
+
+**Verified at Gate B on 2026-07-30. Without this, the build fails and the error
+tells you nothing useful.** Set it in every shell that builds:
+
+```powershell
+$env:CGO_LDFLAGS = '-LC:/msys64/mingw64/x86_64-w64-mingw32/lib -LC:/msys64/mingw64/lib'
+```
+
+(Adjust to `ucrt64` if that is the toolchain you installed. Both work.)
+
+#### The symptom
+
+```
+crt2.o:crtexe.c:(.xdata+0x24): undefined reference to `__mingw_SEH_error_handler'
+collect2.exe: error: ld returned 1 exit status
+```
+
+It appears only when linking something that pulls in GStreamer. Pure-Go binaries
+such as `cmd/mockm2lx` link fine, and `go build ./...` looks clean because Go
+only *links* main packages. So the first thing that fails is `wails build`
+itself, and by then it is easy to blame Wails, cgo, or the compiler.
+
+#### The cause
+
+GStreamer's MinGW distribution ships **its own copies of the toolchain runtime
+archives** in `lib\`:
+
+```
+C:\gstreamer\1.0\mingw_x86_64\lib\libmingw32.a
+C:\gstreamer\1.0\mingw_x86_64\lib\libmingwex.a
+C:\gstreamer\1.0\mingw_x86_64\lib\libgcc.a
+```
+
+`pkg-config` puts `-LC:/gstreamer/1.0/mingw_x86_64/lib` on the link line, and it
+lands *before* the toolchain's own library directory. So `-lmingw32` resolves to
+GStreamer's copy, which was built against an older mingw-w64 and does not define
+`__mingw_SEH_error_handler` — a symbol the current `crt2.o` requires. The
+prepended `-L` paths above put the real runtime first and the collision goes
+away.
+
+#### Things this is NOT, all of which were tested and ruled out
+
+Do not spend time on any of these; each was tried and made no difference.
+
+| Suspected | Verdict |
+|---|---|
+| GCC too new (16.1.0) | No. The same GCC links everything else, including externally-linked pure-Go binaries. |
+| MSVCRT vs UCRT mismatch | No. Fails identically under `mingw64` and `ucrt64`, and the fix works under both. |
+| The `-Wl,-T,fix_debug_gdb_scripts.ld` script | No. Present on working links too; `-ldflags=-w` does not remove it. |
+| Spaces in the install path | No. Fails identically from `C:\gstreamer`. Install there anyway — see 2.5. |
+| Archive ordering, fixable with `-extldflags` | No. Appending `-lmingw32` or a `--start-group` at the end does not help; the `-L` order is what matters. |
+| `-race` specifically | No. It is not race-related; `-race` was simply the first thing tried that links a GStreamer-importing binary. |
+
 ### 2.6 `PKG_CONFIG_PATH`
 
 Specification section 11, verbatim:
