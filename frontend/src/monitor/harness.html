@@ -1,0 +1,245 @@
+<!doctype html>
+<!--
+  WP-5a monitor harness — NOT part of the shipped app.
+
+  This page exists so that R3 (the programme picture) and R4 (the return audio)
+  can be exercised with no Go, no GStreamer, no AWS account and no M2L-X
+  instance. Vite only builds index.html into frontend/dist, so nothing here ends
+  up in the .exe.
+
+  HOW TO OPEN IT
+
+      cd frontend
+      npm run dev
+      # then browse to
+      http://localhost:5173/src/monitor/harness.html
+
+  WHAT IT DOES
+
+  Loopback rig (default — needs nothing but a browser)
+      Generates a synthetic 2240x1440 multiviewer mosaic on a canvas and seven
+      audio buses at seven different pitches, publishes them from a local
+      "master" RTCPeerConnection, and consumes them through the real
+      peer.js / video.js / audio.js code with the real eight-transceiver plan.
+      That exercises the tile crop, the scale factor, the mid-to-bus mapping,
+      the 18 dB make-up gain, the level law, setSinkId and the autoplay
+      handling. Each bus is a different pitch, so if you select CLN and hear the
+      PGM pitch, the mid map is wrong and you can hear that it is wrong.
+
+  Live KVS (needs Gate C — a real signalling channel and real credentials)
+      Runs the real createMonitor() against a real channel with credentials
+      pasted into the form. The form stands in for the Wails-bound
+      GetKVSCredentials; the failure toggles below it stand in for M2L-X being
+      down, so the restart ladder can be watched without unplugging anything.
+-->
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WP-5a monitor harness</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #14141c;
+        --panel: #1d1d29;
+        --line: #33334a;
+        --text: #e6e6f0;
+        --dim: #9797b5;
+        --good: #22c55e;
+        --warn: #f59e0b;
+        --bad: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif;
+      }
+      h1 { font-size: 17px; margin: 0 0 4px; }
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 8px; }
+      .sub { color: var(--dim); margin: 0 0 16px; }
+      .cols { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px;
+      }
+      .grow { flex: 1 1 420px; min-width: 340px; }
+      .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+      .row > label { min-width: 130px; color: var(--dim); }
+      input[type="text"], input[type="number"], select, textarea {
+        background: #12121a; color: var(--text);
+        border: 1px solid var(--line); border-radius: 4px;
+        padding: 5px 7px; font: inherit;
+      }
+      input[type="number"] { width: 90px; }
+      textarea { width: 100%; min-height: 116px; font-family: ui-monospace, monospace; font-size: 12px; }
+      button {
+        background: #2b2b3f; color: var(--text);
+        border: 1px solid var(--line); border-radius: 4px;
+        padding: 6px 12px; font: inherit; cursor: pointer;
+      }
+      button:hover { background: #3a3a55; }
+      button:disabled { opacity: .45; cursor: default; }
+      button.primary { background: #1d4ed8; border-color: #1d4ed8; }
+      button.primary:hover { background: #2563eb; }
+      /* The monitor area. WP-5b owns the real one; this only has to hold the
+         stage the monitor inserts, and let it flow. */
+      #stageHost { background: #000; border: 1px solid var(--line); border-radius: 6px; padding: 0; display: inline-block; line-height: 0; }
+      .lamp { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #555; margin-right: 6px; vertical-align: middle; }
+      .lamp.good { background: var(--good); }
+      .lamp.warn { background: var(--warn); }
+      .lamp.bad { background: var(--bad); }
+      #log {
+        background: #101018; border: 1px solid var(--line); border-radius: 4px;
+        padding: 8px; height: 260px; overflow: auto;
+        font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+      }
+      #log .err { color: #fca5a5; }
+      #log .st { color: #93c5fd; }
+      #log .ok { color: #86efac; }
+      #diag { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; color: var(--dim); }
+      .note { color: var(--dim); font-size: 12px; margin: 8px 0 0; }
+      fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 12px; padding: 10px; }
+      legend { color: var(--dim); font-size: 12px; padding: 0 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>WP-5a monitor harness</h1>
+    <p class="sub">
+      R3 programme picture and R4 return audio, exercised without Go and without the M2L-X instance.
+      Not part of the shipped app.
+    </p>
+
+    <div class="cols">
+      <!-- ------------------------------- picture ------------------------------- -->
+      <div class="panel grow">
+        <h2>Programme picture (R3)</h2>
+        <div id="stageHost">
+          <!-- createMonitor / createMosaicView wraps this element in its stage
+               and crop divs. Nothing else may style it. -->
+          <video id="video" muted playsinline></video>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <label for="scale">Scale</label>
+          <input id="scale" type="range" min="0.1" max="3" step="0.01" value="1" style="flex:1" />
+          <span id="scaleReadout" style="min-width:56px;text-align:right">1.00x</span>
+          <button id="fitWidth" type="button">Fit width</button>
+        </div>
+
+        <fieldset>
+          <legend>monitorTile — spec §9, measured on the dev event</legend>
+          <div class="row">
+            <label for="tileX">x / y / w / h</label>
+            <input id="tileX" type="number" value="0" />
+            <input id="tileY" type="number" value="360" />
+            <input id="tileW" type="number" value="640" />
+            <input id="tileH" type="number" value="360" />
+            <button id="applyTile" type="button">Apply</button>
+            <button id="tilePgm" type="button">PGM</button>
+            <button id="tilePvw" type="button">PVW</button>
+            <button id="tileAll" type="button">Whole mosaic</button>
+          </div>
+          <p class="note">
+            PGM is (0, 360, 640, 360) and PVW is (0, 0, 640, 360). Both are M2L-X configuration,
+            not constants: docs/test-results.md §2.3 says not to assume they are fixed across input counts.
+          </p>
+        </fieldset>
+      </div>
+
+      <!-- -------------------------------- audio -------------------------------- -->
+      <div class="panel grow">
+        <h2>Return audio (R4)</h2>
+        <audio id="audio"></audio>
+
+        <div class="row">
+          <label for="returnMid">Return bus</label>
+          <select id="returnMid" style="flex:1"></select>
+        </div>
+        <div class="row">
+          <label for="gainDb">Make-up gain</label>
+          <input id="gainDb" type="number" value="18" step="1" min="-40" max="40" />
+          <span class="note" style="margin:0">
+            dB — default 18, the measured deficit (docs/test-results.md line 121)
+          </span>
+        </div>
+        <div class="row">
+          <label for="level">Level</label>
+          <input id="level" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1" />
+          <span id="levelReadout" style="min-width:56px;text-align:right">0.50</span>
+        </div>
+        <div class="row">
+          <label for="sink">Headphones</label>
+          <select id="sink" style="flex:1"></select>
+          <button id="refreshDevices" type="button">Refresh</button>
+        </div>
+        <p class="note">
+          Device <em>labels</em> are blank until something grants microphone permission. The shipped app
+          gets them from <code>--auto-accept-camera-and-microphone-capture</code> in
+          <code>WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS</code> (spec §7); in a plain browser, press this:
+        </p>
+        <div class="row">
+          <button id="grantLabels" type="button">Grant microphone permission (for device labels)</button>
+          <button id="resumeAudio" type="button">Resume audio</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="cols" style="margin-top:16px">
+      <!-- ------------------------------ transport ------------------------------ -->
+      <div class="panel grow">
+        <h2>Transport</h2>
+        <div class="row">
+          <label for="mode">Mode</label>
+          <select id="mode" style="flex:1">
+            <option value="loopback">Loopback rig — no AWS, no instance, nothing to configure</option>
+            <option value="live">Live KVS — needs a real channel and real credentials</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <button id="start" class="primary" type="button">Start</button>
+          <button id="stop" type="button" disabled>Stop</button>
+          <span><span id="lamp" class="lamp"></span><span id="lampText">closed</span></span>
+        </div>
+
+        <fieldset id="liveOnly">
+          <legend>GetKVSCredentials — what the Wails binding would return</legend>
+          <textarea id="creds" spellcheck="false"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="saveCreds" type="button">Remember</button>
+            <button id="clearCreds" type="button">Forget</button>
+            <label for="failMode" style="min-width:auto;margin-left:8px">Fault injection</label>
+            <select id="failMode">
+              <option value="none">none — credentials work</option>
+              <option value="always">always fail — watch the restart ladder</option>
+              <option value="flaky3">fail 3 times then work — watch it recover on its own</option>
+              <option value="garbage">return garbage — watch BAD_CREDENTIALS</option>
+            </select>
+          </div>
+          <p class="note">
+            Stored in localStorage on this machine when you press Remember. That is a live AWS session
+            token: fine on a dev box, never near the shipped app.
+          </p>
+        </fieldset>
+
+        <div id="diag"></div>
+      </div>
+
+      <!-- --------------------------------- log --------------------------------- -->
+      <div class="panel grow">
+        <h2>Events</h2>
+        <div id="log"></div>
+        <div class="row" style="margin-top:8px">
+          <button id="clearLog" type="button">Clear</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./harness.js"></script>
+  </body>
+</html>

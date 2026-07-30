@@ -13,8 +13,6 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 // Stream states reported by <statusKey>.stream_state on the status WebSocket.
@@ -226,45 +224,11 @@ type Watcher interface {
 // hostname or host:port with no scheme; the implementation chooses https for
 // REST and wss for the status socket.
 func NewClient(host string) Client {
-	return notImplementedClient{}
+	return newClient(host)
 }
 
 // NewWatcher returns a Watcher for the M2L-X instance at host that authenticates
 // using the bearer token held by c.
 func NewWatcher(host string, c Client) Watcher {
-	return notImplementedWatcher{}
+	return newWatcher(host, c)
 }
-
-// notImplementedClient is the WP-0 placeholder, replaced by WP-2.
-type notImplementedClient struct{}
-
-func (notImplementedClient) SignIn(ctx context.Context, alias, password string) error {
-	return errors.New("not implemented: WP-2")
-}
-
-func (notImplementedClient) Refresh(ctx context.Context) error {
-	return errors.New("not implemented: WP-2")
-}
-
-func (notImplementedClient) Token() string { return "" }
-
-func (notImplementedClient) KVSInfo(ctx context.Context, eventID string) (KVSInfo, error) {
-	return KVSInfo{}, errors.New("not implemented: WP-2")
-}
-
-func (notImplementedClient) KVSToken(ctx context.Context, eventID string) (KVSToken, error) {
-	return KVSToken{}, errors.New("not implemented: WP-2")
-}
-
-// notImplementedWatcher is the WP-0 placeholder, replaced by WP-2.
-type notImplementedWatcher struct{}
-
-func (notImplementedWatcher) Watch(ctx context.Context, statusKey string) <-chan Status {
-	ch := make(chan Status)
-	close(ch)
-	return ch
-}
-
-// Referenced so that `go mod tidy` keeps the frozen dependency on gorilla
-// /websocket before WP-2 writes the status socket. WP-2 deletes this line.
-var _ = websocket.DefaultDialer

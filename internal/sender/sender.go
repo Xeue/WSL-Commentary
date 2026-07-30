@@ -127,22 +127,24 @@ type Sender interface {
 // unit-tested against a fake gst.Pipeline: WP-3b writes that fake in its own
 // test files. The Sender takes ownership of p and calls p.Stop when it stops.
 func New(p gst.Pipeline) Sender {
-	return notImplementedSender{}
+	return newSender(p, realClock{})
 }
 
-// notImplementedSender is the WP-0 placeholder, replaced by WP-3b.
-type notImplementedSender struct{}
-
-func (notImplementedSender) Start(opts Opts) error {
-	return errors.New("not implemented: WP-3b")
-}
-
-func (notImplementedSender) Stop() error {
-	return errors.New("not implemented: WP-3b")
-}
-
-func (notImplementedSender) States() <-chan State {
-	ch := make(chan State)
-	close(ch)
-	return ch
+// backoffDelay returns the delay before reconnect attempt number attempt,
+// counting the attempt that has just failed as attempt zero. It walks
+// BackoffLadder and then returns BackoffCap for every attempt beyond it, so the
+// sequence is 7, 7, 10, 15, 20, 30, 30, 30, ... seconds with no upper bound on
+// the number of attempts.
+//
+// A negative attempt cannot arise from this package's own bookkeeping, but is
+// clamped to the first rung rather than panicking: during a match an
+// over-long wait is survivable and a panic is not.
+func backoffDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt < len(BackoffLadder) {
+		return BackoffLadder[attempt]
+	}
+	return BackoffCap
 }

@@ -1,0 +1,246 @@
+WSL STUDIOS COMMENTARY CONTRIBUTION (wslcomms.exe)
+THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
+==================================================================
+
+This product includes third-party software. This file lists every third-party
+component distributed with it, the licence each is under, and where each one
+sits in the installed program folder. The full text of every licence referred to
+below is in this same folder.
+
+For components under the GNU Lesser General Public License version 2.1, the GNU
+General Public License version 3, or the Mozilla Public License 2.0, see
+WRITTEN-OFFER.txt in this folder. It is a standing offer to supply the
+corresponding source code, and it is part of how this product complies with
+those licences.
+
+The GStreamer, GLib and related libraries listed under "A." below are shipped
+UNMODIFIED and are loaded as separate shared libraries (DLLs) at run time. No
+part of them is linked statically into wslcomms.exe. A user who wishes to run
+this product against a modified, interface-compatible build of any of them may
+replace the corresponding DLL in the program folder; the application loads them
+by name from that folder and will use the replacement.
+
+------------------------------------------------------------------
+A. LGPL-2.1 COMPONENTS - shipped as DLLs, unmodified, dynamically linked
+------------------------------------------------------------------
+
+  GStreamer                       LGPL-2.1-or-later
+    Version 1.28.5, mingw-x86_64 build, from the GStreamer project's official
+    Windows installers. Includes the core library and the following libraries
+    and plugins only: coreelements, typefindfunctions, videoconvertscale,
+    audioconvert, audioresample, imagefreeze, png, audioparsers,
+    videoparsersbad, wasapi2, mediafoundation, mpegtsmux, srt.
+    The complete file list, with SHA-256 for every file, is in
+    gst\BUNDLE-MANIFEST.txt in the program folder.
+
+  GLib, GObject, GIO, GModule     LGPL-2.1-or-later
+    Version: UNVERIFIED - the exact GLib version is whatever the GStreamer
+    1.28.5 mingw-x86_64 build ships. Gate B must record it here, from
+    `pkg-config --modversion glib-2.0` on the build host or from the DLL's
+    version resource. Do not release with this line unresolved.
+
+  GNU gettext runtime (libintl)   LGPL-2.1-or-later
+  GNU libiconv (libiconv)         LGPL-2.1-or-later
+    Present if the GStreamer build links them; see gst\BUNDLE-MANIFEST.txt for
+    whether they are in this particular build.
+
+------------------------------------------------------------------
+B. OTHER RECIPROCAL LICENCES - shipped as DLLs, unmodified
+------------------------------------------------------------------
+
+  libsrt                          MPL-2.0
+    The SRT reference implementation, used by GStreamer's srtsink. MPL-2.0
+    section 3.2 requires that recipients of the executable form are told how to
+    obtain the Source Code Form: see WRITTEN-OFFER.txt.
+
+  libgcc (libgcc_s_seh-1.dll)     GPL-3.0-or-later WITH GCC-exception-3.1
+  libstdc++ (libstdc++-6.dll)     GPL-3.0-or-later WITH GCC-exception-3.1
+    The MinGW-w64 GCC runtime libraries. They are distributed under GPL-3.0
+    with the GCC Runtime Library Exception version 3.1, whose whole purpose is
+    to permit exactly this: distributing a non-GPL program that was compiled
+    with GCC and links the GCC runtime. This product is NOT under the GPL.
+    Both texts are in this folder: GPL-3.0.txt and
+    GCC-RUNTIME-LIBRARY-EXCEPTION-3.1.txt. Source is covered by
+    WRITTEN-OFFER.txt.
+
+------------------------------------------------------------------
+C. PERMISSIVE LICENCES - shipped as DLLs, unmodified
+------------------------------------------------------------------
+
+  ORC (liborc-0.4)                BSD-2-Clause style
+    The SIMD backend for audioconvert, audioresample and videoconvert.
+    UNVERIFIED - copy the exact copyright notice from the ORC source tree's
+    COPYING file at Gate B and paste it here.
+
+  libpng                          PNG Reference Library License (libpng-2.0)
+    Decodes the slate PNG. UNVERIFIED - copy the exact notice from the libpng
+    source at Gate B.
+
+  zlib                            zlib License
+    UNVERIFIED - copy the exact notice at Gate B.
+
+  libffi                          MIT
+  PCRE2                           BSD-3-Clause
+  OpenSSL (libcrypto, libssl)     Apache-2.0
+    Present only if the bundled libsrt uses OpenSSL as its crypto backend;
+    gst\BUNDLE-MANIFEST.txt records which files are actually shipped. If the
+    build uses mbedTLS instead, that is Apache-2.0 as well.
+
+  MinGW-w64 runtime (libwinpthread-1.dll)
+    MinGW-w64 runtime licence (permissive; winpthreads is MIT/BSD-style).
+    UNVERIFIED - copy the exact notice from the MinGW-w64 distribution used at
+    Gate B.
+
+------------------------------------------------------------------
+D. LINKED INTO wslcomms.exe - Go
+------------------------------------------------------------------
+
+Licences below were read from the LICENSE file in each module in the Go module
+cache, not assumed.
+
+  github.com/wailsapp/wails/v2 v2.13.0                MIT
+  github.com/wailsapp/go-webview2 v1.0.22             MIT
+  github.com/jchv/go-winloader (2021-07-11)           ISC
+  github.com/go-gst/go-gst v0.0.2                     MIT
+  github.com/go-gst/go-glib v0.0.2                    MIT
+  github.com/danieljoos/wincred v1.2.3                MIT
+  github.com/gorilla/websocket v1.5.3                 BSD-2-Clause
+  github.com/aws/aws-sdk-go-v2 (config, credentials, cognitoidentity and their
+    transitive modules)                               Apache-2.0
+  github.com/aws/smithy-go v1.27.5                    Apache-2.0
+  The Go standard library                             BSD-3-Clause
+  Other transitive Go modules listed in go.mod        MIT / BSD / Apache-2.0
+
+  Apache-2.0 section 4(d) attribution for the AWS modules:
+
+      AWS SDK for Go
+      Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+      Copyright 2014-2015 Stripe, Inc.
+
+      Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+  github.com/datarhei/gosrt is a build-time dependency of the mock M2L-X test
+  server (cmd\mockm2lx) ONLY. It is not linked into wslcomms.exe and is not
+  distributed with this product.
+
+------------------------------------------------------------------
+E. EMBEDDED IN wslcomms.exe - JavaScript
+------------------------------------------------------------------
+
+The user interface is an HTML page embedded in the executable and rendered in
+WebView2. It contains:
+
+  amazon-kinesis-video-streams-webrtc 2.8.1           Apache-2.0
+  @aws-sdk/client-kinesis-video 3.1099.0              Apache-2.0
+  @aws-sdk/client-kinesis-video-signaling 3.1099.0    Apache-2.0
+
+Licences read from each package's package.json and LICENSE file. Nothing is
+fetched from a CDN at run time; facility networks have no outbound web access.
+
+------------------------------------------------------------------
+F. MICROSOFT COMPONENTS
+------------------------------------------------------------------
+
+  Microsoft Edge WebView2 Evergreen bootstrapper
+    Approximately 150 KB, embedded in wslcomms.exe by `wails build -webview2
+    embed`. Distributed under Microsoft's WebView2 distribution terms. The
+    WebView2 Evergreen runtime itself is part of Windows 11 and is not
+    distributed by this product.
+
+  Media Foundation H.264 and AAC encoders, WASAPI
+    Part of Windows. Not distributed by this product. This is the reason no
+    third-party video or audio encoder is bundled.
+
+------------------------------------------------------------------
+G. DELIBERATE EXCLUSIONS - read this before adding anything to the bundle
+------------------------------------------------------------------
+
+  x264 (libgstx264.dll, libx264)   GPL-2.0-or-later   *** EXCLUDED ***
+
+    x264 is licensed under the GPL. Linking or distributing it with this
+    product would place the entire combined work under the GPL, which is
+    incompatible with a commercial deliverable. It is therefore excluded, and
+    the exclusion is enforced mechanically rather than by convention:
+
+      - build\bundle-gst.ps1 copies from an explicit file list of individual
+        file names. It never copies a directory, so a GPL plugin sitting next
+        to an allowlisted one cannot be swept up.
+      - That script refuses to run if any name in its file list matches
+        *x264*, refuses to copy any resolved file whose name matches, and
+        fails after copying if any file matching *x264* is present in the
+        staged output. There is no override switch.
+      - build\installer.iss refuses to compile unless gst\BUNDLE-MANIFEST.txt
+        is present, which only that script produces.
+
+    The H.264 encoder actually used is mfh264enc: a GStreamer (LGPL) wrapper
+    over the Media Foundation encoder already in Windows.
+
+  gst-libav / FFmpeg              EXCLUDED
+    Licensing depends on how it was built and nothing here needs it. Blocked by
+    the same patterns.
+
+  gst-plugins-ugly                EXCLUDED
+    That plugin set exists because of licensing. Blocked by the same patterns.
+
+  fdkaac, faac, voaacenc          EXCLUDED
+    Not needed: AAC-LC encoding is done by mfaacenc, the Windows encoder, so no
+    third-party AAC implementation and no separate AAC patent licence is
+    involved on our side.
+
+------------------------------------------------------------------
+H. PROVENANCE OF THE LICENCE TEXTS IN THIS FOLDER
+------------------------------------------------------------------
+
+These are canonical, unmodified licence texts, copied byte-for-byte from copies
+already present on the build machine rather than retyped. SHA-256 as shipped:
+
+  LGPL-2.1.txt                          26,530 bytes
+    sha256 DC626520DCD53A22F727AF3EE42C770E56C97A64FE3ADB063799D8AB032FE551
+    source: GNU LGPL 2.1 as distributed with the xz utils in Git for Windows.
+
+  GPL-3.0.txt                           35,147 bytes
+    sha256 8CEB4B9EE5ADEDDE47B31E975C1D90C73AD27B6B165A1DCD80C7C545EB65B903
+    source: GCC COPYING3 as distributed with Git for Windows (gcc-libs).
+
+  GCC-RUNTIME-LIBRARY-EXCEPTION-3.1.txt  3,324 bytes
+    sha256 9D6B43CE4D8DE0C878BF16B54D8E7A10D9BD42B75178153E3AF6A815BDC90F74
+    source: GCC COPYING.RUNTIME as distributed with Git for Windows.
+
+  Apache-2.0.txt                        11,357 bytes
+    sha256 58D1E17FFE5109A7AE296CAAFCADFDBE6A7D176F0BC4AB01E12A689B0499D8BD
+    source: the LICENSE.txt shipped with amazon-kinesis-video-streams-webrtc
+    2.8.1, which is one of the components it covers.
+
+  MPL-2.0.txt                           15,648 bytes
+    sha256 5EBA353FE5076AC3432177F8AB1CF75E3AFCD0584251E37C3BFEAD5F447D040E
+    source: a verbatim MPL-2.0 copy from the frontend build toolchain.
+
+  BEFORE RELEASE: diff each of these against its canonical URL and confirm
+  byte equality. They were obtained from copies on a build machine, not from
+  the issuing organisation.
+
+      LGPL-2.1   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+      GPL-3.0    https://www.gnu.org/licenses/gpl-3.0.txt
+      GCC RLE    https://www.gnu.org/licenses/gcc-exception-3.1.txt
+      Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0.txt
+      MPL-2.0    https://www.mozilla.org/media/MPL/2.0/index.txt
+
+------------------------------------------------------------------
+I. WHAT IS STILL OUTSTANDING IN THIS FILE
+------------------------------------------------------------------
+
+Every line above marked UNVERIFIED is a line that could not be established on
+the machine this file was written on, because no GStreamer installation was
+present (Gate B closed). Each one is a fact that exists on the build host the
+moment GStreamer is installed. They must all be resolved before this product is
+given to anyone outside the project:
+
+  1. The exact GLib version.
+  2. Which of libiconv, OpenSSL and mbedTLS are actually bundled - read
+     gst\BUNDLE-MANIFEST.txt, which lists exactly what was shipped.
+  3. The verbatim copyright notices for ORC, libpng, zlib and the MinGW-w64
+     runtime.
+  4. The identity and contact details in WRITTEN-OFFER.txt.
+
+This file is a factual notice, not legal advice. Have it and WRITTEN-OFFER.txt
+reviewed by whoever signs off the commercial deliverable.

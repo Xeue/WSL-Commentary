@@ -1,0 +1,598 @@
+/*
+ * WSL Commentary — application styling.
+ *
+ * Owner: WP-5b.
+ *
+ * This is a control panel used under pressure in a dim commentary box by
+ * someone whose attention is on the match, not the screen (specification
+ * section 10's design note). Every choice below follows from that:
+ *
+ *   - one fixed dark theme, deliberately, so it does not glare — this is not
+ *     a document read in daylight, it is a facility tool, and there is no
+ *     "light commentary box" to support
+ *   - generous hit targets (44px+ controls, 64px START/STOP)
+ *   - lamp state is encoded in SHAPE and TEXT as well as colour, so a
+ *     colourblind commentator or a monochrome monitor a metre away still
+ *     reads it correctly
+ *   - the only animation is a slow pulse on amber lamps, switched off under
+ *     prefers-reduced-motion
+ *   - system fonts only — the facility has no outbound web access, so no
+ *     webfont is fetched or bundled
+ *
+ * No framework, no CSS-in-JS: plain rules, grouped by the DOM structure
+ * home.js and settings.js build.
+ */
+
+:root {
+  --bg: #0b0d10;
+  --panel: #161b21;
+  --panel-alt: #1e242c;
+  --border: #2a313a;
+  --text: #e9edf1;
+  --text-muted: #96a2ad;
+  --accent: #3b82f6;
+  --accent-hover: #5b98f8;
+  --focus: #7db4ff;
+
+  --green: #2ecc71;
+  --amber: #f5a623;
+  --red: #ef4444;
+  --grey: #7b8794;
+
+  --danger-bg: #341313;
+  --danger-border: #7f2020;
+  --ok-bg: #0d2417;
+  --ok-border: #1e5c37;
+
+  --radius: 10px;
+  --radius-lg: 14px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reset and base                                                      */
+/* ------------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    Roboto,
+    Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+button {
+  font-family: inherit;
+}
+
+*:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.25rem 1.75rem;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------------ */
+/* Top bar (shared by both views)                                      */
+/* ------------------------------------------------------------------ */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar h1 {
+  font-size: 1.3rem;
+  letter-spacing: 0.01em;
+}
+
+.title-wrap {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+}
+
+/* Shown only when backend.js could not find a real Wails runtime, i.e. the
+   UI is running against the in-memory fakes (see backend.js). Never appears
+   in a packaged build. */
+.dev-badge {
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ------------------------------------------------------------------ */
+/* Buttons, inputs — shared controls                                   */
+/* ------------------------------------------------------------------ */
+
+.btn {
+  min-height: 44px;
+  padding: 0.6rem 1.2rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: 1rem;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.btn:hover {
+  background: #262e38;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  background: transparent;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #051023;
+  font-weight: 700;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-stop {
+  background: var(--red);
+  border-color: var(--red);
+  color: #2a0505;
+  font-weight: 700;
+}
+
+.btn-stop:hover:not(:disabled) {
+  background: #f16060;
+}
+
+.btn-start {
+  min-width: 160px;
+  min-height: 64px;
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  border-radius: var(--radius-lg);
+}
+
+select,
+input[type='text'],
+input[type='password'],
+input[type='number'] {
+  min-height: 44px;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem;
+}
+
+select:disabled {
+  opacity: 0.6;
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+  height: 32px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dismissible error banner — NOT the permanent honest line             */
+/* ------------------------------------------------------------------ */
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.85rem;
+  padding: 0.65rem 1rem;
+  border-radius: var(--radius);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: #fecaca;
+}
+
+.error-dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.25rem 0.4rem;
+  border-radius: 6px;
+}
+
+.error-dismiss:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ------------------------------------------------------------------ */
+/* PGM tile                                                             */
+/*                                                                      */
+/* --mosaic-w/--mosaic-h are the fixed KVS mosaic size (spec section 7).*/
+/* --tile-x/--tile-y/--tile-w/--tile-h come from config.monitorTile and */
+/* are set in JS (home.js's setTile). Everything here is proportional,  */
+/* so it stays correct at any window width and at any tile geometry —   */
+/* no pixel value is hardcoded, unlike the spec's own worked example.   */
+/* ------------------------------------------------------------------ */
+
+.pgm-wrap {
+  width: 100%;
+  margin: 1rem 0;
+  background: #000;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.pgm-tile {
+  position: relative;
+  width: 100%;
+  aspect-ratio: var(--tile-w, 640) / var(--tile-h, 360);
+  background: #000;
+  overflow: hidden;
+}
+
+.pgm-tile video {
+  position: absolute;
+  max-width: none;
+  width: calc(var(--mosaic-w, 2240) / var(--tile-w, 640) * 100%);
+  height: calc(var(--mosaic-h, 1440) / var(--tile-h, 360) * 100%);
+  left: calc(var(--tile-x, 0) / var(--tile-w, 640) * -100%);
+  top: calc(var(--tile-y, 360) / var(--tile-h, 360) * -100%);
+}
+
+/* ------------------------------------------------------------------ */
+/* Controls: input / headphones / return + level                       */
+/* ------------------------------------------------------------------ */
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  margin: 0.5rem 0 1.25rem;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.control-row label {
+  min-width: 160px;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+}
+
+.control-row select {
+  flex: 1 1 320px;
+}
+
+.control-row .level-label {
+  min-width: auto;
+  margin-left: 0.5rem;
+}
+
+.control-row input[type='range'] {
+  flex: 1 1 160px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Start/stop + lamps                                                   */
+/* ------------------------------------------------------------------ */
+
+.action-row {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0 1rem;
+}
+
+.lamps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  flex: 1 1 auto;
+}
+
+.lamp {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 44px;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.lamp-glyph {
+  width: 1.4rem;
+  font-size: 1.35rem;
+  line-height: 1;
+  text-align: center;
+}
+
+.lamp-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.lamp-name {
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.lamp-state {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.lamp-green .lamp-glyph,
+.lamp-green .lamp-state {
+  color: var(--green);
+}
+
+.lamp-amber .lamp-glyph,
+.lamp-amber .lamp-state {
+  color: var(--amber);
+}
+
+.lamp-red .lamp-glyph,
+.lamp-red .lamp-state {
+  color: var(--red);
+}
+
+.lamp-grey .lamp-glyph,
+.lamp-grey .lamp-state {
+  color: var(--grey);
+}
+
+/* The only animation in the app: a slow pulse on amber, so "trying to
+   reconnect" reads differently from "connected" or "down" even at a
+   glance, and switched off entirely for anyone who has asked for reduced
+   motion. */
+.lamp-amber .lamp-glyph {
+  animation: lamp-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes lamp-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lamp-amber .lamp-glyph {
+    animation: none;
+  }
+}
+
+.status-unavailable-banner {
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.9rem;
+  border-radius: 8px;
+  background: #241a06;
+  border: 1px solid #6b4a06;
+  color: #fbbf24;
+  font-size: 0.9rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* The honest line — permanent, not dismissible, always visible         */
+/* ------------------------------------------------------------------ */
+
+.honest-line {
+  margin: 0.25rem 0 0;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings                                                             */
+/* ------------------------------------------------------------------ */
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 640px;
+  padding: 0.5rem 0 2.5rem;
+}
+
+.settings-form h2 {
+  font-size: 1.02rem;
+  margin: 1.4rem 0 -0.2rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.settings-form h2:first-of-type {
+  margin-top: 0.3rem;
+  padding-top: 0;
+  border-top: none;
+}
+
+.settings-form h3 {
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin: 0.4rem 0 -0.2rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.field label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.field-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.field-error {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--red);
+}
+
+.secret-badge {
+  align-self: flex-start;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.secret-badge-set {
+  background: var(--green);
+  border-color: var(--green);
+  color: #052e12;
+}
+
+.secrets-hint {
+  margin-top: -0.3rem;
+}
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(80px, 1fr));
+  gap: 0.75rem;
+}
+
+.save-message {
+  margin: 0.25rem 0 0;
+  padding: 0.6rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.save-message-ok {
+  background: var(--ok-bg);
+  border: 1px solid var(--ok-border);
+  color: #86efac;
+}
+
+.save-message-error {
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: #fecaca;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Narrow windows                                                       */
+/* ------------------------------------------------------------------ */
+
+@media (max-width: 560px) {
+  .control-row label {
+    min-width: 100%;
+  }
+
+  .control-row select,
+  .control-row input[type='range'] {
+    flex: 1 1 100%;
+  }
+
+  .tile-grid {
+    grid-template-columns: repeat(2, minmax(80px, 1fr));
+  }
+}

@@ -6,9 +6,23 @@
 // The two secrets referenced by this configuration — the M2L-X password and the
 // SRT passphrase — are deliberately NOT stored here. They live in Windows
 // Credential Manager and are reached through the internal/secrets package.
+//
+// WP-1 addition beyond the WP-0 contract: (*Config).Validate reports which
+// fields required for Start to succeed are missing or out of range. It is not
+// part of the original interface declaration — Config, Defaults, Path, Load
+// and Save are — but WP-8's Start needs a single place that knows which
+// fields are mandatory, so it is added here rather than duplicated at every
+// call site. Reported to the coordinator per contract rule 3.
 package config
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 // Tile is a rectangle in the KVS multiviewer mosaic, in mosaic pixels.
 //
@@ -152,19 +166,150 @@ func Defaults() *Config {
 
 // Path returns the absolute path of the configuration file,
 // %APPDATA%\WSLComms\config.json. It does not create the directory.
+//
+// os.UserConfigDir resolves %AppData% on Windows, which is exactly
+// %APPDATA%; this is also what lets tests substitute a temp directory by
+// setting the APPDATA environment variable.
 func Path() (string, error) {
-	return "", errors.New("not implemented: WP-1")
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("config: resolving user config directory: %w", err)
+	}
+	return filepath.Join(dir, AppDataDirName, FileName), nil
 }
 
 // Load reads the configuration file. If the file does not exist, Load returns
 // Defaults() and a nil error, so that first run is not an error condition.
 // Fields absent from an existing file take their values from Defaults().
+//
+// This works by unmarshalling onto a Defaults()-populated struct rather than
+// a zero one: encoding/json only overwrites fields present in the source
+// JSON, so a key missing from an older or hand-edited config.json leaves the
+// corresponding field at its documented default instead of silently becoming
+// the Go zero value (e.g. srtLatencyMs 0, which is not a valid srtsink
+// latency, instead of the intended 120).
 func Load() (*Config, error) {
-	return nil, errors.New("not implemented: WP-1")
+	path, err := Path()
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Defaults(), nil
+		}
+		return nil, fmt.Errorf("config: reading %s: %w", path, err)
+	}
+
+	cfg := Defaults()
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("config: parsing %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 // Save writes the configuration atomically to Path(), creating the directory if
 // it is missing. It must never write the M2L-X password or the SRT passphrase.
+//
+// Atomicity: the new content is written to a temp file created in the same
+// directory as the target (so the later rename is same-volume, not a copy),
+// flushed to stable storage with Sync, closed, and then moved over the
+// target with os.Rename. On Windows, os.Rename uses MoveFileEx with
+// MOVEFILE_REPLACE_EXISTING, so the target is replaced in a single directory
+// operation: a reader of config.json — including this process crashing mid
+// write, or a power cut during a match — always observes either the old
+// complete file or the new complete file, never a truncated one.
 func (c *Config) Save() error {
-	return errors.New("not implemented: WP-1")
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("config: creating %s: %w", dir, err)
+	}
+
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("config: encoding config: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, FileName+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("config: creating temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: writing %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: syncing %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("config: closing %s: %w", tmpPath, err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("config: renaming %s to %s: %w", tmpPath, path, err)
+	}
+	renamed = true
+	return nil
+}
+
+// Validate reports every reason (*Config) is not ready for Start to succeed,
+// as a single error joining one message per problem field (via errors.Join)
+// so the Settings screen can show the operator every problem at once rather
+// than one edit-rebuild-fail cycle at a time. It returns nil when c is ready.
+//
+// Required non-empty fields: m2lxHost, alias, eventId, srtHost, statusKey,
+// audioDeviceId. srtPort must be a valid TCP/UDP port, 1..65535. pbkeylen
+// must be 0 (no passphrase negotiated), 16 or 32 — the only key lengths SRT's
+// AES-CTR supports. returnMid must be 1..7, the range of transceiver mids the
+// KVS signalling channel can address.
+//
+// WP-1 addition beyond the WP-0 contract; see the package doc comment.
+func (c *Config) Validate() error {
+	var errs []error
+
+	required := []struct {
+		name  string
+		value string
+	}{
+		{"m2lxHost", c.M2LXHost},
+		{"alias", c.Alias},
+		{"eventId", c.EventID},
+		{"srtHost", c.SRTHost},
+		{"statusKey", c.StatusKey},
+		{"audioDeviceId", c.AudioDeviceID},
+	}
+	for _, f := range required {
+		if strings.TrimSpace(f.value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", f.name))
+		}
+	}
+
+	if c.SRTPort < 1 || c.SRTPort > 65535 {
+		errs = append(errs, fmt.Errorf("srtPort must be between 1 and 65535, got %d", c.SRTPort))
+	}
+
+	if c.PBKeyLen != 0 && c.PBKeyLen != 16 && c.PBKeyLen != 32 {
+		errs = append(errs, fmt.Errorf("pbkeylen must be 0, 16 or 32, got %d", c.PBKeyLen))
+	}
+
+	if c.ReturnMid < 1 || c.ReturnMid > 7 {
+		errs = append(errs, fmt.Errorf("returnMid must be between 1 and 7, got %d", c.ReturnMid))
+	}
+
+	return errors.Join(errs...)
 }

@@ -1,13 +1,15 @@
 // Entry point referenced by index.html.
 //
-// WP-0 wrote this stub so that `npm run build` succeeds before any UI exists.
-// WP-5b owns it: it should import the shell from ./ui/ and the styles from
-// ./styles/, and hand the monitor element to WP-5a's module in ./monitor/.
+// Owner: WP-5b.
 //
-// The two halves of the frontend are path-disjoint:
-//   src/monitor/  WP-5a  KVS viewer, mosaic crop, return audio, setSinkId
-//   src/ui/       WP-5b  controls, lamps, Settings view
-//   src/styles/   WP-5b
+// Kept deliberately thin: the shell lives in ./ui/app.js, the styling in
+// ./styles/main.css, and the monitor is reached only from inside ./ui/app.js
+// through WP-5a's createMonitor factory in ./monitor/monitor.js — this file
+// never imports the monitor module directly.
+//
+// One window, no router, no menu (specification section 10).
+import './styles/main.css';
+import { mountApp } from './ui/app.js';
 
-document.querySelector('#app').textContent =
-  'wslcomms: frontend not implemented yet (WP-5a monitor, WP-5b shell)';
+const root = document.querySelector('#app');
+mountApp(root);

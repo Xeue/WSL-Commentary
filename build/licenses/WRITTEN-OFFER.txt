@@ -1,0 +1,148 @@
+WRITTEN OFFER FOR CORRESPONDING SOURCE CODE
+===========================================
+
+Product:  WSL Studios Commentary Contribution (wslcomms.exe)
+Version:  <<<PRODUCT VERSION - MUST BE COMPLETED BEFORE RELEASE>>>
+Offeror:  <<<LEGAL ENTITY NAME - MUST BE COMPLETED BEFORE RELEASE>>>
+          <<<REGISTERED POSTAL ADDRESS - MUST BE COMPLETED BEFORE RELEASE>>>
+Contact:  <<<EMAIL ADDRESS FOR SOURCE REQUESTS - MUST BE COMPLETED BEFORE RELEASE>>>
+Issued:   <<<DATE OF RELEASE - MUST BE COMPLETED BEFORE RELEASE>>>
+
+  *** THIS DOCUMENT IS NOT VALID WHILE ANY <<<...>>> FIELD REMAINS.       ***
+  *** An offer that does not identify who is making it, and how to take   ***
+  *** it up, is not an offer. Do not ship the installer until every       ***
+  *** field above has been completed by the business.                     ***
+
+
+1. THE OFFER
+------------
+
+This product contains software licensed under the GNU Lesser General Public
+License version 2.1, the Mozilla Public License 2.0, and the GNU General Public
+License version 3 with the GCC Runtime Library Exception version 3.1. The full
+text of each of those licences accompanies this document.
+
+For a period of THREE (3) YEARS from the date on which you received this
+product, the Offeror named above will give any third party, on request, a
+complete machine-readable copy of the corresponding source code for each of the
+components listed in section 2 below, together with the scripts used to control
+compilation and installation of that source code.
+
+The source code will be supplied on a physical medium customarily used for
+software interchange, or by a download link, at the requester's option. The
+charge will be no more than the Offeror's cost of physically performing that
+distribution. Where the source code is supplied by download, there will be no
+charge.
+
+The source code supplied will be the source code corresponding to the exact
+binaries distributed with this product - not merely the latest upstream release
+of the same project. The Offeror archives that source at the time each release
+is built, precisely so that this offer can be honoured for its full term.
+
+For the components licensed under the GNU Lesser General Public License version
+2.1, this offer additionally supplies the materials described in section 6(a)
+of that licence, so that a recipient may modify a library and relink it with
+this product: that is, the corresponding source of the library, together with
+the object code or source code of the parts of this product needed to relink it
+against a modified version of that library.
+
+
+2. COMPONENTS COVERED BY THIS OFFER
+-----------------------------------
+
+  Component                       Licence
+  ------------------------------  --------------------------------------------
+  GStreamer 1.28.5                LGPL-2.1-or-later
+    (core, and only these plugins: coreelements, typefindfunctions,
+    videoconvertscale, audioconvert, audioresample, imagefreeze, png,
+    audioparsers, videoparsersbad, wasapi2, mediafoundation, mpegtsmux, srt)
+
+  GLib, GObject, GIO, GModule     LGPL-2.1-or-later
+    (the version shipped with the GStreamer 1.28.5 mingw-x86_64 build; the
+    exact version number is recorded in NOTICE.txt)
+
+  GNU gettext runtime (libintl)   LGPL-2.1-or-later
+  GNU libiconv                    LGPL-2.1-or-later
+    (where present; the file gst\BUNDLE-MANIFEST.txt in the installed program
+    folder lists exactly which files were shipped)
+
+  libsrt                          MPL-2.0
+    This offer also serves as the notice required by section 3.2 of the
+    Mozilla Public License 2.0 informing you how to obtain the Source Code
+    Form of libsrt, which is and remains available under the MPL-2.0.
+
+  libgcc, libstdc++               GPL-3.0-or-later WITH GCC-exception-3.1
+    (the MinGW-w64 GCC runtime libraries distributed as libgcc_s_seh-1.dll and
+    libstdc++-6.dll)
+
+To make a request, write to the contact address above and state:
+
+  a) the product name and version, exactly as shown at the top of this
+     document or in the installed program folder;
+  b) which of the components above you want the source for, or "all";
+  c) whether you want a physical medium or a download link, and if a physical
+     medium, the postal address to send it to.
+
+
+3. HOW THESE COMPONENTS ARE USED IN THIS PRODUCT
+------------------------------------------------
+
+Every component listed in section 2 is shipped UNMODIFIED, in binary form, as a
+separate dynamic-link library (DLL) in the program folder. None of them is
+linked statically into wslcomms.exe, and no part of any of them has been
+altered.
+
+The application loads these libraries at run time, by name, from the program
+folder. A recipient who wishes to use a modified but interface-compatible build
+of any of these libraries may replace the corresponding DLL in that folder, and
+the application will load and use the replacement. No relinking of wslcomms.exe
+is required to do this. This is the "suitable shared library mechanism" of
+section 6(b) of the GNU Lesser General Public License version 2.1.
+
+Prominent notice, as required by section 6 of that licence: this product uses
+the GStreamer and GLib libraries, and those libraries and their use are covered
+by the GNU Lesser General Public License version 2.1, a copy of which is
+supplied with this product in the file LGPL-2.1.txt in the same folder as this
+document.
+
+
+4. NOTES FOR WHOEVER DISTRIBUTES THIS PRODUCT
+---------------------------------------------
+
+These notes are not part of the offer. They are the obligations that make the
+offer above true, and they are the things that go wrong in practice.
+
+  a) ARCHIVE THE SOURCE AT BUILD TIME, NOT AT REQUEST TIME. The offer commits
+     you to supplying the source corresponding to the binaries you shipped, for
+     three years. Upstream projects delete old tarballs. At each release,
+     archive: the GStreamer 1.28.5 source tarballs (from
+     https://gstreamer.freedesktop.org/src/), the cerbero recipes and build
+     configuration used to produce the official Windows binaries, the GLib,
+     gettext, libiconv and libsrt sources at the versions actually bundled, and
+     the MinGW-w64 GCC source for the runtime DLLs you shipped. Key the archive
+     to the installer version. If you cannot produce it in three years' time,
+     this offer was never valid.
+
+  b) IF YOU DISTRIBUTE THE INSTALLER FROM A DOWNLOAD LOCATION, PUT THE SOURCE
+     THERE TOO. Section 4 of the LGPL-2.1 governs distributing the libraries
+     themselves in object form, and it is satisfied by offering equivalent
+     access to the source from the same place as the binary. Publishing the
+     archived sources alongside the installer discharges that cleanly and costs
+     nothing. The written offer above then covers the case of a recipient who
+     got the installer some other way - on a USB stick from an engineer, for
+     instance, which is exactly how software reaches a broadcast facility.
+
+  c) DO NOT MODIFY THE BUNDLED LIBRARIES. The whole compliance position rests
+     on "unmodified and dynamically linked". If a library ever has to be
+     patched, the patched source must be supplied under the same licence and
+     this document must say so.
+
+  d) KEEP gst\BUNDLE-MANIFEST.txt IN THE INSTALLED PRODUCT. It is the record of
+     exactly which files, at which SHA-256, were shipped in a given release. It
+     is what lets you answer a licensing question years later without
+     guesswork, and it is produced automatically by build\bundle-gst.ps1.
+
+  e) THIS IS NOT LEGAL ADVICE. It is a compliance document drafted by the
+     engineering team to be accurate about what the software actually does.
+     Have it reviewed by whoever signs off the commercial deliverable before
+     the first release.

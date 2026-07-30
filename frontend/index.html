@@ -1,10 +1,11 @@
 <!doctype html>
 <!--
-  Minimal shell only. WP-0 wrote it so that `npm run build` produces a
-  frontend/dist for Wails to embed from day one. WP-5b owns it from here:
-  markup, styling and the Settings view all go in, driven from src/ui.
+  Owner: WP-5b.
 
-  There is one window and no menu. Do not add a router.
+  Deliberately minimal: the whole UI — the home screen and the Settings
+  screen, swapped in the same window — is built into #app by
+  src/main.js -> src/ui/app.js. There is one window and no menu; do not
+  add a router or a second HTML entry point.
 -->
 <html lang="en-GB">
   <head>
