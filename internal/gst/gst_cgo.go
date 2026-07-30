@@ -710,12 +710,35 @@ var h264EncoderFallbacks = []string{
 // quality-targeted, because a static slate under QVBR collapses to 200-350 kbps
 // which is cheaper but bursty at every IDR and makes "is it flowing" harder to
 // observe. gop-size=100 is a 2 s GOP at 50p, matching the profile M2L-X locked
-// cleanly. bframes=0 and low-latency=true because there is nothing to gain from
-// reordering a slate.
+// cleanly. low-latency=true because there is nothing to gain from reordering a
+// slate.
+//
+// # bframes is deliberately absent, and the specification is wrong about it
+//
+// Specification section 5 sets bframes=0. Verified at Gate B on 2026-07-30:
+// mfh264enc in GStreamer 1.28.5 HAS NO bframes PROPERTY. Its full property set
+// is adapter-luid, bitrate, cabac, d3d11-aware, gop-size, low-latency,
+// max-bitrate, max-qp, min-qp, qos, qp, qp-b, qp-i, qp-p, quality-vs-speed,
+// rc-mode, ref and vbv-buffer-size.
+//
+// Listing it here would have been harmless — the apply loop skips properties
+// the factory does not have — but it would have logged a warning on every
+// single start, and a warning that always fires is one nobody reads. The
+// specification's pipeline string is a real defect rather than a cosmetic one,
+// because gst_parse_launch rejects an unknown property outright:
+//
+//	ERROR: no property "bframes" in element "mfh264enc"
+//
+// That is a parse failure, not a warning, so anyone pasting section 5 into
+// gst-launch-1.0 to reproduce a fault gets nothing at all. It is corrected in
+// the specification and in this package's doc comment.
+//
+// The intent behind bframes=0 still holds, and low-latency=true delivers it:
+// Media Foundation's H.264 MFT does not emit B-frames in low-latency mode, so
+// there is no reordering to remove.
 var h264EncoderProps = []struct{ name, value string }{
 	{"rc-mode", "cbr"},
 	{"gop-size", "100"},
-	{"bframes", "0"},
 	{"low-latency", "true"},
 	{"cabac", "true"},
 }

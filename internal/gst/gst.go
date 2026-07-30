@@ -31,7 +31,7 @@
 //	  ! srtsink name=srtout sync=false async=false auto-reconnect=false
 //	filesrc location=<slate> ! pngdec ! imagefreeze is-live=true ! videoconvert
 //	  ! video/x-raw,format=NV12,width=1920,height=1080,framerate=50/1,...
-//	  ! mfh264enc name=venc bitrate=2000 rc-mode=cbr gop-size=100 bframes=0
+//	  ! mfh264enc name=venc bitrate=2000 rc-mode=cbr gop-size=100
 //	    low-latency=true cabac=true
 //	  ! h264parse config-interval=-1 ! queue ! mux.
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true

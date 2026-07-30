@@ -93,9 +93,9 @@ mpegtsmux name=mux alignment=7 pcr-interval=3600
   ! srtsink name=srtout sync=false async=false auto-reconnect=false
 
 filesrc location="<appdir>\slate.png" ! pngdec ! imagefreeze is-live=true
-  ! videoconvert
+  ! videoconvert ! videoscale
   ! video/x-raw,format=NV12,width=1920,height=1080,framerate=50/1,pixel-aspect-ratio=1/1,colorimetry=bt709
-  ! mfh264enc name=venc bitrate=2000 rc-mode=cbr gop-size=100 bframes=0 low-latency=true cabac=true
+  ! mfh264enc name=venc bitrate=2000 rc-mode=cbr gop-size=100 low-latency=true cabac=true
   ! video/x-h264,profile=high
   ! h264parse config-interval=-1
   ! video/x-h264,stream-format=byte-stream,alignment=au
@@ -111,6 +111,8 @@ wasapi2src name=asrc device="<IMMDevice endpoint id>" low-latency=true
 ```
 
 `srtout` properties: `uri="srt://<host>:<port>"`, `mode=caller`, `latency=120`, `passphrase="<from Credential Manager>"`, `pbkeylen=16`.
+
+**Verified end to end at Gate C, 2026-07-30.** This pipeline, driven from a real capture device into M2L-X router input 22, brought the input to `online` reporting `h264 1920x1080@50` and `aac/48000`, and held it. Two corrections came out of that run, both now applied above: `bframes=0` is removed because **`mfh264enc` has no such property** in GStreamer 1.28.5 and `gst_parse_launch` rejects an unknown property outright — pasting the old string into `gst-launch-1.0` failed with `no property "bframes"` rather than merely warning; and `videoscale` is added so a slate that is not exactly 1920x1080 is scaled rather than failing negotiation. The intent behind `bframes=0` is unaffected: Media Foundation's H.264 MFT emits no B-frames in low-latency mode.
 
 **Decided values and why.** 2000 kbps CBR video plus 128 kbps AAC-LC is about 2.3 Mbit/s on the wire after MPEG-TS and SRT overhead; provision 2.9 Mbit/s of uplink to cover libsrt's default 25% retransmission allowance. CBR rather than quality-targeted rate control: a static slate under QVBR collapses to 200–350 kbps, which is cheaper but makes the stream bursty at every IDR and makes "is it flowing" harder to observe. `gop-size=100` is a 2 s GOP at 50p, matching the profile M2L-X locked cleanly. `bframes=0` and `low-latency=true` because there is nothing to gain from reordering a slate. `config-interval=-1` puts SPS/PPS in front of every IDR so M2L-X can re-lock mid-stream. `alignment=7` gives 7 × 188 = 1316-byte buffers, exactly one SRT payload, so nothing fragments. `imagefreeze is-live=true` is mandatory — without it the slate branch is not a live source and will not pace correctly. `latency=120` is milliseconds (srtsink's property is ms, not µs as the brief's example string suggests), roughly 5× the measured 21 ms median RTT.
 
