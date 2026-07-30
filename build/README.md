@@ -125,21 +125,25 @@ pkg-config --version
 (If you do not have Chocolatey: https://chocolatey.org/install. `pkgconfiglite`
 is a standalone `pkg-config.exe`; any pkg-config on `PATH` will do.)
 
-### 2.5 GStreamer 1.28.5, mingw-x86_64 — **both** packages
+### 2.5 GStreamer 1.28.5, mingw-x86_64 — one installer, Complete install type
 
-From https://gstreamer.freedesktop.org/download/ take the **MinGW 64-bit**
-downloads for **1.28.5**, and install **both**:
+**VERIFIED 2026-07-30 against the download site.** There is exactly one file:
 
-| Package | Why |
-|---|---|
-| runtime | the DLLs and plugins that get bundled |
-| **development** | headers, `.pc` files and import libraries — **cgo cannot compile without this** |
+```
+https://gstreamer.freedesktop.org/data/pkg/windows/1.28.5/mingw/gstreamer-1.0-mingw-x86_64-1.28.5.exe
+```
 
-**The runtime installer alone is not enough.** Without the development package
-there is no `lib\pkgconfig\gstreamer-1.0.pc`, so `pkg-config` finds nothing, so
-cgo has no include or link flags, and the build fails at the first
-`#include <gst/gst.h>`. This is the single most common way to lose an hour at
-Gate B.
+916 MB, `.exe`. Note two things that older instructions get wrong. It is **not**
+an `.msi`, and there is **no separate devel package** — up to 1.26 the runtime
+and development builds were shipped as two installers, and from 1.28 they are
+one unified installer whose contents you choose at install time.
+
+**Choose the Complete install type, not Typical.** Complete is what installs the
+headers, the `.pc` files and the import libraries. Without them there is no
+`lib\pkgconfig\gstreamer-1.0.pc`, so `pkg-config` finds nothing, so cgo has no
+include or link flags, and the build fails at the first `#include <gst/gst.h>`.
+That is the single most common way to lose an hour at Gate B, and picking
+Typical is now the way you get there.
 
 Install to the default location. Specification section 11 gives the path this
 project expects:
@@ -148,11 +152,12 @@ project expects:
 C:\gstreamer\1.0\mingw_x86_64\
 ```
 
-> **UNVERIFIED — Gate B must confirm:** the exact installer file names
-> (expected `gstreamer-1.0-mingw-x86_64-1.28.5.msi` and
-> `gstreamer-1.0-devel-mingw-x86_64-1.28.5.msi`) and whether 1.28.5 is still the
-> current release. If the version has moved on, that is a specification change,
-> not a build decision — the version is pinned in specification section 3.
+**On the version.** 1.28.5 is the current stable release and the pin in
+specification section 3 is correct. The tree at
+`gstreamer.freedesktop.org/data/pkg/windows/` also carries 1.29.x — do not take
+it. GStreamer uses odd minor numbers for its development series, so 1.29 is
+pre-release and 1.28 is the stable line it leads to. If the stable line moves
+past 1.28.5, that is a specification change rather than a build decision.
 
 ### 2.6 `PKG_CONFIG_PATH`
 
@@ -488,9 +493,9 @@ check for itself.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `pkg-config: exit status 1` during `wails build` | GStreamer **development** package not installed, or `PKG_CONFIG_PATH` not set in this shell | section 2.5, 2.6 |
+| `pkg-config: exit status 1` during `wails build` | GStreamer installed with the **Typical** install type instead of Complete, so there are no `.pc` files — or `PKG_CONFIG_PATH` not set in this shell | section 2.5, 2.6 |
 | `gcc: executable file not found` | no MinGW on `PATH`, or `CGO_ENABLED=0` | section 2.3 |
-| `cannot find -lgstreamer-1.0` | runtime installed, development package not | section 2.5 |
+| `cannot find -lgstreamer-1.0` | same cause: Typical install, no import libraries | section 2.5 |
 | Undefined references to `__mingw_*` or CRT internals | MSVCRT vs UCRT toolchain mismatch | section 2.3 |
 | App exits instantly, `0xC0000135` | runtime DLLs not beside the `.exe` | section 6 |
 | App starts, device dropdown empty | `wasapi2` plugin not loading — missing dependency | section 4, then 5 |
