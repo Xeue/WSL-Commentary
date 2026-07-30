@@ -36,7 +36,13 @@ Write-Host "wslcomms build environment ready" -ForegroundColor Green
 Write-Host ("  gcc         " + (Get-Command gcc).Source)
 Write-Host ("  pkg-config  " + (& pkg-config --modversion gstreamer-1.0) + " (gstreamer-1.0)")
 Write-Host ""
-Write-Host "  wails build -webview2 embed        release build"
-Write-Host "  go test ./... -count=1             Gate A tests"
-Write-Host "  go test -tags dev . -count=1       root package tests"
-Write-Host "  go test -race ./... -count=3       race detector"
+Write-Host "  wails build -webview2 embed              release build"
+Write-Host "  go test -race -tags 'dev gststub' ./...  THE test command - see below"
+Write-Host ""
+Write-Host "The 'gststub' tag is not optional here." -ForegroundColor Yellow
+Write-Host "This environment sets CGO_ENABLED=1, which selects internal/gst's REAL"
+Write-Host "implementation and excludes the pure-Go stub. But app_test.go and"
+Write-Host "internal/gst's own tests are written against that stub - correctly, since"
+Write-Host "no unit test should be driving live GStreamer. Without the tag those"
+Write-Host "packages do not compile, and the root package's tests are skipped in"
+Write-Host "silence. 'dev' alone is a Gate A command; at Gate B you need both."

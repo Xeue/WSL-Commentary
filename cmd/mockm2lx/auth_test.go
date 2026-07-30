@@ -23,7 +23,7 @@ func newAuthTestApp(t *testing.T) *App {
 		StatusInterval: time.Hour,
 		TokenTTL:       time.Hour,
 	}
-	return NewApp(opts, log.New(testWriter{t}, "", 0))
+	return NewApp(opts, log.New(newTestWriter(t), "", 0))
 }
 
 func doJSON(t *testing.T, h http.HandlerFunc, method, body string) *httptest.ResponseRecorder {

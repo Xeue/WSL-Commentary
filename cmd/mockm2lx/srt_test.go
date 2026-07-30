@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,15 +34,66 @@ func newTestApp(t *testing.T) *App {
 		OnePeerOnly:    true,
 		RefusalWindow:  150 * time.Millisecond,
 	}
-	logger := log.New(testWriter{t}, "", 0)
+	logger := log.New(newTestWriter(t), "", 0)
 	return NewApp(opts, logger)
 }
 
 // testWriter adapts *testing.T into an io.Writer so App's log lines show up
 // under `go test -v` attributed to the right test, instead of on stdout.
-type testWriter struct{ t *testing.T }
+//
+// It goes inert the moment its test finishes, and that is the whole point of
+// it rather than a refinement. Some of the mock's goroutines deliberately
+// outlive the test that started them: handleConnRequest spawns readSRTConn
+// detached, and a status WebSocket handler has hijacked its connection, which
+// httptest.Server stops tracking on hijack and therefore does not wait for in
+// Close. Both log on their way out, and a test cannot join either. Go's testing
+// package does not support that — t.Logf reads t.done, which tRunner writes
+// with no lock precisely so that the race detector reports exactly this
+// (testing.go:1919 "Do not lock t.done to allow race detector to detect race"),
+// and once every ancestor is done Logf panics the whole process with "Log in
+// goroutine after ... has completed". So the writer must be the thing that
+// stops, because the goroutines will not.
+//
+// The lock is held across the Logf call and not merely around the flag. Taking
+// it only to read done would leave a writer that had already passed the check
+// still inside Logf when the test completed, which narrows the window instead
+// of closing it; holding it means the Cleanup below cannot return until any
+// forward in flight has finished.
+type testWriter struct {
+	mu   sync.Mutex
+	t    *testing.T
+	done bool
+}
 
-func (w testWriter) Write(p []byte) (int, error) {
+// newTestWriter returns a writer that forwards to t until t finishes.
+//
+// The Cleanup is registered here, when the App is built, which is the first
+// thing every test in this package does. Cleanups run last-registered-first, so
+// this one runs after startListener's and startBroadcaster's cancel-and-wait
+// and after httptest.Server.Close — their log lines are kept, which is the
+// reason for routing them through a *testing.T at all — and still strictly
+// before tRunner marks the test done, which is where the window actually is.
+func newTestWriter(t *testing.T) *testWriter {
+	t.Helper()
+	w := &testWriter{t: t}
+	t.Cleanup(func() {
+		w.mu.Lock()
+		w.done = true
+		w.mu.Unlock()
+	})
+	return w
+}
+
+// Write forwards p to t.Logf, or discards it once the test has finished. A
+// discarded line is reported as written: this is a log sink, and failing the
+// mock's logger because a test ended would be a worse lie than dropping a line
+// nobody can attribute any more.
+func (w *testWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return len(p), nil
+	}
 	w.t.Logf("%s", p)
 	return len(p), nil
 }
@@ -61,9 +113,16 @@ func freeSRTAddr(t *testing.T) string {
 // startListener runs a's SRT listener on addr in the background and blocks
 // until it is actually accepting connections. It registers a t.Cleanup that
 // cancels the listener's context AND WAITS for the listener goroutine to
-// actually exit, so no log line from it can ever fire after the test (or,
-// for the last test in the binary, the whole run) has finished — a goroutine
-// that outlives its test and then calls t.Logf panics the process.
+// actually exit, which is what makes the t.Logf below legal: cleanups run
+// before the testing package marks the test done, so a goroutine this has
+// joined cannot log after it.
+//
+// That join covers this goroutine and nothing else. The accept loop hands each
+// connection to handleConnRequest, which spawns readSRTConn detached, and that
+// goroutine logs a DISCONNECT line whenever its peer goes away — after this
+// test, routinely. There is no handle to wait on and the mock is right not to
+// invent one, so the protection against it is testWriter going inert rather
+// than anything here.
 func startListener(t *testing.T, a *App, addr string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())

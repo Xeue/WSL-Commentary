@@ -146,6 +146,24 @@ type fakePipeline struct {
 	// test puts one there deterministically.
 	onForceKeyUnit func()
 
+	// keyUnitGate, when non-nil, is received from by ForceKeyUnit before it
+	// returns. It is gateSinks' counterpart one call further along, and it
+	// parks the state machine in the only window where an injected error is
+	// certain to be honoured rather than merely likely to be.
+	//
+	// CONNECTING drains s.errs immediately before ReplaceSink, so an error
+	// injected earlier than that is discarded as stale by design; the CONNECTED
+	// select consumes the first error it finds and nothing drains after the
+	// swap, so an error injected here cannot be missed. Between those two
+	// points sits exactly one call the fake can hold the machine inside, and
+	// this is it. onForceKeyUnit runs the injection on the state-machine
+	// goroutine, which suits a test that only needs a side effect; the gate
+	// hands control to the TEST goroutine instead, which is what a test needs
+	// when it must assert — t.Fatalf on the machine's goroutine calls
+	// runtime.Goexit on the goroutine driving the machine and turns a clear
+	// failure into a hang.
+	keyUnitGate chan struct{}
+
 	errs   chan error
 	closed bool
 
@@ -224,20 +242,29 @@ func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 	return err
 }
 
-// ForceKeyUnit records the request and then runs onForceKeyUnit, if one is
-// installed. The hook runs with the lock released so that it can inject an error
-// — injectError takes the same lock — exactly as the real pipeline's bus thread
+// ForceKeyUnit records the request, runs onForceKeyUnit if one is installed,
+// and then — if a gate is installed — blocks until the test releases it. Both
+// happen with the lock released so that either can inject an error —
+// injectError takes the same lock — exactly as the real pipeline's bus thread
 // would while the sender is parked in this call.
+//
+// The count is incremented before either, so waitForceKeyUnits observing it
+// means the machine is genuinely inside this call and not merely about to enter
+// it.
 func (p *fakePipeline) ForceKeyUnit() error {
 	p.mu.Lock()
 	p.counts.forceKeyUnits++
 	p.log.add("forceKeyUnit")
 	err := p.forceKeyUnitErr
 	hook := p.onForceKeyUnit
+	gate := p.keyUnitGate
 	p.mu.Unlock()
 
 	if hook != nil {
 		hook()
+	}
+	if gate != nil {
+		<-gate
 	}
 	return err
 }
@@ -310,6 +337,19 @@ func (p *fakePipeline) gateSinks() (release func()) {
 	gate := make(chan struct{})
 	p.mu.Lock()
 	p.sinkGate = gate
+	p.mu.Unlock()
+
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// gateForceKeyUnits installs a gate that ForceKeyUnit blocks on. The returned
+// function releases every call, present and future. See keyUnitGate for what
+// the window it holds the machine in is worth.
+func (p *fakePipeline) gateForceKeyUnits() (release func()) {
+	gate := make(chan struct{})
+	p.mu.Lock()
+	p.keyUnitGate = gate
 	p.mu.Unlock()
 
 	var once sync.Once
@@ -532,6 +572,22 @@ func waitReplaceSinks(t *testing.T, p *fakePipeline, n int) {
 		select {
 		case <-deadline:
 			t.Fatalf("the sender called ReplaceSink %d times, want %d", p.snapshot().replaceSinks, n)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+// waitForceKeyUnits spins until the pipeline has been asked to force n key
+// units. With a gate installed that is how a test knows the machine is parked
+// inside the call, rather than about to enter it.
+func waitForceKeyUnits(t *testing.T, p *fakePipeline, n int) {
+	t.Helper()
+	deadline := time.After(testTimeout)
+	for p.snapshot().forceKeyUnits < n {
+		select {
+		case <-deadline:
+			t.Fatalf("the sender called ForceKeyUnit %d times, want %d", p.snapshot().forceKeyUnits, n)
 		default:
 			runtime.Gosched()
 		}

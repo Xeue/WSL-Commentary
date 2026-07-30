@@ -1223,51 +1223,63 @@ func TestStopFromEveryState(t *testing.T) {
 		name string
 		// target is the state Stop is called from.
 		target State
-		// setup drives the machine towards target.
-		setup func(t *testing.T, p *fakePipeline, clk *fakeClock)
+		// arm prepares the fake before Start and returns the step, if any, that
+		// has to run once the machine is under way. It is the same shape
+		// TestNewSinkFailureAroundTheSwapIsNotDiscardedIntoAFalseGreen uses, for
+		// the same reason: a case that has to meet the machine at a
+		// synchronisation point cannot do all of its work before Start.
+		arm func(p *fakePipeline) (drive func(t *testing.T, s *senderImpl))
 		// want is the full sequence of states expected, STOPPED included.
 		want []State
 	}{
 		{
 			name:   "CONNECTING",
 			target: StateConnecting,
-			setup:  func(*testing.T, *fakePipeline, *fakeClock) {},
+			arm:    func(*fakePipeline) func(*testing.T, *senderImpl) { return nil },
 			want:   []State{StateConnecting, StateStopped},
 		},
 		{
 			name:   "CONNECTED",
 			target: StateConnected,
-			setup:  func(*testing.T, *fakePipeline, *fakeClock) {},
+			arm:    func(*fakePipeline) func(*testing.T, *senderImpl) { return nil },
 			want:   []State{StateConnecting, StateConnected, StateStopped},
 		},
 		{
 			name:   "DRAINING",
 			target: StateDraining,
-			setup: func(t *testing.T, p *fakePipeline, _ *fakeClock) {
-				// The peer disappears once the session is up. The hook fires on
-				// the DRAINING that follows.
-				go func() {
-					deadline := time.After(testTimeout)
-					for {
-						if p.injectError(errPeerGone) {
-							return
-						}
-						select {
-						case <-deadline:
-							return
-						default:
-							runtime.Gosched()
-						}
-					}
-				}()
+			arm: func(p *fakePipeline) func(*testing.T, *senderImpl) {
+				// The peer disappears once the session is up, and the hook
+				// stopOnState installed fires on the DRAINING that follows.
+				//
+				// Landing that error is the whole difficulty, and it is not a
+				// race to be won by spinning. CONNECTING drains s.errs
+				// immediately before ReplaceSink, so anything injected before
+				// that point is discarded as stale by design — correctly, since
+				// no sink exists yet to have failed. DRAINING itself is now a
+				// RemoveSink and straight on, so there is no dwell there to aim
+				// at either. Gating ForceKeyUnit parks the machine between the
+				// two, after the drain and before CONNECTED is announced, and
+				// holds it there while this test injects, confirms the error
+				// reached the machine's own queue, and only then lets go. Every
+				// step is an ordering the machine cannot get past, so DRAINING
+				// is reached on every run rather than on most of them.
+				release := p.gateForceKeyUnits()
+				return func(t *testing.T, s *senderImpl) {
+					t.Helper()
+					waitForceKeyUnits(t, p, 1)
+					p.mustInjectError(t, errPeerGone)
+					waitErrsLen(t, s, 1, "the injected error never reached the state machine's queue")
+					release()
+				}
 			},
 			want: []State{StateConnecting, StateConnected, StateDraining, StateStopped},
 		},
 		{
 			name:   "BACKOFF",
 			target: StateBackoff,
-			setup: func(_ *testing.T, p *fakePipeline, _ *fakeClock) {
+			arm: func(p *fakePipeline) func(*testing.T, *senderImpl) {
 				p.failSinks(1, errConnectRefused)
+				return nil
 			},
 			want: []State{StateConnecting, StateBackoff, StateStopped},
 		},
@@ -1280,10 +1292,13 @@ func TestStopFromEveryState(t *testing.T) {
 			s := newSender(p, clk)
 
 			result := stopOnState(t, s, tt.target)
-			tt.setup(t, p, clk)
+			drive := tt.arm(p)
 
 			if err := s.Start(testOpts()); err != nil {
 				t.Fatalf("Start: %v", err)
+			}
+			if drive != nil {
+				drive(t, s)
 			}
 
 			awaitStop(t, result)

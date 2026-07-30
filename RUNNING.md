@@ -34,6 +34,31 @@ lifecycle, the event pump, `Start`/`Stop`, the shutdown ordering, and the 52
 tests over them — into the run. Nothing about that tag builds or runs a GUI:
 see §4.
 
+**At Gate B the tag is `dev gststub`, not `dev`.** Everything above assumes
+`CGO_ENABLED=0`. Once the toolchain is installed and you are working with
+`build\env.ps1` — which sets `CGO_ENABLED=1` — the same command fails to
+compile:
+
+```
+.\app_test.go:919:30: undefined: gst.StubPipeline
+```
+
+With cgo enabled, `internal/gst` selects its real GStreamer implementation and
+excludes the pure-Go stub. But `app_test.go` and `internal/gst`'s own tests are
+written against that stub, and rightly so: no unit test should be driving a live
+media pipeline. So at Gate B the command is
+
+```powershell
+go test -race -tags 'dev gststub' ./... -count=5
+```
+
+This matters more than a missing tag usually would. `go test -tags dev ./...`
+under Gate B does not fail loudly for the whole run — the root package fails to
+build while every other package reports `ok`, so a hurried reader sees mostly
+green and moves on, and the 52 tests over the lifecycle and shutdown ordering
+are never executed. `build\env.ps1` prints the correct command when you
+dot-source it.
+
 Last run, 2026-07-30, whole tree:
 
 ```
