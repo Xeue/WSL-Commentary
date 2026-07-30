@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && (dev || production || bindings)
 
 // This file holds the Wails-bound object: the frontend's entire view of Go, and
 // the wire-up that makes nine independently written packages one application.

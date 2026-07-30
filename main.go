@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && (dev || production || bindings)
 
 // Command wslcomms is the WSL Studios commentary contribution application: one
 // window, one process, one installer.
