@@ -125,11 +125,20 @@ $ErrorActionPreference = 'Stop'
 # six months from now can be traced back to the list that produced it.
 $ScriptVersion = '1.0.0'
 
-# Expected bundle size, specification section 3: the GStreamer folder is
-# 60-110 MB. Outside that range something is wrong in one direction or the
-# other - a missing plugin, or a directory copy that crept back in.
-$ExpectedMinBytes = 60MB
-$ExpectedMaxBytes = 110MB
+# Expected bundle size. Outside this range something is wrong in one direction
+# or the other - a missing plugin, or a directory copy that crept back in.
+#
+# MEASURED, not estimated: the first complete bundle, GStreamer 1.28.5
+# mingw-x86_64 at Gate B on 2026-07-30, was 52.5 MB - 13 plugins and 33 runtime
+# files, with the dependency closure verified complete by objdump. Specification
+# section 3's 60-110 MB was an estimate made before anyone could build one, and
+# it is superseded by this.
+#
+# The band below is the measured figure with room either side: enough slack that
+# a GStreamer point release does not trip it, tight enough that a directory copy
+# (the whole install is 2.4 GB) or a silently dropped plugin still does.
+$ExpectedMinBytes = 40MB
+$ExpectedMaxBytes = 80MB
 
 # ---------------------------------------------------------------------------
 # Forbidden names. The licensing control.
@@ -288,6 +297,9 @@ function Get-RuntimeEntries {
             -Why 'The Media Foundation plugin uses D3D11 for GPU-backed MFTs in recent releases. UNVERIFIED for 1.28.5 - if the dependency report shows libgstmediafoundation.dll importing it, this stops being optional.'
         New-BundleEntry -Kind Runtime -Names 'gstdxgi-1.0-0.dll', 'libgstdxgi-1.0-0.dll' -Optional `
             -Why 'Companion to gstd3d11 in some releases. UNVERIFIED - copied only if present.'
+        New-BundleEntry -Kind Runtime -Names 'gstd3dshader-1.0-0.dll', 'libgstd3dshader-1.0-0.dll' `
+            -Why 'VERIFIED REQUIRED, 1.28.5, Gate B 2026-07-30: libgstd3d11-1.0-0.dll imports it, and it was the single unresolved import the dependency report found on the first real run. Not optional - without it the D3D11 library fails to load, which takes the Media Foundation plugin with it, which is where mfh264enc and mfaacenc live.' `
+            -Fix 'If a future GStreamer drops this DLL, check whether libgstd3d11 still imports it before removing the entry - the dependency report is the authority, not this comment.'
 
         # -- GLib -----------------------------------------------------------
         New-BundleEntry -Kind Runtime -Names 'glib-2.0-0.dll', 'libglib-2.0-0.dll' `
@@ -899,7 +911,8 @@ if ($skippedOptional.Count -gt 0) {
 
 if ($totalBytes -lt $ExpectedMinBytes -or $totalBytes -gt $ExpectedMaxBytes) {
     Write-Host ''
-    Write-Warning ("Bundle is {0:N1} MB. Specification section 3 expects 60-110 MB." -f ($totalBytes / 1MB))
+    Write-Warning ("Bundle is {0:N1} MB. Expected {1:N0}-{2:N0} MB, around the 52.5 MB measured at Gate B." -f `
+            ($totalBytes / 1MB), ($ExpectedMinBytes / 1MB), ($ExpectedMaxBytes / 1MB))
     Write-Warning 'Under: something is missing, most likely an optional file that is not optional'
     Write-Warning 'on this build. Over: something is being copied that should not be - check the'
     Write-Warning 'manifest file list before shipping.'
