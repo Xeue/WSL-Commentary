@@ -1,0 +1,18 @@
+﻿# Build output
+/build/bin/
+/dist/
+*.exe
+*.syso
+
+# Go
+/vendor/
+
+# Node
+node_modules/
+/frontend/dist/
+/frontend/wailsjs/
+
+# Local
+*.local
+.env
+registry.bin
