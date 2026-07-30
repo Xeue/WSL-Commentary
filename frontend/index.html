@@ -1,0 +1,19 @@
+<!doctype html>
+<!--
+  Minimal shell only. WP-0 wrote it so that `npm run build` produces a
+  frontend/dist for Wails to embed from day one. WP-5b owns it from here:
+  markup, styling and the Settings view all go in, driven from src/ui.
+
+  There is one window and no menu. Do not add a router.
+-->
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WSL Commentary</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

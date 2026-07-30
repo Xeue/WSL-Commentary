@@ -28,7 +28,7 @@
 
 | Component | Choice | How it ships | Why, and what was rejected |
 |---|---|---|---|
-| Language | Go 1.24, `CGO_ENABLED=1` | the .exe | Client preference. cgo is required for GStreamer. Rejected: C#/.NET (the rejected spec's stack). |
+| Language | Go 1.25, `CGO_ENABLED=1` | the .exe | Client preference. cgo is required for GStreamer. Rejected: C#/.NET (the rejected spec's stack). *(Was 1.24; Wails v2.13.0, go-gst v0.0.2 and gosrt all declare `go 1.25.0`, so 1.24 is not reachable.)* |
 | GUI | Wails v2.13.0, rendering in WebView2 | frontend embedded via `//go:embed all:frontend/dist` | The UI is HTML, so WebRTC video, Opus decode and headphone-device selection come free. Rejected: Fyne/Gio (per-frame CPU RGBA upload, no video sink), walk + `d3d11videosink` (native, but still leaves signalling and decode to write). |
 | WebView2 | Evergreen runtime; `wails build -webview2 embed` puts Microsoft's ~150 KB bootstrapper in the .exe | in the .exe | Evergreen is part of Windows 11 — nothing to install on the target machine. Rejected: Fixed Version (+250 MB, no benefit here). |
 | Media | GStreamer 1.28.5 (mingw-x86_64), hand-picked DLL allowlist | `<appdir>\gst\` (~60–110 MB) | Client preference, and it is bundled. Rejected: the 916 MB full installer, and any design requiring the user to install GStreamer. |

@@ -1,0 +1,148 @@
+// Package sender owns section 6 of the specification in full: monotonic
+// timestamps across a pipeline restart, and the SRT reconnect state machine.
+//
+// Owner: WP-3b. No other work package writes files in this directory.
+//
+// It is pure Go. It never imports cgo and never mentions GStreamer: it drives a
+// gst.Pipeline handed to it by New, which in a Gate A build is the pure-Go stub
+// and in a Gate B build is the real thing. That is what makes the reconnect
+// logic — the part most likely to cause an outage during a match — testable
+// today against a fake.
+//
+// # The state machine
+//
+//	CONNECTING --connect ok--> CONNECTED --error on srtout--> DRAINING --> BACKOFF --> CONNECTING
+//	     '--connect fails------------------------------------------------> BACKOFF
+//
+// DRAINING blocks the src pad of the leaky srtq queue, unlinks, and removes the
+// sink; everything upstream stays in PLAYING. BACKOFF sleeps on a goroutine —
+// never inside a pad probe or a bus callback. CONNECTING installs a fresh sink
+// and, on success, forces a key unit so the picture recovers at once.
+//
+// The application must reconnect indefinitely: on total network loss libsrt
+// declares the peer dead at about 5.27 s and exits, and M2L-X never recovers by
+// itself.
+package sender
+
+import (
+	"errors"
+	"time"
+
+	"wslcomms/internal/gst"
+)
+
+// State is the sender's connection state. It is the source of the SENDING lamp,
+// and is emitted to the frontend on the Wails "sender" event, so these string
+// values are part of the contract with WP-5b.
+type State string
+
+const (
+	// StateConnecting means a sink is being installed: the SRT caller handshake
+	// is in progress. The lamp is amber.
+	StateConnecting State = "CONNECTING"
+
+	// StateConnected means the handshake succeeded and media is flowing. This is
+	// the only good state; the lamp is green.
+	StateConnected State = "CONNECTED"
+
+	// StateDraining means the sink has failed and is being torn out. Everything
+	// upstream of the leaky queue stays in PLAYING. The lamp is amber.
+	StateDraining State = "DRAINING"
+
+	// StateBackoff means the sender is waiting before the next attempt. The lamp
+	// is amber.
+	StateBackoff State = "BACKOFF"
+
+	// StateStopped means the sender is not running, either because Start has not
+	// been called or because Stop has. The lamp is grey.
+	StateStopped State = "STOPPED"
+)
+
+// BackoffLadder is the reconnect delay sequence from specification section 6.2,
+// followed by BackoffCap repeated forever.
+//
+// The first delay must stay at or above six seconds: it has to clear M2L-X's
+// re-accept refusal window, and the same ladder is what eventually wins the
+// one-peer race against our own stale socket, because an SRT listener accepts
+// exactly one peer and never displaces the incumbent.
+var BackoffLadder = []time.Duration{
+	7 * time.Second,
+	7 * time.Second,
+	10 * time.Second,
+	15 * time.Second,
+	20 * time.Second,
+}
+
+// BackoffCap is the delay used for every attempt after the ladder is exhausted.
+// There is no attempt limit: the sender retries forever until Stop.
+const BackoffCap = 30 * time.Second
+
+// ErrAlreadyStarted is returned by Start on a Sender that is already running.
+var ErrAlreadyStarted = errors.New("sender: already started")
+
+// ErrNotStarted is returned by Stop on a Sender that is not running.
+var ErrNotStarted = errors.New("sender: not started")
+
+// Opts is everything the sender needs for one session. It is composed from the
+// two gst option structs rather than restating their fields, so that there is no
+// field-by-field translation for anyone to get wrong.
+type Opts struct {
+	// Pipeline configures the capture, encode and mux chain, which is built once
+	// by Start and never rebuilt for the life of the session.
+	Pipeline gst.PipelineOpts
+
+	// Sink configures the srtsink, which is rebuilt on every reconnect.
+	Sink gst.SinkOpts
+}
+
+// Sender runs a media session and keeps it connected.
+type Sender interface {
+	// Start builds and plays the pipeline, then enters the state machine at
+	// StateConnecting. It returns as soon as the pipeline is playing; a
+	// connection failure is not an error from Start, it is a transition to
+	// StateBackoff, because the sender retries indefinitely.
+	//
+	// Start returns ErrAlreadyStarted if the sender is already running.
+	Start(opts Opts) error
+
+	// Stop tears the session down: it stops the reconnect loop, stops the
+	// pipeline, emits StateStopped and closes the channel returned by States.
+	// A stopped Sender cannot be restarted; call New again.
+	//
+	// Stop returns ErrNotStarted if the sender was never started.
+	Stop() error
+
+	// States returns the stream of state transitions, in order and without
+	// duplicates. It is buffered so that a slow consumer cannot stall the
+	// reconnect loop; a consumer that falls too far behind loses intermediate
+	// states but always eventually sees the current one.
+	//
+	// The channel is closed by Stop, after StateStopped has been sent.
+	States() <-chan State
+}
+
+// New returns a Sender that drives p.
+//
+// The pipeline is injected rather than created here so that this package can be
+// unit-tested against a fake gst.Pipeline: WP-3b writes that fake in its own
+// test files. The Sender takes ownership of p and calls p.Stop when it stops.
+func New(p gst.Pipeline) Sender {
+	return notImplementedSender{}
+}
+
+// notImplementedSender is the WP-0 placeholder, replaced by WP-3b.
+type notImplementedSender struct{}
+
+func (notImplementedSender) Start(opts Opts) error {
+	return errors.New("not implemented: WP-3b")
+}
+
+func (notImplementedSender) Stop() error {
+	return errors.New("not implemented: WP-3b")
+}
+
+func (notImplementedSender) States() <-chan State {
+	ch := make(chan State)
+	close(ch)
+	return ch
+}

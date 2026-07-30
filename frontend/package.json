@@ -1,0 +1,20 @@
+{
+  "name": "wslcomms-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "WSL Studios commentary contribution - embedded WebView2 UI. Vanilla JS, no framework.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kinesis-video": "^3.918.0",
+    "@aws-sdk/client-kinesis-video-signaling": "^3.918.0",
+    "amazon-kinesis-video-streams-webrtc": "^2.3.0"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}
