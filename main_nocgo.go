@@ -1,4 +1,4 @@
-//go:build !(cgo && (dev || production || bindings))
+//go:build !(dev || production || bindings)
 
 // This file supplies main() for every build that is NOT a real Wails build, so
 // that `go build ./...` and `go test ./...` always succeed and always produce an

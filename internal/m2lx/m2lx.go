@@ -206,6 +206,16 @@ type Client interface {
 
 	// KVSToken fetches the Cognito identity and token for an event.
 	KVSToken(ctx context.Context, eventID string) (KVSToken, error)
+
+	// Close cancels the background token-refresh goroutine started by
+	// SignIn, if one was ever started, and blocks until it has actually
+	// exited. Idempotent and safe to call concurrently with itself and
+	// with Token. Callers that construct a Client for a bounded lifetime
+	// (WP-8's per-generation control plane, restarted on every config
+	// change) must call Close when tearing that generation down, or the
+	// goroutine leaks for the rest of the process holding a timer for up
+	// to RefreshFraction*TokenLifetime.
+	Close() error
 }
 
 // Watcher owns the switcher_status WebSocket.
@@ -220,15 +230,30 @@ type Watcher interface {
 	Watch(ctx context.Context, statusKey string) <-chan Status
 }
 
-// NewClient returns a Client for the M2L-X instance at host. host is a bare
-// hostname or host:port with no scheme; the implementation chooses https for
-// REST and wss for the status socket.
+// NewClient returns a Client for the M2L-X instance at host.
+//
+// host is a bare hostname or host:port with no scheme, OR host:port
+// prefixed with an explicit "http://" or "https://". A bare host, and an
+// explicit "https://" host, both choose https for REST and wss for the
+// status socket — that is the production path and the only one that
+// cannot put a commentator's password on the wire in clear. An explicit
+// "http://" host chooses http/ws instead; its only legitimate use is
+// cmd/mockm2lx (WP-7), which speaks plain HTTP with no TLS option at Gate
+// A. See host.go (resolveHost) for the full decision, including what
+// happens with a scheme this package does not recognise.
 func NewClient(host string) Client {
 	return newClient(host)
 }
 
 // NewWatcher returns a Watcher for the M2L-X instance at host that authenticates
 // using the bearer token held by c.
+//
+// host follows the same scheme rules as NewClient's host (host.go,
+// resolveHost): a bare host or an explicit "https://" host uses wss, an
+// explicit "http://" host uses ws. Callers must pass the SAME host string
+// given to the NewClient that produced c, so the REST and status-socket
+// schemes can never disagree about which M2L-X instance — real or mock —
+// they are both pointed at.
 func NewWatcher(host string, c Client) Watcher {
 	return newWatcher(host, c)
 }

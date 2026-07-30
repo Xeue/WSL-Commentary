@@ -61,7 +61,14 @@
 //  4. The consumer of Errors(). Reads a buffered channel. Sends into it never
 //     block: if it is full the error is dropped, per the contract in gst.go.
 //
-//  5. Go's garbage collector, via go-gst's finalizers. Every GStreamer object
+//  5. The warning-log goroutine, started by New and ended by Stop. It exists so
+//     that no streaming thread ever calls log.Printf. Go's log package takes a
+//     process-global mutex and writes to stderr, so under the warning storm a
+//     marginal SRT link produces, logging from onBusMessage would serialise
+//     every streaming thread in the pipeline behind one file handle. The bus
+//     handler does a non-blocking send instead; this goroutine does the I/O.
+//
+//  6. Go's garbage collector, via go-gst's finalizers. Every GStreamer object
 //     this file keeps across calls is stored in a struct field so that it stays
 //     reachable; dropping a Go reference to a live GstElement would unref it.
 //
@@ -144,28 +151,67 @@ import (
 	gogst "github.com/go-gst/go-gst/pkg/gst"
 )
 
-// Timeouts. All of these bound a synchronous GStreamer state change so that a
-// hung element surfaces as an error rather than as a wedged application. They
-// are upper bounds on a hang, not expected durations.
+// Timeouts.
+//
+// READ THIS BEFORE RELYING ON ONE OF THEM: they do NOT bound a state change.
+// They bound only the ASYNCHRONOUS TAIL of one. go-gst v0.0.2's BlockSetState
+// (element_manual.go) is, in full:
+//
+//	ret := el.SetState(state)
+//	if ret == StateChangeAsync {
+//		_, _, ret = el.GetState(timeout)
+//	}
+//	return ret
+//
+// gst_element_set_state itself takes no timeout and cannot be given one. It
+// holds the element's GST_STATE_LOCK and runs every change_state function
+// downwards through the bin synchronously on the calling goroutine. If
+// wasapi2src's NULL→READY blocks inside IAudioClient::Initialize on a wedged
+// WASAPI endpoint, SetState never returns, the timeouts below are never
+// consulted, and Start hangs forever holding p.mu.
+//
+// A watchdog was considered and rejected. There is nothing to cancel:
+// gst_element_set_state offers no abort, the thread is inside C and cannot be
+// preempted, and it holds the pipeline's state lock — so the "recovery" path
+// (teardownLocked, which sets the pipeline to NULL) would block on that same
+// lock the instant it ran. A watchdog would turn one wedged goroutine into a
+// wedged goroutine plus a leaked one plus a misleading error return. What is
+// implemented instead is stateChangeWatchdog below: it cannot unwedge anything,
+// it only makes the hang legible in the field log rather than silent.
+//
+// The real mitigation is architectural and belongs to the caller: Start,
+// ReplaceSink and Stop must never be called from the Wails message loop. See
+// BUILD-NOTES.md section 7.
 const (
-	// pipelineStartTimeout bounds the NULL→PLAYING transition of the capture
-	// and encode chain. The costly parts are opening the WASAPI endpoint in
-	// shared mode and initialising the Media Foundation encoder MFTs. Ten
-	// seconds is far beyond either; it exists so that a wedged audio driver
-	// fails visibly at Start instead of hanging the UI thread that called it.
+	// pipelineStartTimeout bounds the asynchronous tail of the NULL→PLAYING
+	// transition of the capture and encode chain, and is the interval after
+	// which the watchdog starts complaining about the synchronous part. The
+	// costly parts are opening the WASAPI endpoint in shared mode and
+	// initialising the Media Foundation encoder MFTs; ten seconds is far beyond
+	// either.
 	pipelineStartTimeout = 10 * time.Second
 
-	// sinkStateChangeTimeout bounds the NULL→PLAYING transition of a fresh
-	// srtsink, which is where the SRT caller handshake happens. libsrt's
-	// SRTO_CONNTIMEO defaults to 3 s and srtsink does not override it, so a
-	// refused or unreachable listener reports itself well inside this. The
-	// specification measures a successful lock at about 1.1 s. Ten seconds only
-	// fires if the state change itself hangs.
+	// sinkStateChangeTimeout bounds the asynchronous tail of the NULL→PLAYING
+	// transition of a fresh srtsink. It does NOT bound the SRT caller
+	// handshake: async=false means srtsink connects inside its READY→PAUSED
+	// change_state, which runs synchronously inside SyncStateWithParent, which
+	// takes no timeout argument at all. libsrt's own SRTO_CONNTIMEO — 3 s by
+	// default, not overridden by srtsink — is the only thing bounding a
+	// connect, and it is the reason a dead listener still fails in seconds. The
+	// specification measures a successful lock at about 1.1 s.
 	sinkStateChangeTimeout = 10 * time.Second
 
-	// elementShutdownTimeout bounds taking a single element to NULL. Setting a
-	// disconnected srtsink to NULL closes a socket; it does not block.
+	// elementShutdownTimeout bounds the asynchronous tail of taking a single
+	// element to NULL. Setting a disconnected srtsink to NULL closes a socket;
+	// it does not block.
 	elementShutdownTimeout = 5 * time.Second
+
+	// watchdogInterval is how long a synchronous state change may run before
+	// stateChangeWatchdog logs that it is still running, and how often it
+	// repeats afterwards. It is deliberately shorter than every timeout above:
+	// the point is to have a log line already written by the time a human
+	// notices the application has stopped responding.
+	watchdogInterval = 3 * time.Second
 )
 
 // errorChannelBuffer is how many asynchronous errors are held before further
@@ -174,6 +220,17 @@ const (
 // gst.go requires dropping rather than blocking: the sender of these errors is
 // a GStreamer streaming thread and it must never wait on a Go consumer.
 const errorChannelBuffer = 16
+
+// warningChannelBuffer is how many bus warnings are held for the logging
+// goroutine before further ones are dropped.
+//
+// Warnings are NOT errors and never reach Errors(): internal/sender would
+// count one as a connection failure. They exist only for the field log. They go
+// through a channel for the same reason errors do — the poster is a GStreamer
+// streaming thread, and a marginal SRT link produces warnings faster than
+// stderr accepts them. Sixteen is a storm's worth; past that the log line count
+// is the diagnosis and the individual messages add nothing.
+const warningChannelBuffer = 16
 
 // srtSinkNamePrefix is prepended to a serial number to name each srtsink
 // uniquely — srtout-1, srtout-2 and so on.
@@ -191,11 +248,12 @@ const srtSinkNamePrefix = "srtout-"
 // Element names inside the parsed pipeline. These are the only names this file
 // looks up, and they match the specification's section 5 string.
 const (
-	nameMux        = "mux"   // mpegtsmux
-	nameSRTQueue   = "srtq"  // the leaky queue whose src pad feeds the sink
-	nameSlateSrc   = "slate" // filesrc reading the slate PNG
-	nameAudioSrc   = "asrc"  // wasapi2src
-	nameVideoEncod = "venc"  // the H.264 encoder chosen at runtime
+	nameMux        = "mux"    // mpegtsmux
+	nameSRTQueue   = "srtq"   // the leaky queue whose src pad feeds the sink
+	nameSlateSrc   = "slate"  // filesrc reading the slate PNG
+	nameAudioSrc   = "asrc"   // wasapi2src
+	nameVideoEncod = "venc"   // the H.264 encoder chosen at runtime
+	nameVideoScale = "vscale" // videoscale, so a slate that is not 1920x1080 still starts
 )
 
 // Package-level GStreamer initialisation state. Init is idempotent because
@@ -243,6 +301,7 @@ var requiredElements = []struct{ factory, plugin string }{
 	{"pngdec", "png"},
 	{"imagefreeze", "imagefreeze"},
 	{"videoconvert", "videoconvertscale"},
+	{"videoscale", "videoconvertscale"},
 	{"audioconvert", "audioconvert"},
 	{"audioresample", "audioresample"},
 	{"h264parse", "videoparsersbad"},
@@ -255,10 +314,13 @@ var requiredElements = []struct{ factory, plugin string }{
 
 // Init prepares the bundled GStreamer for use and calls gst_init.
 //
-// appDir is the directory holding wslcomms.exe. Before gst_init, Init sets:
+// appDir is the directory holding wslcomms.exe. Before gst_init, Init sets all
+// four of these to the bundled plugin directory <appDir>\gst\lib\gstreamer-1.0,
+// plus a per-user registry:
 //
-//	GST_PLUGIN_SYSTEM_PATH_1_0 = ""                              (disables the default search)
-//	GST_PLUGIN_PATH_1_0        = <appDir>\gst\lib\gstreamer-1.0
+//	GST_PLUGIN_SYSTEM_PATH_1_0 = <pluginDir>
+//	GST_PLUGIN_SYSTEM_PATH     = <pluginDir>
+//	GST_PLUGIN_PATH_1_0        = <pluginDir>
 //	GST_REGISTRY_1_0           = %LOCALAPPDATA%\WSLComms\registry.bin
 //
 // Go's os.Setenv calls SetEnvironmentVariableW, which is what GLib reads, so
@@ -292,22 +354,66 @@ func doInit(appDir string) error {
 		return fmt.Errorf("gst: Init: resolving appDir %q: %w", appDir, err)
 	}
 
-	// An empty GST_PLUGIN_SYSTEM_PATH_1_0 is not the same as an unset one:
-	// unset means "search the compiled-in system directories", empty means
-	// "search nothing". os.Setenv with "" sets it to empty, which is what is
-	// wanted. Do not switch this to os.Unsetenv.
-	if err := os.Setenv("GST_PLUGIN_SYSTEM_PATH_1_0", ""); err != nil {
-		return fmt.Errorf("gst: Init: setting GST_PLUGIN_SYSTEM_PATH_1_0: %w", err)
-	}
-
 	pluginDir := filepath.Join(abs, "gst", "lib", "gstreamer-1.0")
-	if err := os.Setenv("GST_PLUGIN_PATH_1_0", pluginDir); err != nil {
-		return fmt.Errorf("gst: Init: setting GST_PLUGIN_PATH_1_0: %w", err)
-	}
 	if fi, err := os.Stat(pluginDir); err != nil {
 		return fmt.Errorf("gst: Init: bundled plugin directory %q is not readable: %w", pluginDir, err)
 	} else if !fi.IsDir() {
 		return fmt.Errorf("gst: Init: bundled plugin path %q is not a directory", pluginDir)
+	}
+
+	// All three plugin-path variables are pointed at the bundle, and none of
+	// them is set to the empty string.
+	//
+	// This is NOT because the empty-string idiom is broken. It was claimed to
+	// be, and the claim was tested and is false. The claim: os.Setenv calls
+	// SetEnvironmentVariableW, Windows cannot represent an empty value, the
+	// variable is deleted, and GLib then sees it as unset. The measurement, on
+	// Windows 11 26200 with Go 1.24.5 — TestEmptyEnvVarSurvivesOnWindows in
+	// gst_stub_test.go, which runs at Gate A:
+	//
+	//	PARENT LookupEnv -> value="" present=true
+	//	PARENT Environ entry -> "WSLCOMMS_EMPTY_ENV_PROBE="
+	//	CHILD  LookupEnv -> value="" present=true
+	//
+	// The entry survives in the block and is inherited by a child process, so
+	// GetEnvironmentVariableW did not report ERROR_ENVVAR_NOT_FOUND. (The
+	// folklore is real but belongs to the wrappers: cmd.exe's `set FOO=` calls
+	// SetEnvironmentVariable with NULL, the CRT's _putenv("FOO=") deletes, and
+	// .NET normalises an empty value to null — the same probe run through
+	// PowerShell prints $null. None of those is the Win32 API, and none of them
+	// is what Go calls.)
+	//
+	// What is set here is nevertheless a path rather than "", because of the
+	// one link in the chain that CANNOT be tested at Gate A: whether GLib's
+	// g_getenv maps an empty value to "" or to NULL. Reading gutils.c it
+	// returns "", and gstregistry.c then splits "" into zero directories and
+	// scans nothing, which is the wanted behaviour. But that is a reading, not
+	// a measurement, and if it is wrong the fallthrough is to the compiled-in
+	// system directories — silently loading a foreign GStreamer.
+	//
+	// A non-empty path is correct under BOTH behaviours: the system search path
+	// becomes exactly the bundle, whether GLib reports it as set or not. It
+	// costs one redundant scan of a directory that is already
+	// GST_PLUGIN_PATH_1_0, which gstregistry deduplicates by filename. The
+	// unversioned name is set for the same reason — it is the fallback
+	// gstregistry.c consults when the versioned one is absent.
+	//
+	// missingElements() below does not back any of this up. It detects
+	// factories that are ABSENT; it cannot detect a foreign install's copy of
+	// the same factory outranking ours. The Gate B assertion in BUILD-NOTES.md
+	// section 8 — every plugin in gst_registry_get_plugin_list() has a filename
+	// under pluginDir — is what actually proves this worked.
+	for _, name := range []string{
+		"GST_PLUGIN_SYSTEM_PATH_1_0",
+		"GST_PLUGIN_SYSTEM_PATH",
+		"GST_PLUGIN_PATH_1_0",
+	} {
+		if err := os.Setenv(name, pluginDir); err != nil {
+			return fmt.Errorf("gst: Init: setting %s: %w", name, err)
+		}
+		if got, ok := os.LookupEnv(name); !ok || got != pluginDir {
+			return fmt.Errorf("gst: Init: %s did not take: LookupEnv returned %q, %v", name, got, ok)
+		}
 	}
 
 	registryPath, err := registryFile()
@@ -656,13 +762,35 @@ func preferenceIndex(name string) int {
 }
 
 // New creates a Pipeline. Init must have been called first.
+//
+// It starts one goroutine, which does nothing but write bus warnings to the
+// log; Stop ends it. A Pipeline that is created and never stopped therefore
+// leaks that goroutine, which is why the contract in gst.go says Stop is
+// idempotent and must always be called.
 func New() (Pipeline, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: New: Init has not been called")
 	}
-	return &cgoPipeline{
-		errs: make(chan error, errorChannelBuffer),
-	}, nil
+	p := &cgoPipeline{
+		errs:  make(chan error, errorChannelBuffer),
+		warns: make(chan string, warningChannelBuffer),
+	}
+	go p.logWarnings()
+	return p, nil
+}
+
+// logWarnings writes bus warnings to the log, off the streaming thread that
+// produced them. It ends when Stop closes the channel.
+//
+// This exists so that onBusMessage never calls log.Printf. Go's log package
+// takes a process-global mutex and writes synchronously to stderr; a marginal
+// SRT link produces warnings in bursts, and serialising several GStreamer
+// streaming threads behind one file handle during an outage is exactly the
+// wrong moment to add latency to the capture chain.
+func (p *cgoPipeline) logWarnings() {
+	for w := range p.warns {
+		log.Print(w)
+	}
 }
 
 // sinkErrRoute diverts a GST_ELEMENT_ERROR posted by one specific srtsink away
@@ -744,11 +872,18 @@ type cgoPipeline struct {
 	// Written by ReplaceSink under mu, read by onBusMessage without any lock.
 	route atomic.Pointer[sinkErrRoute]
 
-	// errs carries GST_ELEMENT_ERROR bus messages to Errors. Guarded by errMu,
+	// busSilenced makes onBusMessage return immediately once the pipeline is
+	// being torn down. It exists because the bus sync handler is NEVER
+	// detached; see teardownLocked.
+	busSilenced atomic.Bool
+
+	// errs carries GST_ELEMENT_ERROR bus messages to Errors, and warns carries
+	// GST_ELEMENT_WARNING to the logging goroutine. Both are guarded by errMu,
 	// which exists only so that a streaming thread cannot send on a channel
 	// Stop is closing. errMu is never held across anything that can block.
 	errMu      sync.RWMutex
 	errs       chan error
+	warns      chan string
 	errsClosed bool
 }
 
@@ -825,6 +960,25 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		return abort(err)
 	}
 
+	// add-borders is set here rather than in the parse string because
+	// gst_parse_launch treats an unknown property as a hard error, and a
+	// commentary position that will not start because a scaler property was
+	// renamed is a worse outcome than a slate scaled at the element's default.
+	// The value pins the behaviour for artwork whose aspect ratio is not 16:9:
+	// letterbox it rather than stretch it. videoscale's own default is already
+	// true, so this is a guard against the default changing, not a change.
+	if vscale := pipeline.GetByName(nameVideoScale); vscale != nil {
+		if hasProperty(vscale, "add-borders") {
+			vscale.SetObjectProperty("add-borders", true)
+		} else {
+			log.Printf("gst: %s has no add-borders property; a slate that is not 16:9 will be stretched",
+				nameVideoScale)
+		}
+	} else {
+		log.Printf("gst: parsed pipeline has no element named %s; a slate that is not "+
+			"1920x1080 will fail caps negotiation", nameVideoScale)
+	}
+
 	asrc := pipeline.GetByName(nameAudioSrc)
 	if asrc == nil {
 		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioSrc))
@@ -882,6 +1036,10 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if p.bus == nil {
 		return abort(errors.New("gst: pipeline has no bus"))
 	}
+	// busSilenced is cleared before the handler is attached and set by
+	// teardownLocked; it is what replaces detaching the handler. See
+	// teardownLocked for why the handler is never detached.
+	p.busSilenced.Store(false)
 	p.bus.SetSyncHandler(p.onBusMessage)
 
 	// Specification section 6.1, in exactly this order. Every line matters.
@@ -914,7 +1072,11 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	// measured bug: audio DTS jumping backwards by exactly the previous run's
 	// uptime, 1,523 non-monotonic errors downstream, every indicator green.
 
-	if ret := pipeline.BlockSetState(gogst.StatePlaying, gogst.ClockTime(pipelineStartTimeout)); !stateChangeOK(ret) {
+	stopWatchdog := stateChangeWatchdog("pipeline NULL to PLAYING (opening the WASAPI endpoint " +
+		"and initialising the encoder MFTs)")
+	ret := pipeline.BlockSetState(gogst.StatePlaying, gogst.ClockTime(pipelineStartTimeout))
+	stopWatchdog()
+	if !stateChangeOK(ret) {
 		err := fmt.Errorf("gst: pipeline would not go to PLAYING (%s)", ret)
 		if busErr := p.drainStartupError(); busErr != nil {
 			err = fmt.Errorf("%w: %v", err, busErr)
@@ -968,6 +1130,26 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 	//
 	// config-interval=-1 puts SPS/PPS in front of every IDR so M2L-X can
 	// re-lock mid-stream.
+	//
+	// videoscale is present so that the slate PNG does not have to be exactly
+	// 1920x1080. assets/slate.png is 1920x1080 today and CONTRACT.md says so,
+	// but the artwork is replaced every season by someone who will not read
+	// this file, and without videoscale a 1920x1200 export fails caps
+	// negotiation at Start with no diagnostic that names the size. The
+	// videoconvertscale plugin is already required for videoconvert, so the
+	// element costs nothing and does nothing at all when the slate is the right
+	// size.
+	//
+	// There is deliberately NO capsfilter between wasapi2src and audioconvert.
+	// One used to sit there pinning rate=48000,channels=2, upstream of the
+	// resampler that exists to produce exactly that — where it could not help,
+	// only refuse. wasapi2src in shared mode can only ever produce its
+	// endpoint's mix format, and Dante Virtual Soundcard is commonly configured
+	// at 44.1 or 96 kHz, so on a DVS endpoint that is not at 48 k the caps
+	// filter fails negotiation at Start, twenty minutes before kick-off, with
+	// an error naming neither the sample rate nor the device. audioconvert and
+	// audioresample convert whatever the endpoint gives us; the capsfilter that
+	// actually matters is the one below them, pinning what enters mfaacenc.
 	return "" +
 		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
 		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
@@ -976,6 +1158,7 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 		" ! pngdec" +
 		" ! imagefreeze is-live=true" +
 		" ! videoconvert" +
+		" ! videoscale name=" + nameVideoScale +
 		" ! video/x-raw,format=NV12,width=1920,height=1080,framerate=50/1," +
 		"pixel-aspect-ratio=1/1,colorimetry=bt709" +
 		" ! " + encoderName + " name=" + nameVideoEncod +
@@ -985,7 +1168,6 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 		" ! queue name=vq max-size-time=1000000000 ! " + nameMux + ".\n" +
 
 		"wasapi2src name=" + nameAudioSrc +
-		" ! audio/x-raw,rate=48000,channels=2" +
 		" ! audioconvert ! audioresample" +
 		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
 		" ! mfaacenc bitrate=" + strconv.Itoa(audioBitrateBps) +
@@ -1071,6 +1253,11 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 	if msg == nil {
 		return gogst.BusDrop
 	}
+	// Teardown has begun. Everything below this point would be pointless work
+	// on a pipeline that is going to NULL, and deliver would drop it anyway.
+	if p.busSilenced.Load() {
+		return gogst.BusDrop
+	}
 
 	switch msg.Type() {
 	case gogst.MessageError:
@@ -1113,10 +1300,17 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		if src := msg.Source(); src != nil {
 			source = src.GetName()
 		}
-		// Warnings are logged and not delivered. A GStreamer warning is not a
-		// pipeline failure, and putting it on Errors() would make
+		// Warnings are logged and NOT delivered on Errors(). A GStreamer
+		// warning is not a pipeline failure, and putting it there would make
 		// internal/sender treat it as one.
-		log.Printf("gst: warning: %s: %v (%s)", source, gerr, debug)
+		//
+		// The log call itself happens on logWarnings' goroutine, not here.
+		// log.Printf takes a process-global mutex and blocks on stderr; a
+		// marginal SRT link produces warnings in bursts, and this function runs
+		// on a GStreamer streaming thread. Serialising the streaming threads
+		// behind Go's log mutex during an outage would add latency to the
+		// capture chain at the one moment it must not have any.
+		p.deliverWarning(fmt.Sprintf("gst: warning: %s: %v (%s)", source, gerr, debug))
 	}
 
 	return gogst.BusDrop
@@ -1168,6 +1362,24 @@ func (p *cgoPipeline) deliver(err error) {
 	}
 }
 
+// deliverWarning hands a pre-formatted warning line to the logging goroutine
+// without blocking, and without racing Stop's close.
+//
+// Dropping under a storm is the correct behaviour: past a burst of sixteen the
+// number of warnings is the diagnosis and the individual lines add nothing,
+// whereas a streaming thread waiting on stderr adds latency to a live capture.
+func (p *cgoPipeline) deliverWarning(line string) {
+	p.errMu.RLock()
+	defer p.errMu.RUnlock()
+	if p.errsClosed {
+		return
+	}
+	select {
+	case p.warns <- line:
+	default:
+	}
+}
+
 // ReplaceSink installs a fresh srtsink with the given properties, replacing any
 // sink already present.
 //
@@ -1209,23 +1421,15 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 		}
 	}
 
-	// 1. Close the gate. Both probes now drop buffers, which isolates srtq from
-	//    the sink about to be removed and isolates mpegtsmux from srtq.
-	p.gateClosed.Store(true)
-
-	// 2. Detach and destroy the old sink, in the order unlink, NULL, remove.
-	//    Removing an element that is not in NULL is what produces the
-	//    "removing element in state PLAYING" warnings and leaks its resources.
-	if err := p.detachSinkLocked(); err != nil {
+	// 1. Tear out whatever is there. This is the SAME teardown path RemoveSink
+	//    uses — close the gate, unlink, NULL, remove, re-arm the queue — and it
+	//    is the only one in this file. When internal/sender has honoured
+	//    specification section 6.2 and already called RemoveSink on entry to
+	//    DRAINING, this is a cheap no-op: there is no sink to detach and the
+	//    queue's last flow return is already GST_FLOW_OK.
+	if err := p.removeSinkLocked(); err != nil {
 		return err
 	}
-
-	// 3. Re-arm srtq if its loop was poisoned by the failure that got us here.
-	//    A queue that took GST_FLOW_ERROR or GST_FLOW_NOT_LINKED from
-	//    downstream stores it in srcresult, pauses its task, and thereafter
-	//    returns that same error upstream from gst_queue_chain — so a sink swap
-	//    alone would reconnect SRT and still deliver nothing.
-	p.rearmQueueLocked()
 
 	// 4. Build the new sink.
 	p.sinkSerial++
@@ -1259,37 +1463,155 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 	//    error and returns STATE_CHANGE_FAILURE from the same call.
 	route := &sinkErrRoute{name: name, ch: make(chan error, 1)}
 	p.route.Store(route)
+	// Backstop for the early returns below ONLY. The success path clears the
+	// route explicitly at step 7 and must keep doing so: a deferred clear runs
+	// after the function body has finished, which would leave the route
+	// installed across the final drain, across the gate opening and across the
+	// log line — and an error arriving in that window would be swallowed by a
+	// channel nobody ever reads again. That is the false green this whole
+	// package exists to prevent. Do not delete step 7 and lean on this.
 	defer p.route.Store(nil)
 
+	stopWatchdog := stateChangeWatchdog(name + ": SRT caller handshake to " + endpointForLog(opts))
 	if !sink.SyncStateWithParent() {
+		stopWatchdog()
 		p.abandonSinkLocked(sink, sinkPad)
 		return fmt.Errorf("gst: %s: SRT caller handshake to %s failed: %v",
 			name, endpointForLog(opts), routeErrOr(route, errors.New("gst_element_sync_state_with_parent returned FALSE")))
 	}
-	if ret := sink.BlockSetState(gogst.StatePlaying, gogst.ClockTime(sinkStateChangeTimeout)); !stateChangeOK(ret) {
+	ret := sink.BlockSetState(gogst.StatePlaying, gogst.ClockTime(sinkStateChangeTimeout))
+	stopWatchdog()
+	if !stateChangeOK(ret) {
 		p.abandonSinkLocked(sink, sinkPad)
 		return fmt.Errorf("gst: %s: SRT caller handshake to %s failed (%s): %v",
 			name, endpointForLog(opts), ret, routeErrOr(route, errors.New("no bus error was posted")))
 	}
 
-	// A late error can still have arrived while the state change was reported
-	// as successful — srtsink can accept the socket and then fail its first
-	// write. Checking here means ReplaceSink does not report a connection that
-	// has already gone.
+	// 7. Clear the route BEFORE the last drain, and drain after clearing.
+	//
+	//    Order is the whole point. From the instant this store lands,
+	//    onBusMessage stops diverting srtout-N's errors into a channel that is
+	//    about to be abandoned and starts putting them on Errors(), where
+	//    internal/sender reads them and reconnects. The drain that follows
+	//    catches anything that arrived before the store.
+	//
+	//    Doing this with `defer` instead — which is what was here — leaves the
+	//    route installed through the drain, through the gate opening and
+	//    through the success log. srtsink accepting the socket and then failing
+	//    its first write is M2L-X's ordinary one-peer / re-accept behaviour,
+	//    not an exotic case; such an error would be matched by name, pushed
+	//    into r.ch, and read by nobody. It would reach neither Errors() nor
+	//    p.fatal, while onBusMessage had already set gateClosed. ReplaceSink
+	//    would return nil, sender would go CONNECTED, the lamp would go green,
+	//    and no reconnect would ever be triggered: commentary off air with
+	//    every indicator healthy.
+	p.route.Store(nil)
 	if err := routeErr(route); err != nil {
 		p.abandonSinkLocked(sink, sinkPad)
 		return fmt.Errorf("gst: %s: SRT connection to %s failed immediately: %w",
 			name, endpointForLog(opts), err)
 	}
 
-	// 7. Open the gate. From this instant media flows to the new sink; the
+	// 8. A pipeline-fatal error — one whose source is mux or the capture chain
+	//    rather than the sink — can have been posted by the churn of adding and
+	//    starting an element. fatal is checked on entry to this function; check
+	//    it again before promising success, so that the synchronous answer and
+	//    the asynchronous one cannot disagree. Without this a caller can be
+	//    told the connection came up in the same instant Errors() is told the
+	//    muxer has stopped.
+	if err := p.fatalError(); err != nil {
+		p.abandonSinkLocked(sink, sinkPad)
+		return err
+	}
+
+	// 9. Open the gate. From this instant media flows to the new sink; the
 	//    sticky events left pending by the gated pushes are delivered ahead of
 	//    the first buffer by gst_pad_push_data's check_sticky.
+	//
+	//    A residual window remains and is deliberate: an error posted between
+	//    step 7 and here sets gateClosed true, and this store then reopens a
+	//    gate onto a sink that has already failed. That is not a false green,
+	//    and the reason is a property of the CALLER, not of this file: the error
+	//    is on Errors() by construction, and internal/sender's state machine
+	//    performs no drain of its error queue after ReplaceSink returns — it
+	//    drains only immediately BEFORE the call, where a queued message can
+	//    only belong to the sink DRAINING already removed. Given that, the
+	//    message survives, the sender tears the sink down, and the worst case is
+	//    a few milliseconds of buffers pushed into a dead socket.
+	//
+	//    The dependency is stated because it has already been broken once. If a
+	//    drain is ever reinstated on the far side of ReplaceSink, this window
+	//    stops being harmless and becomes a PERMANENT false green: the discarded
+	//    message is the only one there will ever be. onBusMessage has already set
+	//    gateClosed, and the gate probe drops rather than blocks — a dropped
+	//    probe returns GST_FLOW_OK, as the file comment on the gate explains — so
+	//    srtq never takes a bad flow return, mpegtsmux never notices, and no
+	//    further bus error is posted. The lamp stays green with nothing on the
+	//    wire and no reconnect, and nothing in this file would say so.
+	//
+	//    Closing the window here instead would need the gate to be a compare-and-
+	//    swap against a generation counter, which is more machinery than a
+	//    microsecond window on a path that already recovers correctly.
 	p.sink = sink
 	p.gateClosed.Store(false)
 
 	log.Printf("gst: %s connected to %s, latency %d ms, encryption %s",
 		name, endpointForLog(opts), opts.LatencyMs, encryptionForLog(opts))
+	return nil
+}
+
+// RemoveSink tears the current sink out without installing another.
+//
+// Specification section 6.2 orders a reconnect DRAINING (tear down) -> BACKOFF
+// (wait) -> CONNECTING (install), and that order is load-bearing: an M2L-X SRT
+// listener accepts exactly one peer, never displaces the incumbent, and refuses
+// re-accept for roughly five seconds. The wait only clears that window if our
+// socket is already gone when it starts. See the doc comment on Pipeline in
+// gst.go for the full argument.
+//
+// It is idempotent. Removing when no sink is installed is not an error — it
+// still closes the gate and re-arms the queue, which is exactly what a caller
+// entering DRAINING after a failed connect attempt needs.
+func (p *cgoPipeline) RemoveSink() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return errors.New("gst: pipeline is stopped")
+	}
+	if !p.started {
+		return errors.New("gst: pipeline has not been started")
+	}
+	return p.removeSinkLocked()
+}
+
+// removeSinkLocked is the ONE teardown path in this file. p.mu must be held.
+//
+// ReplaceSink is this followed by an install, rather than a second copy of the
+// same three steps, so that there is a single place where the ordering of gate,
+// unlink, NULL, remove and queue re-arm can be got right or wrong.
+func (p *cgoPipeline) removeSinkLocked() error {
+	// 1. Close the gate. Both probes now drop buffers, which isolates srtq from
+	//    the sink about to be removed and isolates mpegtsmux from srtq.
+	p.gateClosed.Store(true)
+
+	// 2. Detach and destroy the sink, in the order unlink, NULL, remove.
+	//    Removing an element that is not in NULL is what produces the
+	//    "removing element in state PLAYING" warnings and leaks its resources.
+	if err := p.detachSinkLocked(); err != nil {
+		return err
+	}
+
+	// 3. Re-arm srtq if its loop was poisoned by the failure that got us here.
+	//    A queue that took GST_FLOW_ERROR or GST_FLOW_NOT_LINKED from
+	//    downstream stores it in srcresult, pauses its task, and thereafter
+	//    returns that same error upstream from gst_queue_chain — so a sink swap
+	//    alone would reconnect SRT and still deliver nothing.
+	//
+	//    Nothing upstream of srtq is touched. wasapi2src, both encoders and
+	//    mpegtsmux stay in PLAYING, which is the single most important property
+	//    of this file.
+	p.rearmQueueLocked()
 	return nil
 }
 
@@ -1355,7 +1677,33 @@ func (p *cgoPipeline) abandonSinkLocked(sink gogst.Element, sinkPad gogst.Pad) {
 	}
 }
 
-// rearmQueueLocked restores srtq's loop if it stopped with a bad flow return.
+// stickyEventTypes are the sticky events that must be present on srtq's src pad
+// before a buffer can legally reach a freshly installed srtsink, in ascending
+// GstEventType order.
+//
+// The first three are mandatory. STREAM_COLLECTION and TAG are carried because
+// mpegtsmux may have sent them and losing them silently changes what is
+// signalled downstream; neither is fatal by itself.
+//
+// gstpad.c's store_event() places each event at its own sticky index, so the
+// order in this slice is documentation rather than mechanism.
+var stickyEventTypes = []gogst.EventType{
+	gogst.EventStreamStart,
+	gogst.EventCaps,
+	gogst.EventSegment,
+	gogst.EventStreamCollection,
+	gogst.EventTag,
+}
+
+// maxStickyEventsPerType bounds the per-type index scan in stickyEventsOf. Only
+// TAG realistically has more than one; eight is generous and stops a malformed
+// pad turning a reconnect into an unbounded loop.
+const maxStickyEventsPerType = 8
+
+// rearmQueueLocked restores srtq's loop if it stopped with a bad flow return,
+// and puts back the sticky events that restoring it destroys.
+//
+// # Why a re-arm is needed at all
 //
 // gst_queue_loop stores the flow return of its last push in srcresult and
 // pauses its task on anything other than GST_FLOW_OK. gst_queue_chain then
@@ -1364,10 +1712,47 @@ func (p *cgoPipeline) abandonSinkLocked(sink gogst.Element, sinkPad gogst.Pad) {
 // srcresult to GST_FLOW_OK, flushes the stale queued data — which is what
 // leaky=downstream would have done to it anyway — and restarts the loop task.
 //
-// This deliberately does NOT send a flush event pair through the queue. A
-// FLUSH_STOP removes the sticky SEGMENT event from the pad it is sent to, and
-// nothing would then re-push it, which is a far more obscure failure than the
-// one being repaired.
+// # Why the re-arm has to be repaired afterwards
+//
+// gst_pad_set_active(pad, FALSE) reaches post_activate() with new_mode
+// GST_PAD_MODE_NONE, and that branch calls remove_events(pad), which drops
+// EVERY sticky event the pad holds. That is precisely the damage this function
+// used to say it had rejected a FLUSH_START/FLUSH_STOP pair in order to avoid —
+// and it is worse than the flush pair, which only removes SEGMENT, EOS and
+// STREAM_GROUP_DONE and leaves STREAM_START and CAPS alone.
+//
+// Nothing puts them back on its own. mpegtsmux sends STREAM_START, CAPS and
+// SEGMENT once, at the start of the stream; a queue forwards them once;
+// gst_pad_link's events_foreach(mark_event_not_received) re-marks the src pad's
+// sticky list for the new peer, but that list is now EMPTY, so it marks
+// nothing. The fresh srtsink would then receive buffers with no segment, and
+// gstbasesink would log "Received buffer without a new-segment. Assuming
+// timestamps start from 0" — timestamps restarting at zero being the exact
+// measured fault this entire file is built to prevent.
+//
+// This is not an exotic path. rearmQueueLocked runs whenever srtq:src's last
+// flow return is not GST_FLOW_OK, and on a genuine mid-match disconnect the
+// in-flight buffer is inside srtsink's render() when the gate closes, so the
+// last flow return IS an error. Every real reconnect takes it.
+//
+// # The repair
+//
+// There is no re-arm in GStreamer that leaves the sticky events alone —
+// deactivation clears all of them, a flush pair clears SEGMENT, and taking the
+// queue element to READY does both plus more. So the events are snapshotted
+// before the deactivation and stored back afterwards with
+// gst_pad_store_sticky_event, which inserts them with received = FALSE and sets
+// GST_PAD_FLAG_PENDING_EVENTS. check_sticky() then pushes them ahead of the
+// first buffer the moment the gate opens, which is the ordinary delivery path
+// and not a special case.
+//
+// The snapshot is taken from srtq's src pad, which is what the peer would
+// actually have received. Anything missing there is taken from srtq's sink pad,
+// whose own sticky list is untouched by any of this — the queue forwarded the
+// same events from mpegtsmux, so it is the same data by a different route.
+//
+// UNVERIFIED, and a Gate B must-verify: see BUILD-NOTES.md section 4.10 for the
+// gst-launch reproduction.
 //
 // It is a no-op on the healthy path, which is every first connect and every
 // reconnect where the gate closed before the queue saw the failure.
@@ -1377,6 +1762,19 @@ func (p *cgoPipeline) rearmQueueLocked() {
 		return
 	}
 	log.Printf("gst: %s stopped with %s; re-arming its loop", nameSRTQueue, last)
+
+	// Snapshot BEFORE the deactivation destroys them.
+	saved := stickyEventsOf(p.srtqSrcPad)
+	for _, ev := range stickyEventsOf(p.srtqSinkPad) {
+		if _, have := saved[ev.key]; !have {
+			saved[ev.key] = ev
+		}
+	}
+	if _, have := saved[stickyKey{gogst.EventSegment, 0}]; !have {
+		log.Printf("gst: WARNING: %s has no sticky SEGMENT event to preserve across the re-arm; "+
+			"the next sink will be told timestamps start from zero", nameSRTQueue)
+	}
+
 	if !p.srtqSrcPad.SetActive(false) {
 		log.Printf("gst: could not deactivate %s:src while re-arming", nameSRTQueue)
 	}
@@ -1384,6 +1782,77 @@ func (p *cgoPipeline) rearmQueueLocked() {
 		log.Printf("gst: could not reactivate %s:src while re-arming; "+
 			"media will not flow until the pipeline is rebuilt", nameSRTQueue)
 	}
+
+	restoreStickyEvents(p.srtqSrcPad, saved)
+}
+
+// stickyKey identifies one sticky event on a pad: its type and, for the types
+// that permit several, its index.
+type stickyKey struct {
+	typ gogst.EventType
+	idx uint
+}
+
+// stickyEvent is one snapshotted sticky event and the key it was found under.
+type stickyEvent struct {
+	key   stickyKey
+	event *gogst.Event
+}
+
+// stickyEventsOf snapshots the sticky events of interest from a pad.
+//
+// It reads by type and index with gst_pad_get_sticky_event rather than
+// iterating, because go-gst v0.0.2 does not bind gst_pad_sticky_events_foreach
+// (it takes a C callback and is not in the generated surface). The set in
+// stickyEventTypes is the complete set that matters here: srtq sits between one
+// muxer and one sink and carries a single stream.
+func stickyEventsOf(pad gogst.Pad) map[stickyKey]stickyEvent {
+	out := make(map[stickyKey]stickyEvent, len(stickyEventTypes))
+	if pad == nil {
+		return out
+	}
+	for _, typ := range stickyEventTypes {
+		for idx := uint(0); idx < maxStickyEventsPerType; idx++ {
+			ev := pad.GetStickyEvent(typ, idx)
+			if ev == nil {
+				break
+			}
+			key := stickyKey{typ: typ, idx: idx}
+			out[key] = stickyEvent{key: key, event: ev}
+		}
+	}
+	return out
+}
+
+// restoreStickyEvents stores a snapshot back onto a pad whose sticky list was
+// emptied by a deactivation.
+//
+// gst_pad_store_sticky_event inserts with received = FALSE, so check_sticky()
+// pushes each one to the peer ahead of the next buffer. A failure is logged
+// rather than returned: the caller is mid-reconnect and there is nothing better
+// to do than continue and let the resulting bus error be the report.
+func restoreStickyEvents(pad gogst.Pad, saved map[stickyKey]stickyEvent) {
+	if pad == nil || len(saved) == 0 {
+		return
+	}
+	restored := 0
+	// Iterate stickyEventTypes rather than the map so the log line is stable
+	// and the store order matches gstpad.c's own sticky ordering.
+	for _, typ := range stickyEventTypes {
+		for idx := uint(0); idx < maxStickyEventsPerType; idx++ {
+			ev, ok := saved[stickyKey{typ: typ, idx: idx}]
+			if !ok {
+				continue
+			}
+			if ret := pad.StoreStickyEvent(ev.event); ret != gogst.FlowOK {
+				log.Printf("gst: could not restore the sticky %s event on %s:src after re-arming (%s); "+
+					"the next sink may see buffers with no segment", typ, nameSRTQueue, ret)
+				continue
+			}
+			restored++
+		}
+	}
+	log.Printf("gst: restored %d sticky event(s) on %s:src after re-arming", restored, nameSRTQueue)
 }
 
 // configureSRTSink applies every srtsink property from specification section 5.
@@ -1567,32 +2036,64 @@ func (p *cgoPipeline) Stop() error {
 
 	err := p.teardownLocked()
 
-	// Close the error channel last, and only after the sync handler has been
-	// detached and the pipeline has stopped posting. errMu is taken for writing
-	// here; a streaming thread inside deliver holds it for reading only for the
-	// duration of a non-blocking channel send, so this cannot wait long.
+	// Close the channels last, after teardownLocked has silenced the bus
+	// handler and the pipeline has reached NULL. errMu is taken for writing
+	// here; a streaming thread inside deliver or deliverWarning holds it for
+	// reading only for the duration of a non-blocking channel send, so this
+	// cannot wait long.
 	//
-	// The handler is detached inside teardownLocked BEFORE the state change,
-	// because gst_element_set_state posts messages synchronously on the calling
-	// goroutine: with the handler still attached, this goroutine would re-enter
-	// deliver while holding errMu for writing and deadlock against itself.
+	// It does not deadlock against a message posted by the state change on this
+	// same goroutine either: errMu is NOT held during teardownLocked, so a
+	// re-entrant deliver would take it for reading and return. (An earlier
+	// comment here claimed the opposite and used it to justify detaching the
+	// bus sync handler. That justification was wrong; see teardownLocked.)
+	//
+	// errsClosed guards both channels: nothing sends on either without holding
+	// errMu for reading and checking it first.
 	p.errMu.Lock()
 	if !p.errsClosed {
 		p.errsClosed = true
 		close(p.errs)
+		close(p.warns)
 	}
 	p.errMu.Unlock()
 
 	return err
 }
 
-// teardownLocked detaches the bus handler, removes the pad probes and takes the
+// teardownLocked silences the bus handler, removes the pad probes and takes the
 // pipeline to NULL. p.mu must be held. It is safe to call on a partially built
 // pipeline, which is how Start unwinds a failure.
+//
+// # Why the bus sync handler is silenced with a flag and never detached
+//
+// gst_bus_set_sync_handler(bus, NULL, ...) would look tidier and would kill the
+// process. gst_bus_post reads the handler and its user_data under
+// GST_OBJECT_LOCK, drops the lock, and only then calls it. Setting the handler
+// to NULL runs the GDestroyNotify go-gst installed alongside it, which calls
+// userdata.Delete and unregisters the Go closure. A streaming thread that had
+// already read the pointer then enters go-gst's exported callback
+// _gogst_gst1_BusSyncHandler, finds userdata.Load returns nil, and executes
+//
+//	panic(`callback not found`)
+//
+// in an //export'ed cgo function. A Go panic cannot unwind through a C frame,
+// so the process dies. Worse, go-glib's userdata allocator recycles the freed C
+// pointer onto a free list, so a later registration can hand the same address
+// out again and the late call reaches somebody else's closure instead.
+//
+// The window is narrow, but it is at Stop — the end of every match, and every
+// mid-match capture-device change — and the failure is process death during a
+// live broadcast.
+//
+// So the handler stays attached for the life of the bus and onBusMessage
+// returns immediately once busSilenced is set. The cost is one userdata
+// registration per pipeline, released when the GstBus is finalised. The
+// deadlock this detachment was said to prevent does not exist: Stop does not
+// hold errMu while teardownLocked runs, and errsClosed already makes a late
+// delivery safe.
 func (p *cgoPipeline) teardownLocked() error {
-	if p.bus != nil {
-		p.bus.SetSyncHandler(nil)
-	}
+	p.busSilenced.Store(true)
 
 	// gst_pad_remove_probe waits for a running callback to return. gateProbe
 	// never blocks, so this cannot wait meaningfully, and removing the probes
@@ -1610,7 +2111,10 @@ func (p *cgoPipeline) teardownLocked() error {
 	if p.pipeline != nil {
 		// The whole pipeline goes to NULL in one call; there is no need to take
 		// the sink down separately, and doing so would only add a way to fail.
-		if ret := p.pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(pipelineStartTimeout)); !stateChangeOK(ret) {
+		stopWatchdog := stateChangeWatchdog("pipeline to NULL (releasing the WASAPI endpoint)")
+		ret := p.pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(pipelineStartTimeout))
+		stopWatchdog()
+		if !stateChangeOK(ret) {
 			err = fmt.Errorf("gst: pipeline would not go to NULL (%s)", ret)
 		}
 	}
@@ -1639,6 +2143,59 @@ func (p *cgoPipeline) teardownLocked() error {
 // with a timeout — an ASYNC at that point means the timeout expired.
 func stateChangeOK(ret gogst.StateChangeReturn) bool {
 	return ret == gogst.StateChangeSuccess || ret == gogst.StateChangeNoPreroll
+}
+
+// stateChangeWatchdog logs, every watchdogInterval, that a synchronous
+// GStreamer state change has still not returned. The returned function stops
+// it and must be called on every path out, including the failure paths.
+//
+// IT CANNOT RECOVER ANYTHING, and it is not a timeout. Read the comment on the
+// timeout constants at the top of this file: gst_element_set_state takes no
+// timeout, holds the element's GST_STATE_LOCK, and cannot be cancelled or
+// preempted from Go. If wasapi2src wedges inside IAudioClient::Initialize on a
+// broken endpoint, the calling goroutine is gone for the life of the process
+// and it is holding p.mu.
+//
+// What this buys is the difference between "the application froze" and a log
+// with a line in it naming the element and the transition. That is the whole
+// claim; nothing here promises a bound.
+//
+// It runs on its own timer goroutine, so it does not call log.Printf from a
+// streaming thread, and it does not touch the pipeline.
+func stateChangeWatchdog(what string) (stop func()) {
+	var (
+		mu      sync.Mutex
+		stopped bool
+		timer   *time.Timer
+		started = time.Now()
+	)
+	var arm func()
+	arm = func() {
+		timer = time.AfterFunc(watchdogInterval, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if stopped {
+				return
+			}
+			log.Printf("gst: WATCHDOG: %s has not returned after %s. "+
+				"gst_element_set_state cannot be interrupted; if this repeats, the audio driver "+
+				"or an encoder MFT is wedged and only restarting the application will clear it.",
+				what, time.Since(started).Round(time.Second))
+			arm()
+		})
+	}
+	mu.Lock()
+	arm()
+	mu.Unlock()
+
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = true
+		if timer != nil {
+			timer.Stop()
+		}
+	}
 }
 
 // hasProperty reports whether a GObject has an installed property of this name.

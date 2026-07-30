@@ -1,14 +1,18 @@
-//go:build cgo && (dev || production || bindings)
+//go:build dev || production || bindings
 
 // Command wslcomms is the WSL Studios commentary contribution application: one
 // window, one process, one installer.
 //
 // Owner: WP-8.
 //
-// This file is behind //go:build cgo because internal/gst's real implementation
-// links GStreamer through cgo. main_nocgo.go supplies a main for CGO_ENABLED=0
-// builds so that `go build ./...` stays honest at Gate A, where there is no
-// MinGW gcc.
+// This file is behind //go:build dev || production || bindings — the tags the
+// Wails CLI sets for `wails dev`, `wails build` and its bindings step.
+// main_nocgo.go supplies an inert main for every other build, which is what
+// keeps a stray `go build .` from reaching Wails' modal build-tag dialog. The
+// constraint does not require cgo: Wails on Windows is pure Go, so this file is
+// compiled and type-checked at Gate A with CGO_ENABLED=0. A real executable
+// still needs Gate B, and a production build without cgo fails deliberately in
+// internal/gst/gst_stub_guard.go rather than shipping the stub.
 //
 // # Startup order, which is not negotiable
 //
@@ -19,6 +23,16 @@
 // Steps 1 and 2 both write process environment variables that a later
 // subsystem reads exactly once, so both have to happen before that subsystem
 // exists. See setWebView2Arguments and internal/gst's Init.
+//
+// # The four Wails callbacks, and why each one is wired
+//
+//	OnStartup    load config, bring up the control plane. Runs before the page
+//	             exists, so it emits nothing — see App.startup.
+//	OnDomReady   start the event pump. The page is now listening, so everything
+//	             OnStartup queued is delivered here — see App.domReady.
+//	OnShutdown   the ordered teardown — see App.teardown.
+//	SingleInstanceLock
+//	             a second launch hands over to the first and exits.
 package main
 
 import (
@@ -64,6 +78,19 @@ const (
 	// windowTitle matches the <title> in frontend/index.html and the header in
 	// specification section 10.
 	windowTitle = "WSL Commentary"
+
+	// singleInstanceID names the OS-level lock that keeps exactly one wslcomms
+	// running per machine. Any stable, unique string will do; this one is
+	// namespaced so it cannot collide with another Wails application.
+	//
+	// One process is not a stylistic preference here. A second instance would
+	// open the same WASAPI endpoint — shared mode, so it would succeed — and dial
+	// the same M2L-X router input, whose SRT listener accepts exactly one peer
+	// and never displaces the incumbent (specification section 6.2). The second
+	// instance would therefore sit in its backoff ladder forever, showing amber,
+	// while the first is the one actually on air. A commentator who double-clicks
+	// the shortcut twice must get their existing window back, not that.
+	singleInstanceID = "uk.co.wslstudios.wslcomms"
 )
 
 // backgroundRGB is --bg from frontend/src/styles/main.css, #0b0d10. Setting it
@@ -105,9 +132,6 @@ func main() {
 	}
 
 	app := NewApp(dir, gstInitErr)
-	// Belt and braces against wails.Run returning by a path that does not fire
-	// OnShutdown. teardown is idempotent, so the two cannot both do the work.
-	defer app.teardown()
 
 	err = wails.Run(&options.App{
 		Title:            windowTitle,
@@ -118,6 +142,7 @@ func main() {
 		BackgroundColour: options.NewRGB(backgroundR, backgroundG, backgroundB),
 		AssetServer:      &assetserver.Options{Assets: assets},
 		OnStartup:        app.startup,
+		OnDomReady:       app.domReady,
 		OnShutdown:       app.shutdown,
 		Bind:             []interface{}{app},
 		WindowStartState: options.Normal,
@@ -132,7 +157,19 @@ func main() {
 		// commentary position is operated by a commentator, not an engineer,
 		// and an accidental reload mid-match drops the monitor and the lamps.
 		EnableDefaultContextMenu: false,
+
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId:               singleInstanceID,
+			OnSecondInstanceLaunch: app.secondInstanceLaunched,
+		},
 	})
+
+	// teardown is idempotent and normally ran under OnShutdown already. It is
+	// repeated here because wails.Run can also return by a path that never fires
+	// OnShutdown — a WebView2 environment that fails to create, for instance —
+	// and because the os.Exit below would skip a deferred call entirely.
+	app.teardown()
+
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "wslcomms:", err)
 		os.Exit(1)

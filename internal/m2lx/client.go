@@ -83,44 +83,78 @@ func (r signInResponse) bearerToken() (string, error) {
 // or the bearer token: neither appears in any error message this file
 // constructs.
 type client struct {
-	host       string
+	rest       resolvedHost // REST base: host[:port] plus http-vs-https, decided once (host.go)
 	httpClient *http.Client
 
 	// ctx/cancel bound the lifetime of the background refresh goroutine.
 	// They are the client's own, not derived from any single call's
 	// context: a caller that wraps SignIn in a short-lived
 	// context.WithTimeout (entirely reasonable for one REST call) must not
-	// thereby kill hours of subsequent token refreshes. Close cancels them;
-	// nothing in the frozen Client interface requires callers to call it,
-	// since the client's natural lifetime is the process's.
+	// thereby kill hours of subsequent token refreshes. Close cancels them
+	// and waits for refreshLoop to actually exit before returning.
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	startRefreshOnce sync.Once
 
 	mu           sync.RWMutex
 	alias        string
 	password     string
 	token        string
 	refreshToken string
+
+	// refreshStarted and refreshLoopDone track the lazily-started refresh
+	// goroutine, guarded by mu so SignIn (which starts it) and Close
+	// (which waits for it) always agree on whether there is anything to
+	// wait for. refreshLoopDone is only meaningful — only guaranteed to
+	// ever be closed — once refreshStarted is true; Close checks both
+	// under the same lock acquisition rather than racing two separate
+	// reads against SignIn's writes.
+	refreshStarted  bool
+	refreshLoopDone chan struct{}
 }
+
+// var _ Client = (*client)(nil) is a compile-time check that *client keeps
+// satisfying Client, including Close, as both evolve.
+var _ Client = (*client)(nil)
 
 // newClient constructs the real Client for host.
 func newClient(host string) *client {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &client{
-		host:       host,
+		rest:       resolveHost(host, "REST"),
 		httpClient: &http.Client{Timeout: httpTimeout},
 		ctx:        ctx,
 		cancel:     cancel,
 	}
 }
 
-// Close stops the background refresh goroutine, if one was started. It is
-// not part of the Client interface (which is frozen); it exists for tests
-// and for any caller that holds the concrete type and wants a clean
-// shutdown instead of relying on process exit.
-func (c *client) Close() { c.cancel() }
+// Close implements Client. It cancels the background token-refresh
+// goroutine, if SignIn ever started one, and blocks until that goroutine
+// has actually returned — not merely until cancellation was requested —
+// so a caller that follows Close with reusing the process's http.Client
+// or exiting never races a refresh cycle's in-flight request.
+//
+// Idempotent and safe to call concurrently with itself, with Token, and
+// even with a SignIn racing to start the goroutine for the first time:
+// context.CancelFunc is inherently safe to call more than once, and
+// refreshStarted/refreshLoopDone are only ever read and written under mu,
+// so every caller — Close or SignIn — sees a consistent, final answer to
+// "was the loop started, and if so, which channel reports its exit".
+// A SignIn that starts the loop for the first time after Close has
+// already run is harmless: ctx is already cancelled, so refreshLoop's
+// first select observes ctx.Done() and returns immediately.
+func (c *client) Close() error {
+	c.cancel()
+
+	c.mu.RLock()
+	started := c.refreshStarted
+	done := c.refreshLoopDone
+	c.mu.RUnlock()
+
+	if started {
+		<-done
+	}
+	return nil
+}
 
 // SignIn implements Client.
 func (c *client) SignIn(ctx context.Context, alias, password string) error {
@@ -145,8 +179,22 @@ func (c *client) SignIn(ctx context.Context, alias, password string) error {
 	// Started at most once per client, regardless of how many times SignIn
 	// is later called (e.g. re-authenticating after a Settings change):
 	// the same loop keeps refreshing whatever credentials/token are
-	// current, so it never needs to be restarted.
-	c.startRefreshOnce.Do(func() { go c.refreshLoop() })
+	// current, so it never needs to be restarted. The check-and-set of
+	// refreshStarted happens under mu so a racing Close (which reads the
+	// same two fields under mu) can never observe a half-started loop:
+	// either it sees refreshStarted still false and has nothing to wait
+	// for, or it sees it true together with the exact channel that
+	// goroutine will close on exit.
+	c.mu.Lock()
+	startLoop := !c.refreshStarted
+	if startLoop {
+		c.refreshStarted = true
+		c.refreshLoopDone = make(chan struct{})
+	}
+	c.mu.Unlock()
+	if startLoop {
+		go c.refreshLoop()
+	}
 
 	return nil
 }
@@ -207,7 +255,9 @@ func (c *client) Refresh(ctx context.Context) error {
 // RefreshFraction of TokenLifetime (m2lx.go: 0.5 of 86399 s, both measured
 // values per CONTRACT.md). It is the "goroutine owned by the client,
 // cancellable by context" the WP-2 brief requires: it selects on c.ctx,
-// which Close cancels.
+// which Close cancels — and closes refreshLoopDone on the way out, which
+// is the signal Close blocks on so it returns only once this goroutine
+// has actually stopped, not merely once it has been asked to.
 //
 // A failed refresh cycle is not retried on a shorter timer here — Refresh
 // itself already falls back to a full SignIn, and if that also fails it
@@ -216,6 +266,7 @@ func (c *client) Refresh(ctx context.Context) error {
 // try again from empty credentials being cached is exactly the
 // ErrNotSignedIn case Refresh returns for.
 func (c *client) refreshLoop() {
+	defer close(c.refreshLoopDone)
 	interval := time.Duration(float64(TokenLifetime) * RefreshFraction)
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -306,7 +357,7 @@ func (c *client) doJSON(ctx context.Context, method, path string, body, out any,
 		bodyReader = bytes.NewReader(b)
 	}
 
-	u := url.URL{Scheme: "https", Host: c.host, Path: path}
+	u := url.URL{Scheme: c.rest.restScheme(), Host: c.rest.hostPort, Path: path}
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
 	if err != nil {
 		return fmt.Errorf("building request for %s: %w", path, err)

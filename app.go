@@ -1,13 +1,22 @@
-//go:build cgo && (dev || production || bindings)
+//go:build dev || production || bindings
 
 // This file holds the Wails-bound object: the frontend's entire view of Go, and
 // the wire-up that makes nine independently written packages one application.
 //
 // Owner: WP-8.
 //
-// It is behind //go:build cgo with main.go. main_nocgo.go supplies a main for
-// CGO_ENABLED=0 builds so that `go build ./...` stays honest at Gate A, where
-// there is no MinGW gcc.
+// It is behind //go:build dev || production || bindings with main.go — the tags
+// the Wails CLI sets, which is what stops a stray `go build .` reaching the
+// modal build-tag dialog Wails pops when they are absent. main_nocgo.go supplies
+// an inert main for every other build. The constraint deliberately does NOT
+// require cgo: Wails on Windows is pure Go, so this file compiles and its tests
+// run at Gate A with CGO_ENABLED=0 against the internal/gst stub. Run them with
+//
+//	go test -tags dev . -count=1
+//
+// The hazard that requiring cgo used to prevent as a side effect — a production
+// build silently backed by the stub — is prevented on purpose in
+// internal/gst/gst_stub_guard.go.
 //
 // # The bound surface, which is frozen with the interfaces
 //
@@ -31,6 +40,10 @@
 //	"sender"  a sender.State
 //	"error"   a string
 //
+// The "error" event carries first-run configuration problems, gst.Init failures,
+// sign-in failures, and — rate-limited, because the sender retries forever — the
+// reason each connection attempt failed. See connectErrorReporter.
+//
 // Headphone enumeration and selection are JavaScript-side only, through
 // enumerateDevices and setSinkId. No Go package owns output devices.
 //
@@ -41,24 +54,38 @@
 // goroutines, and the event pump below. Every one of them is rooted in a single
 // context created by NewApp, and shut down in exactly one order by teardown:
 //
+//  0. the closing flag is raised, so that a bound method already in flight on a
+//     Wails message-handler goroutine cannot build a new session or a new
+//     control plane behind the teardown that has just walked past them;
 //  1. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
 //     endpoint and the SRT socket are released before anything else moves;
 //  2. the status watcher — its context is cancelled and its goroutines joined;
-//  3. the token refresh — the m2lx client's own background goroutine, stopped
-//     through its Close method (see stopControlPlaneLocked for why that needs a
-//     type assertion);
+//  3. the token refresh — the m2lx client's own background goroutine, which is
+//     bounded by a context of the client's own and so survives step 2; only
+//     m2lx.Client.Close stops it (see stopControlPlaneLocked);
 //  4. the root context, then a WaitGroup join of everything left.
+//
+// Step 0 is what makes the order deterministic rather than merely usual. Both
+// races it closes are decided the same way whichever goroutine wins the lock:
+// a Start that got sessMu first completes and is then stopped by step 1, and a
+// Start that arrives after step 1 is refused. There is no interleaving in which
+// a pipeline outlives teardown.
 //
 // The whole sequence is bounded by shutdownTimeout. A process that will not exit
 // is a support call, so a wedged pipeline loses the race rather than the window.
 //
-// # Three locks, in this order
+// # Four locks, in this order
 //
 //	sessMu -> cfgMu     (Start reads the config while holding the session lock)
 //	ctlMu               (never held with either of the others)
+//	senderMu            (leaf; never held while any other lock is taken)
 //
-// No goroutine started here takes any of the three, so the WaitGroup joins
+// No goroutine started here takes any of the four, so the WaitGroup joins
 // performed under ctlMu and sessMu cannot deadlock against their own workers.
+//
+// connectErrorReporter has a fifth, but it belongs to one session's reporter
+// rather than to the App: it is taken only by report, on the sender's own
+// goroutine, and nothing else is ever taken while it is held.
 package main
 
 import (
@@ -68,8 +95,10 @@ import (
 	"log"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/wailsapp/wails/v2/pkg/options"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"wslcomms/internal/config"
@@ -129,6 +158,24 @@ const (
 	// HTTP calls at ten seconds; this is the outer bound on the whole attempt,
 	// including a DNS lookup for a host that does not resolve.
 	signInTimeout = 30 * time.Second
+
+	// connectErrorRepeat is how long an unchanged connection failure is
+	// suppressed for before the operator is told about it again.
+	//
+	// It is derived from the producer's rate. sender.BackoffCap is thirty
+	// seconds and there is no attempt limit, so a fault that cannot clear itself
+	// — the commentator's Dante endpoint unplugged, which errors wasapi2src and
+	// makes every subsequent ReplaceSink fail immediately — calls
+	// Opts.OnConnectError twice a minute for the rest of the match. Forwarding
+	// every one of those would put forty identical lines on the screen in the
+	// twenty minutes of a second half and bury everything else, which is the same
+	// failure as saying nothing at all.
+	//
+	// Five minutes turns that forty into four: often enough that whatever the
+	// operator is looking at is recent rather than historical, rare enough that a
+	// genuinely new message is still visible next to it. It is a judgement, not a
+	// measurement, and it is stated as one.
+	connectErrorRepeat = 5 * time.Minute
 )
 
 // signInBackoff is the delay ladder between sign-in attempts, followed by
@@ -160,6 +207,10 @@ var errNotSending = errors.New("wslcomms: not sending")
 // one path that forces a pipeline rebuild (specification section 6.1).
 var errAlreadySending = errors.New("wslcomms: already sending; press STOP first")
 
+// errShuttingDown is returned by Start when the window is already closing. See
+// step 0 of the shutdown order in the file comment.
+var errShuttingDown = errors.New("wslcomms: the application is shutting down")
+
 // App is the object bound to the frontend. One instance exists for the life of
 // the process.
 type App struct {
@@ -179,7 +230,15 @@ type App struct {
 
 	// ctx is the Wails runtime context, captured by startup. Every
 	// wailsruntime call needs it.
-	ctx context.Context
+	//
+	// It is atomic because it is written on one goroutine and read on another:
+	// Wails calls OnStartup on the main thread, and calls
+	// OnSecondInstanceLaunch on the goroutine serving the single-instance named
+	// pipe. Those are unordered with respect to each other — a second launch
+	// during startup is unlikely but entirely possible — so a plain field would
+	// be a data race, and one the race detector cannot catch here because it
+	// needs cgo (Gate B).
+	ctx atomic.Pointer[context.Context]
 
 	// rootCtx is the root of the app's one context tree; rootCancel ends it.
 	// rootWG holds every goroutine whose lifetime is the whole process.
@@ -214,8 +273,25 @@ type App struct {
 	sessMu  sync.Mutex
 	session *session
 
+	// senderMu guards lastSender, the most recent sender.State forwarded to the
+	// frontend. It is a leaf lock: nothing is taken while it is held.
+	//
+	// It exists so that domReady can replay the current state to a page that has
+	// just loaded. The sender emits only on transitions, so a session that has
+	// been CONNECTED for an hour sends nothing; a page that reloaded mid-match
+	// would otherwise show the SENDING lamp grey while the feed was up, which is
+	// the one direction the status display must never be wrong in.
+	senderMu   sync.Mutex
+	lastSender sender.State
+
+	// closing is raised by teardown before it stops anything, so that a bound
+	// method already running on a Wails message-handler goroutine cannot build a
+	// new session or control plane behind it. See step 0 of the shutdown order
+	// in the file comment.
+	closing atomic.Bool
+
 	// shutdownOnce makes teardown idempotent: it is reachable both from Wails'
-	// OnShutdown and from main's defer, and exactly one of them must do the
+	// OnShutdown and from main's error path, and exactly one of them must do the
 	// work.
 	shutdownOnce sync.Once
 }
@@ -242,6 +318,7 @@ func NewApp(appDir string, gstInitErr error) *App {
 		rootCancel: cancel,
 		events:     newEventPump(),
 		store:      secrets.New(),
+		lastSender: sender.StateStopped,
 	}
 }
 
@@ -253,9 +330,16 @@ func NewApp(appDir string, gstInitErr error) *App {
 // shown, so anything slow here is a window that does not appear. Reading
 // config.json is a local file read; everything with a network in it — sign-in,
 // the status socket — happens on goroutines owned by startControlPlane.
+//
+// It deliberately does NOT start the event pump. OnStartup runs before the
+// frontend is loaded, so anything emitted here would be delivered to a page with
+// no listeners and silently lost — and the events this function produces are
+// exactly the ones a first run depends on: "no M2L-X password is stored",
+// "configuration could not be read", "GStreamer could not be initialised". The
+// pump is started by domReady instead, and every event raised in between waits
+// in its queue. See eventPump.
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-	a.events.start(a.rootCtx, ctx, &a.rootWG)
+	a.setRuntimeContext(ctx)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -273,6 +357,72 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.startControlPlane()
+}
+
+// domReady is the Wails OnDomReady callback, called once the embedded page has
+// loaded and its EventsOn subscriptions exist.
+//
+// This is where the event pump starts emitting. Everything startup queued —
+// including the first-run "enter your password on the Settings screen" message —
+// is delivered here, in order, to a page that is now listening.
+//
+// It also replays the current sender state, because the sender emits only on
+// transitions: a page that reloaded during a live session would otherwise show
+// the SENDING lamp grey while the feed was up. The status lamps need no such
+// replay and deliberately get none — m2lx.Watcher re-emits on its own one second
+// tick and declares staleness after m2lx.StaleAfter (15 s), so the three
+// WebSocket-derived lamps repopulate themselves from live data within seconds.
+// Replaying a cached Status would risk showing stale green, which specification
+// section 8 forbids.
+func (a *App) domReady(ctx context.Context) {
+	a.events.start(a.rootCtx, ctx, &a.rootWG)
+
+	a.senderMu.Lock()
+	last := a.lastSender
+	a.senderMu.Unlock()
+	a.events.send(EventSender, last)
+}
+
+// secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
+// in THIS, the first, process when somebody starts wslcomms again; the second
+// process exits without ever creating a window.
+//
+// All it has to do is make the existing window findable, which is what the
+// person who double-clicked the shortcut was actually asking for. It restores
+// the window if it was minimised and brings it to the front. It must not touch
+// the session: the feed this process is carrying is the one on air, and a second
+// launch is not a request to interrupt it.
+//
+// The launch arguments are ignored. wslcomms takes none — it is started from a
+// desktop shortcut with no parameters (specification section 1) — so there is
+// nothing in them to act on.
+func (a *App) secondInstanceLaunched(_ options.SecondInstanceData) {
+	ctx, ok := a.runtimeContext()
+	if !ok {
+		// A second launch inside the window between wails.Run starting and
+		// OnStartup capturing the runtime context. There is nothing to raise yet,
+		// and every wailsruntime call would panic on a nil context.
+		log.Printf("wslcomms: a second instance was launched before this one finished starting; ignoring it")
+		return
+	}
+	wailsruntime.WindowUnminimise(ctx)
+	wailsruntime.WindowShow(ctx)
+}
+
+// setRuntimeContext records the Wails runtime context. Called once, by startup.
+func (a *App) setRuntimeContext(ctx context.Context) {
+	a.ctx.Store(&ctx)
+}
+
+// runtimeContext returns the Wails runtime context and whether startup has
+// captured it yet. Callers on any goroutine but the main one must check ok:
+// passing a nil context to a wailsruntime function panics.
+func (a *App) runtimeContext() (context.Context, bool) {
+	p := a.ctx.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
 }
 
 // shutdown is the Wails OnShutdown callback, called when the window closes.
@@ -306,8 +456,15 @@ func (a *App) teardown() {
 	})
 }
 
-// teardownOrdered is teardown's body: sender, watcher, token refresh, join.
+// teardownOrdered is teardown's body: raise the closing flag, then sender,
+// watcher, token refresh, join.
+//
+// The flag is raised before anything is stopped, which is what makes the order
+// hold against a bound method that is already running. See step 0 of the
+// shutdown order in the file comment for why both interleavings are safe.
 func (a *App) teardownOrdered() {
+	a.closing.Store(true)
+
 	if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
 		log.Printf("wslcomms: stopping the sender during shutdown: %v", err)
 	}
@@ -399,11 +556,19 @@ func (a *App) SetSecret(key, value string) error {
 // A connection failure is not an error from Start — it is a transition to
 // sender.StateBackoff, because the sender retries indefinitely (specification
 // section 6.2). What Start does return is a configuration that cannot work, and
-// it names the field.
+// it names the field. The reason a connection attempt failed reaches the
+// operator on the "error" event instead, rate-limited; see senderOpts and
+// connectErrorReporter.
 func (a *App) Start() error {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 
+	if a.closing.Load() {
+		// The window is going away. Building a pipeline now would open the WASAPI
+		// endpoint and an SRT socket that teardown has already walked past, and
+		// the process would exit still holding them.
+		return errShuttingDown
+	}
 	if a.session != nil {
 		return errAlreadySending
 	}
@@ -429,25 +594,7 @@ func (a *App) Start() error {
 	}
 
 	snd := sender.New(pipe)
-	opts := sender.Opts{
-		Pipeline: gst.PipelineOpts{
-			SlatePath:     a.slatePath(cfg),
-			AudioDeviceID: cfg.AudioDeviceID,
-			// The bitrates are left at zero so that internal/gst applies its own
-			// documented constants — 2000 kbps video, 128000 bps audio,
-			// specification section 5. Codec, resolution and bitrate are
-			// explicitly not exposed to the user (specification section 2), so
-			// config.Config carries no field for them and nothing here should
-			// invent one.
-		},
-		Sink: gst.SinkOpts{
-			Host:       cfg.SRTHost,
-			Port:       cfg.SRTPort,
-			LatencyMs:  cfg.SRTLatencyMs,
-			Passphrase: passphrase,
-			PBKeyLen:   cfg.PBKeyLen,
-		},
-	}
+	opts := a.senderOpts(cfg, passphrase)
 
 	if err := snd.Start(opts); err != nil {
 		// sender.Start leaves the pipeline it was given untouched on failure,
@@ -521,9 +668,190 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 			"wslcomms: cannot fetch monitor credentials: eventId is not configured — set it on the Settings screen")
 	}
 
+	// kvs.Fetch does not sign in on its own — it requires a client that already
+	// holds a bearer token, and both of its M2L-X calls would return
+	// m2lx.ErrNotSignedIn. Saying so here names the actual problem: the monitor
+	// page retries this call whenever its peer connection dies, so during a
+	// sign-in outage this is the message the operator would see repeatedly, and
+	// it should point at the password rather than at the KVS chain.
+	if client.Token() == "" {
+		return kvs.Credentials{}, fmt.Errorf(
+			"wslcomms: cannot fetch monitor credentials: not signed in to M2L-X at %q yet — "+
+				"check the alias and the password stored in Windows Credential Manager under %q",
+			cfg.M2LXHost, secrets.TargetM2LX)
+	}
+
 	ctx, cancel := context.WithTimeout(a.rootCtx, kvsFetchTimeout)
 	defer cancel()
 	return kvs.Fetch(ctx, client, cfg.EventID)
+}
+
+// ---------------------------------------------------------------------------
+// The contribution session
+// ---------------------------------------------------------------------------
+
+// senderOpts builds the options for one session from a configuration snapshot
+// and the passphrase already read from Credential Manager.
+//
+// It is separate from Start so that what the sender is actually given can be
+// asserted without running a session — including the one field with behaviour
+// attached to it, OnConnectError.
+//
+// passphrase is a secret. It goes into gst.SinkOpts, which internal/gst sets
+// with g_object_set rather than in the URI, and must not be logged or returned
+// across the Wails boundary.
+func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
+	reporter := newConnectErrorReporter(a.emitError, cfg.SRTHost, cfg.SRTPort, time.Now)
+
+	return sender.Opts{
+		Pipeline: gst.PipelineOpts{
+			SlatePath:     a.slatePath(cfg),
+			AudioDeviceID: cfg.AudioDeviceID,
+			// The bitrates are left at zero so that internal/gst applies its own
+			// documented constants — 2000 kbps video, 128000 bps audio,
+			// specification section 5. Codec, resolution and bitrate are
+			// explicitly not exposed to the user (specification section 2), so
+			// config.Config carries no field for them and nothing here should
+			// invent one.
+		},
+		Sink: gst.SinkOpts{
+			Host:       cfg.SRTHost,
+			Port:       cfg.SRTPort,
+			LatencyMs:  cfg.SRTLatencyMs,
+			Passphrase: passphrase,
+			PBKeyLen:   cfg.PBKeyLen,
+		},
+		// A fresh reporter per session, so that its memory of what it has
+		// already said dies with the session it said it about. An operator who
+		// presses STOP and START has told us they want to be told again.
+		OnConnectError: reporter.report,
+	}
+}
+
+// connectErrorReporter forwards the sender's connection failures to the
+// frontend's "error" event, rate-limited.
+//
+// # What it is for
+//
+// The sender retries forever by design, and without this the reason each
+// attempt failed is discarded. That is fine for a peer that has gone away for
+// ten seconds and comes back. It is not fine for a fault that cannot clear
+// itself:
+// unplug the commentator's Dante endpoint and wasapi2src errors, every
+// subsequent gst.Pipeline.ReplaceSink fails immediately, and the operator has an
+// amber SENDING lamp and nothing else for the rest of the match. The lamp says
+// "connecting" when the truthful answer is "your audio device is gone".
+//
+// # Why it is rate-limited, and how
+//
+// The producer is unbounded: sender.BackoffCap is thirty seconds and there is no
+// attempt limit, so a permanent fault reports twice a minute forever. A wall of
+// identical lines is as useless as silence, so:
+//
+//   - a failure whose message differs from the last one shown is shown at once,
+//     because a changed reason is new information — the endpoint coming back and
+//     the connection then being refused is a different fault from the endpoint
+//     being missing;
+//   - a repeat of the same message is suppressed until connectErrorRepeat has
+//     passed, and the repeat then says how many attempts were suppressed, so the
+//     operator can tell "still broken" from "broken again".
+//
+// Comparison is on the error's message, not on error identity: the sender
+// produces a freshly wrapped error every attempt, so errors.Is would report a
+// new fault every thirty seconds and defeat the whole thing.
+//
+// # Concurrency
+//
+// report is called on the sender's state-machine goroutine, and must not block
+// it: emit is App.emitError, which logs and queues on the event pump, and the
+// pump discards rather than blocking. The mutex is held only around the
+// bookkeeping and never across emit, so the state machine cannot be stalled
+// behind a log write either.
+type connectErrorReporter struct {
+	// emit publishes one error to the operator. It is App.emitError in the
+	// application and a recorder in the tests.
+	emit func(error)
+
+	// host and port name the SRT endpoint being dialled, so that the message
+	// says where the feed was going. The reason from the sender says what
+	// actually failed, which may well be local rather than the network.
+	host string
+	port int
+
+	// now is time.Now, injected so that the tests can cross connectErrorRepeat
+	// without waiting five minutes.
+	now func() time.Time
+
+	mu sync.Mutex
+	// last is the message of the failure most recently shown, empty before the
+	// first one.
+	last string
+	// lastAt is when it was shown.
+	lastAt time.Time
+	// suppressed counts identical failures swallowed since lastAt.
+	suppressed int
+}
+
+// newConnectErrorReporter returns a reporter that publishes through emit, naming
+// host and port as the endpoint the feed was going to. now supplies the clock; a
+// nil now means time.Now, which is what the application passes.
+func newConnectErrorReporter(emit func(error), host string, port int, now func() time.Time) *connectErrorReporter {
+	if now == nil {
+		now = time.Now
+	}
+	return &connectErrorReporter{emit: emit, host: host, port: port, now: now}
+}
+
+// report is the sender.Opts.OnConnectError callback. It decides whether this
+// failure is worth the operator's attention now, and publishes it if so.
+//
+// A nil error is ignored rather than announced: it would carry no reason, which
+// is the one thing this exists to deliver.
+func (r *connectErrorReporter) report(err error) {
+	if err == nil {
+		return
+	}
+
+	msg := err.Error()
+	if msg == "" {
+		// An error whose message is empty would compare equal to the "nothing
+		// has been shown yet" sentinel and be suppressed forever, and would
+		// render as a message that trails off. Nothing in internal/gst produces
+		// one, but this is a callback on a public contract rather than a promise
+		// between two files, so it is handled rather than assumed away.
+		err = errors.New("an unspecified connection failure")
+		msg = err.Error()
+	}
+
+	r.mu.Lock()
+	at := r.now()
+	changed := msg != r.last
+	due := !r.lastAt.IsZero() && at.Sub(r.lastAt) >= connectErrorRepeat
+	suppressed := r.suppressed
+
+	switch {
+	case changed || due:
+		r.last = msg
+		r.lastAt = at
+		r.suppressed = 0
+	default:
+		r.suppressed++
+	}
+	r.mu.Unlock()
+
+	if !changed && !due {
+		return
+	}
+
+	if changed {
+		r.emit(fmt.Errorf(
+			"wslcomms: the commentary feed to %s:%d is not connected and is retrying: %w",
+			r.host, r.port, err))
+		return
+	}
+	r.emit(fmt.Errorf(
+		"wslcomms: the commentary feed to %s:%d is still not connected after %d further attempts: %w",
+		r.host, r.port, suppressed, err))
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +961,13 @@ func (a *App) startControlPlane() {
 
 	a.stopControlPlaneLocked()
 
+	if a.closing.Load() {
+		// Shutting down. Whichever of this and teardown took ctlMu first, the
+		// outcome is the same: the previous generation has just been unwound
+		// above, and no new one is built.
+		return
+	}
+
 	if cfg.M2LXHost == "" {
 		// First run. Not an error and not worth an "error" event: the Settings
 		// screen exists precisely for this, and SaveConfig will call us back.
@@ -674,18 +1009,21 @@ func (a *App) startControlPlane() {
 // The order is: cancel the context, which ends the watcher and any sign-in
 // attempt in flight; stop the client's token-refresh goroutine; then join.
 //
-// # Reported under CONTRACT.md rule 3
+// # Why Close is not optional
 //
-// m2lx.NewClient returns the m2lx.Client interface, and that interface has no
-// Close. The concrete client owns a background token-refresh goroutine started
-// by SignIn and bounded by a context of its own — deliberately not derived from
-// any call's context, so that a short-lived sign-in context cannot kill hours of
-// refreshes — and the only way to stop it is the unexported type's Close method.
-// Without the type assertion below, every control plane generation would leak
-// one goroutine holding a timer for half of the measured 86399 s token lifetime.
-// The assertion works and is not a hack around a bug, but the interface should
-// grow Close, or NewClient should return something that has it. WP-8 does not
-// edit WP-2's interface; this is the report.
+// The client owns a background token-refresh goroutine, started by SignIn and
+// bounded by a context of its own — deliberately not derived from any call's
+// context, so that a short-lived sign-in context cannot kill hours of refreshes.
+// Cancelling ctx above therefore does not stop it. Without the Close call below,
+// every control plane generation would leak one goroutine holding a timer for
+// half of the measured 86399 s token lifetime, and startControlPlane runs again
+// on every Settings change.
+//
+// This used to be an interface{ Close() } type assertion, because m2lx.Client
+// had no Close and WP-8 does not edit WP-2's interface. It was reported under
+// CONTRACT.md rule 3 and the coordinator has since added Close() error to the
+// interface, so the assertion — and the silent leak if the concrete type had
+// ever changed — is gone.
 func (a *App) stopControlPlaneLocked() {
 	if a.ctlCancel == nil {
 		return
@@ -693,10 +1031,17 @@ func (a *App) stopControlPlaneLocked() {
 
 	a.ctlCancel()
 
-	if closer, ok := a.client.(interface{ Close() }); ok {
-		closer.Close()
-	} else {
-		log.Printf("wslcomms: m2lx.Client has no Close method; the token refresh goroutine will run until the process exits")
+	// a.client is set with a.ctlCancel and cleared with it, so it is non-nil
+	// here; the check is what makes that assumption visible rather than a nil
+	// interface panic during shutdown if it ever stops holding.
+	if a.client != nil {
+		if err := a.client.Close(); err != nil {
+			// Nothing can be done about it at this point — the generation is
+			// going away regardless — but a client that will not close is how a
+			// refresh goroutine survives into the next generation, and that is
+			// worth a line in the log.
+			log.Printf("wslcomms: closing the M2L-X client: %v", err)
+		}
 	}
 
 	a.ctlWG.Wait()
@@ -800,8 +1145,16 @@ func (a *App) forwardStatus(statuses <-chan m2lx.Status) {
 // forwardSenderStates republishes the sender's transitions on the "sender"
 // event. sender.Stop closes the channel after emitting sender.StateStopped, so
 // the range ends when the session does.
+//
+// Each state is also recorded as the current one, so that domReady can replay it
+// to a page that has just loaded. The record is taken before the send, so a
+// reload racing a transition sees the newer value rather than the older.
 func (a *App) forwardSenderStates(states <-chan sender.State) {
 	for state := range states {
+		a.senderMu.Lock()
+		a.lastSender = state
+		a.senderMu.Unlock()
+
 		a.events.send(EventSender, state)
 	}
 }
@@ -842,36 +1195,48 @@ type pumpEvent struct {
 // displays of a current value, so a consumer that has fallen behind loses
 // intermediate transitions but always converges on the latest — which is the
 // only one it can render anyway.
+// Until start is called the queue simply fills, which is what lets startup raise
+// first-run errors before the page that must display them exists.
 type eventPump struct {
 	ch chan pumpEvent
+
+	// startOnce keeps there being exactly one consumer of ch. OnDomReady fires
+	// again after a page reload — routine under `wails dev`, and reachable in
+	// production through the WebView2 keyboard shortcuts — and two consumers
+	// would split the queue between them, so each event would reach the page
+	// once but the ordering between them would no longer hold.
+	startOnce sync.Once
 }
 
 // newEventPump creates a pump. It does not start the emitting goroutine; that
-// needs the Wails context, which does not exist until startup.
+// needs the Wails context and a frontend that is listening, neither of which
+// exists until domReady.
 func newEventPump() *eventPump {
 	return &eventPump{ch: make(chan pumpEvent, eventQueueDepth)}
 }
 
-// start launches the emitting goroutine under wg.
+// start launches the emitting goroutine under wg, at most once.
 //
 // rootCtx ends it at shutdown; wailsCtx is what wailsruntime.EventsEmit needs
 // and is also watched, because Wails cancels it as the window closes and
 // emitting into a dead runtime is pointless.
 func (p *eventPump) start(rootCtx, wailsCtx context.Context, wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-wailsCtx.Done():
-				return
-			case e := <-p.ch:
-				wailsruntime.EventsEmit(wailsCtx, e.name, e.data)
+	p.startOnce.Do(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-rootCtx.Done():
+					return
+				case <-wailsCtx.Done():
+					return
+				case e := <-p.ch:
+					wailsruntime.EventsEmit(wailsCtx, e.name, e.data)
+				}
 			}
-		}
-	}()
+		}()
+	})
 }
 
 // send queues an event, discarding rather than blocking. See the type comment.

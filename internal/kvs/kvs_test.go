@@ -52,6 +52,7 @@ type testClient struct {
 func (c *testClient) SignIn(ctx context.Context, alias, password string) error { return nil }
 func (c *testClient) Refresh(ctx context.Context) error                        { return nil }
 func (c *testClient) Token() string                                            { return "" }
+func (c *testClient) Close() error                                             { return nil }
 
 func (c *testClient) KVSInfo(ctx context.Context, eventID string) (m2lx.KVSInfo, error) {
 	body, status, err := getJSON(ctx, c.baseURL+"/api/live_operation/kvs/webrtc_info/"+eventID)

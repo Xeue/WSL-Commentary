@@ -58,7 +58,7 @@ type wsConn interface {
 
 // watcher is the concrete Watcher implementation.
 type watcher struct {
-	host   string
+	status resolvedHost // status socket host[:port] plus ws-vs-wss, decided once (host.go)
 	client Client
 	clk    clockSource
 
@@ -84,10 +84,14 @@ type watcher struct {
 	started func()
 }
 
+// var _ Watcher = (*watcher)(nil) is a compile-time check that *watcher
+// keeps satisfying Watcher as both evolve.
+var _ Watcher = (*watcher)(nil)
+
 // newWatcher constructs the real Watcher for host, authenticating with c.
 func newWatcher(host string, c Client) *watcher {
 	return &watcher{
-		host:   host,
+		status: resolveHost(host, "status socket"),
 		client: c,
 		clk:    realClock{},
 		dial:   dialStatusSocket,
@@ -104,14 +108,18 @@ func dialStatusSocket(ctx context.Context, urlStr string) (wsConn, error) {
 	return conn, nil
 }
 
-// statusURL builds wss://<host>/api/v1/switcher_status?access_token=<...>,
+// statusURL builds <ws-scheme>://<host>/api/v1/switcher_status?access_token=<...>,
 // percent-encoding the token as CONTRACT.md requires ("PERCENT-ENCODED
 // token"). url.Values.Encode performs standard percent-encoding, which is
 // the correct treatment regardless of what characters the token contains.
-func statusURL(host, token string) string {
+//
+// The scheme is rh.wsScheme(): wss for every production host, and ws only
+// when rh was explicitly resolved as insecure (host.go) — never decided
+// separately from the REST scheme that produced tok in the first place.
+func statusURL(rh resolvedHost, token string) string {
 	u := url.URL{
-		Scheme:   "wss",
-		Host:     host,
+		Scheme:   rh.wsScheme(),
+		Host:     rh.hostPort,
 		Path:     "/api/v1/switcher_status",
 		RawQuery: url.Values{"access_token": {token}}.Encode(),
 	}
@@ -174,7 +182,7 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 
 	dialNow := func() {
 		tok := w.client.Token()
-		c, err := w.dial(ctx, statusURL(w.host, tok))
+		c, err := w.dial(ctx, statusURL(w.status, tok))
 		if err != nil {
 			conn = nil
 			return

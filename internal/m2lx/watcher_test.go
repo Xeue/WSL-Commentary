@@ -71,6 +71,10 @@ func (f *fakeClientToken) KVSToken(ctx context.Context, eventID string) (KVSToke
 	return KVSToken{}, nil
 }
 
+// Close satisfies the Client interface. fakeClientToken starts no
+// goroutine of its own, so there is nothing to cancel or wait for.
+func (f *fakeClientToken) Close() error { return nil }
+
 // wsConnOrErr is what the test-controlled dialer hands back for one dial
 // attempt.
 type wsConnOrErr struct {
@@ -90,7 +94,26 @@ type testWatcher struct {
 	started  chan struct{}
 }
 
-const testSafetyTimeout = 5 * time.Second
+// testSafetyTimeout bounds every "wait for the watcher to do something"
+// select in this file. It exists purely to fail a genuinely hung test
+// promptly rather than hang the suite forever; it is not a correctness
+// parameter (the fake clock, not this timeout, drives what the watcher
+// under test actually does). It is deliberately generous — not the ~1s
+// that would suffice for this package's channel ops alone — because this
+// tree is worked on by several CPU-heavy sibling agents building and
+// testing other packages concurrently (see the task brief), and a 5s
+// bound was observed to fire spuriously under that contention: a
+// goroutine that is merely descheduled for a few real seconds, not
+// hung, otherwise panics tick() and fails a test that has nothing wrong
+// with it.
+const testSafetyTimeout = 20 * time.Second
+
+// testStatusHost is the resolvedHost every testWatcher dials, matching the
+// bare "m2lx.example.invalid" every test in this file asserts against.
+// resolvedHost's zero-value insecure=false already means https/wss (see
+// host.go), so this is the same secure default a bare host from
+// resolveHost would have produced.
+var testStatusHost = resolvedHost{hostPort: "m2lx.example.invalid"}
 
 func newTestWatcher(client Client) *testWatcher {
 	tw := &testWatcher{
@@ -101,7 +124,7 @@ func newTestWatcher(client Client) *testWatcher {
 		started:  make(chan struct{}),
 	}
 	tw.w = &watcher{
-		host:   "m2lx.example.invalid",
+		status: testStatusHost,
 		client: client,
 		clk:    tw.clk,
 		dial: func(ctx context.Context, urlStr string) (wsConn, error) {
@@ -135,6 +158,28 @@ func (tw *testWatcher) waitStarted(t *testing.T) {
 	}
 }
 
+// tickOuterSlack is added to testSafetyTimeout for the wait function tick
+// returns below, so that timeout is STRICTLY longer than the one the
+// background goroutine uses for itself. Without this margin the two
+// timeouts started within nanoseconds of each other and raced outright:
+// fakeClock.Advance's non-blocking send onto the ticker channel (the same
+// doc comment explains why — it mirrors real time.Ticker, which drops a
+// tick rather than queuing it for a slow consumer) means run() can
+// legitimately coalesce two Advance() calls into one observed tick, so
+// tw.ticked sometimes has nothing to deliver for a given call to tick()
+// even though the watcher is not remotely hung. That is not an error —
+// it is documented above conn1.Close() in
+// TestWatcher_ReconnectsAfterConnectionDrop as "wasted ticks" the retry
+// budget there already expects — but with equal timeouts it was a coin
+// flip whether the background goroutine's own fallback (which always
+// closes done) or wait's independent timer (which panics) fired first.
+// Reproduced directly: run TestWatcher_ReconnectsAfterConnectionDrop with
+// -count=100 before this fix and it panics within a handful of runs, on
+// this exact race, not on any real hang. Giving the outer wait strictly
+// more time guarantees the inner goroutine's close(done) always wins on a
+// merely-coalesced tick, so wait's timeout is reserved for a genuine hang.
+const tickOuterSlack = 5 * time.Second
+
 // tick advances the fake clock by one tickInterval on a background
 // goroutine and returns a function that blocks until the watcher has
 // fully finished processing the resulting tick.
@@ -154,12 +199,18 @@ func (tw *testWatcher) tick() func() {
 		select {
 		case <-tw.ticked:
 		case <-time.After(testSafetyTimeout):
+			// This Advance() did not produce an observable afterTick
+			// signal within the ordinary budget. Most likely a
+			// coalesced/dropped tick (see tickOuterSlack above), not a
+			// hang: fall through and close done regardless, so a caller
+			// blocked in wait() below is unblocked by THIS timeout, not
+			// racing it.
 		}
 	}()
 	return func() {
 		select {
 		case <-done:
-		case <-time.After(testSafetyTimeout):
+		case <-time.After(testSafetyTimeout + tickOuterSlack):
 			panic("tick: watcher did not finish processing within the safety timeout — a Status or dial was probably left unserviced")
 		}
 	}
@@ -221,7 +272,7 @@ func TestWatcher_ConnectAndReceiveMessage(t *testing.T) {
 	out := tw.w.Watch(ctx, "cam7")
 
 	url := <-tw.dials
-	if url != statusURL("m2lx.example.invalid", "tok-1") {
+	if url != statusURL(testStatusHost, "tok-1") {
 		t.Fatalf("dial URL = %q", url)
 	}
 	conn := newFakeConn()
@@ -468,6 +519,36 @@ func TestWatcher_ReconnectsAfterConnectionDrop(t *testing.T) {
 		tw.nextConn <- wsConnOrErr{conn: conn2}
 	}
 
+	// Drain `out` for the duration of the retry loop below. If scheduling
+	// pressure is severe enough that redial genuinely needs >=StaleAfter
+	// (15) ticks — not just a handful of "wasted" ones — run's ticker-case
+	// (watcher.go) tries to emit a Stale Status before this loop is done,
+	// and emit() blocks on sending to `out` until something reads it. This
+	// test does not read `out` again until after the loop, so without a
+	// drain here that emit — and with it the ENTIRE watcher goroutine,
+	// which cannot get back to its top-level select while parked inside
+	// emit() — deadlocks for the rest of the test: every subsequent
+	// tick() then burns a full testSafetyTimeout falling through its own
+	// fallback path instead of returning promptly, which is slow rather
+	// than a clean failure and can blow go test's own -timeout budget
+	// under enough contention (reproduced directly: this loop needed
+	// >15 ticks under simultaneous heavy parallel load, and without this
+	// drain the whole package timed out at 400s instead of failing fast).
+	// It is stopped and joined before the loop's final recvStatus below so
+	// it can never steal the message that call is meant to observe.
+	drainStop := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case <-out:
+			case <-drainStop:
+				return
+			}
+		}
+	}()
+
 	var redialURL string
 	for i := 0; i < 30 && redialURL == ""; i++ {
 		wait := tw.tick()
@@ -477,6 +558,8 @@ func TestWatcher_ReconnectsAfterConnectionDrop(t *testing.T) {
 		default:
 		}
 	}
+	close(drainStop)
+	<-drainDone
 	if redialURL == "" {
 		t.Fatalf("no redial observed after dropping the connection")
 	}
@@ -496,7 +579,7 @@ func TestWatcher_ReopensSocketOnTokenRotation(t *testing.T) {
 
 	out := tw.w.Watch(ctx, "cam7")
 	firstURL := <-tw.dials
-	if firstURL != statusURL("m2lx.example.invalid", "tok-1") {
+	if firstURL != statusURL(testStatusHost, "tok-1") {
 		t.Fatalf("initial dial URL = %q", firstURL)
 	}
 	conn1 := newFakeConn()
@@ -514,7 +597,7 @@ func TestWatcher_ReopensSocketOnTokenRotation(t *testing.T) {
 	conn2 := newFakeConn()
 	wait := tw.tick() // detects the rotation, closes conn1, redials immediately
 	secondURL := <-tw.dials
-	if secondURL != statusURL("m2lx.example.invalid", "tok-2") {
+	if secondURL != statusURL(testStatusHost, "tok-2") {
 		t.Fatalf("dial URL after rotation = %q, want the new token", secondURL)
 	}
 	tw.nextConn <- wsConnOrErr{conn: conn2}

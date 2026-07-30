@@ -93,6 +93,25 @@ type Opts struct {
 
 	// Sink configures the srtsink, which is rebuilt on every reconnect.
 	Sink gst.SinkOpts
+
+	// OnConnectError, if set, is called with the reason every failed connection
+	// attempt failed, immediately before the transition to StateBackoff.
+	//
+	// Retrying forever is the requirement and this does not change it. What it
+	// changes is that the reason stops being discarded. The case that matters is
+	// a pipeline that has gone permanently fatal — the commentator's Dante
+	// endpoint unplugged, say, which errors wasapi2src and makes every subsequent
+	// ReplaceSink return the same failure immediately. Without this the operator
+	// sees an amber SENDING lamp and nothing else for the rest of the match,
+	// while the one lamp that could have said "your audio device is gone" says
+	// "connecting". WP-8 forwards it to the frontend's "error" event.
+	//
+	// It is called on the state-machine goroutine, so it must not block and must
+	// not call back into the Sender. A nil value disables reporting.
+	//
+	// Added after WP-0 by the coordinator, on the adversarial review of
+	// internal/sender finding 3.
+	OnConnectError func(error)
 }
 
 // Sender runs a media session and keeps it connected.
@@ -108,6 +127,17 @@ type Sender interface {
 	// Stop tears the session down: it stops the reconnect loop, stops the
 	// pipeline, emits StateStopped and closes the channel returned by States.
 	// A stopped Sender cannot be restarted; call New again.
+	//
+	// Stop blocks until all of that is done, and it must not be called from a UI
+	// thread. Its worst case is not set by this package: a gst.Pipeline.
+	// ReplaceSink already in flight is synchronous by contract and cannot be
+	// cancelled, so Stop waits for it, and internal/gst bounds that at its
+	// sinkStateChangeTimeout of ten seconds plus whatever the SRT caller
+	// handshake has already spent. Everything this package does contribute is
+	// prompt — the backoff wait is cancelled rather than served, which is what
+	// the injected clock exists for. A measured successful handshake is about
+	// 1.1 s (specification section 6); ten seconds is the bound that only a
+	// hung state change reaches.
 	//
 	// Stop returns ErrNotStarted if the sender was never started.
 	Stop() error
@@ -125,7 +155,14 @@ type Sender interface {
 //
 // The pipeline is injected rather than created here so that this package can be
 // unit-tested against a fake gst.Pipeline: WP-3b writes that fake in its own
-// test files. The Sender takes ownership of p and calls p.Stop when it stops.
+// test files.
+//
+// Ownership transfers only on a successful Start. From then on the Sender drives
+// p and calls p.Stop when it stops, and the caller must not touch p itself. If
+// Start returns an error the pipeline is left exactly as it was found — this
+// package never calls p.Stop on that path — and since a gst.Pipeline is
+// single-use, the caller must stop it or leak the capture device and the
+// goroutine reading its Errors channel. app.go does precisely that.
 func New(p gst.Pipeline) Sender {
 	return newSender(p, realClock{})
 }

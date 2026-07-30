@@ -2,6 +2,10 @@ package sender
 
 import (
 	"errors"
+	"io"
+	"log"
+	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +29,67 @@ var errPeerGone = errors.New("gst: srtout: connection lost")
 var errConnectRefused = errors.New("gst: srtsink: connection refused")
 
 // ---------------------------------------------------------------------------
+// the ordered call log
+// ---------------------------------------------------------------------------
+
+// callLog is an ordered record of what the state machine did, shared between the
+// fake pipeline and the fake clock.
+//
+// Counters alone cannot express the property specification section 6.2 is
+// actually about, which is an ORDER: the sink must be gone before the backoff
+// wait starts, not merely gone by the time the wait ends. Both fakes append to
+// one log so that "removeSink" and "wait 7s" appear in a single sequence that
+// can be asserted literally. Every append happens on the state-machine
+// goroutine, which is the only caller of either fake's recorded methods, so the
+// order recorded is the order of events with no interleaving to reason about.
+type callLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+// add appends one event. It is nil-safe so that a fake built without a log costs
+// nothing.
+func (l *callLog) add(ev string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, ev)
+}
+
+// all returns a copy of the events recorded so far.
+func (l *callLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.events...)
+}
+
+// newRecorded returns a pipeline and a clock that share one ordered log.
+func newRecorded() (*fakePipeline, *fakeClock, *callLog) {
+	l := &callLog{}
+	p := newFakePipeline()
+	p.log = l
+	clk := newFakeClock()
+	clk.log = l
+	return p, clk, l
+}
+
+// expectEvents fails unless the log holds exactly want, in order.
+func expectEvents(t *testing.T, l *callLog, want ...string) {
+	t.Helper()
+	got := l.all()
+	if len(got) != len(want) {
+		t.Fatalf("call sequence = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("call sequence = %v, want %v (first difference at %d)", got, want, i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // fake pipeline
 // ---------------------------------------------------------------------------
 
@@ -32,6 +97,7 @@ var errConnectRefused = errors.New("gst: srtsink: connection refused")
 type fakeCounts struct {
 	starts        int
 	replaceSinks  int
+	removeSinks   int
 	forceKeyUnits int
 	stops         int
 }
@@ -50,8 +116,14 @@ type fakeCounts struct {
 type fakePipeline struct {
 	mu sync.Mutex
 
-	startErr error
-	stopErr  error
+	// log, when set, records each call in order alongside the fake clock's
+	// waits. See callLog.
+	log *callLog
+
+	startErr   error
+	stopErr    error
+	removeErr  error
+	removeErrN int
 
 	// sinkResults are handed to successive ReplaceSink calls in order. Once
 	// exhausted, sinkDefault is returned for every further call.
@@ -64,6 +136,15 @@ type fakePipeline struct {
 	sinkGate chan struct{}
 
 	forceKeyUnitErr error
+
+	// onForceKeyUnit, when set, is called by ForceKeyUnit with the fake's lock
+	// released. It is the seam for the window that matters most on the connect
+	// path: ForceKeyUnit is a full round trip into GStreamer, it happens after
+	// ReplaceSink has returned nil and opened the data gate, and it happens
+	// before the sender announces CONNECTED. A new sink that accepts the socket
+	// and fails its first write posts its error right there, and this is how a
+	// test puts one there deterministically.
+	onForceKeyUnit func()
 
 	errs   chan error
 	closed bool
@@ -88,8 +169,35 @@ func (p *fakePipeline) Start(opts gst.PipelineOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.counts.starts++
+	p.log.add("start")
 	p.pipeOpts = opts
 	return p.startErr
+}
+
+// RemoveSink tears the sink out without installing another, as gst.Pipeline
+// requires of DRAINING. It is idempotent — a removal with nothing attached is
+// not an error — so the fake, like the real thing, does not care whether a sink
+// was ever installed; it counts the call, which is the thing under test.
+func (p *fakePipeline) RemoveSink() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.counts.removeSinks++
+	p.log.add("removeSink")
+
+	if p.removeErrN > 0 {
+		p.removeErrN--
+		return p.removeErr
+	}
+	return nil
+}
+
+// failRemovals makes the next n RemoveSink calls return err. It is how the
+// "a teardown failure must still reach BACKOFF" path is driven.
+func (p *fakePipeline) failRemovals(n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.removeErrN = n
+	p.removeErr = err
 }
 
 // ReplaceSink records the options, pops the next queued result, and — if a gate
@@ -99,6 +207,7 @@ func (p *fakePipeline) Start(opts gst.PipelineOpts) error {
 func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 	p.mu.Lock()
 	p.counts.replaceSinks++
+	p.log.add("replaceSink")
 	p.sinkOpts = append(p.sinkOpts, opts)
 
 	err := p.sinkDefault
@@ -115,12 +224,22 @@ func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 	return err
 }
 
-// ForceKeyUnit records the request.
+// ForceKeyUnit records the request and then runs onForceKeyUnit, if one is
+// installed. The hook runs with the lock released so that it can inject an error
+// — injectError takes the same lock — exactly as the real pipeline's bus thread
+// would while the sender is parked in this call.
 func (p *fakePipeline) ForceKeyUnit() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.counts.forceKeyUnits++
-	return p.forceKeyUnitErr
+	p.log.add("forceKeyUnit")
+	err := p.forceKeyUnitErr
+	hook := p.onForceKeyUnit
+	p.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	return err
 }
 
 // Errors returns the asynchronous error channel, which Stop closes.
@@ -136,6 +255,7 @@ func (p *fakePipeline) Stop() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.counts.stops++
+	p.log.add("stop")
 	if !p.closed {
 		p.closed = true
 		close(p.errs)
@@ -247,8 +367,15 @@ func (t *fakeTimer) wasStopped() bool {
 	return t.stopped
 }
 
-// fakeClockTimerBuffer is how many armed timers can queue up before a test that
-// is not consuming them would block. No test here arms more than a hundred.
+// fakeClockTimerBuffer is how many armed timers can queue up before the state
+// machine would block inside NewTimer.
+//
+// It bounds the machine's run-ahead, not a test's total. The longest run,
+// TestNoAttemptLimit, arms five hundred, but it consumes each one before firing
+// it and the machine cannot arm the next until that one has fired, so the real
+// backlog never exceeds one. The depth is generous purely so that a test which
+// fires timers without draining armed cannot deadlock the machine and turn a
+// simple assertion failure into a five second hang.
 const fakeClockTimerBuffer = 256
 
 // fakeClock is the injected clock. Every backoff wait becomes an entry on
@@ -257,6 +384,10 @@ const fakeClockTimerBuffer = 256
 type fakeClock struct {
 	mu    sync.Mutex
 	delay []time.Duration
+
+	// log, when set, records each armed wait in order alongside the fake
+	// pipeline's calls. See callLog.
+	log *callLog
 
 	armed chan *fakeTimer
 }
@@ -272,7 +403,10 @@ func (c *fakeClock) NewTimer(d time.Duration) (<-chan time.Time, func()) {
 
 	c.mu.Lock()
 	c.delay = append(c.delay, d)
+	l := c.log
 	c.mu.Unlock()
+
+	l.add("wait " + d.String())
 
 	c.armed <- t
 
@@ -326,6 +460,99 @@ func testOpts() Opts {
 			Port:      9000,
 			LatencyMs: gst.DefaultSRTLatencyMs,
 		},
+	}
+}
+
+// TestMain silences the package's logging by default.
+//
+// The sender logs every failed connection attempt, which is the point of it,
+// but TestNoAttemptLimit alone drives five hundred failures and the suite is
+// expected to run under -count=50 in the absence of the race detector. Left on
+// stderr that is tens of thousands of lines of noise around the one line that
+// matters. Tests that assert on the log opt back in with captureLog.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
+
+// logCapture collects everything the package logs during one test.
+//
+// It exists because two of the fixes here are only observable in the log: the
+// reason a connection attempt failed, and the fact that a caller's callback
+// panicked and was contained. Without reading the log those tests would pass
+// whether or not the code did anything, which is worse than not having them.
+//
+// Writes are serialised by the log package's own mutex and by this one, and the
+// sender's goroutine is joined by Stop before any test reads the buffer, so
+// there is no ordering to reason about.
+type logCapture struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+// Write implements io.Writer for the standard logger.
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, p...)
+	return len(p), nil
+}
+
+// text returns everything logged so far.
+func (c *logCapture) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.buf)
+}
+
+// captureLog redirects the standard logger for the duration of the test and
+// returns the sink. The previous destination and flags are restored by a
+// t.Cleanup, so a failure part-way through cannot leave the whole test binary
+// silently writing into a dead buffer.
+func captureLog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(c)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return c
+}
+
+// waitReplaceSinks spins until the pipeline has been asked to install n sinks.
+// With a gate installed that is how a test knows the machine is genuinely
+// parked inside the one synchronous call it makes, rather than about to be.
+func waitReplaceSinks(t *testing.T, p *fakePipeline, n int) {
+	t.Helper()
+	deadline := time.After(testTimeout)
+	for p.snapshot().replaceSinks < n {
+		select {
+		case <-deadline:
+			t.Fatalf("the sender called ReplaceSink %d times, want %d", p.snapshot().replaceSinks, n)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+// expectNoBackoff fails if the machine arms a backoff timer within grace.
+//
+// It is the one bounded negative wait in this file and it earns it: the assertion
+// is that the machine STAYED in CONNECTED, and staying somewhere produces no
+// event to synchronise on. The polarity is favourable — a machine that did back
+// off arms its timer within microseconds of the state it was not supposed to
+// leave, so the failing direction is immediate and only the passing direction
+// pays the grace period. The companion assertion inside the hook, which runs on
+// the state-machine goroutine, is the deterministic half.
+func expectNoBackoff(t *testing.T, clk *fakeClock, grace time.Duration) {
+	t.Helper()
+	select {
+	case tm := <-clk.armed:
+		t.Fatalf("the sender armed a %v backoff; it should still be CONNECTED", tm.d)
+	case <-time.After(grace):
 	}
 }
 

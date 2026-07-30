@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -369,15 +370,427 @@ func TestForceKeyUnitAfterEveryConnect(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// DRAINING actually drains
+// ---------------------------------------------------------------------------
+
+// TestDrainingRemovesTheSinkBeforeTheBackoffWait is the test that the reconnect
+// costs seven seconds rather than fourteen.
+//
+// Specification section 6.2 orders the cycle DRAINING (unlink, srtout to NULL,
+// remove) -> BACKOFF -> CONNECTING, and the order is the entire value of the
+// ladder. An M2L-X SRT listener accepts exactly one peer, never displaces the
+// incumbent, and refuses re-accept for roughly five seconds; the >= 6 s first
+// rung is sized to outlast that window, and it only outlasts anything if our own
+// socket is already gone when the wait begins. Leaving the teardown to the next
+// ReplaceSink puts milliseconds between our socket closing and the new handshake,
+// so the retry lands inside the refusal window, fails, and the connection does
+// not come back until the second rung has elapsed too.
+//
+// The assertion is on the ORDER, not on a count, because a count is satisfied by
+// the broken version as well: ReplaceSink tears the old sink out too, just far
+// too late. Pipeline calls and clock waits share one log for exactly this.
+func TestDrainingRemovesTheSinkBeforeTheBackoffWait(t *testing.T) {
+	p, clk, callLog := newRecorded()
+	s := newSender(p, clk)
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	p.mustInjectError(t, errPeerGone)
+	expectStates(t, s.States(), StateDraining, StateBackoff)
+
+	tm := clk.next(t)
+	if tm.d != BackoffLadder[0] {
+		t.Fatalf("waited %v, want the first rung %v", tm.d, BackoffLadder[0])
+	}
+
+	// The sink is gone and only then does the clock start. Firing the timer is
+	// deliberately left until after this assertion so that nothing the next
+	// attempt does can be mistaken for the teardown.
+	expectEvents(t, callLog,
+		"start",
+		"replaceSink", "forceKeyUnit",
+		"removeSink",
+		"wait 7s",
+	)
+
+	tm.fire()
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	expectEvents(t, callLog,
+		"start",
+		"replaceSink", "forceKeyUnit",
+		"removeSink",
+		"wait 7s",
+		"replaceSink", "forceKeyUnit",
+	)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestDrainingRemovesTheSinkOnEveryCycle: the teardown is not a first-outage
+// special case. Every reconnect for the length of a match must vacate the
+// listener before it starts waiting.
+func TestDrainingRemovesTheSinkOnEveryCycle(t *testing.T) {
+	const cycles = 5
+
+	p := newFakePipeline()
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	for cycle := 1; cycle <= cycles; cycle++ {
+		p.mustInjectError(t, errPeerGone)
+		expectStates(t, s.States(), StateDraining, StateBackoff)
+
+		tm := clk.next(t)
+		if got := p.snapshot().removeSinks; got != cycle {
+			t.Fatalf("cycle %d: RemoveSink called %d times by the time the wait was armed, want %d",
+				cycle, got, cycle)
+		}
+		tm.fire()
+		expectStates(t, s.States(), StateConnecting, StateConnected)
+	}
+
+	// A successful connect must not remove anything of its own: the only
+	// teardown is the one DRAINING performs.
+	if got := p.snapshot().removeSinks; got != cycles {
+		t.Fatalf("RemoveSink called %d times over %d outages, want %d", got, cycles, cycles)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestDrainingSucceedsWithoutRemovingAnything: a connect that never succeeded
+// leaves no sink to remove, so the CONNECTING -> BACKOFF edge must not call
+// RemoveSink at all. gst.Pipeline.RemoveSink is idempotent, so calling it would
+// be harmless — but it would also mean the machine could not tell the two edges
+// apart, and the log would say a sink was torn down when none existed.
+func TestDrainingSucceedsWithoutRemovingAnything(t *testing.T) {
+	p := newFakePipeline()
+	p.failSinks(2, errConnectRefused)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectState(t, s.States(), StateConnecting)
+
+	for i := 0; i < 2; i++ {
+		expectState(t, s.States(), StateBackoff)
+		clk.next(t).fire()
+		expectState(t, s.States(), StateConnecting)
+	}
+	expectState(t, s.States(), StateConnected)
+
+	if got := p.snapshot().removeSinks; got != 0 {
+		t.Fatalf("RemoveSink called %d times on the failed-connect path, want 0", got)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestRemoveSinkFailureStillReachesBackoff: a teardown that will not complete
+// must not wedge the machine. The next ReplaceSink performs the same removal
+// itself, so a machine that carries on can still recover; one that stopped would
+// be off air for the rest of the match, which is the outcome this whole package
+// exists to prevent.
+func TestRemoveSinkFailureStillReachesBackoff(t *testing.T) {
+	logs := captureLog(t)
+
+	errRemove := errors.New("gst: could not remove srtout-1 from the pipeline")
+
+	p := newFakePipeline()
+	p.failRemovals(1, errRemove)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	p.mustInjectError(t, errPeerGone)
+	expectStates(t, s.States(), StateDraining, StateBackoff)
+
+	tm := clk.next(t)
+	if tm.d != BackoffLadder[0] {
+		t.Fatalf("waited %v, want the first rung %v; a failed teardown must not disturb the ladder", tm.d, BackoffLadder[0])
+	}
+	tm.fire()
+
+	// And it reconnects.
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	expectState(t, s.States(), StateStopped)
+	expectClosed(t, s.States())
+
+	// Carrying on is right; carrying on silently is not. A sink that will not
+	// leave the pipeline is exactly the thing an engineer needs to see after a
+	// match that half worked.
+	if text := logs.text(); !strings.Contains(text, errRemove.Error()) {
+		t.Fatalf("the teardown failure was swallowed; the log says:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // errors arriving at awkward moments
 // ---------------------------------------------------------------------------
 
-// TestErrorWhileDraining: a second error arriving while the machine is already
-// in DRAINING must be absorbed. It is deposited on the sender's internal queue
-// from inside the DRAINING hook, which runs on the state-machine goroutine
-// immediately before DRAINING is published and therefore strictly before the
-// drain — so this is deterministic, not a race the test hopes to win.
-func TestErrorWhileDraining(t *testing.T) {
+// The two tests below are one property seen from both sides, and the thing that
+// separates them is WHEN the error is queued relative to ReplaceSink. Before the
+// call there is no sink installed — DRAINING removed it before the backoff wait
+// — so a queued message is stale and must be discarded. After the call returns
+// nil the gate is open and buffers are on the wire, so a queued message belongs
+// to the new sink and must be obeyed. A drain on the wrong side of that call
+// fails exactly one of these two, which is the point of having both.
+
+// TestStaleErrorQueuedBeforeTheSinkSwapIsDiscarded is the test that stops a
+// recovered network from flapping every seven seconds.
+//
+// The stale message is real rather than theoretical. DRAINING drives the old
+// srtsink to NULL and removes it, and srtq's own flow error follows it onto the
+// asynchronous Errors channel; the backoff wait absorbs the bulk of that burst,
+// but the wait ends at a moment nobody chooses and anything arriving between
+// sleep returning and the swap is still queued when the reconnect succeeds.
+// Acting on it tears down a session that has just come up: green lamp, amber
+// lamp, seven second wait — and since attempt is zeroed by every successful
+// connect the ladder restarts at its first rung each time, so the flap sustains
+// itself for the rest of the match.
+//
+// The error is placed on the machine's own queue from the hook that runs
+// immediately before the second CONNECTING is published — on the state-machine
+// goroutine, after the backoff wait has already returned and before the swap. No
+// timing, no race, no grace period, and no way for sleep to absorb it and make
+// the test pass for the wrong reason.
+func TestStaleErrorQueuedBeforeTheSinkSwapIsDiscarded(t *testing.T) {
+	p := newFakePipeline()
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	var (
+		mu         sync.Mutex
+		connecting int
+		drainings  int
+		pending    = -1
+	)
+	s.hook = func(st State) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch st {
+		case StateConnecting:
+			connecting++
+			if connecting == 2 {
+				s.errs <- errPeerGone
+			}
+		case StateConnected:
+			if connecting >= 2 && pending < 0 {
+				pending = len(s.errs)
+			}
+		case StateDraining:
+			drainings++
+		}
+	}
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	// A genuine outage first, so that the second connect is a real reconnect
+	// with a real removed sink behind it and the injected message is stale in
+	// the way the production one is.
+	p.mustInjectError(t, errPeerGone)
+	expectStates(t, s.States(), StateDraining, StateBackoff)
+	clk.next(t).fire()
+
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	mu.Lock()
+	gotPending := pending
+	mu.Unlock()
+	if gotPending != 0 {
+		t.Fatalf("%d stale error(s) were still queued when the reconnect was announced; "+
+			"a message about the sink DRAINING already removed is about to tear down its replacement", gotPending)
+	}
+
+	// And from the outside: CONNECTED is not just announced, it stays.
+	expectNoBackoff(t, clk, 100*time.Millisecond)
+
+	mu.Lock()
+	gotDrainings := drainings
+	mu.Unlock()
+	if gotDrainings != 1 {
+		t.Fatalf("the machine entered DRAINING %d times, want 1; the stale error was acted on", gotDrainings)
+	}
+	if got := p.snapshot().removeSinks; got != 1 {
+		t.Fatalf("RemoveSink called %d times, want 1: only the genuine outage tears a sink down", got)
+	}
+
+	// And the drain has not deafened the machine: a failure of the sink that is
+	// now installed still works normally.
+	p.mustInjectError(t, errPeerGone)
+	expectStates(t, s.States(), StateDraining, StateBackoff)
+	if tm := clk.next(t); tm.d != BackoffLadder[0] {
+		t.Fatalf("waited %v, want the first rung %v", tm.d, BackoffLadder[0])
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestNewSinkFailureAroundTheSwapIsNotDiscardedIntoAFalseGreen is the regression
+// test for a permanent false green: green lamp, nothing on the wire, no
+// reconnect, for the rest of the match.
+//
+// It is what a drain placed AFTER ReplaceSink produces. gst_cgo.go opens the
+// data gate as the last thing it does, so from that instant buffers are hitting
+// the new srtsink, and it has already cleared the private route that diverted
+// that sink's errors into the call — any error from here on goes to Errors(),
+// reaches the sender's queue, and is the only notification there will ever be.
+// A drain on this side of the call throws it away, and nothing replaces it:
+// onBusMessage closes the gate before delivering, and the gate probe DROPS,
+// which returns GST_FLOW_OK, so srtq never takes a bad flow return and no
+// further bus error is posted.
+//
+// The failure is not exotic. An M2L-X listener still holding its one permitted
+// peer accepts the socket and fails the first write, which lands in the window
+// between the gate opening and CONNECTED being announced — a window that spans
+// gst_cgo.go's success log under the process-global log mutex, its unlock, a
+// quit check and a full ForceKeyUnit round trip into GStreamer. Both cases below
+// are inside it: one with ReplaceSink still in flight, one after it has returned
+// nil.
+func TestNewSinkFailureAroundTheSwapIsNotDiscardedIntoAFalseGreen(t *testing.T) {
+	tests := []struct {
+		name string
+		// arm prepares the failure before Start and returns the step, if any,
+		// that has to run once the machine is in CONNECTING. landed is called
+		// with whether the failure genuinely reached the state machine's queue
+		// before CONNECTED was announced.
+		arm func(p *fakePipeline, s *senderImpl, landed func(bool)) (drive func(t *testing.T))
+	}{
+		{
+			// The old sink is gone by now, so a message arriving mid-handshake
+			// can only be the new one refusing the socket, or srtq beneath it.
+			name: "posted while ReplaceSink is still in flight",
+			arm: func(p *fakePipeline, s *senderImpl, landed func(bool)) func(*testing.T) {
+				release := p.gateSinks()
+				return func(t *testing.T) {
+					t.Helper()
+					waitReplaceSinks(t, p, 1)
+					p.mustInjectError(t, errPeerGone)
+					waitErrsLen(t, s, 1, "the injected error never reached the state machine's queue")
+					landed(true)
+					release()
+				}
+			},
+		},
+		{
+			// The exact production shape: ReplaceSink has returned nil, the gate
+			// is open, and the sink fails its first write while the sender is
+			// away forcing an IDR.
+			name: "posted after ReplaceSink returned nil, during the ForceKeyUnit round trip",
+			arm: func(p *fakePipeline, s *senderImpl, landed func(bool)) func(*testing.T) {
+				var once sync.Once
+				p.onForceKeyUnit = func() {
+					once.Do(func() {
+						// Only the first connect fails this way; the reconnect
+						// at the end of the test has to be allowed to succeed.
+						landed(p.injectError(errPeerGone) && awaitErrsLen(s, 1))
+					})
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newFakePipeline()
+			clk := newFakeClock()
+			s := newSender(p, clk)
+
+			var (
+				mu     sync.Mutex
+				queued bool
+			)
+			landed := func(v bool) {
+				mu.Lock()
+				defer mu.Unlock()
+				queued = v
+			}
+
+			drive := tt.arm(p, s, landed)
+
+			if err := s.Start(testOpts()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			expectState(t, s.States(), StateConnecting)
+			if drive != nil {
+				drive(t)
+			}
+
+			// ReplaceSink returned nil, so CONNECTED is announced — and then
+			// immediately withdrawn, because the sink behind it has already
+			// failed. A machine that stalls here is the false green: this
+			// assertion times out rather than passing.
+			expectStates(t, s.States(), StateConnected, StateDraining, StateBackoff)
+
+			mu.Lock()
+			gotQueued := queued
+			mu.Unlock()
+			if !gotQueued {
+				t.Fatal("the failure never reached the state machine's queue, so this run proved nothing")
+			}
+
+			if got := p.snapshot().removeSinks; got != 1 {
+				t.Fatalf("RemoveSink called %d times, want 1: the failed sink must be torn out", got)
+			}
+
+			// And it reconnects, on the first rung, exactly as a real drop does.
+			tm := clk.next(t)
+			if tm.d != BackoffLadder[0] {
+				t.Fatalf("waited %v, want the first rung %v", tm.d, BackoffLadder[0])
+			}
+			tm.fire()
+			expectStates(t, s.States(), StateConnecting, StateConnected)
+
+			if err := s.Stop(); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+		})
+	}
+}
+
+// TestExtraErrorsDuringOneOutageDoNotAdvanceTheLadder: a second error arriving
+// while the machine is already on its way out of CONNECTED must be absorbed. It
+// is deposited on the sender's internal queue from inside the DRAINING hook,
+// which runs on the state-machine goroutine immediately before DRAINING is
+// published — so this is deterministic, not a race the test hopes to win.
+//
+// The mechanism that absorbs it is the backoff wait, not a drain: sleep selects
+// on s.errs alongside the timer, and every path out of DRAINING reaches sleep.
+// This test is named and commented for that after the adversarial review found
+// its predecessor claiming to cover drainErrors, which it did not — the call it
+// was named for could be deleted with the whole suite still green.
+func TestExtraErrorsDuringOneOutageDoNotAdvanceTheLadder(t *testing.T) {
 	p := newFakePipeline()
 	clk := newFakeClock()
 	s := newSender(p, clk)
@@ -426,6 +839,10 @@ func TestErrorWhileDraining(t *testing.T) {
 // forwarded by the watcher, must produce exactly one DRAINING and one BACKOFF.
 // The timer is deliberately never fired, so no straggler can be mistaken for a
 // second failure.
+//
+// As above, the absorbing mechanism is the backoff wait. Nothing here exercises
+// drainErrors, and the comment saying otherwise was wrong; the test that does
+// exercise it is TestStaleErrorQueuedBeforeTheSinkSwapIsDiscarded.
 func TestErrorBurstCollapsesToOneTransition(t *testing.T) {
 	p := newFakePipeline()
 	clk := newFakeClock()
@@ -514,17 +931,245 @@ func TestErrorDuringBackoff(t *testing.T) {
 // entries, failing with msg if it never does.
 func waitErrsLen(t *testing.T, s *senderImpl, want int, msg string) {
 	t.Helper()
-	deadline := time.After(testTimeout)
+	if !awaitErrsLen(s, want) {
+		t.Fatalf("%s (queue length %d, want %d)", msg, len(s.errs), want)
+	}
+}
+
+// awaitErrsLen is waitErrsLen without the testing.T, reporting rather than
+// failing. It exists because one caller runs on the state-machine goroutine —
+// inside a pipeline hook — where t.Fatalf would call runtime.Goexit on the
+// goroutine that drives the whole machine, turning a clear assertion failure
+// into a hang with no explanation. That caller records the answer and the test
+// goroutine asserts on it.
+func awaitErrsLen(s *senderImpl, want int) bool {
+	deadline := time.Now().Add(testTimeout)
 	for {
 		if len(s.errs) == want {
-			return
+			return true
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("%s (queue length %d, want %d)", msg, len(s.errs), want)
-		default:
-			runtime.Gosched()
+		if time.Now().After(deadline) {
+			return false
 		}
+		runtime.Gosched()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// saying why
+// ---------------------------------------------------------------------------
+
+// TestOnConnectErrorReportsEveryFailure: retrying forever is the requirement,
+// and it does not change. What changes is that the reason stops being discarded.
+// The case that matters is a pipeline that has gone permanently fatal — the
+// commentator's Dante endpoint unplugged, which internal/gst marks fatal so that
+// every subsequent ReplaceSink returns the same error instantly. The sender then
+// climbs to the thirty second cap and stays there, and without this the operator
+// sees an amber lamp and nothing else for the rest of the match.
+func TestOnConnectErrorReportsEveryFailure(t *testing.T) {
+	const failures = 4
+
+	logs := captureLog(t)
+
+	p := newFakePipeline()
+	p.failSinks(failures, errConnectRefused)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	var (
+		mu   sync.Mutex
+		seen []error
+	)
+	opts := testOpts()
+	opts.OnConnectError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, err)
+	}
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectState(t, s.States(), StateConnecting)
+
+	for i := 0; i < failures; i++ {
+		expectState(t, s.States(), StateBackoff)
+
+		// The report is made before the transition to BACKOFF, so by the time
+		// BACKOFF is observed the callback has already run. Nothing here has to
+		// wait for it.
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n != i+1 {
+			t.Fatalf("after failure %d the callback had been called %d times, want %d", i+1, n, i+1)
+		}
+
+		clk.next(t).fire()
+		expectState(t, s.States(), StateConnecting)
+	}
+	expectState(t, s.States(), StateConnected)
+
+	mu.Lock()
+	got := append([]error(nil), seen...)
+	mu.Unlock()
+
+	if len(got) != failures {
+		t.Fatalf("callback called %d times, want %d (the successful connect must not report)", len(got), failures)
+	}
+	for i, err := range got {
+		if !errors.Is(err, errConnectRefused) {
+			t.Fatalf("report %d = %v, want it to be %v", i, err, errConnectRefused)
+		}
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// The log is the half of this that survives a caller which sets no
+	// callback, and it is where a support engineer looks after the match. It
+	// must carry the reason, the attempt number and the wait, because a reason
+	// that never changes while the attempt count climbs is the signature of the
+	// permanently fatal pipeline this exists for.
+	text := logs.text()
+	for _, want := range []string{
+		errConnectRefused.Error(),
+		"attempt 1", "attempt 4",
+		BackoffLadder[0].String(), BackoffLadder[3].String(),
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the log does not mention %q; it says:\n%s", want, text)
+		}
+	}
+}
+
+// TestOnConnectErrorIsNotCalledForPeerLoss draws the line the name draws. Losing
+// the peer after a successful connect is not a connection failure: it has its
+// own state, the lamp already says so, and reporting it as an error would bury
+// the case above — the one failure that never changes and never recovers — in a
+// stream of routine drops.
+func TestOnConnectErrorIsNotCalledForPeerLoss(t *testing.T) {
+	p := newFakePipeline()
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	var (
+		mu   sync.Mutex
+		seen []error
+	)
+	opts := testOpts()
+	opts.OnConnectError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, err)
+	}
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	for cycle := 0; cycle < 3; cycle++ {
+		p.mustInjectError(t, errPeerGone)
+		expectStates(t, s.States(), StateDraining, StateBackoff)
+		clk.next(t).fire()
+		expectStates(t, s.States(), StateConnecting, StateConnected)
+	}
+
+	mu.Lock()
+	n := len(seen)
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("callback called %d times for peer loss, want 0", n)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestNilOnConnectErrorIsFine: the field is optional and every existing caller
+// and test leaves it unset. A nil callback must not panic the state machine,
+// which runs the only goroutine that can reconnect.
+//
+// It asserts on the log rather than only on survival, and it has to. The
+// recover that contains a panicking callback also contains a nil one, so a
+// version with the nil check deleted survives every behavioural assertion —
+// proved by mutation — while quietly panicking and recovering on every single
+// failed attempt for the majority of callers, who set no callback at all.
+// Reading the log is what makes the difference visible.
+func TestNilOnConnectErrorIsFine(t *testing.T) {
+	logs := captureLog(t)
+
+	p := newFakePipeline()
+	p.failSinks(2, errConnectRefused)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	opts := testOpts()
+	if opts.OnConnectError != nil {
+		t.Fatal("testOpts set OnConnectError; this test needs it nil")
+	}
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectState(t, s.States(), StateConnecting)
+	for i := 0; i < 2; i++ {
+		expectState(t, s.States(), StateBackoff)
+		clk.next(t).fire()
+		expectState(t, s.States(), StateConnecting)
+	}
+	expectState(t, s.States(), StateConnected)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if text := logs.text(); strings.Contains(text, "panicked") {
+		t.Fatalf("a nil OnConnectError was called and recovered from; it must be checked, not caught:\n%s", text)
+	}
+}
+
+// TestOnConnectErrorPanicDoesNotKillTheReconnectLoop. The callback belongs to
+// WP-8 and reaches the WebView2 event bridge. A panic there is a bug in
+// somebody else's code, but Go gives no way to contain a panic raised on this
+// goroutine from outside it, so without the recover it would take the whole
+// process down — during a match, for the sake of an error message. The reconnect
+// must outlive its own reporting.
+func TestOnConnectErrorPanicDoesNotKillTheReconnectLoop(t *testing.T) {
+	logs := captureLog(t)
+
+	p := newFakePipeline()
+	p.failSinks(2, errConnectRefused)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	opts := testOpts()
+	opts.OnConnectError = func(error) { panic("wslcomms: the event bridge is gone") }
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectState(t, s.States(), StateConnecting)
+	for i := 0; i < 2; i++ {
+		expectState(t, s.States(), StateBackoff)
+		clk.next(t).fire()
+		expectState(t, s.States(), StateConnecting)
+	}
+	expectState(t, s.States(), StateConnected)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	expectState(t, s.States(), StateStopped)
+	expectClosed(t, s.States())
+
+	// Containing it silently would be its own bug: the operator loses the
+	// reason for every failure from then on and nothing says why.
+	if text := logs.text(); !strings.Contains(text, "panicked") {
+		t.Fatalf("the contained panic was not logged; the log says:\n%s", text)
 	}
 }
 
@@ -1066,6 +1711,7 @@ type rudePipeline struct{ errs chan error }
 
 func (p *rudePipeline) Start(gst.PipelineOpts) error   { return nil }
 func (p *rudePipeline) ReplaceSink(gst.SinkOpts) error { return nil }
+func (p *rudePipeline) RemoveSink() error              { return nil }
 func (p *rudePipeline) ForceKeyUnit() error            { return nil }
 func (p *rudePipeline) Errors() <-chan error           { return p.errs }
 func (p *rudePipeline) Stop() error                    { return nil }

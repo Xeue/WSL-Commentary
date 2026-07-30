@@ -150,6 +150,31 @@ type Pipeline interface {
 	// again. Nothing upstream of srtq leaves PLAYING either way.
 	ReplaceSink(opts SinkOpts) error
 
+	// RemoveSink tears the current sink out without installing another: block the
+	// srtq src pad, unlink, set srtsink to NULL, remove it. Everything upstream
+	// stays in PLAYING. It is idempotent — removing when no sink is installed is
+	// not an error.
+	//
+	// This exists because specification section 6.2 orders the reconnect
+	// DRAINING (tear down) -> BACKOFF (wait) -> CONNECTING (install), and that
+	// order is load-bearing rather than cosmetic. An M2L-X SRT listener accepts
+	// exactly one peer, never displaces the incumbent, and refuses re-accept for
+	// roughly five seconds; the >= 6 s first rung of sender.BackoffLadder is
+	// sized to outlast that window. The wait only achieves anything if OUR socket
+	// is already gone when it starts.
+	//
+	// Without this method the only teardown available is the one inside
+	// ReplaceSink, which destroys the old sink microseconds before dialling the
+	// new one — so the backoff elapses while we still hold the socket, and the
+	// retry lands inside the refusal window it was supposed to clear. That costs
+	// a wasted attempt, and roughly fourteen seconds off air instead of seven, on
+	// every mid-match reconnect.
+	//
+	// Added after WP-0 by the coordinator, on the adversarial review of
+	// internal/sender finding 1. It is the one change to this interface since it
+	// was frozen.
+	RemoveSink() error
+
 	// ForceKeyUnit sends a GstForceKeyUnit event upstream so that the encoder
 	// emits an IDR immediately. It is called after a successful ReplaceSink so
 	// the picture recovers at once instead of waiting up to two seconds for the

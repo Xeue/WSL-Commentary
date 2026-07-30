@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // hostOf strips the scheme from an httptest.Server URL, since Client's host
@@ -337,6 +338,195 @@ func TestClient_Refresh_WithoutPriorSignInIsErrNotSignedIn(t *testing.T) {
 	defer c.Close()
 	if err := c.Refresh(context.Background()); !errors.Is(err, ErrNotSignedIn) {
 		t.Fatalf("Refresh() = %v, want ErrNotSignedIn", err)
+	}
+}
+
+// httpHostOf is hostOf's plain-HTTP counterpart: it returns "http://" +
+// host, the form that resolveHost (host.go) requires to opt out of the
+// https default, for use against an httptest.NewServer (not
+// httptest.NewTLSServer).
+func httpHostOf(t *testing.T, rawURL string) string {
+	t.Helper()
+	return "http://" + hostOf(t, rawURL)
+}
+
+// TestClient_TalksToPlainHTTPMock is the demonstrated Gate A blocker from
+// the review, reproduced directly: cmd/mockm2lx serves plain HTTP with no
+// TLS option, and client.go used to hardcode Scheme: "https", producing
+//
+//	Post "https://127.0.0.1:18081/api/local_auth/signin": http: server
+//	gave HTTP response to HTTPS client
+//
+// on every call. An explicit "http://" host must now reach a plain HTTP
+// server successfully.
+func TestClient_TalksToPlainHTTPMock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"access_token": "tok-1"})
+	}))
+	defer srv.Close()
+
+	c := newClient(httpHostOf(t, srv.URL))
+	defer c.Close()
+
+	if err := c.SignIn(context.Background(), "commentator1", "hunter2"); err != nil {
+		t.Fatalf("SignIn against a plain-HTTP mock with an explicit http:// host: %v", err)
+	}
+	if got := c.Token(); got != "tok-1" {
+		t.Fatalf("Token() = %q, want tok-1", got)
+	}
+}
+
+// TestClient_BareHostNeverSilentlyDowngradesToPlainHTTP is
+// TestClient_TalksToPlainHTTPMock's negative case: a bare host (no
+// scheme) pointed at the very same plain-HTTP server must NOT succeed by
+// falling back to http. It must fail — loudly, as an https handshake
+// against a server that never speaks TLS — because a bare host silently
+// downgrading is exactly the failure mode ("a config typo must not put a
+// commentator's password on the wire in clear") the fix has to prevent.
+func TestClient_BareHostNeverSilentlyDowngradesToPlainHTTP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"access_token": "tok-1"})
+	}))
+	defer srv.Close()
+
+	c := newClient(hostOf(t, srv.URL)) // no "http://" prefix
+	defer c.Close()
+
+	err := c.SignIn(context.Background(), "commentator1", "hunter2")
+	if err == nil {
+		t.Fatalf("SignIn succeeded against a plain-HTTP server via a bare (scheme-less) host; " +
+			"want it to fail rather than silently use http")
+	}
+	if got := c.Token(); got != "" {
+		t.Fatalf("Token() = %q after a bare host was (wrongly) able to sign in over http, want empty", got)
+	}
+}
+
+// TestClient_CloseIsPartOfClientInterface guards the other half of the
+// "add Close() error to the Client interface" fix: not just that *client
+// has a Close method, but that it is reachable through a Client-typed
+// variable with no type assertion. WP-8 previously needed
+// `a.client.(interface{ Close() })` specifically because Close was not on
+// Client; if it were ever removed from the interface again, this
+// assignment would fail to COMPILE, which is a stronger guarantee than a
+// runtime check.
+func TestClient_CloseIsPartOfClientInterface(t *testing.T) {
+	var c Client = newClient("example.invalid")
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() via the Client interface = %v, want nil", err)
+	}
+}
+
+// TestClient_Close_Idempotent covers the "idempotent, safe to call
+// concurrently" requirement directly: several concurrent Close calls on a
+// client whose refresh goroutine really is running (via a prior SignIn)
+// must all return cleanly with no panic and no deadlock.
+func TestClient_Close_Idempotent(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"access_token": "tok-1"})
+	}))
+	defer srv.Close()
+
+	c := newClient(hostOf(t, srv.URL))
+	c.httpClient = srv.Client()
+	if err := c.SignIn(context.Background(), "a", "b"); err != nil {
+		t.Fatalf("SignIn: %v", err)
+	}
+
+	const n = 5
+	results := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- c.Close() }()
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("concurrent Close() returned an error: %v", err)
+			}
+		case <-time.After(testSafetyTimeout):
+			t.Fatalf("a concurrent Close() call never returned")
+		}
+	}
+
+	// A Close() called after all of the above must also still return
+	// cleanly rather than hang or panic on an already-cancelled context.
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() after prior Close() calls returned an error: %v", err)
+	}
+}
+
+// TestClient_Close_WithoutSignInReturnsImmediately covers Close on a
+// client whose refresh goroutine was never started: there is nothing to
+// wait for, and Close must not block on a channel that nothing will ever
+// close.
+func TestClient_Close_WithoutSignInReturnsImmediately(t *testing.T) {
+	c := newClient("example.invalid")
+
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close() = %v, want nil", err)
+		}
+	case <-time.After(testSafetyTimeout):
+		t.Fatalf("Close() on a client that never SignIn'd did not return — it must not wait on a refresh loop that was never started")
+	}
+}
+
+// TestClient_Close_WaitsForRefreshLoopToActuallyExit is a white-box test
+// of Close's synchronization, exercising the exact fields (refreshStarted,
+// refreshLoopDone, mu) SignIn and Close coordinate through. It stands in
+// for waiting out a real refresh cycle (RefreshFraction*TokenLifetime,
+// ~12 hours) by simulating a slow-to-exit refresh goroutine the same way
+// the real one is wired: Close must not return until AFTER that
+// goroutine's cleanup finishes, not merely after ctx is cancelled.
+func TestClient_Close_WaitsForRefreshLoopToActuallyExit(t *testing.T) {
+	c := newClient("example.invalid")
+
+	c.mu.Lock()
+	c.refreshStarted = true
+	c.refreshLoopDone = make(chan struct{})
+	done := c.refreshLoopDone
+	c.mu.Unlock()
+
+	const cleanupDelay = 80 * time.Millisecond
+	cleanupFinished := make(chan struct{})
+	go func() {
+		<-c.ctx.Done() // Close must cancel the context before anything else
+		time.Sleep(cleanupDelay)
+		close(cleanupFinished)
+		close(done)
+	}()
+
+	closeReturned := make(chan struct{})
+	go func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close() = %v, want nil", err)
+		}
+		close(closeReturned)
+	}()
+
+	// Close must still be blocked well before the simulated goroutine's
+	// cleanup finishes.
+	select {
+	case <-closeReturned:
+		t.Fatalf("Close() returned before the refresh goroutine finished exiting")
+	case <-time.After(cleanupDelay / 2):
+	}
+
+	select {
+	case <-closeReturned:
+	case <-time.After(testSafetyTimeout):
+		t.Fatalf("Close() never returned after the refresh goroutine finished")
+	}
+
+	select {
+	case <-cleanupFinished:
+	default:
+		t.Fatalf("Close() returned before the refresh goroutine's cleanup actually completed")
 	}
 }
 

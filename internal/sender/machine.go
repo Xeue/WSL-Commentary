@@ -2,6 +2,7 @@ package sender
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -161,7 +162,10 @@ func (s *senderImpl) Start(opts Opts) error {
 // The one wait Stop cannot shorten is a gst.Pipeline.ReplaceSink call already in
 // flight: ReplaceSink is synchronous by contract and the loop checks quit
 // immediately on either side of it. Cancelling an SRT handshake mid-flight is
-// not something the frozen gst.Pipeline interface offers.
+// not something the frozen gst.Pipeline interface offers. That, and not anything
+// this package controls, is Stop's worst case — internal/gst bounds the sink
+// state change at ten seconds — so Stop must not be called from a UI thread.
+// See the Sender interface.
 func (s *senderImpl) Stop() error {
 	s.mu.Lock()
 	started := s.started
@@ -255,6 +259,13 @@ func (s *senderImpl) watchErrors(errs <-chan error) {
 // a successful connect, so the first wait after a mid-match drop is the seven
 // second rung that clears M2L-X's re-accept refusal window, not whatever rung
 // an earlier outage had climbed to.
+//
+// The three calls the loop makes on the pipeline are ordered exactly as
+// specification section 6.2 orders the states: RemoveSink on entry to DRAINING,
+// then the wait, then ReplaceSink on entry to CONNECTING. Collapsing the first
+// into the third — which the frozen interface used to force, and which
+// gst.Pipeline.RemoveSink was added to make unnecessary — is what makes the wait
+// elapse while we still hold the socket.
 func (s *senderImpl) loop(opts Opts) {
 	attempt := 0
 	s.emit(StateConnecting)
@@ -264,9 +275,58 @@ func (s *senderImpl) loop(opts Opts) {
 			return
 		}
 
-		// CONNECTING. ReplaceSink installs a fresh srtsink: block the srtq src
-		// pad, unlink, NULL, remove, recreate, link, sync, unblock. It is
-		// synchronous — a nil error means the SRT caller handshake succeeded.
+		// CONNECTING. The first thing this state does is discard whatever is
+		// queued, BEFORE the swap and never after it. What a queued error MEANS
+		// depends on which side of the swap it arrives on, and that is what makes
+		// the placement correct rather than arbitrary:
+		//
+		//   - Before. Nothing is installed to fail. DRAINING called
+		//     gst.Pipeline.RemoveSink on the way out of CONNECTED and the
+		//     shortest rung of the ladder has elapsed since, so anything queued
+		//     here is the tail of the old sink's death rattle, or srtq's, posted
+		//     while it was being driven to NULL. It is stale by construction and
+		//     it describes a connection already declared lost. Carrying it across
+		//     the swap would tear down the session this iteration is about to
+		//     establish: green lamp, amber lamp, seven second wait — and because
+		//     attempt is zeroed by every successful connect, the ladder restarts
+		//     at its first rung each time, so on a network that has fully
+		//     recovered the flap sustains itself indefinitely. sleep absorbs the
+		//     bulk of these during the wait; this covers the sliver between the
+		//     wait ending and the call, and the first-connect case where Start
+		//     itself posted something.
+		//
+		//   - After it returns nil. The gate is open — gst_cgo.go's last act is
+		//     p.gateClosed.Store(false) — buffers are already hitting the new
+		//     srtsink, and the private route that diverted that sink's errors
+		//     into the call has been cleared. So an error on this channel now
+		//     belongs to the NEW sink, or to srtq beneath it. It is live, and it
+		//     must be honoured. This is not a corner: an M2L-X listener still
+		//     holding its one permitted peer accepts the socket and then fails
+		//     the first write, which lands squarely in the window spanning
+		//     gst_cgo.go's success log, its unlock, the quit check and the
+		//     ForceKeyUnit round trip below. Discarding that error leaves the
+		//     machine CONNECTED with nothing on the wire, and it stays there:
+		//     onBusMessage closes the gate before delivering, a dropping _BLOCK
+		//     probe returns GST_FLOW_OK, so srtq never takes a bad flow return
+		//     and no second bus error is ever posted. Permanent false green,
+		//     which is the one outcome this package exists to prevent.
+		//
+		// So the drain goes on the stale side and nowhere else. Leaving it on the
+		// live side and shrinking the window does not help, because the window
+		// cannot be made not to exist; telling the two cases apart there would
+		// need every error to carry a sink generation, which is a change to the
+		// frozen gst.Pipeline contract, not a change to this file.
+		s.drainErrors()
+
+		// ReplaceSink installs a fresh srtsink: block the srtq src pad, unlink,
+		// NULL, remove, recreate, link, sync, unblock. It is synchronous — a nil
+		// error means the SRT caller handshake succeeded.
+		//
+		// On the reconnect path the removal half of that is a no-op, because
+		// DRAINING has already torn the old sink out. That is the point: the
+		// removal must happen before the wait, not at the end of it, and it is
+		// also what makes the drain above safe — there has been no sink in the
+		// pipeline for the whole of the backoff.
 		err := s.p.ReplaceSink(opts.Sink)
 		if s.quitting() {
 			return
@@ -286,6 +346,12 @@ func (s *senderImpl) loop(opts Opts) {
 			_ = s.p.ForceKeyUnit()
 
 			attempt = 0
+
+			// Nothing is discarded here. Everything on s.errs from this point on
+			// is about the sink that has just been installed — see the drain
+			// above the ReplaceSink call — so the CONNECTED select below is
+			// entitled to act on the first message it finds, including one that
+			// was already queued before this emit.
 			s.emit(StateConnected)
 
 			// CONNECTED. The only thing that can happen here is the peer going
@@ -296,16 +362,28 @@ func (s *senderImpl) loop(opts Opts) {
 			case <-s.errs:
 			}
 
-			// DRAINING. On the frozen gst.Pipeline interface the teardown the
-			// specification describes — block the srtq src pad, unlink, set
-			// srtout to NULL, remove it — is performed by the next ReplaceSink,
-			// which is documented to do exactly that sequence before installing
-			// the new sink. There is therefore no call to make here: DRAINING
-			// is the interval between losing the peer and starting to wait, and
-			// what it does is absorb the rest of the error burst so that one
-			// lost peer produces one transition rather than five.
+			// DRAINING. Tear the dead sink out now, before the wait, not as a
+			// side effect of the next ReplaceSink. Specification section 6.2
+			// orders the cycle DRAINING (block the srtq src pad, unlink, srtout
+			// to NULL, remove) -> BACKOFF -> CONNECTING, and that order is the
+			// whole point of the ladder: an M2L-X listener accepts one peer,
+			// never displaces the incumbent, and refuses re-accept for roughly
+			// five seconds, so the >= 6 s first rung only buys anything if OUR
+			// socket is already gone when it starts ticking. Leaving the
+			// teardown to ReplaceSink would close the socket microseconds before
+			// dialling again, landing the retry inside the refusal window and
+			// costing a wasted attempt — about fourteen seconds off air instead
+			// of seven, on every mid-match reconnect.
 			s.emit(StateDraining)
-			s.drainErrors()
+
+			// A teardown failure must not wedge the machine. Reaching BACKOFF
+			// and trying again is strictly better than stopping: the next
+			// ReplaceSink performs the same removal itself, so a machine that
+			// keeps going can still recover, and one that gave up is off air for
+			// the rest of the match.
+			if rmErr := s.p.RemoveSink(); rmErr != nil {
+				log.Printf("sender: could not remove the failed sink: %v; backing off and retrying anyway", rmErr)
+			}
 			if s.quitting() {
 				return
 			}
@@ -319,6 +397,12 @@ func (s *senderImpl) loop(opts Opts) {
 		// the commentary off air for the rest of the match.
 		d := backoffDelay(attempt)
 		attempt++
+		if err != nil {
+			// Only a failed CONNECTING has a reason to report. Arriving here
+			// with err nil means the peer went away after a successful connect,
+			// which is not a connection error and already has its own state.
+			s.reportConnectError(opts.OnConnectError, err, attempt, d)
+		}
 		s.emit(StateBackoff)
 		if !s.sleep(d) {
 			return
@@ -327,15 +411,58 @@ func (s *senderImpl) loop(opts Opts) {
 	}
 }
 
+// reportConnectError announces why one connection attempt failed: to the log
+// always, and to the caller's Opts.OnConnectError if it set one. It is called on
+// the state-machine goroutine immediately before the transition to StateBackoff.
+//
+// attempt is the number of consecutive failures including this one, and d the
+// wait about to be served. Both are in the message because the pair is what
+// distinguishes a network blip from the case this exists for: a pipeline that
+// has gone permanently fatal — the commentator's Dante endpoint unplugged, say —
+// where internal/gst marks it fatal and every subsequent ReplaceSink returns the
+// same error instantly, so the attempt count climbs while the reason never
+// changes and the sender sits at the thirty second cap for the rest of the
+// match. Retrying forever is still correct; not saying why is not.
+//
+// The callback is invoked on this goroutine, so a caller that blocks in it
+// blocks the reconnect. That is documented on Opts. The recover is there because
+// the failure mode is asymmetric: a panic in a UI callback would take down the
+// whole process — Go gives no way to contain a panic on another goroutine — and
+// during a live match keeping the commentary path alive beats failing fast on
+// someone else's bug, which the log line preserves either way.
+func (s *senderImpl) reportConnectError(report func(error), err error, attempt int, d time.Duration) {
+	log.Printf("sender: connect attempt %d failed: %v; retrying in %v", attempt, err, d)
+
+	if report == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("sender: OnConnectError panicked: %v; the reconnect loop is continuing", r)
+		}
+	}()
+	report(err)
+}
+
 // sleep waits for d on the injected clock and reports whether the wait
 // completed. It returns false as soon as quit is closed, which is what makes
 // Stop prompt from the middle of the thirty second rung.
 //
 // Errors arriving during the wait are absorbed without restarting or shortening
-// it. They are stale by definition: there is no sink installed to fail, so they
-// can only be the tail of the burst that caused this backoff, and reacting to
-// them would either double-count the ladder or reset the timer forever on a
-// noisy bus.
+// it. They are stale by definition: DRAINING has already called
+// gst.Pipeline.RemoveSink, so by the time this is entered there is genuinely no
+// sink installed to fail and they can only be the tail of the burst that caused
+// this backoff. Reacting to them would either double-count the ladder or reset
+// the timer forever on a noisy bus.
+//
+// That claim used to be made here without the removal behind it, and it was
+// false: the old sink stayed installed and in PLAYING for the whole wait. It is
+// worth stating rather than assuming, because it is the sentence that concealed
+// the missing teardown — the reasoning read as sound, so nobody checked that
+// anything actually performed it.
+//
+// It is also why this absorbs rather than drains once on entry: a burst is
+// spread over the wait, not queued before it.
 func (s *senderImpl) sleep(d time.Duration) bool {
 	fire, stop := s.clock.NewTimer(d)
 	defer stop()
@@ -352,9 +479,18 @@ func (s *senderImpl) sleep(d time.Duration) bool {
 }
 
 // drainErrors removes everything currently queued on s.errs without blocking.
-// It is called on entry to BACKOFF so that the burst of bus messages produced
-// by one lost peer does not immediately re-trigger the machine on the next
-// connect.
+//
+// It is called at exactly one place: immediately before ReplaceSink installs a
+// new sink, to discard bus messages left over from the sink DRAINING already
+// tore out. See the comment at that call site for why it belongs on that side of
+// the call and why calling it on the other side is a permanent false green.
+//
+// It was previously called on entry to BACKOFF as well, where it was dead code —
+// sleep selects on s.errs and absorbs the whole burst, and every path from
+// DRAINING reaches sleep. That was demonstrated by mutation: with the call
+// commented out the entire suite still passed, including the two tests named for
+// it. Removing it means the drain is now load-bearing wherever it appears, which
+// is the only condition under which a test of it means anything.
 func (s *senderImpl) drainErrors() {
 	for {
 		select {

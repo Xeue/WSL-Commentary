@@ -16,12 +16,27 @@ $ CGO_ENABLED=0 go build ./internal/gst/...
 (no output)
 $ CGO_ENABLED=0 go vet ./internal/gst/...
 (no output)
-$ CGO_ENABLED=0 go test ./internal/gst/...
-ok      wslcomms/internal/gst
+$ CGO_ENABLED=0 go test ./internal/gst/... -count=50
+ok      wslcomms/internal/gst   1.215s
 ```
 
-That proves only that the frozen stub twin is undisturbed. It proves nothing about the file you
-are about to build, because `//go:build cgo` excludes it entirely.
+That proves the frozen stub twin is undisturbed, that `gst_cgo.go` is at least syntactically valid
+Go and structurally satisfies the `Pipeline` interface (§6.1), and nothing else. It proves nothing
+about whether the file you are about to build *works*, because `//go:build cgo` excludes it from
+every one of those commands.
+
+**Race detection is deferred to Gate B.** `-race` requires cgo, which is exactly what this machine
+does not have, so `go test -race` cannot be run here at all. The compensation is `-count=50` above
+plus hand-reading the concurrency against the threading model in the `gst_cgo.go` file comment. The
+first thing to do once Gate B is open, before anything else in §1's smoke test, is:
+
+```
+go test ./internal/gst/... -race -count=50
+go test ./internal/sender/... -race -count=50
+```
+
+`internal/sender` matters more than this package for that: it is the one that drives a `Pipeline`
+from a goroutine while the UI reads its state.
 
 ---
 
@@ -281,22 +296,229 @@ helpers `endpointForLog` and `encryptionForLog` exist so that no future edit is 
 which providers it uses. If the filter is wrong the dropdown comes back empty; the fastest check
 is to comment out the filter and log `structureFieldNames(props)` for every device.
 
-### 4.10 `gst_pad_set_active(FALSE)` then `(TRUE)` re-arms a stalled `queue`
+### 4.10 The queue re-arm destroys every sticky event, and puts them back by hand
+
+**This is the highest-risk unverified thing in the file. Verify it first at Gate B.**
 
 `rearmQueueLocked` relies on `gst_queue_src_activate_mode` resetting `srcresult` to
 `GST_FLOW_OK`, flushing the queued data and restarting the loop task — which is what gstqueue.c
 does. It runs only when `gst_pad_get_last_flow_return` on `srtq:src` is not `GST_FLOW_OK`, so on
-the healthy path it is a single read and a return. The alternative (a `FLUSH_START`/`FLUSH_STOP`
-pair) was rejected because `FLUSH_STOP` removes the sticky `SEGMENT` event from the pad it is sent
-to and nothing re-pushes it.
+the healthy path it is a single read and a return.
 
-### 4.11 A pipeline with no sink element can reach PLAYING
+What was missed originally, and is now handled: **`gst_pad_set_active(pad, FALSE)` destroys all of
+the pad's sticky events.** `gst_pad_activate_mode` reaches `post_activate()` with `new_mode ==
+GST_PAD_MODE_NONE`, and that branch calls `remove_events (pad)`, which empties the pad's entire
+sticky event list — `STREAM_START`, `CAPS`, `SEGMENT`, the lot. That is strictly worse than the
+`FLUSH_START`/`FLUSH_STOP` pair the original comment said it had rejected in order to avoid exactly
+this: `FLUSH_STOP` only removes `SEGMENT`, `EOS` and `STREAM_GROUP_DONE`.
+
+Nothing puts them back. `mpegtsmux` sends `STREAM_START`, `CAPS` and `SEGMENT` once, at the start of
+the stream; the queue forwards them once; `gst_pad_link`'s
+`events_foreach (srcpad, mark_event_not_received, NULL)` re-marks the src pad's sticky list so
+`check_sticky()` will re-push it to the new peer — but the list is now empty, so it marks nothing.
+The fresh `srtsink` then receives buffers with no segment and `gstbasesink` logs
+
+```
+Received buffer without a new-segment. Assuming timestamps start from 0
+```
+
+Timestamps restarting at zero downstream of this package is the measured fault the whole design
+exists to prevent.
+
+**It is not a rare path.** `rearmQueueLocked` runs whenever `srtq:src`'s last flow return is not
+`GST_FLOW_OK`, and on a genuine mid-match disconnect the in-flight buffer is inside `srtsink`'s
+`render()` when the gate closes, so the last flow return *is* an error. Every real reconnect takes
+it.
+
+There is no re-arm in GStreamer that leaves the sticky events alone — deactivation clears all of
+them, a flush pair clears `SEGMENT`, and taking the queue element to `READY` does both and more. So
+the events are snapshotted before the deactivation and stored back afterwards:
+
+- `stickyEventsOf(pad)` reads `STREAM_START`, `CAPS`, `SEGMENT`, `STREAM_COLLECTION` and `TAG` with
+  `gst_pad_get_sticky_event(type, idx)`. go-gst v0.0.2 does **not** bind
+  `gst_pad_sticky_events_foreach` (it takes a C callback), so the read is by type and index. The
+  snapshot is taken from `srtq:src`; anything absent there is taken from `srtq:sink`, whose own
+  sticky list is untouched by the deactivation.
+- `restoreStickyEvents(pad, saved)` stores them back with `gst_pad_store_sticky_event`, which
+  inserts with `received = FALSE` and sets `GST_PAD_FLAG_PENDING_EVENTS`, so `check_sticky()` pushes
+  them ahead of the first buffer the moment the gate opens. That is the ordinary delivery path, not
+  a special case. `gst_pad_link` on the new sink also re-marks them, so the two mechanisms agree.
+
+**Gate B reproduction.** Confirm the destruction and the repair separately, because they fail
+differently. Run with `GST_DEBUG=GST_PADS:5,basesink:4,queue:5` and watch for `remove_events` on
+`srtq:src` and for the `new-segment` warning from `srtsink`:
+
+```
+set GST_DEBUG=GST_PADS:5,basesink:4,queue:5
+set GST_DEBUG_FILE=rearm.log
+gst-launch-1.0 -v ^
+  audiotestsrc is-live=true ! audioconvert ! avenc_aac ! aacparse ^
+    ! mpegtsmux name=mux alignment=7 ^
+    ! queue name=srtq leaky=downstream max-size-buffers=4000 ^
+    ! srtsink name=srtout uri=srt://127.0.0.1:9001 mode=caller sync=false async=false auto-reconnect=false
+```
+
+with `cmd\mockm2lx` listening on 9001, then kill the listener mid-stream, restart it, and drive a
+`ReplaceSink` from the application rather than from `gst-launch` (the re-arm lives in our code, not
+in a launch line). The two things to grep the log for:
+
+1. `srtq:src` `removing events` / `remove_events` right after the deactivation — proves the
+   destruction is real on this GStreamer.
+2. `Received buffer without a new-segment` from `srtout-N` after the reconnect — if this appears,
+   the restore did **not** work and the fix is incomplete. Escalate; do not ship.
+
+If `gst_pad_store_sticky_event` turns out not to set `PENDING_EVENTS` on this version, the fallback
+is to push the saved events with `gst_pad_push_event` on `srtq:src` **while the gate is closed and
+after the new sink is linked**, which forces them through `check_sticky` explicitly.
+
+### 4.11 `os.Setenv(name, "")` — a claim that was tested and is FALSE
+
+Recorded because it was asserted confidently in review and acting on it would have been a change
+made for a wrong reason.
+
+**The claim.** Go's `os.Setenv` calls `SetEnvironmentVariableW`; Windows cannot represent an
+empty-valued variable so it deletes the name; `GetEnvironmentVariableW` then returns
+`ERROR_ENVVAR_NOT_FOUND`; GLib's `g_getenv` sees it as *unset* rather than *empty*; and
+`gstregistry.c` therefore falls through to `GST_PLUGIN_SYSTEM_PATH` and the compiled-in system
+directories — silently loading a foreign GStreamer.
+
+**The measurement**, on this machine (Windows 11 Pro 26200, Go 1.24.5), parent and child process:
+
+```
+GOOS = windows  Go = go1.24.5
+PARENT LookupEnv -> value="" present=true
+PARENT Environ entry -> "WSLCOMMS_EMPTY_ENV_PROBE="
+CHILD  LookupEnv -> value="" present=true
+CHILD  Environ entry -> "WSLCOMMS_EMPTY_ENV_PROBE="
+PS     GetEnvironmentVariable -> $null
+```
+
+The variable survives with an empty value, is present in the environment block as the literal entry
+`NAME=`, and is inherited by a child process. `GetEnvironmentVariableW` did not report
+`ERROR_ENVVAR_NOT_FOUND` — if it had, Go's `LookupEnv` would have returned `present=false`.
+`TestEmptyEnvVarSurvivesOnWindows` in `gst_stub_test.go` pins this at Gate A.
+
+The folklore is real but belongs to the wrappers, not to Win32: `cmd.exe`'s `set FOO=` passes `NULL`
+(which *does* delete), the CRT's `_putenv("FOO=")` deletes, and .NET's `GetEnvironmentVariable`
+normalises an empty value to `null` — which is the `$null` on the last line above. Go calls the API
+directly and none of them apply.
+
+**`doInit` nevertheless sets a path rather than `""`.** Not because of the disproven claim, but
+because of the one link that cannot be tested without GLib: whether `g_getenv` maps an empty value
+to `""` or to `NULL`. Reading `gutils.c` it returns `""`, and `gstregistry.c` splits `""` into zero
+directories and scans nothing, which is the wanted behaviour — but that is a reading, not a
+measurement. A non-empty path is correct under **both** behaviours, costs one redundant scan of a
+directory that is already `GST_PLUGIN_PATH_1_0`, and cannot be lost. `GST_PLUGIN_SYSTEM_PATH`
+(unversioned) is set for the same reason: it is the fallback `gstregistry.c` consults when the
+versioned name is absent.
+
+### 4.12 The bus sync handler is never detached — `SetSyncHandler(nil)` can kill the process
+
+`teardownLocked` sets `busSilenced` and leaves the handler attached. Do not "tidy" this back into
+`p.bus.SetSyncHandler(nil)`.
+
+`gst_bus_post` reads the handler and its `user_data` under `GST_OBJECT_LOCK`, drops the lock, and
+only then calls it. `gst_bus_set_sync_handler(bus, NULL, ...)` runs the `GDestroyNotify` go-gst
+installed alongside the closure, which is `destroyUserdata` →
+`userdata.Delete`. A streaming thread that had already read the pointer then enters
+`_gogst_gst1_BusSyncHandler` in `go-gst/pkg/gst/bus_manual_export.go`:
+
+```go
+v := userdata.Load(unsafe.Pointer(carg3))
+if v == nil {
+    panic(`callback not found`)
+}
+fn = v.(BusSyncHandler)
+```
+
+A Go panic cannot unwind through a C frame, so the process dies. It is worse than a panic, in fact:
+go-glib's `userdata` allocator returns the freed C pointer to a free list (`returnPointer`) and
+hands the same address out to the next `Register`, so a late call can reach somebody else's closure
+— or fail the type assertion on the following line.
+
+The window is narrow. It is also at `Stop`, which is the end of every match and every mid-match
+capture-device change, and the failure is the application vanishing during a live broadcast.
+
+The justification the original code gave for detaching — that leaving the handler attached would
+deadlock `deliver` against `Stop` — was wrong. `Stop` does not hold `errMu` while `teardownLocked`
+runs; it takes `errMu` only afterwards, to close the channels. A re-entrant `deliver` on the same
+goroutine would take `errMu.RLock()` and return. `errsClosed` already makes a late delivery safe.
+
+Cost of not detaching: one `userdata` registration per pipeline, released when the `GstBus` is
+finalised. A match with several device changes leaks a handful of map entries.
+
+### 4.13 The timeout constants do not bound a state change, and cannot
+
+`pipelineStartTimeout`, `sinkStateChangeTimeout` and `elementShutdownTimeout` used to be documented
+as bounding a hang. They do not. go-gst's `BlockSetState` (`element_manual.go`) is:
+
+```go
+ret := el.SetState(state)
+if ret == StateChangeAsync {
+    _, _, ret = el.GetState(timeout)
+}
+return ret
+```
+
+`gst_element_set_state` takes no timeout, holds the element's `GST_STATE_LOCK`, and runs every
+`change_state` function downwards through the bin synchronously on the calling goroutine. If
+`wasapi2src` blocks inside `IAudioClient::Initialize` on a wedged WASAPI endpoint, `SetState` never
+returns, the timeout is never consulted, and `Start` hangs forever holding `p.mu`. Likewise
+`srtsink` with `async=false` performs its SRT connect inside its `READY→PAUSED` transition, which
+runs inside `SyncStateWithParent()` — a call that takes no timeout argument at all. The only thing
+bounding a connect is libsrt's own `SRTO_CONNTIMEO`, 3 s by default and not overridden by srtsink.
+
+**A watchdog was considered and rejected**, and the comments were corrected instead. There is
+nothing to cancel: `gst_element_set_state` offers no abort, a goroutine inside C cannot be
+preempted, and it holds the pipeline's state lock — so the obvious "recovery" (`teardownLocked`,
+which sets the pipeline to `NULL`) would block on that same lock the instant it ran. A watchdog
+would convert one wedged goroutine into a wedged goroutine, plus a leaked one, plus an error return
+that lies.
+
+What *is* implemented is `stateChangeWatchdog`, which logs every `watchdogInterval` (3 s) that a
+state change has still not returned, and stops. It recovers nothing. It buys the difference between
+"the application froze" and a log line naming the element and the transition. The real mitigation is
+architectural and belongs to WP-8 — see section 7.
+
+### 4.14 A pipeline with no sink element can reach PLAYING
 
 `Start` deliberately installs no sink. Nothing in `gst_bin_change_state_func` requires a sink, and
 the pipeline's clock is pinned explicitly rather than provided by one, so this should be fine —
 and it is the single most important structural property of the design. If the pipeline refuses to
 go to PLAYING with no sink, the fallback is to install a `fakesink sync=false` at `Start` and have
 the first `ReplaceSink` swap it out. That is a change inside `gst_cgo.go`; do not change `gst.go`.
+
+---
+
+### 4.15 The audio branch has no capsfilter above `audioresample`
+
+There is deliberately nothing between `wasapi2src` and `audioconvert`. A capsfilter pinning
+`rate=48000,channels=2` used to sit there, upstream of the resampler whose entire job is to produce
+exactly that — where it could not convert anything and could only refuse.
+
+`wasapi2src` in shared mode can only ever produce its endpoint's mix format. Dante Virtual
+Soundcard is commonly configured at 44.1 or 96 kHz, and a DVS endpoint that is not at 48 k would
+fail caps negotiation inside `Start`, twenty minutes before kick-off, with an error naming neither
+the sample rate nor the device. `audioconvert ! audioresample` handle whatever the endpoint gives
+us; the capsfilter that matters is the one below them, pinning `S16LE,48000,2ch` into `mfaacenc`.
+
+If a Gate B run ever shows the encoder receiving something unexpected, that lower capsfilter is the
+one to look at — not the absence of the upper one.
+
+### 4.16 `videoscale` in the slate branch
+
+`assets/slate.png` is 1920x1080 and `CONTRACT.md` says so, but the artwork is replaced every season
+by somebody who will not read this file, and without `videoscale` a 1920x1200 export fails caps
+negotiation at `Start` with no diagnostic naming the size. `videoconvertscale` is already a required
+plugin for `videoconvert`, so the element costs nothing and does nothing at all when the slate is
+already correct.
+
+`add-borders` is set to `true` from `Start` with a `hasProperty` guard rather than in the parse
+string, because `gst_parse_launch` treats an unknown property as a hard error and a commentary
+position that will not start because a scaler property was renamed is worse than a slate scaled at
+the element's default. The value letterboxes artwork whose aspect ratio is not 16:9 rather than
+stretching it. `videoscale`'s own default is already `true`; this pins it against the default
+changing.
 
 ---
 
@@ -329,14 +551,61 @@ bus error whose source is `mux`.**
 
 ## 6. Tests
 
-`internal/gst/gst_cgo_test.go` was NOT created. WP-3a's allocated paths are `gst_cgo.go` and this
-file, and rule R1 says not to create anything outside them for any reason. The test file below is
-ready to paste; the coordinator should drop it in if the allocation is extended.
+### 6.1 What runs at Gate A today
+
+`gst_stub_test.go` (`//go:build !cgo`) holds three kinds of test. Know which you are reading.
+
+1. **Behavioural tests of the stub twin.** Real tests of real code — `Start` installs no sink,
+   `ReplaceSink` fails synchronously, `RemoveSink` detaches and is idempotent, `Stop` closes
+   `Errors()`. These are what let WP-3b, WP-5b and WP-8 be built and demonstrated.
+
+2. **One platform measurement**, `TestEmptyEnvVarSurvivesOnWindows`. See §4.11. It tests Windows,
+   not us, and it exists because a comment in `doInit` cites it.
+
+3. **Source-level guards on `gst_cgo.go`.** These parse `gst_cgo.go` with `go/parser` and assert
+   structural properties of the *source*. They are **not** behavioural tests and they are not a
+   substitute for one — `gst_cgo.go` carries `//go:build cgo` and not one line of it is linked into
+   the Gate A test binary.
+
+   They earn their place for two reasons. First, `TestCgoSourceParses` is the only check anywhere
+   that `gst_cgo.go` is even valid Go; without it a missing brace sits in the repository until
+   somebody opens Gate B. Second, and more usefully, several of the defects this file has already
+   had were structural and invisible to a reviewer reading prose:
+
+   | Guard | The defect it would have caught |
+   |---|---|
+   | `TestCgoPipelineImplementsEveryPipelineMethod` | `RemoveSink` added to the interface and to the stub, missing from `*cgoPipeline`. `var _ Pipeline = (*cgoPipeline)(nil)` cannot catch this until Gate B. |
+   | `TestReplaceSinkClearsTheRouteBeforeOpeningTheGate` | The route cleared by `defer` instead of before the gate opened — a swallowed sink error and a false green. |
+   | `TestReplaceSinkRechecksFatalBeforeSucceeding` | A `nil` return alongside an asynchronous pipeline-fatal error. |
+   | `TestRearmQueueRestoresStickyEvents` | §4.10, the sticky events destroyed by the re-arm. |
+   | `TestTeardownDoesNotDetachTheBusSyncHandler` | §4.12, the process-killing `SetSyncHandler(nil)`. |
+   | `TestBusHandlerDoesNotLogOnTheStreamingThread` | `log.Printf` from a bus callback under a warning storm. |
+   | `TestPipelineDescriptionHasNoCapsfilterAboveTheResampler` | A rate capsfilter upstream of `audioresample`, failing Start on a 44.1 or 96 kHz DVS endpoint. |
+   | `TestPipelineDescriptionScalesTheSlate` | No `videoscale`, so next season's artwork must be exactly 1920x1080. |
+   | `TestInitPointsEveryPluginPathAtTheBundle` | A plugin path variable that stops isolating the bundle. |
+
+   Every one of them was verified to FAIL with the fix reverted, in a scratchpad copy of the
+   package. A guard that passes either way is worse than no guard, so if you add one, prove it the
+   same way.
+
+   If a guard starts failing because the code was legitimately restructured, **read the reason in
+   its doc comment before changing it** — each of them is a bug that actually happened.
+
+### 6.2 What still needs Gate B
+
+`internal/gst/gst_cgo_test.go` was NOT created. WP-3a's allocated paths are `gst_cgo.go`,
+`gst_stub_test.go` and this file, and rule R1 says not to create anything outside them for any
+reason. The test file below is ready to paste; the coordinator should drop it in if the allocation
+is extended.
 
 It only covers the pure-Go logic — string building, option validation and encoder-property
 selection. Everything else in `gst_cgo.go` needs a GStreamer, which is Gate B, and a real WASAPI
 endpoint and SRT listener, which is Gate C. It carries `//go:build cgo`, so it does not run at
 Gate A and cannot affect `CGO_ENABLED=0 go test ./...`.
+
+Note that the audio-branch assertions in it are stale in one respect: the description no longer
+contains a capsfilter directly after `wasapi2src` (§4.11 of the review, finding 7), so a test
+asserting `audio/x-raw,rate=48000` appears twice would now fail correctly.
 
 ```go
 //go:build cgo
@@ -540,3 +809,131 @@ func PadProbeTypeBlockForTest() gogst.PadProbeType           { return gogst.PadP
 `gogst "github.com/go-gst/go-gst/pkg/gst"` there — the helpers exist only to keep new exported
 symbols out of the package, since `gst_stub.go` would not have them and the two builds must expose
 the same API.)
+
+---
+
+## 7. What the CALLER must not do — this is a WP-8 constraint, not a suggestion
+
+### 7.1 No `Pipeline` method may be called from the Wails message loop
+
+**`Stop` can block for the full length of an SRT connect attempt.** `Stop` takes `p.mu`, and
+`ReplaceSink` holds `p.mu` across the handshake — `SyncStateWithParent` plus `BlockSetState`, which
+is where libsrt's `SRTO_CONNTIMEO` (3 s by default, not overridden) is spent, plus a possible
+`BlockSetState(NULL)` on the abandoned sink. A user pressing Stop while a reconnect attempt is in
+flight waits for that attempt to finish. Called from the goroutine that services the Windows message
+loop, the whole window stops repainting and Windows marks it "Not Responding" — during a match.
+
+The same applies to `Start` and `ReplaceSink`, and worse: per §4.13 neither has an enforceable upper
+bound at all. A wedged WASAPI endpoint hangs `Start` for the life of the process.
+
+So: **WP-8 must call `Start`, `ReplaceSink`, `RemoveSink` and `Stop` from a dedicated goroutine and
+report progress back through events.** A bound Wails method must return promptly and never wait on
+one of these. `internal/sender` already owns its own goroutine, which covers `ReplaceSink`,
+`RemoveSink` and `ForceKeyUnit`; the two that need attention are the ones the UI drives directly,
+`Start` and `Stop`.
+
+### 7.2 `Stop` must always be called
+
+`New` starts one goroutine (the warning logger, §4.12's sibling — see `logWarnings`). `Stop` ends
+it. A `Pipeline` created and abandoned leaks it. `Stop` is idempotent, so calling it on every path
+out costs nothing.
+
+---
+
+## 8. Gate B assertions to add once GStreamer is present
+
+These cannot be written at Gate A because they need a live registry. Add them to the smoke test in
+§1 and record the results.
+
+### 8.1 Every loaded plugin comes from the bundle
+
+The single check that proves §4.11's isolation actually worked. `missingElements()` does not cover
+it: that detects factories which are ABSENT, and the failure mode here is a foreign install's copy
+of the same factory being loaded *instead of* ours — same name, different binary, possibly a
+different licence.
+
+```go
+// Gate B only. After Init(appDir) returns nil.
+pluginDir := filepath.Join(appDir, "gst", "lib", "gstreamer-1.0")
+for _, plugin := range gogst.RegistryGet().GetPluginList() {
+    file := plugin.GetFilename()
+    if file == "" {
+        continue // statically registered, e.g. the core elements
+    }
+    abs, _ := filepath.Abs(file)
+    if !strings.HasPrefix(strings.ToLower(abs), strings.ToLower(pluginDir)) {
+        t.Errorf("plugin %s was loaded from %s, which is outside the bundle at %s",
+            plugin.GetName(), abs, pluginDir)
+    }
+}
+```
+
+Run it on a machine that **also** has a system-wide GStreamer installed, or the test proves nothing.
+Install the 1.28.5 runtime MSI system-wide, set `GST_PLUGIN_SYSTEM_PATH` machine-wide to its plugin
+directory, and confirm the assertion still passes.
+
+### 8.2 The sticky events survive a reconnect
+
+§4.10, and it is the one to do first. The reproduction and the two log lines to grep for are there.
+
+### 8.3 The H.264 encoder actually chosen
+
+Record the `gst: H.264 encoder resolved by rank: ... (rank N)` line. That is the answer to
+specification open question 3 and it belongs in `docs/test-results.md`, not in someone's memory.
+
+---
+
+## 9. WP-9 soak items
+
+### 9.1 `savedBase` never resets — running time is process uptime, and MPEG-TS PTS wraps
+
+**Documented deliberately rather than coded around. Read this before "fixing" it.**
+
+`savedBase` is sampled once, the first time any pipeline in the process is started, and is then
+never reset — not by `Stop`, not by a later `Start`, not by a capture-device change. That is the
+whole point: it is the secondary defence against the measured backwards-DTS bug, and every pipeline
+this process builds gets the same base time so running time continues rather than restarting at
+zero.
+
+The consequence is that **running time equals process uptime, not stream duration.** MPEG-TS PTS and
+PCR are 33-bit values at 90 kHz, so they wrap at
+
+```
+2^33 / 90000 = 95443.7 s = 26 h 30 m 44 s
+```
+
+A commentary PC left powered on between fixtures — which is the normal state of a rack machine —
+that does `Stop`, `New`, `Start` two days later begins its second match at a running time of roughly
+48 hours. That is past the wrap, and the first minutes of the match sit right on a wrap boundary.
+
+**What is not known:** whether M2L-X's relay tolerates a PTS wrap. It forwards our timestamps
+verbatim, which is why the original bug was never absorbed downstream, and "non-monotonic DTS
+downstream" is precisely the symptom class this file exists to prevent. A wrap is legal MPEG-TS and
+a correct demuxer handles it; whether M2L-X's does is unmeasured.
+
+**Do not fix this by resetting `savedBase`.** That reintroduces the measured fault, which is
+certain, to avoid one that is speculative. If it does turn out to matter, the fix is to seed
+`savedBase` from a value that is small at the start of each match while still never moving backwards
+within a match — which is a design change, not a one-line edit, and it needs the measurement first.
+
+**Soak test.** Leave a machine powered on and the application running for 30 hours with an active
+SRT session, and watch for a discontinuity at the 26 h 30 m mark: `ffprobe -show_packets` on M2L-X's
+output, or the relay's own logs. A second run should `Stop`/`Start` at hour 27 to exercise the
+rebuild across the wrap.
+
+**Operational rule until that measurement exists**, and it belongs in the operator documentation
+rather than only here:
+
+> **Restart the WSL Commentary application before every match.** Do not leave it running between
+> fixtures. Closing and reopening the application is sufficient; the machine does not need to be
+> rebooted.
+
+That rule costs the operator ten seconds and removes the entire question, which is why it is the
+answer rather than a code change.
+
+### 9.2 A bus error whose source is `mux`
+
+Already noted in §5: the residual race at the end of the file comment in `gst_cgo.go`. The window is
+microseconds against a ~4.6 ms buffer period, it is loud rather than silent when it fires, and
+closing it would need a pipeline-shape change. If the soak produces a `gst: pipeline-fatal:` error
+naming `mux`, that is it, and it needs escalating rather than retrying.

@@ -135,6 +135,10 @@ type StubCounters struct {
 	Starts int
 	// ReplaceSinks is the number of ReplaceSink calls, successful or not.
 	ReplaceSinks int
+	// SinkRemovals is the number of RemoveSink calls, including the idempotent
+	// no-op ones. A reconnect cycle that honours specification section 6.2
+	// increments this once on entry to DRAINING, before the backoff wait.
+	SinkRemovals int
 	// SinksAttached is the number of ReplaceSink calls that succeeded.
 	SinksAttached int
 	// ForceKeyUnits is the number of successful ForceKeyUnit calls.
@@ -262,6 +266,29 @@ func (p *StubPipeline) ReplaceSink(opts SinkOpts) error {
 	p.hasSk = true
 	p.state = StubStateSinkAttached
 	p.counters.SinksAttached++
+	return nil
+}
+
+// RemoveSink detaches the fake sink without installing another, leaving the
+// pipeline running. It is idempotent: removing when nothing is attached is not
+// an error, which is what lets the reconnect loop call it unconditionally on
+// entry to DRAINING.
+func (p *StubPipeline) RemoveSink() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.counters.SinkRemovals++
+
+	if p.closed || p.state == StubStateStopped {
+		return errStubStopped
+	}
+	if !p.hasSk {
+		return nil
+	}
+
+	p.sink = SinkOpts{}
+	p.hasSk = false
+	p.state = StubStateRunning
 	return nil
 }
 
