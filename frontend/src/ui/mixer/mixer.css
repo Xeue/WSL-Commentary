@@ -1,0 +1,730 @@
+/*
+ * Mixer drawer styling.
+ *
+ * Owner: WP-M4. Every rule is scoped under .mx-* so it cannot reach anything in
+ * styles/main.css, which another workflow owns.
+ *
+ * The room: dim, under time pressure, attention on the match. So —
+ *
+ *   - state is never colour alone. A lit crosspoint carries a filled glyph, an
+ *     unlit one an open glyph, the clean-feed column a diamond rather than a
+ *     square, and a locked matrix a DASHED outline. Turn the monitor to
+ *     greyscale and every one of those still reads.
+ *   - the clean-feed column is banded and ruled on both edges, because it is
+ *     the one column where a lit cell means audio is going to the client.
+ *   - hit targets are 34px+ in a 54-row matrix, and 44px for the controls that
+ *     can write.
+ *   - system fonts only. The facility has no outbound web access, so nothing
+ *     here fetches or bundles a webfont.
+ *   - the only animation is the staged-change outline, and it is switched off
+ *     under prefers-reduced-motion.
+ *
+ * Custom properties fall back to literals so the drawer renders correctly on
+ * its own — see demo.html, which loads this file with no application CSS.
+ */
+
+.mx-root {
+  --mx-bg: var(--panel, #161b21);
+  --mx-bg-alt: var(--panel-alt, #1e242c);
+  --mx-border: var(--border, #2a313a);
+  --mx-text: var(--text, #e9edf1);
+  --mx-muted: var(--text-muted, #96a2ad);
+  --mx-focus: var(--focus, #7db4ff);
+  --mx-green: var(--green, #2ecc71);
+  --mx-amber: var(--amber, #f5a623);
+  --mx-red: var(--red, #ef4444);
+  --mx-clean: #b073ff;
+  --mx-clean-band: rgba(176, 115, 255, 0.14);
+
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  color: var(--mx-text);
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    Roboto,
+    Arial,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.mx-root[hidden],
+.mx-root [hidden] {
+  display: none !important;
+}
+
+.mx-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.mx-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(1180px, 96vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--mx-bg);
+  border-left: 1px solid var(--mx-border);
+  box-shadow: -18px 0 44px rgba(0, 0, 0, 0.5);
+  animation: mx-slide-in 140ms ease-out;
+}
+
+@keyframes mx-slide-in {
+  from {
+    transform: translateX(3%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mx-drawer {
+    animation: none;
+  }
+}
+
+.mx-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.1rem;
+  border-bottom: 1px solid var(--mx-border);
+  background: var(--mx-bg-alt);
+}
+
+.mx-titles {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.mx-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.mx-fresh {
+  font-size: 0.8rem;
+  color: var(--mx-muted);
+}
+
+.mx-fresh--stale {
+  color: var(--mx-amber);
+  font-weight: 700;
+}
+
+.mx-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.9rem 1.1rem 1.4rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Clean-feed banner: the first thing on screen                        */
+/* ------------------------------------------------------------------ */
+
+.mx-banner {
+  margin: 0 0 0.9rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--mx-border);
+  background: var(--mx-bg-alt);
+  font-size: 0.98rem;
+}
+
+.mx-banner--alert {
+  border: 2px solid var(--mx-clean);
+  background: rgba(176, 115, 255, 0.12);
+  font-weight: 700;
+}
+
+.mx-banner--warn {
+  border-color: var(--mx-amber);
+}
+
+.mx-banner--ok {
+  border-color: #1e5c37;
+}
+
+.mx-banner--unknown {
+  color: var(--mx-muted);
+  border-style: dashed;
+}
+
+/* ------------------------------------------------------------------ */
+/* Arm bar                                                             */
+/* ------------------------------------------------------------------ */
+
+.mx-armbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--mx-border);
+  border-radius: 10px;
+  background: var(--mx-bg-alt);
+}
+
+.mx-armstate {
+  font-size: 0.85rem;
+  color: var(--mx-muted);
+  letter-spacing: 0.01em;
+}
+
+.mx-armstate--armed {
+  color: var(--mx-amber);
+  font-weight: 700;
+}
+
+.mx-btn {
+  min-height: 44px;
+  padding: 0.5rem 0.95rem;
+  border-radius: 9px;
+  border: 1px solid var(--mx-border);
+  background: #232a33;
+  color: var(--mx-text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mx-btn:hover {
+  background: #2b333e;
+}
+
+.mx-btn--small {
+  min-height: 34px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.mx-btn--armed {
+  border-color: var(--mx-amber);
+  color: #1a1206;
+  background: var(--mx-amber);
+}
+
+.mx-btn--danger {
+  border-color: var(--mx-red);
+  background: #3a1414;
+}
+
+.mx-btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.mx-notice {
+  margin: 0.7rem 0 0;
+  padding: 0.55rem 0.7rem;
+  border-left: 4px solid var(--mx-border);
+  border-radius: 6px;
+  background: var(--mx-bg-alt);
+  font-size: 0.9rem;
+}
+
+.mx-notice--warn {
+  border-left-color: var(--mx-amber);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ */
+/* Staged / awaiting / drift lists                                     */
+/* ------------------------------------------------------------------ */
+
+.mx-h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--mx-muted);
+}
+
+.mx-stagedbox,
+.mx-awaitbox,
+.mx-drift {
+  margin-top: 0.9rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--mx-border);
+  border-radius: 10px;
+  background: var(--mx-bg-alt);
+}
+
+.mx-drift-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.mx-drift-head .mx-h3 {
+  margin-right: auto;
+}
+
+.mx-list {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.mx-staged,
+.mx-await,
+.mx-diff {
+  padding: 0.4rem 0.55rem;
+  border-radius: 7px;
+  border-left: 4px solid var(--mx-border);
+  background: #1a2028;
+  font-size: 0.9rem;
+}
+
+.mx-sev--critical {
+  border-left-color: var(--mx-red);
+}
+
+.mx-sev--warn {
+  border-left-color: var(--mx-amber);
+}
+
+.mx-sev--info {
+  border-left-color: var(--mx-muted);
+}
+
+.mx-await--failed {
+  border-left-color: var(--mx-red);
+  font-weight: 700;
+}
+
+.mx-await--confirmed {
+  border-left-color: var(--mx-green);
+}
+
+.mx-diff {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 0.1rem 0.6rem;
+}
+
+.mx-diff-badge {
+  grid-row: span 2;
+  align-self: start;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 0.15rem 0.35rem;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  text-align: center;
+}
+
+.mx-sev--critical .mx-diff-badge {
+  color: var(--mx-red);
+}
+
+.mx-sev--warn .mx-diff-badge {
+  color: var(--mx-amber);
+}
+
+.mx-sev--info .mx-diff-badge {
+  color: var(--mx-muted);
+}
+
+.mx-diff-head {
+  font-weight: 600;
+}
+
+.mx-diff-detail {
+  font-size: 0.8rem;
+  color: var(--mx-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mx-drift-summary {
+  margin: 0.5rem 0 0;
+  font-size: 0.9rem;
+}
+
+.mx-drift-summary--alert {
+  color: var(--mx-red);
+  font-weight: 700;
+}
+
+.mx-drift-summary--warn {
+  color: var(--mx-amber);
+  font-weight: 600;
+}
+
+.mx-drift-summary--none,
+.mx-drift-summary--ok {
+  color: var(--mx-muted);
+}
+
+/* ------------------------------------------------------------------ */
+/* Filters and legend                                                  */
+/* ------------------------------------------------------------------ */
+
+.mx-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+.mx-tools-label {
+  font-size: 0.85rem;
+  color: var(--mx-muted);
+}
+
+.mx-chip {
+  min-height: 34px;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--mx-border);
+  background: #1a2028;
+  color: var(--mx-text);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.mx-chip--on {
+  border-color: var(--mx-focus);
+  background: #223046;
+  font-weight: 700;
+}
+
+.mx-chip--on::before {
+  content: '● ';
+}
+
+.mx-legend {
+  margin: 0.6rem 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--mx-muted);
+}
+
+.mx-matrix-note {
+  margin: 0.6rem 0;
+  padding: 0.6rem;
+  border: 1px dashed var(--mx-border);
+  border-radius: 8px;
+  color: var(--mx-muted);
+}
+
+/* ------------------------------------------------------------------ */
+/* The matrix                                                          */
+/* ------------------------------------------------------------------ */
+
+.mx-matrix-wrap {
+  margin-top: 0.4rem;
+  max-height: 62vh;
+  overflow: auto;
+  border: 1px solid var(--mx-border);
+  border-radius: 10px;
+}
+
+.mx-matrix {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.mx-caption {
+  caption-side: top;
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  font-size: 0.8rem;
+  color: var(--mx-muted);
+  background: var(--mx-bg-alt);
+  border-bottom: 1px solid var(--mx-border);
+}
+
+.mx-th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  vertical-align: bottom;
+  font-size: 0.76rem;
+  font-weight: 700;
+  background: var(--mx-bg-alt);
+  border-bottom: 1px solid var(--mx-border);
+  white-space: nowrap;
+}
+
+.mx-th--bus {
+  text-align: center;
+  min-width: 7.5rem;
+}
+
+.mx-th-name,
+.mx-th-sub {
+  display: block;
+}
+
+.mx-th-sub {
+  font-weight: 400;
+  font-size: 0.68rem;
+  color: var(--mx-muted);
+  white-space: normal;
+  max-width: 9rem;
+}
+
+.mx-busmeter {
+  display: block;
+  height: 4px;
+  margin-top: 3px;
+  background: #10151b;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.mx-busmeter-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--mx-green);
+}
+
+.mx-row:nth-child(even) .mx-cell {
+  background: #151a20;
+}
+
+.mx-row--onair .mx-cell--name {
+  box-shadow: inset 3px 0 0 var(--mx-clean);
+}
+
+.mx-cell {
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid #20262e;
+  background: var(--mx-bg);
+  vertical-align: middle;
+}
+
+.mx-cell--name {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  text-align: left;
+  min-width: 13rem;
+  border-right: 1px solid var(--mx-border);
+}
+
+.mx-strip-label {
+  display: block;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.mx-strip-wire {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--mx-muted);
+  font-family: ui-monospace, Consolas, 'Courier New', monospace;
+}
+
+.mx-cell--meter {
+  min-width: 9rem;
+}
+
+.mx-meter {
+  display: block;
+  width: 8rem;
+}
+
+.mx-meter-bar {
+  display: block;
+  height: 6px;
+  margin-bottom: 2px;
+  background: #10151b;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.mx-meter-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--mx-green);
+}
+
+.mx-zone--silence {
+  background: #2c343d;
+}
+
+.mx-zone--low {
+  background: #2f7d54;
+}
+
+.mx-zone--nominal {
+  background: var(--mx-green);
+}
+
+.mx-zone--hot {
+  background: var(--mx-amber);
+}
+
+.mx-zone--over {
+  background: var(--mx-red);
+}
+
+.mx-meter-text {
+  font-size: 0.75rem;
+  color: var(--mx-muted);
+}
+
+.mx-meter-text.mx-zone--over,
+.mx-meter-text.mx-zone--hot {
+  background: none;
+  color: var(--mx-amber);
+  font-weight: 700;
+}
+
+.mx-meter-text.mx-zone--over {
+  color: var(--mx-red);
+}
+
+.mx-meter-text.mx-zone--over::after {
+  content: ' OVER';
+}
+
+.mx-meter-text--absent {
+  font-style: italic;
+}
+
+.mx-cell--state {
+  min-width: 10rem;
+  font-size: 0.78rem;
+  color: var(--mx-muted);
+}
+
+.mx-mute,
+.mx-fader {
+  display: block;
+}
+
+.mx-mute--on {
+  color: var(--mx-text);
+  font-weight: 700;
+}
+
+.mx-mute--on::before {
+  content: '× ';
+}
+
+/* --- crosspoints --------------------------------------------------- */
+
+.mx-cell--x {
+  text-align: center;
+  padding: 0.15rem 0.25rem;
+}
+
+.mx-x {
+  width: 100%;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  border-radius: 7px;
+  border: 1px solid var(--mx-border);
+  background: #12171d;
+  color: var(--mx-muted);
+  font: inherit;
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mx-x--on {
+  color: var(--mx-text);
+  background: #223046;
+  border-color: #3c5a86;
+}
+
+.mx-x-text {
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+/* The clean-feed column. Banded, ruled on both edges, and lit cells get a
+   diamond instead of a square plus the word CLN — a cell lit here is audio
+   going to the client, and it must be unmistakable at a glance. */
+.mx-col-clean {
+  background: var(--mx-clean-band) !important;
+  border-left: 2px solid var(--mx-clean);
+  border-right: 2px solid var(--mx-clean);
+}
+
+.mx-x--clean.mx-x--on {
+  color: #fff;
+  background: #4a2a72;
+  border-color: var(--mx-clean);
+  font-weight: 700;
+}
+
+.mx-x--noegress {
+  opacity: 0.85;
+}
+
+.mx-x--noegress.mx-x--on::after {
+  content: '(no egress)';
+  font-size: 0.6rem;
+  color: var(--mx-muted);
+}
+
+.mx-x--staged {
+  outline: 2px dashed var(--mx-amber);
+  outline-offset: -2px;
+  animation: mx-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes mx-pulse {
+  50% {
+    outline-color: #ffd48a;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mx-x--staged {
+    animation: none;
+  }
+}
+
+/* Disarmed: dashed, dimmed, and not-allowed. A SHAPE change, so it survives
+   greyscale — and the cell still shows its true routing, because reading the
+   matrix must not require arming the write path. */
+.mx-x--locked {
+  border-style: dashed;
+  opacity: 0.72;
+  cursor: not-allowed;
+}
+
+.mx-x:hover:not(.mx-x--locked) {
+  border-color: var(--mx-focus);
+}
+
+.mx-root *:focus-visible {
+  outline: 3px solid var(--mx-focus);
+  outline-offset: 1px;
+}

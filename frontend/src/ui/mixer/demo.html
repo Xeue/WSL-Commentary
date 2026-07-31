@@ -1,0 +1,133 @@
+<!doctype html>
+<!--
+  Mixer drawer demo harness. Owner: WP-M4. DEV ONLY.
+
+  HOW TO SEE THE DRAWER WITHOUT RUNNING THE APP
+
+    cd frontend
+    npx vite            # or: python -m http.server 8080
+    # then open  http://localhost:5173/src/ui/mixer/demo.html
+    #        or  http://localhost:8080/src/ui/mixer/demo.html
+
+  A static server is needed only because ES modules do not load over file://.
+  Nothing here talks to the M2L-X: the mixer is an in-memory copy of the
+  captured live frame, so clicking Apply cannot reach a real clean feed.
+
+  This file is deliberately NOT an entry point. index.html is the application's
+  only one, and `npm run build` emits neither this page nor demo.js.
+
+  Things worth doing once it is open:
+    1. Look at the banner before touching anything. CLAUDE-COMMS is in the
+       clean feed, on the default routing, exactly as the live mixer had it.
+    2. Click a crosspoint while it says READ-ONLY. Nothing happens, and it says
+       why.
+    3. Arm it, click the aux1 cell on CLAUDE-COMMS, read the staged line, then
+       Apply. Watch "sent" become "confirmed" only when the next snapshot
+       shows it.
+    4. Turn on the deaf mixer and do it again: the send resolves and the drawer
+       still refuses to call it applied.
+    5. Load the golden, then press "Reset every strip to defaults" and watch
+       the CRITICAL list.
+    6. Stop the 1 Hz feed and watch the header go STALE.
+    7. Close it with Escape and check the log: it disarmed, and said so.
+-->
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mixer drawer - WP-M4 demo</title>
+    <link rel="stylesheet" href="./mixer.css" />
+    <style>
+      /* Stand-ins for the application shell's custom properties, so this page
+         needs nothing from styles/main.css (which another workflow owns). */
+      :root {
+        --bg: #0b0d10;
+        --panel: #161b21;
+        --panel-alt: #1e242c;
+        --border: #2a313a;
+        --text: #e9edf1;
+        --text-muted: #96a2ad;
+        --focus: #7db4ff;
+        --green: #2ecc71;
+        --amber: #f5a623;
+        --red: #ef4444;
+      }
+      body {
+        margin: 0;
+        padding: 1.5rem;
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif;
+      }
+      h1 {
+        font-size: 1.2rem;
+        margin: 0 0 0.35rem;
+      }
+      p.lede {
+        margin: 0 0 1rem;
+        color: var(--text-muted);
+        max-width: 60rem;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+      }
+      button {
+        min-height: 40px;
+        padding: 0.4rem 0.8rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #232a33;
+        color: var(--text);
+        font: inherit;
+        cursor: pointer;
+      }
+      button[aria-pressed='true'] {
+        border-color: var(--amber);
+        color: #1a1206;
+        background: var(--amber);
+      }
+      #log {
+        max-height: 55vh;
+        overflow: auto;
+        padding: 0.6rem 0.8rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #10151b;
+        font-family: ui-monospace, Consolas, 'Courier New', monospace;
+        font-size: 0.78rem;
+        line-height: 1.6;
+        color: #cfd8e3;
+      }
+      *:focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 2px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Mixer drawer - WP-M4 demo harness</h1>
+    <p class="lede">
+      The mixer below the drawer is in-memory, built from the captured live frame of 31 July 2026: 54 strips, 7 buses,
+      and cam22-1 ("CLAUDE-COMMS") on the default routing, which puts it in the clean feed. Nothing on this page can
+      reach the real M2L-X. Every call the drawer makes across the contract is logged.
+    </p>
+
+    <div class="controls">
+      <button id="open" type="button">Open the drawer</button>
+      <button id="golden-clean" type="button">Load a golden without CLAUDE-COMMS in the clean feed</button>
+      <button id="golden-clear" type="button">Clear the golden</button>
+      <button id="reset-defaults" type="button">Reset every strip to defaults</button>
+      <button id="unmute-comms" type="button">Toggle mute on CLAUDE-COMMS</button>
+      <button id="deaf" type="button" aria-pressed="false">Deaf mixer: off</button>
+      <button id="feed" type="button" aria-pressed="false">Stop the 1 Hz feed</button>
+    </div>
+
+    <div id="drawer-mount"></div>
+    <div id="log" role="log" aria-live="off"></div>
+
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>
