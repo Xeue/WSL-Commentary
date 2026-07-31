@@ -122,7 +122,7 @@ func TestEnvelopeMatchesMeasuredJSON(t *testing.T) {
 				AGCMode:      AGCLimiter,
 				PreGain:      0,
 				CompressorTh: 0,
-				LimiterTh:    -3,
+				LimiterTh:    LimiterAt(-3),
 			},
 			want: `{"args":{"agc_mode":"limiter","compressor_th":0,"limiter_th":-3,"name":"cam23-1","pre_gain":0},"command":"set_comp_limit","node":"advanced_audio_mixer"}`,
 		},
@@ -142,7 +142,7 @@ func TestEnvelopeMatchesMeasuredJSON(t *testing.T) {
 				Strip:     "cam22-1",
 				AGCMode:   AGCLimiter,
 				PreGain:   -6.5,
-				LimiterTh: -3,
+				LimiterTh: LimiterAt(-3),
 			},
 			want: `{"args":{"agc_mode":"limiter","compressor_th":0,"limiter_th":-3,"name":"cam22-1","pre_gain":-6.5},"command":"set_comp_limit","node":"advanced_audio_mixer"}`,
 		},
@@ -247,14 +247,15 @@ func TestMuteCommandsUseTheArrayForm(t *testing.T) {
 // read-back check cannot catch.
 func TestSetCompLimitCarriesAGCMode(t *testing.T) {
 	tests := []struct {
-		name string
-		mode AGCMode
-		th   float64
-		want string
+		name   string
+		mode   AGCMode
+		th     *float64
+		want   string
+		wantTh float64
 	}{
-		{"limiter armed", AGCLimiter, -3, "limiter"},
-		{"limiter armed at 0 threshold", AGCLimiter, 0, "limiter"},
-		{"dynamics off", AGCOff, 0, "off"},
+		{"limiter armed", AGCLimiter, LimiterAt(-3), "limiter", -3},
+		{"limiter armed at 0 threshold", AGCLimiter, LimiterAt(0), "limiter", 0},
+		{"dynamics off", AGCOff, nil, "off", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -273,11 +274,68 @@ func TestSetCompLimitCarriesAGCMode(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("agc_mode = %v, want %q", got, tt.want)
 			}
-			if args["limiter_th"] != tt.th {
-				t.Errorf("limiter_th = %v, want %v", args["limiter_th"], tt.th)
+			// The wire shape is unchanged by LimiterTh becoming a pointer: a
+			// nil threshold still serialises as a bare 0, exactly as the
+			// vendor's own agc_mode:"off" example does.
+			if args["limiter_th"] != tt.wantTh {
+				t.Errorf("limiter_th = %v, want %v", args["limiter_th"], tt.wantTh)
 			}
 		})
 	}
+}
+
+// TestLimiterAtZeroIsAThresholdNotAnAbsentLimiter is the S5 regression.
+//
+// The guard used to read `c.LimiterTh != 0 && c.AGCMode != AGCLimiter`, which
+// is correct for every threshold except the one an engineer reaches for on a
+// bus that is MEASURED to sum past full scale: a brickwall at 0 dBFS. With a
+// plain float64 that request was indistinguishable from the zero value, so it
+// passed validation with AGCOff, was accepted by the mixer, read back
+// unchanged, and did no limiting — silently disabling the only mitigation
+// this package has for BusMaster.
+//
+// The fix is that "no limiter" has its own spelling. These four cases are the
+// whole of it, and each one fails if LimiterTh goes back to a bare float64.
+func TestLimiterAtZeroIsAThresholdNotAnAbsentLimiter(t *testing.T) {
+	t.Run("a brickwall at 0 dBFS with the AGC off is REFUSED", func(t *testing.T) {
+		env, err := (SetCompLimit{Strip: "cam22-1", AGCMode: AGCOff, LimiterTh: LimiterAt(0)}).Envelope()
+		if err == nil {
+			t.Fatalf("Envelope() = %v, want a refusal: a limiter at 0 dBFS with agc_mode off is accepted, reads back unchanged and does no limiting", env)
+		}
+		if !strings.Contains(err.Error(), "SILENTLY INERT") {
+			t.Errorf("error = %q, want it to name the silent-inertness trap", err.Error())
+		}
+	})
+
+	t.Run("a brickwall at 0 dBFS with the limiter armed is ALLOWED", func(t *testing.T) {
+		env, err := (SetCompLimit{Strip: "cam22-1", AGCMode: AGCLimiter, LimiterTh: LimiterAt(0)}).Envelope()
+		if err != nil {
+			t.Fatalf("Envelope() error = %v, want nil: a brickwall at digital full scale is a real and useful threshold", err)
+		}
+		args := env["args"].(map[string]any)
+		if args["limiter_th"] != 0.0 {
+			t.Errorf("limiter_th = %v, want 0", args["limiter_th"])
+		}
+	})
+
+	t.Run("no limiter at all stays legal and is spelled nil", func(t *testing.T) {
+		if _, err := (SetCompLimit{Strip: "cam22-1", AGCMode: AGCOff, PreGain: -3}).Envelope(); err != nil {
+			t.Fatalf("Envelope() error = %v, want nil: agc off with no limiter is the factory state of every strip in the live frame", err)
+		}
+	})
+
+	t.Run("arming the limiter without saying where it clamps is REFUSED", func(t *testing.T) {
+		// The converse guess: this would send limiter_th 0 and brickwall the
+		// strip at digital full scale without the caller ever naming a
+		// threshold.
+		env, err := (SetCompLimit{Strip: "cam22-1", AGCMode: AGCLimiter}).Envelope()
+		if err == nil {
+			t.Fatalf("Envelope() = %v, want a refusal: AGCLimiter with no LimiterTh sends limiter_th 0", env)
+		}
+		if !strings.Contains(err.Error(), "LimiterAt") {
+			t.Errorf("error = %q, want it to point at LimiterAt", err.Error())
+		}
+	})
 }
 
 // TestEnvelopeRejects covers every refusal, because each one is a message that
@@ -341,12 +399,12 @@ func TestEnvelopeRejects(t *testing.T) {
 		},
 		{
 			name:       "SetCompLimit with a limiter threshold and the AGC off - SILENTLY INERT",
-			cmd:        SetCompLimit{Strip: "cam23-1", AGCMode: AGCOff, LimiterTh: -3},
+			cmd:        SetCompLimit{Strip: "cam23-1", AGCMode: AGCOff, LimiterTh: LimiterAt(-3)},
 			wantSubstr: "SILENTLY INERT",
 		},
 		{
 			name:       "SetCompLimit with a limiter threshold and no AGC mode at all",
-			cmd:        SetCompLimit{Strip: "cam23-1", LimiterTh: -3},
+			cmd:        SetCompLimit{Strip: "cam23-1", LimiterTh: LimiterAt(-3)},
 			wantSubstr: "AGCMode is empty",
 		},
 		{
@@ -356,7 +414,7 @@ func TestEnvelopeRejects(t *testing.T) {
 		},
 		{
 			name:       "SetCompLimit with no strip",
-			cmd:        SetCompLimit{AGCMode: AGCLimiter},
+			cmd:        SetCompLimit{AGCMode: AGCLimiter, LimiterTh: LimiterAt(-3)},
 			wantSubstr: "Strip is empty",
 		},
 	}
@@ -576,6 +634,7 @@ func TestTokenNeverAppearsInAnyError(t *testing.T) {
 		t.Fatalf("start with a stub dial: %v", err)
 	}
 	defer up.Close()
+	up.Arm(ArmWindow)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -745,6 +804,12 @@ func dialTest(ctx context.Context, urlStr string) (wsConn, error) {
 
 // newTestController builds a started controller against s, with a backoff
 // ladder short enough for a test to wait through.
+//
+// It returns the controller DISARMED, exactly as NewController does, because
+// the whole point of the Go-side gate is that nothing opens it implicitly. The
+// transport tests below are about the socket rather than the gate, so they
+// call armed() to open a window first — which is also what the real caller
+// has to do, so the tests exercise the real sequence.
 func newTestController(t *testing.T, s *wsTestServer) *WSController {
 	t.Helper()
 	const token = "test-token"
@@ -757,11 +822,25 @@ func newTestController(t *testing.T, s *wsTestServer) *WSController {
 	return c
 }
 
+// armed opens a write window on c for the duration of the test, and asserts
+// that the controller was disarmed before it did. That assertion is the reason
+// this is a helper rather than a bare c.Arm call at each site: every transport
+// test now also proves that a freshly dialled controller cannot write.
+func armed(t *testing.T, c *WSController) *WSController {
+	t.Helper()
+	if until := c.ArmedUntil(); !until.IsZero() {
+		t.Fatalf("a freshly dialled controller reports ArmedUntil %s, want the zero Time: nothing may open the write gate implicitly", until)
+	}
+	c.Arm(ArmWindow)
+	t.Cleanup(c.Disarm)
+	return c
+}
+
 // TestLifecycleConnectSendDropReconnectClose is the whole connection
 // lifecycle in one pass, in the order the brief names it.
 func TestLifecycleConnectSendDropReconnectClose(t *testing.T) {
 	s := newWSTestServer(t)
-	c := newTestController(t, s)
+	c := armed(t, newTestController(t, s))
 
 	// Connect.
 	select {
@@ -810,20 +889,204 @@ func TestLifecycleConnectSendDropReconnectClose(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// The Go-side arm gate (S3)
+// ============================================================================
+
+// TestSendIsRefusedWhileDisarmed is the S3 regression, and the property the
+// whole gate exists for: the write path is CLOSED by default and no amount of
+// dialling, reconnecting or previously succeeding opens it.
+//
+// Before this gate the arm check lived only in JavaScript. Once the drawer is
+// behind a Wails binding, that binding is reachable from anything in the
+// webview — a devtools console, a future code path that forgets to construct
+// createWriteGate — and every one of those was an ungated write to a live
+// clean feed. Nothing here removes the JS gate; the point is that a bypass now
+// needs both.
+func TestSendIsRefusedWhileDisarmed(t *testing.T) {
+	s := newWSTestServer(t)
+	c := newTestController(t, s)
+
+	// The socket is up: this is a controller that CAN write and refuses to.
+	select {
+	case <-s.conn:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never accepted a connection")
+	}
+
+	if until := c.ArmedUntil(); !until.IsZero() {
+		t.Fatalf("ArmedUntil = %s on a freshly dialled controller, want the zero Time", until)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}})
+	if err == nil {
+		t.Fatal("Send on a disarmed controller returned nil; the Go-side gate is not enforcing")
+	}
+	if !errors.Is(err, ErrDisarmed) {
+		t.Errorf("Send error = %v, want it to wrap ErrDisarmed", err)
+	}
+	var be *BatchError
+	if !errors.As(err, &be) {
+		t.Fatalf("Send returned %T, want a *BatchError", err)
+	}
+	if be.Written != 0 {
+		t.Errorf("BatchError.Written = %d, want 0: a refused batch must write nothing", be.Written)
+	}
+
+	// The decisive assertion. Not "an error was returned" — that a routing
+	// change for a live clean feed never reached the wire.
+	time.Sleep(50 * time.Millisecond)
+	if f := s.frames(); len(f) != 0 {
+		t.Fatalf("a disarmed Send put %d frame(s) on the wire: %s", len(f), f[0])
+	}
+
+	// And that arming is what unblocks it, so the test cannot pass by the
+	// socket simply being broken.
+	c.Arm(ArmWindow)
+	if err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}}); err != nil {
+		t.Fatalf("Send after Arm: %v", err)
+	}
+	s.waitForFrames(1)
+}
+
+// TestArmWindowExpiresOnItsOwn covers the auto-clear. An armed write path that
+// stays armed because nothing remembered to close it is the failure mode the
+// timeout exists for: an operator called away, a webview that crashed with the
+// gate open, a code path that forgot to disarm.
+//
+// The expiry is a stored deadline compared at the moment of the write, so this
+// test can prove it with a short window and no timer racing anything.
+func TestArmWindowExpiresOnItsOwn(t *testing.T) {
+	s := newWSTestServer(t)
+	c := newTestController(t, s)
+
+	c.Arm(30 * time.Millisecond)
+	if c.ArmedUntil().IsZero() {
+		t.Fatal("ArmedUntil is the zero Time immediately after Arm")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Inside the window.
+	if err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}}); err != nil {
+		t.Fatalf("Send inside the arm window: %v", err)
+	}
+	s.waitForFrames(1)
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Outside it. Nothing was called to close the window.
+	if until := c.ArmedUntil(); !until.IsZero() {
+		t.Errorf("ArmedUntil = %s after the window lapsed, want the zero Time: an expired window must read as disarmed, not as a stale deadline", until)
+	}
+	err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}})
+	if !errors.Is(err, ErrDisarmed) {
+		t.Fatalf("Send after the window lapsed = %v, want ErrDisarmed", err)
+	}
+	// The error says the window lapsed rather than only that it was shut: an
+	// operator whose correction did not go out needs to know which.
+	if !strings.Contains(err.Error(), "closed at") {
+		t.Errorf("error = %q, want it to say the window opened and lapsed", err.Error())
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if f := s.frames(); len(f) != 1 {
+		t.Errorf("frames on the wire = %d, want 1: the second Send must not have written", len(f))
+	}
+}
+
+// TestDisarmAndCloseShutTheWindow covers the two explicit closes.
+//
+// Close disarming matters beyond tidiness: Close is what a shutdown path, a
+// reconnect-with-new-credentials and a failed teardown all run, and none of
+// them should be able to leave a write window open behind a socket somebody
+// then re-establishes.
+func TestDisarmAndCloseShutTheWindow(t *testing.T) {
+	t.Run("Disarm", func(t *testing.T) {
+		s := newWSTestServer(t)
+		c := newTestController(t, s)
+		c.Arm(ArmWindow)
+		c.Disarm()
+		if until := c.ArmedUntil(); !until.IsZero() {
+			t.Errorf("ArmedUntil = %s after Disarm, want the zero Time", until)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}}); !errors.Is(err, ErrDisarmed) {
+			t.Errorf("Send after Disarm = %v, want ErrDisarmed", err)
+		}
+		time.Sleep(30 * time.Millisecond)
+		if f := s.frames(); len(f) != 0 {
+			t.Errorf("a disarmed Send wrote %d frame(s)", len(f))
+		}
+	})
+
+	t.Run("Arm(0) is Disarm", func(t *testing.T) {
+		s := newWSTestServer(t)
+		c := newTestController(t, s)
+		c.Arm(ArmWindow)
+		c.Arm(0)
+		if until := c.ArmedUntil(); !until.IsZero() {
+			t.Errorf("ArmedUntil = %s after Arm(0), want the zero Time", until)
+		}
+	})
+
+	t.Run("Close", func(t *testing.T) {
+		s := newWSTestServer(t)
+		c := newTestController(t, s)
+		c.Arm(ArmWindow)
+		c.Close()
+		if until := c.ArmedUntil(); !until.IsZero() {
+			t.Errorf("ArmedUntil = %s after Close, want the zero Time: a closed Controller is never armed", until)
+		}
+		// Re-arming a closed controller must not resurrect the write path.
+		c.Arm(ArmWindow)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		err := c.Send(ctx, SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}})
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("Send after Close then Arm = %v, want ErrClosed", err)
+		}
+	})
+}
+
+// TestArmWindowIsSaneAndBounded pins the constant itself, in both directions.
+//
+// The lower bound is the gesture it has to survive: arm, read the matrix,
+// stage, Apply, and wait out the drawer's 4 s confirmation window, possibly
+// across a reconnect whose backoff caps at 10 s. The upper bound is the thing
+// it must NOT survive: a break in play or a handover, during which an armed
+// write path is a hazard nobody is watching.
+func TestArmWindowIsSaneAndBounded(t *testing.T) {
+	if ArmWindow < 30*time.Second {
+		t.Errorf("ArmWindow = %s, too short: an operator staging a correction and waiting for read-back confirmation would have the gate close mid-gesture on a live desk", ArmWindow)
+	}
+	if ArmWindow > 5*time.Minute {
+		t.Errorf("ArmWindow = %s, too long: it must not survive a break in play, or it stops being a gate", ArmWindow)
+	}
+	if ArmWindow <= reconnectBackoffCap {
+		t.Errorf("ArmWindow = %s is not longer than the reconnect backoff cap %s; a socket coming back up would outlive the window that permits the write waiting on it", ArmWindow, reconnectBackoffCap)
+	}
+}
+
 // TestSendAppliesCommandsInOrder checks the ordering guarantee. A batch that
 // removes a strip from the clean feed and then arms a limiter must arrive in
 // that order; reversed, there is a window in which the limiter is armed on a
 // strip still feeding CLN.
 func TestSendAppliesCommandsInOrder(t *testing.T) {
 	s := newWSTestServer(t)
-	c := newTestController(t, s)
+	c := armed(t, newTestController(t, s))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	cmds := []Command{
 		SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}},
-		SetCompLimit{Strip: "cam22-1", AGCMode: AGCLimiter, LimiterTh: -3},
+		SetCompLimit{Strip: "cam22-1", AGCMode: AGCLimiter, LimiterTh: LimiterAt(-3)},
 		SetInputMuted{Strip: "cam22-1", Muted: false},
 	}
 	if err := c.Send(ctx, cmds...); err != nil {
@@ -850,6 +1113,13 @@ func TestSendZeroCommandsIsANoOp(t *testing.T) {
 	s := newWSTestServer(t)
 	c := newTestController(t, s)
 
+	// Deliberately NOT armed. A batch that writes nothing cannot change a
+	// mixer, so the arm gate does not stand in front of it — and a caller that
+	// computed "nothing to correct" must not have to open a live write window
+	// in order to say so.
+	if until := c.ArmedUntil(); !until.IsZero() {
+		t.Fatalf("ArmedUntil = %s, want the zero Time", until)
+	}
 	if err := c.Send(context.Background()); err != nil {
 		t.Fatalf("Send() with no commands = %v, want nil", err)
 	}
@@ -864,7 +1134,7 @@ func TestSendZeroCommandsIsANoOp(t *testing.T) {
 // command at the end of a batch cannot leave the earlier ones applied.
 func TestInvalidCommandInBatchWritesNothing(t *testing.T) {
 	s := newWSTestServer(t)
-	c := newTestController(t, s)
+	c := armed(t, newTestController(t, s))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -872,7 +1142,7 @@ func TestInvalidCommandInBatchWritesNothing(t *testing.T) {
 	err := c.Send(ctx,
 		SetRouting{Matrix: MatrixOutput, Strip: "cam22-1", Outputs: []Bus{BusMaster}},
 		SetInputMuted{Strip: "cam22-1", Muted: true},
-		SetCompLimit{Strip: "cam22-1", AGCMode: AGCOff, LimiterTh: -3}, // silently inert
+		SetCompLimit{Strip: "cam22-1", AGCMode: AGCOff, LimiterTh: LimiterAt(-3)}, // silently inert
 	)
 	if err == nil {
 		t.Fatal("Send with an inert SetCompLimit returned nil")
@@ -917,6 +1187,7 @@ func TestMidBatchTransportFailureIsObservable(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	defer c.Close()
+	c.Arm(ArmWindow)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1030,6 +1301,7 @@ func TestWriteFailureIsRetriedOnceOnAFreshConnection(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	defer c.Close()
+	c.Arm(ArmWindow)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1206,7 +1478,7 @@ func (c *blockingConn) Close() error {
 // inert rather than reconnecting behind the caller's back.
 func TestSendAfterCloseFailsAndWritesNothing(t *testing.T) {
 	s := newWSTestServer(t)
-	c := newTestController(t, s)
+	c := armed(t, newTestController(t, s))
 	c.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1259,6 +1531,7 @@ func TestSendWaitsForReconnectAndRespectsContext(t *testing.T) {
 		close(block)
 		c.Close()
 	}()
+	c.Arm(ArmWindow)
 
 	// Take the socket down and leave it down.
 	c.mu.Lock()

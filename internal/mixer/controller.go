@@ -102,6 +102,106 @@ const maxPeerMessages = 16
 // controller, is always none.
 var ErrClosed = errors.New("mixer: controller is closed")
 
+// ErrDisarmed is returned by Send when no write window is open.
+//
+// Like ErrClosed it is wrapped in a *BatchError with Written 0, because a
+// refused batch and a half-written one must be distinguishable by a caller
+// deciding whether to re-read switcher_status.
+var ErrDisarmed = errors.New("mixer: controller is disarmed; call Arm before writing to a live mixer")
+
+// ArmWindow is the write window Arm is expected to be given, and the value a
+// caller should use unless it has a reason not to.
+//
+// TWO MINUTES, and here is the reasoning, because a number chosen carelessly
+// here is either a gate that is not a gate or a gate that fires mid-gesture on
+// a live desk.
+//
+// What has to fit inside it: an operator arms, reads a 54-row matrix, stages
+// one or more crosspoints, presses Apply, and waits for the change to be
+// confirmed from a following switcher_status frame. The drawer's own
+// confirmation window is 4 s (four frames at the measured ~1 Hz) and its
+// two-press golden confirm is 5 s, so the gesture itself is seconds. Two
+// minutes is roughly an order of magnitude of headroom over the slowest
+// realistic version of it — including a reconnect, whose backoff ladder caps
+// at 10 s and whose acquire wait is unbounded by design.
+//
+// What must NOT fit inside it: a break in play, a walk to the machine room, a
+// handover. Those are the states in which an armed write path is a hazard
+// nobody is watching, and two minutes is far shorter than any of them.
+//
+// Why a duration and not a latch: re-arming costs one call, so an operator who
+// overruns loses a click. An over-long or never-clearing window is not
+// recoverable by anyone, because nothing in the system notices it is open.
+//
+// The expiry is evaluated AT THE MOMENT OF THE WRITE against a stored
+// deadline, not by a timer goroutine. A timer can be delayed by a suspended or
+// heavily loaded process and leave the gate open past its deadline; comparing
+// a deadline cannot. It also means there is no goroutine to leak and no race
+// between a firing timer and a Send already in flight.
+const ArmWindow = 2 * time.Minute
+
+// armGate is the Go half of the two-gate write path.
+//
+// It is EMBEDDED in the Controller rather than sitting beside it so that a
+// binding cannot be handed the socket without it — see the Controller
+// interface comment. Its zero value is disarmed, which is the only safe
+// default: a Controller that has just been dialled must not be able to write.
+type armGate struct {
+	mu sync.Mutex
+	// until is the instant the window closes. The zero Time means disarmed,
+	// and a past value means expired — both are refused by armedAt, so
+	// expiry needs no timer and no cleanup.
+	until time.Time
+}
+
+// arm opens the window and returns its deadline. A non-positive window
+// disarms.
+func (g *armGate) arm(window time.Duration) time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if window <= 0 {
+		g.until = time.Time{}
+		return time.Time{}
+	}
+	g.until = time.Now().Add(window)
+	return g.until
+}
+
+// disarm shuts the window immediately.
+func (g *armGate) disarm() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.until = time.Time{}
+}
+
+// armedUntil reports the deadline, or the zero Time once it has passed. An
+// expired window reads as disarmed rather than as a stale deadline, so a
+// caller cannot mistake "it ran out four minutes ago" for "it is open".
+func (g *armGate) armedUntil() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.until.IsZero() || !time.Now().Before(g.until) {
+		return time.Time{}
+	}
+	return g.until
+}
+
+// armedAt reports whether a write happening now is permitted, and says why not
+// when it is not. The reason names the expiry explicitly, because "disarmed"
+// and "armed four minutes ago and it lapsed" are different things to an
+// operator whose routing change did not go out.
+func (g *armGate) armedAt(now time.Time) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.until.IsZero() {
+		return false, ErrDisarmed
+	}
+	if !now.Before(g.until) {
+		return false, fmt.Errorf("%w (the write window opened earlier and closed at %s; arm again)", ErrDisarmed, g.until.Format(time.RFC3339))
+	}
+	return true, nil
+}
+
 // ============================================================================
 // Command envelopes
 // ============================================================================
@@ -343,12 +443,29 @@ func (c SetChFader) Envelope() (map[string]any, error) {
 // package cannot catch this one. The state will show exactly what was sent and
 // no limiting will happen.
 //
-// A SetCompLimit carrying a non-zero LimiterTh with any other AGCMode is
-// therefore refused before transmission. Note the shape of that rule: it is
-// keyed on LimiterTh being MEANT, not on the mode. Turning a limiter off is
-// legitimate and stays legal — AGCOff with LimiterTh 0 is the factory state of
-// every strip in the live frame, and it renders exactly as measured, including
-// the vendor bundle's own agc_mode:"off" example.
+// A SetCompLimit carrying a LimiterTh with any other AGCMode is therefore
+// refused before transmission. Note the shape of that rule: it is keyed on
+// LimiterTh being MEANT, not on the mode. Turning a limiter off is legitimate
+// and stays legal — AGCOff with a NIL LimiterTh is the factory state of every
+// strip in the live frame, and it renders exactly as measured, including the
+// vendor bundle's own agc_mode:"off" example.
+//
+// WHY "MEANT" IS A NIL CHECK AND NOT A ZERO CHECK. It used to be
+// `c.LimiterTh != 0`, which had a hole exactly where it hurts: 0 dBFS is a
+// real threshold — a brickwall at digital full scale — and it is the natural
+// thing to reach for on the very bus that is MEASURED to sum past full scale
+// (BusMaster, two sources at -5 dBFS summing to +1 dBFS with a -27 dB
+// distortion residual). A caller asking for that with AGCOff passed the
+// guard, was accepted by the mixer, read the value back unchanged, and did no
+// limiting whatsoever. The one command that mitigates the clipping was the one
+// command that could silently not run. SetCompLimit.LimiterTh is now a
+// pointer, so "no limiter" (nil) and "limiter at 0 dBFS" (LimiterAt(0)) are
+// different values and this guard can tell them apart.
+//
+// The converse is refused too: AGCLimiter with a nil LimiterTh would arm the
+// limiter and leave its threshold at whatever limiter_th 0 means, which is a
+// brickwall nobody asked for. Arming a limiter without saying where it clamps
+// is the same guess in the other direction.
 func (c SetCompLimit) Envelope() (map[string]any, error) {
 	if c.Strip == "" {
 		return nil, errors.New("mixer: SetCompLimit: Strip is empty; want a strip name such as \"cam23-1\"")
@@ -360,16 +477,28 @@ func (c SetCompLimit) Envelope() (map[string]any, error) {
 	default:
 		return nil, fmt.Errorf("mixer: SetCompLimit: unknown AGCMode %q for strip %q; want %q or %q", string(c.AGCMode), c.Strip, string(AGCOff), string(AGCLimiter))
 	}
-	if c.LimiterTh != 0 && c.AGCMode != AGCLimiter {
-		return nil, fmt.Errorf("mixer: SetCompLimit: strip %q sets LimiterTh %g dBFS with AGCMode %q; the limiter threshold is SILENTLY INERT unless AGCMode is %q — the mixer stores the value and reads it back unchanged while doing no limiting, so a read-back check will not catch this. Set AGCMode to %q, or leave LimiterTh at 0",
-			c.Strip, c.LimiterTh, string(c.AGCMode), string(AGCLimiter), string(AGCLimiter))
+	if c.LimiterTh != nil && c.AGCMode != AGCLimiter {
+		return nil, fmt.Errorf("mixer: SetCompLimit: strip %q sets LimiterTh %g dBFS with AGCMode %q; the limiter threshold is SILENTLY INERT unless AGCMode is %q — the mixer stores the value and reads it back unchanged while doing no limiting, so a read-back check will not catch this. Set AGCMode to %q, or leave LimiterTh nil for no limiter",
+			c.Strip, *c.LimiterTh, string(c.AGCMode), string(AGCLimiter), string(AGCLimiter))
+	}
+	if c.LimiterTh == nil && c.AGCMode == AGCLimiter {
+		return nil, fmt.Errorf("mixer: SetCompLimit: strip %q selects AGCMode %q with no LimiterTh; that would arm the limiter and send limiter_th 0, a brickwall at digital full scale the caller did not ask for. Say the threshold with LimiterAt, e.g. LimiterAt(-3)",
+			c.Strip, string(AGCLimiter))
+	}
+	// nil serialises as limiter_th 0, which is the factory state and the
+	// measured shape of the vendor's own agc_mode:"off" example. The wire is
+	// identical either way; the distinction lives entirely in the guards
+	// above, because the mixer cannot make it.
+	limiterTh := 0.0
+	if c.LimiterTh != nil {
+		limiterTh = *c.LimiterTh
 	}
 	return envelope("set_comp_limit", map[string]any{
 		"name":          c.Strip,
 		"agc_mode":      string(c.AGCMode),
 		"pre_gain":      c.PreGain,
 		"compressor_th": c.CompressorTh,
-		"limiter_th":    c.LimiterTh,
+		"limiter_th":    limiterTh,
 	}), nil
 }
 
@@ -661,6 +790,12 @@ type WSController struct {
 
 	dial    dialFunc
 	backoff []time.Duration
+
+	// gate is the Go-side arm gate. EMBEDDED, not a collaborator held
+	// alongside: there is no *WSController that does not have one, so there is
+	// no assembly of this type that produces an ungated Send. Its zero value
+	// is disarmed, so a freshly dialled controller cannot write.
+	gate armGate
 
 	// ctx is cancelled by Close; it bounds every dial and wakes every waiter.
 	ctx    context.Context
@@ -1117,12 +1252,46 @@ func writeOne(ctx context.Context, conn wsConn, payload []byte) error {
 // and comparing. Reporting a nil error to an operator as "routing fixed" is
 // how a fix that never applied gets signed off.
 //
-// Sending zero commands is a no-op and not an error. The context bounds the
-// whole batch, including any wait for a reconnect; on cancellation, commands
-// already written have already been applied and are not rolled back.
+// # The arm gate
+//
+// Send refuses with ErrDisarmed, having written nothing, unless Arm has opened
+// a window that has not expired. The check is HERE, in Go, and not only in the
+// drawer that calls it: the JavaScript gate is good but it is one layer, and
+// once this is behind a Wails binding anything in the webview can reach the
+// binding. Two independent gates means a bypass needs both.
+//
+// The check runs BEFORE any envelope is built, so a disarmed Send does not
+// even serialise the commands, let alone open the socket.
+//
+// Sending zero commands is a no-op and not an error, and is permitted while
+// disarmed: a caller that computed "nothing to correct" must be able to call
+// Send unconditionally without first opening a live write window, and a batch
+// that writes nothing cannot change a mixer.
+//
+// The context bounds the whole batch, including any wait for a reconnect; on
+// cancellation, commands already written have already been applied and are not
+// rolled back.
 func (c *WSController) Send(ctx context.Context, cmds ...Command) error {
 	if len(cmds) == 0 {
 		return nil
+	}
+
+	// Phase 0: the gate. Evaluated against the clock now, not against
+	// anything a caller read earlier, and before a single byte is built.
+	//
+	// Closed is reported ahead of disarmed because Close disarms, so after a
+	// Close both are true and ErrClosed is the one that tells the caller
+	// something they did not already know. acquire would reach the same
+	// conclusion later; doing it here keeps a closed controller from
+	// serialising a batch it can never write.
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return &BatchError{Index: 0, Total: len(cmds), Written: 0, Command: commandName(cmds[0]), Err: ErrClosed}
+	}
+	if ok, err := c.gate.armedAt(time.Now()); !ok {
+		return &BatchError{Index: 0, Total: len(cmds), Written: 0, Command: commandName(cmds[0]), Err: err}
 	}
 
 	// Phase 1: build everything. Nothing is written in this loop, so a
@@ -1153,6 +1322,35 @@ func (c *WSController) Send(ctx context.Context, cmds ...Command) error {
 		}
 	}
 	return nil
+}
+
+// Arm opens the write window for window and returns the instant it closes.
+//
+// Pass ArmWindow unless there is a reason not to; see that constant for how
+// two minutes was chosen and why the expiry is a stored deadline rather than a
+// timer. A window of zero or less disarms.
+//
+// Arming is the only thing that permits Send. Nothing else opens the gate:
+// dialling does not, reconnecting does not, and a previous successful Send
+// does not. Arming again extends the window rather than stacking, so a caller
+// that arms on every operator gesture cannot accumulate one.
+//
+// Arming does not touch the mixer. It permits a later Send to.
+func (c *WSController) Arm(window time.Duration) time.Time {
+	return c.gate.arm(window)
+}
+
+// Disarm shuts the write window immediately. Idempotent, and safe on a closed
+// controller.
+func (c *WSController) Disarm() {
+	c.gate.disarm()
+}
+
+// ArmedUntil reports when the window closes, or the zero Time when disarmed,
+// expired or closed. See the Controller interface: it is a report, not a
+// permission — Send re-checks at the moment of the write.
+func (c *WSController) ArmedUntil() time.Time {
+	return c.gate.armedUntil()
 }
 
 // sendOne writes one envelope, retrying once on a fresh connection.
@@ -1189,9 +1387,15 @@ func (c *WSController) sendOne(ctx context.Context, payload []byte) error {
 // and only then waits for the supervisor to exit. No lock is held across that
 // wait, and the reader takes no lock Close holds.
 //
-// After Close, Send fails with ErrClosed wrapped in a *BatchError, having
-// written nothing.
+// After Close, Send fails wrapped in a *BatchError, having written nothing.
+//
+// Close DISARMS first, before anything else and outside closeOnce, so that a
+// second Close, a Close racing a Send, and a Close that somehow fails to tear
+// the socket down all leave the gate shut. A closed Controller is never armed:
+// ArmedUntil reports the zero Time, and Arm on a closed controller opens a
+// window that Send refuses anyway, with ErrClosed.
 func (c *WSController) Close() error {
+	c.gate.disarm()
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true

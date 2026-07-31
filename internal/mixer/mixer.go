@@ -649,6 +649,19 @@ const (
 // WP-M1 must reject a SetCompLimit that carries a LimiterTh with any AGCMode
 // other than AGCLimiter rather than relying on verification after the fact.
 //
+// THE SECOND TRAP, and why LimiterTh is a POINTER: 0 dBFS is a legitimate
+// limiter threshold — a brickwall at digital full scale is precisely the
+// mitigation this command exists for. With a plain float64 there is no way to
+// tell "I want a brickwall at 0 dBFS" from "I am not setting a limiter at
+// all", because both are the zero value. The rejection above keys on the
+// threshold being MEANT, so a caller who meant 0 dBFS slipped through it,
+// sent AGCOff, was accepted, read the value back unchanged, and did no
+// limiting — on the one command that mitigates BusMaster summing at unity.
+//
+// So "no limiter" has an explicit spelling: LimiterTh nil. A non-nil
+// LimiterTh — INCLUDING LimiterAt(0) — means the caller means that threshold
+// and therefore requires AGCLimiter. Build one with LimiterAt.
+//
 // This command is the mitigation for the master bus summing at unity with no
 // limiter: see BusMaster, where two sources at -5 dBFS summed to +1 dBFS with
 // a -27 dB distortion residual.
@@ -668,9 +681,26 @@ type SetCompLimit struct {
 	// CompressorTh is the compressor threshold in dBFS.
 	CompressorTh float64 `json:"compressor_th"`
 
-	// LimiterTh is the limiter threshold in dBFS. Inert unless AGCMode is
-	// AGCLimiter — see the type comment.
-	LimiterTh float64 `json:"limiter_th"`
+	// LimiterTh is the limiter threshold in dBFS, or nil for NO LIMITER.
+	//
+	// nil is the explicit spelling of "not setting a limiter": the wire still
+	// carries limiter_th 0, which is the factory state of every strip in the
+	// live frame, and AGCOff stays legal. A non-nil value means the caller
+	// means that threshold — LimiterAt(0) is a brickwall at digital full
+	// scale, not an absent limiter — and is refused unless AGCMode is
+	// AGCLimiter. See the type comment for both traps.
+	LimiterTh *float64 `json:"limiter_th"`
+}
+
+// LimiterAt returns a LimiterTh for a threshold the caller MEANS, in dBFS.
+//
+// It exists so that a brickwall at 0 dBFS can be spelled at all:
+// LimiterAt(0) is a threshold, whereas a nil LimiterTh is no limiter. Both
+// serialise limiter_th, so the wire shape is unchanged either way — the
+// distinction is enforced before transmission, in Envelope, because the mixer
+// itself cannot tell the two apart and reads either back unchanged.
+func LimiterAt(dbfs float64) *float64 {
+	return &dbfs
 }
 
 // Envelope for SetCompLimit is implemented in controller.go (WP-M1), which
@@ -682,14 +712,29 @@ type SetCompLimit struct {
 // through ParseSnapshot, and nothing in this package requires a Controller in
 // order to display the mixer — the drawer is fully functional, and safe,
 // with no Controller at all.
+//
+// # The arm gate is part of this interface, deliberately
+//
+// Arm, Disarm and ArmedUntil are on the interface rather than on the concrete
+// *WSController so that there is no way to hold a Controller and not have the
+// gate. A Wails binding, a coordinator, a devtools console or a future code
+// path receives this interface, and every one of them gets a Send that is
+// closed until somebody armed it.
+//
+// This is the SECOND of two independent gates. The first is in JavaScript
+// (createWriteGate in frontend/src/ui/mixer/model.js) and is a good gate — but
+// it is one layer, in the language a webview makes easiest to bypass. Once the
+// drawer is wired to a binding, anything with access to that binding can call
+// it. A bypass now needs both: the JS gate's armed state AND an unexpired
+// window here.
 type Controller interface {
 	// Send transmits commands in order and returns when they have been
 	// written.
 	//
-	// THIS IS THE ARM-GATED WRITE PATH. It changes a live mixer that feeds
-	// PGM and CLN outputs, and the drawer must not call it unless the
-	// operator has explicitly armed the UI — see setArmed in
-	// frontend/src/ui/mixer/contract.js.
+	// THIS IS THE ARM-GATED WRITE PATH, and the gate is enforced HERE and not
+	// only by the caller's convention. It changes a live mixer that feeds the
+	// PGM and CLN outputs. Send refuses with ErrDisarmed unless Arm has
+	// opened a window that has not expired — see Arm.
 	//
 	// A nil return means the commands were SENT, not that they took effect.
 	// The mixer acknowledges at the transport level, and at least one command
@@ -699,13 +744,46 @@ type Controller interface {
 	// Treating a nil error as confirmation is how a routing "fix" that never
 	// applied gets reported to the operator as done.
 	//
-	// Sending zero commands is a no-op and not an error. The context bounds
-	// the write; on cancellation, commands already written have already been
-	// applied and are not rolled back.
+	// Sending zero commands is a no-op and not an error, armed or not: a
+	// caller that computed "nothing to correct" must be able to call Send
+	// unconditionally without first opening a write window.
+	//
+	// The context bounds the write; on cancellation, commands already written
+	// have already been applied and are not rolled back.
 	Send(ctx context.Context, cmds ...Command) error
 
+	// Arm opens the write window for window and returns the instant it
+	// closes. It is the ONLY thing that permits Send, and nothing opens it
+	// implicitly: not dialling, not reconnecting, not a previous successful
+	// Send.
+	//
+	// The window AUTO-CLEARS. It is not a flag somebody has to remember to
+	// clear — an operator who arms the drawer and is called away, a webview
+	// that crashes with the gate open, a code path that forgets to disarm,
+	// all end with a shut gate and no live write path. See ArmWindow for the
+	// default and for why a duration was chosen over a latch.
+	//
+	// Arming again extends the window; it does not stack. A window of zero or
+	// less disarms, so Arm(0) and Disarm mean the same thing.
+	//
+	// Arming changes nothing on the mixer. It only permits a later Send to.
+	Arm(window time.Duration) time.Time
+
+	// Disarm shuts the window immediately. Idempotent, and safe to call on a
+	// closed Controller.
+	Disarm()
+
+	// ArmedUntil reports when the current window closes, or the zero Time
+	// when the Controller is disarmed, expired or closed.
+	//
+	// It is a report, not a permission: it can go stale the instant it
+	// returns, so Send re-checks the deadline at the moment of the write
+	// rather than trusting anything a caller read beforehand.
+	ArmedUntil() time.Time
+
 	// Close releases the WebSocket. It is safe to call more than once, and a
-	// Controller must not be used after it.
+	// Controller must not be used after it. It also disarms — a closed
+	// Controller is never armed.
 	Close() error
 }
 

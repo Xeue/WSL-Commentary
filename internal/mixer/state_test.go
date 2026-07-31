@@ -519,6 +519,92 @@ const minimalState = `{
 	"fader":{"cam1-1":{"ch_fader":{"enabled":[true,true],"gain":[-3,-3]}}}
 }`
 
+// objectNeighboursState is minimalState with one addition that the live frame
+// cannot supply: non-strip keys inside an input whose values ARE JSON objects.
+//
+// WHY IT HAD TO BE SYNTHESISED. TestLiveFrameNonStripKeysAreNotStrips looks
+// like it covers looksLikeStrip and does not. Every non-strip key in the real
+// frame is "assign_list" (an array) or "channel_count" (a number), and
+// decodeObject rejects both before the muted/display_name test is ever
+// consulted. So the live frame stays green with looksLikeStrip's body replaced
+// by `return true` — the detector was structurally untested by the fixture
+// that appeared to test it.
+//
+// The three neighbours below close that off, one per way the detector can be
+// weakened:
+//
+//	"eq"       an object with NEITHER marker key — passes decodeObject, so
+//	           only the marker test rejects it. Catches `return true`.
+//	"agc"      an object with muted but no display_name. Catches hasMuted ||
+//	           hasName, and mirrors a bus entry, which really does have that
+//	           shape.
+//	"settings" an object with display_name but no muted. Catches the same
+//	           mutation from the other side, and mirrors the per-input status
+//	           node, whose shape this genuinely is.
+//
+// A promoted neighbour is not a cosmetic bug: it appears on the surface as a
+// channel with no routing entry, which the drawer renders as NOT in the clean
+// feed, and it inflates the strip count an operator uses to check the drawer
+// against the desk.
+const objectNeighboursState = `{
+	"inputs":{"cam1":{"assign_list":[[1,2]],"channel_count":2,
+		"eq":{"enabled":true,"bands":[{"freq":100,"gain":0}]},
+		"agc":{"muted":false,"channel_count":2},
+		"settings":{"display_name":"CLAUDE-COMMS","phantom":true},
+		"cam1-1":{"display_name":"cam1-1","follow":false,"follow_sources":["cam1"],
+			"muted":true,"sub_ch_mode":"ST_W","sub_ch_mode_set":"ST_W"}}},
+	"matrix":{"cam1-1":{"outputs":["master","aux1","aux2"],"pfl_outputs":[]}},
+	"outputs":{"master":{"channel_count":2,"muted":false},"aux1":{"channel_count":2,"muted":false},
+		"aux2":{"channel_count":2,"muted":false},"mon1":{"channel_count":2,"muted":false},
+		"mon2":{"channel_count":2,"muted":false},"mon3":{"channel_count":2,"muted":false},
+		"mon4":{"channel_count":2,"muted":false}},
+	"levels":{"cam1-1":[-20,-21]},
+	"peak_hold_levels":{"cam1-1":[-10,-11]},
+	"fader":{"cam1-1":{"ch_fader":{"enabled":[true,true],"gain":[-3,-3]}}}
+}`
+
+// TestObjectNeighboursOfAStripAreNotStrips exercises looksLikeStrip through
+// the whole parse, against neighbours the live frame does not contain.
+//
+// See objectNeighboursState for why this fixture exists and what each of the
+// three neighbours catches.
+func TestObjectNeighboursOfAStripAreNotStrips(t *testing.T) {
+	snap, warnings, err := ParseSnapshotWithWarnings(buildFrame(objectNeighboursState, inputNode("cam1", "Input 1")))
+	if err != nil {
+		t.Fatalf("ParseSnapshotWithWarnings: %v", err)
+	}
+	for _, w := range warnings {
+		t.Errorf("unexpected warning: %s", w)
+	}
+
+	if len(snap.Strips) != 1 {
+		names := make([]string, 0, len(snap.Strips))
+		for _, s := range snap.Strips {
+			names = append(names, s.Name)
+		}
+		t.Fatalf("len(Strips) = %d %v, want 1 [cam1-1]: an object sitting beside a strip was promoted to a phantom channel", len(snap.Strips), names)
+	}
+	if snap.Strips[0].Name != "cam1-1" {
+		t.Fatalf("Strips[0].Name = %q, want %q", snap.Strips[0].Name, "cam1-1")
+	}
+
+	for _, name := range []string{"eq", "agc", "settings"} {
+		if _, ok := snap.Strip(name); ok {
+			t.Errorf("Strip(%q) found; it is an object key of an input, not a channel strip", name)
+		}
+	}
+
+	// The real strip must still be intact, so the test cannot pass by the
+	// detector having become too strict instead of too loose.
+	s := snap.Strips[0]
+	if !s.Muted || s.SubChMode != "ST_W" || s.DisplayName != "Input 1" {
+		t.Errorf("strip = %+v, want muted / ST_W / Input 1", s)
+	}
+	if len(s.Outputs) != 3 {
+		t.Errorf("Outputs = %v, want the three default buses", s.Outputs)
+	}
+}
+
 // TestParseSnapshotFatalCases covers the frames that must NOT yield a Snapshot.
 //
 // The rule these enforce is the one from ParseSnapshot's contract: an empty

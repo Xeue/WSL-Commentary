@@ -35,6 +35,7 @@ import { ALL_BUSES, CLEAN_FEED_BUS, busLabel } from './contract.js';
 import {
   METER_FLOOR_DB,
   buildMatrixModel,
+  busListText,
   changeSeverity,
   compareSnapshots,
   createWriteGate,
@@ -160,6 +161,7 @@ export function createMixerDrawer(opts) {
   const gate = createWriteGate({
     sendCommands: (cmds) => o.sendCommands(cmds),
     isArmed: () => state.armed,
+    viewIsFresh: () => viewFreshness(state.lastUpdateAt, Date.now()),
     onError,
   });
 
@@ -253,14 +255,101 @@ export function createMixerDrawer(opts) {
    * applyPending sends the staged crosspoint changes. The ONLY place in this
    * module that reaches the write gate, and it runs solely from the Apply
    * click handler.
+   *
+   * ===================== WHY THIS RE-READS BEFORE IT SENDS ==================
+   *
+   * set_routing REPLACES a strip's whole bus set. The staged crosspoint says
+   * what ONE bus should become; every other bus in the command comes from the
+   * routing this drawer happens to be holding. If that routing is old, the
+   * command is one intended change wrapped in a rollback of everything else on
+   * that strip — applied to a desk that is on air.
+   *
+   * So the apply path has three separate defences, in this order:
+   *
+   *   1. REFUSE A STALE VIEW. If updates have stopped, nothing is sent and the
+   *      operator is told why, with the age. Staged changes are KEPT, because
+   *      the intention was fine — it is the picture that was not.
+   *   2. RE-PLAN FROM A FRESH FRAME. Even a live view is up to a second old,
+   *      and the desk is shared. The staged crosspoints are re-applied to the
+   *      frame that arrives AFTER Apply was pressed, never to the one that was
+   *      on screen when it was. If the base moved, the operator is told after
+   *      the fact — their intent is still expressed exactly, on the routing
+   *      that is actually there.
+   *   3. THE GATE. createWriteGate re-checks armed AND freshness at the moment
+   *      of the write, so none of this depends on this function remembering to.
+   *
+   * The refusal is a property of this path and of the gate, never of the Apply
+   * button's disabled state: a keyboard activation or a programmatic click
+   * arrives here just the same, and a disabled attribute stops neither.
    */
   async function applyPending() {
-    const plan = planPending();
-    if (plan.commands.length === 0) {
+    if (state.pending.size === 0) {
       notice('Nothing staged to send.', 'info');
       render();
       return;
     }
+
+    // 1. Freshness, before anything is planned or read.
+    const fresh = viewFreshness(state.lastUpdateAt, Date.now());
+    if (!fresh.fresh) {
+      notice(
+        `NOT SENT - ${fresh.text.toUpperCase()}. Nothing was written. ` +
+          'set_routing replaces a strip\'s WHOLE bus set, so applying from a view this old would send every other bus ' +
+          'back to what it was when the feed stopped - to a live desk. ' +
+          'Your staged changes have been KEPT. Wait for the view to go live again and press Apply.',
+        'warn',
+      );
+      render();
+      return;
+    }
+
+    // 2. Re-plan from the frame that arrives AFTER Apply.
+    const before = state.model;
+    try {
+      const snap = await o.getSnapshot();
+      if (!snap || typeof snap !== 'object') throw new Error('the mixer returned no state');
+      applySnapshot(snap);
+    } catch (err) {
+      onError(err, 'mixer: getSnapshot before Apply');
+      notice(
+        'NOT SENT: the mixer could not be re-read immediately before writing, so the routing this change would ' +
+          'replace is unknown. Nothing was written and your staged changes have been kept.',
+        'warn',
+      );
+      render();
+      return;
+    }
+    if (!state.model.hasData) {
+      notice(
+        'NOT SENT: the mixer reported no state when re-read, so there is no routing to build a replacement from. ' +
+          'Nothing was written and your staged changes have been kept.',
+        'warn',
+      );
+      render();
+      return;
+    }
+
+    const plan = planPending();
+    if (plan.commands.length === 0) {
+      // Everything staged is already true on the fresh frame — most likely
+      // somebody else just made the same correction. Not an error, and
+      // emphatically not a write.
+      state.pending.clear();
+      notice(
+        'Nothing sent: on the state just read back, every staged change is already in effect. ' +
+          'The staged list has been cleared.',
+        'info',
+      );
+      render();
+      return;
+    }
+
+    const moved = plan.intents.filter((i) => {
+      const was = before.rows.find((r) => r.name === i.strip);
+      return was && !sameSet(was.outputs, i.base);
+    });
+
+    // 3. The gate. It re-checks armed and freshness itself.
     const result = await gate.submit(plan.commands, 'operator pressed Apply');
     if (!result.sent) {
       notice(`NOT SENT: ${result.reason}`, 'warn');
@@ -270,8 +359,14 @@ export function createMixerDrawer(opts) {
     state.pending.clear();
     const deadline = Date.now() + CONFIRM_WINDOW_MS;
     state.awaiting = plan.intents.map((i) => ({ ...i, deadline, state: 'pending' }));
+    const movedWord =
+      moved.length === 0
+        ? ''
+        : ` The desk had moved since the view you acted on: ${moved
+            .map((i) => i.label)
+            .join(', ')} - your change was re-planned onto the routing that is actually there, so no other bus was rolled back.`;
     notice(
-      `Sent ${plan.commands.length} routing change(s). SENT IS NOT APPLIED - waiting for the mixer to report it back.`,
+      `Sent ${plan.commands.length} routing change(s). SENT IS NOT APPLIED - waiting for the mixer to report it back.${movedWord}`,
       'warn',
     );
     render();
@@ -283,6 +378,13 @@ export function createMixerDrawer(opts) {
    * One command per strip, never one per crosspoint: set_routing REPLACES the
    * whole bus set, so two separate commands for the same strip would have the
    * second undo the first.
+   *
+   * IT PLANS FROM state.model, WHICH IS WHATEVER FRAME WAS LAST APPLIED. That
+   * is the whole reason applyPending re-reads before calling this: the base
+   * every unstaged bus is copied from is only as current as the last snapshot,
+   * and set_routing sends that base back to the desk verbatim. Each intent
+   * carries the base it was planned from so the caller can say whether the
+   * desk moved underneath the operator.
    */
   function planPending() {
     const byStrip = new Map();
@@ -301,7 +403,12 @@ export function createMixerDrawer(opts) {
       // every avoidable write to a live mixer is worth avoiding.
       if (sameSet(entry.outputs, entry.row.outputs)) continue;
       commands.push(routingCommand(stripName, entry.outputs));
-      intents.push({ strip: stripName, label: entry.row.label, desired: entry.outputs.slice() });
+      intents.push({
+        strip: stripName,
+        label: entry.row.label,
+        desired: entry.outputs.slice(),
+        base: entry.row.outputs.slice(),
+      });
     }
     return { commands, intents };
   }
@@ -376,7 +483,13 @@ export function createMixerDrawer(opts) {
     // writes; the contract's "must not poll" is about getSnapshot.
     if (typeof setInterval !== 'function') return null;
     const t = setInterval(() => {
-      if (state.open && !state.destroyed) renderFreshness();
+      if (!state.open || state.destroyed) return;
+      renderFreshness();
+      // renderArm too, so that when the feed stops the Apply control says
+      // BLOCKED without waiting for an update() that is not coming. This is
+      // the only case where the drawer changes without new state, and it is
+      // exactly the case that matters.
+      renderArm();
     }, 1000);
     if (t && typeof t.unref === 'function') t.unref();
     return t;
@@ -430,11 +543,21 @@ export function createMixerDrawer(opts) {
     ui.armState.className = state.armed ? 'mx-armstate mx-armstate--armed' : 'mx-armstate';
 
     const staged = state.pending.size;
+    // The freshness state is SHOWN on the Apply control as well as enforced in
+    // applyPending and in the write gate. Showing it is not the gate — an
+    // aria-disabled button still activates from a keyboard and still fires
+    // from a programmatic click — it is so the operator learns why before they
+    // press it rather than after.
+    const fresh = viewFreshness(state.lastUpdateAt, Date.now());
     ui.applyBtn.hidden = !state.armed;
     ui.discardBtn.hidden = !state.armed || staged === 0;
-    ui.applyBtn.textContent = staged === 0 ? 'Apply (nothing staged)' : `Apply ${staged} change(s) to the live mixer`;
-    ui.applyBtn.setAttribute('aria-disabled', String(staged === 0));
-    ui.applyBtn.className = staged === 0 ? 'mx-btn' : 'mx-btn mx-btn--danger';
+    ui.applyBtn.textContent = !fresh.fresh
+      ? `Apply BLOCKED - ${fresh.text}`
+      : staged === 0
+        ? 'Apply (nothing staged)'
+        : `Apply ${staged} change(s) to the live mixer`;
+    ui.applyBtn.setAttribute('aria-disabled', String(staged === 0 || !fresh.fresh));
+    ui.applyBtn.className = staged === 0 || !fresh.fresh ? 'mx-btn' : 'mx-btn mx-btn--danger';
 
     renderStagedList();
     renderAwaiting();
@@ -458,16 +581,28 @@ export function createMixerDrawer(opts) {
     }
   }
 
+  /**
+   * renderAwaiting is the HIGHEST-STAKES READ IN THIS DRAWER.
+   *
+   * It appears immediately after a write to a live desk and it is what the
+   * operator checks to decide the change did what they meant. Every bus in it
+   * goes through busListText, never a bare join: "CONFIRMED: CLAUDE-COMMS ->
+   * master, aux1" reads as success while confirming that commentary is in the
+   * client's clean feed, which is the single failure this whole drawer exists
+   * to prevent. Rendered through the labels it reads "... -> master (PGM),
+   * aux1 (CLN - clean feed)" and cannot be misread as success.
+   */
   function renderAwaiting() {
     clear(ui.awaitList);
     ui.awaitBox.hidden = state.awaiting.length === 0;
     for (const a of state.awaiting) {
+      const buses = busListText(a.desired);
       const text =
         a.state === 'confirmed'
-          ? `CONFIRMED by the mixer: ${a.label} -> ${a.desired.join(', ') || '(none)'}`
+          ? `CONFIRMED by the mixer: ${a.label} -> ${buses}`
           : a.state === 'failed'
-            ? `NOT CONFIRMED: ${a.label} was sent as ${a.desired.join(', ') || '(none)'} but the mixer has not reported it. The write may not have taken effect.`
-            : `Sent, awaiting confirmation: ${a.label} -> ${a.desired.join(', ') || '(none)'}`;
+            ? `NOT CONFIRMED: ${a.label} was sent as ${buses} but the mixer has not reported it. The write may not have taken effect.`
+            : `Sent, awaiting confirmation: ${a.label} -> ${buses}`;
       ui.awaitList.appendChild(
         el(doc, 'li', {
           className: `mx-await mx-await--${a.state}`,
@@ -524,7 +659,12 @@ export function createMixerDrawer(opts) {
       li.appendChild(
         el(doc, 'span', {
           className: 'mx-diff-detail',
-          text: `${d.target} ${d.field}: golden "${d.golden}" -> now "${d.current}"`,
+          // d.label, never d.target: for a bus diff the target IS a raw bus
+          // name, so "aux1 muted: golden ..." would be the clean feed
+          // described as a string the operator cannot decode. MixerDiff says
+          // label is "already resolved, safe to show" — this is the read it
+          // was resolved for.
+          text: `${d.label} ${d.field}: golden "${d.golden}" -> now "${d.current}"`,
         }),
       );
       ui.driftList.appendChild(li);

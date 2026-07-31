@@ -15,12 +15,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ALL_BUSES, CLEAN_FEED_BUS } from './contract.js';
+import { ALL_BUSES, CLEAN_FEED_BUS, busLabel } from './contract.js';
 import {
   METER_CEIL_DB,
   METER_FLOOR_DB,
   MUTE_FADER_DB,
   buildMatrixModel,
+  busListText,
   changeSeverity,
   compareSnapshots,
   createWriteGate,
@@ -364,14 +365,22 @@ function gateHarness(armed) {
   const sent = [];
   const errors = [];
   let isArmed = armed;
+  let fresh = true;
   const gate = createWriteGate({
     sendCommands: async (cmds) => {
       sent.push(cmds);
     },
     isArmed: () => isArmed,
+    viewIsFresh: () => (fresh ? { fresh: true, text: 'live' } : { fresh: false, text: 'STALE - no update for 40s' }),
     onError: (err, ctx) => errors.push([err.message, ctx]),
   });
-  return { gate, sent, errors, arm: (v) => { isArmed = v; } };
+  return {
+    gate,
+    sent,
+    errors,
+    arm: (v) => { isArmed = v; },
+    setFresh: (v) => { fresh = v; },
+  };
 }
 
 const ONE_COMMAND = [{ kind: 'setRouting', args: { matrix: 'output', input: 'cam22-1', outputs: ['master'] } }];
@@ -423,6 +432,31 @@ test('the write gate reads armed at the moment of the write, not when it was bui
   assert.deepEqual(h.sent, []);
 });
 
+test('the write gate REFUSES a write from a stale view, however armed and however gestured', async () => {
+  // S2. set_routing is an absolute replace, so a write planned from a stale
+  // matrix carries a rollback of every bus the operator did not touch. This is
+  // the gate, not the button: submit() is what a keyboard activation, a
+  // programmatic click and any future control all reach.
+  const h = gateHarness(true);
+  h.setFresh(false);
+  const r = await h.gate.submit(ONE_COMMAND, 'operator pressed Apply');
+  assert.equal(r.sent, false);
+  assert.match(r.reason, /REPLACES/);
+  assert.match(r.reason, /STALE - no update for 40s/, 'the refusal must carry the age, not just the fact');
+  assert.deepEqual(h.sent, [], 'sendCommands must not have been called at all');
+});
+
+test('the write gate reads freshness at the moment of the write, not when it was built', async () => {
+  // The same property isArmed has, for the same reason: a plan built while the
+  // feed was live must not be sent after it stopped.
+  const h = gateHarness(true);
+  h.setFresh(false);
+  assert.equal((await h.gate.submit(ONE_COMMAND, 'operator pressed Apply')).sent, false);
+  h.setFresh(true);
+  assert.equal((await h.gate.submit(ONE_COMMAND, 'operator pressed Apply')).sent, true);
+  assert.equal(h.sent.length, 1);
+});
+
 test('the write gate reports a failed send and does not claim it was sent', async () => {
   const errors = [];
   const gate = createWriteGate({
@@ -430,6 +464,7 @@ test('the write gate reports a failed send and does not claim it was sent', asyn
       throw new Error('websocket closed');
     },
     isArmed: () => true,
+    viewIsFresh: () => ({ fresh: true, text: 'live' }),
     onError: (err, ctx) => errors.push([err.message, ctx]),
   });
   const r = await gate.submit(ONE_COMMAND, 'operator pressed Apply');
@@ -442,6 +477,13 @@ test('the write gate reports a failed send and does not claim it was sent', asyn
 test('createWriteGate refuses to exist without its dependencies', () => {
   assert.throws(() => createWriteGate({}), /needs sendCommands/);
   assert.throws(() => createWriteGate({ sendCommands: async () => {} }), /needs isArmed/);
+  // viewIsFresh is REQUIRED, not optional. An optional safety check is one a
+  // future call site omits by accident, and this one stands between a stale
+  // matrix and a live clean feed.
+  assert.throws(
+    () => createWriteGate({ sendCommands: async () => {}, isArmed: () => true }),
+    /needs viewIsFresh/,
+  );
 });
 
 /* ------------------------------------------------------------------ */
@@ -593,6 +635,35 @@ test('diffHeadline speaks the operator language, not the wire language', () => {
   ];
   for (const [d, want] of cases) assert.match(diffHeadline(d), want);
   assert.equal(diffHeadline(null), '(empty difference)');
+});
+
+test('busListText never renders a raw bus name, and a diff computed here reads like one from Go', () => {
+  // S4. contract.js: "Never render a raw bus name. An operator reading 'aux1'
+  // has no way to know they are looking at the clean feed." The default
+  // routing of every strip is the worst case, because 'master, aux1, aux2' is
+  // both the most common string and the one that says commentary is in the
+  // client's clean feed.
+  const got = busListText(['master', 'aux1', 'aux2']);
+  assert.match(got, /clean feed/, 'the clean feed must be named as the clean feed');
+  assert.equal(got, 'master (PGM), aux1 (CLN - clean feed), aux2 (no egress)');
+  assert.equal(busListText([]), '(none)');
+  assert.equal(busListText(null), '(none)');
+  for (const bus of ALL_BUSES) {
+    assert.equal(busListText([bus]), busLabel(bus), `${bus} must render through busLabel`);
+  }
+
+  // The diff values compareSnapshots produces go through it too, so the drift
+  // panel cannot show a bare 'aux1' either.
+  const diffs = compareSnapshots(snapshot([strip({ outputs: ['master'] })]), snapshot([strip()]));
+  const outputs = diffs.find((d) => d.field === 'outputs');
+  assert.ok(outputs, 'expected an outputs diff');
+  assert.match(outputs.current, /clean feed/);
+  assert.match(outputs.golden, /PGM/);
+
+  // And diffHeadline still classifies correctly off the labelled strings —
+  // renderedHasBus tokenises, so it reads both the labelled form produced here
+  // and the one mixer.Compare produces in Go.
+  assert.match(diffHeadline(outputs), /IS NOW IN THE CLEAN FEED/);
 });
 
 test('renderedHasBus matches whole tokens so aux1 does not match aux10', () => {

@@ -476,6 +476,15 @@ export const EGRESS_BUSES = Object.freeze(['master', CLEAN_FEED_BUS]);
  */
 
 /**
+ * STALE_VIEW_REFUSAL is why a write from a stale view is refused, in the words
+ * the operator is shown. Exported so the drawer and the tests quote the same
+ * sentence rather than two that might drift.
+ */
+export const STALE_VIEW_REFUSAL =
+  'the view is not live, and set_routing REPLACES a strip\'s whole bus set - ' +
+  'applying from a stale matrix would send every OTHER bus back to what it was when the feed stopped';
+
+/**
  * createWriteGate is the ONLY path from this drawer to the mixer.
  *
  * Every precondition the contract puts on opts.sendCommands is enforced here
@@ -485,10 +494,32 @@ export const EGRESS_BUSES = Object.freeze(['master', CLEAN_FEED_BUS]);
  *   - armed. isArmed() is read at the moment of the write, not captured when
  *     the control was built, so a control rendered while armed cannot fire
  *     after a disarm.
+ *   - a FRESH VIEW. viewIsFresh() is likewise read at the moment of the write.
  *   - a named operator gesture. Lifecycle hooks and timers have no gesture to
  *     name, which is the point: a drawer that "corrects" routing by itself
  *     changes a live clean feed while nobody is looking at it.
  *   - never an empty array.
+ *
+ * ======================= WHY FRESHNESS IS A GATE ============================
+ *
+ * set_routing is an ABSOLUTE REPLACE, and the drawer builds its argument from
+ * the routing it has on screen. So a write from a stale view is not "one
+ * change, slightly late": it is one change PLUS a rollback of every other bus
+ * on that strip to whatever they were when the feed stopped.
+ *
+ * The scenario is not hypothetical — the status feed stalls, which is why the
+ * controller carries a full reconnect supervisor. The header reads STALE, the
+ * matrix still shows the old frame, somebody changes routing on the desk, and
+ * the operator takes commentary out of the clean feed from the stale matrix.
+ * The bus they aimed at is correct; every other bus in that command is a
+ * forty-second-old rollback applied to a live desk.
+ *
+ * This check lives HERE, at the gate, and not on the Apply button's disabled
+ * state, because a disabled button is a suggestion: a keyboard activation, a
+ * programmatic click, or a future control that forgets to consult freshness
+ * all reach submit() and none of them reach the button. The caller is expected
+ * to refuse earlier and more legibly as well — see applyPending in drawer.js,
+ * which re-reads and re-plans — but nothing gets past this.
  *
  * A resolved promise means SENT, NOT APPLIED. This returns {sent:true} and
  * nothing more; confirmation must come from a following snapshot. At least one
@@ -499,14 +530,19 @@ export const EGRESS_BUSES = Object.freeze(['master', CLEAN_FEED_BUS]);
  * @param {{
  *   sendCommands: (cmds: import('./contract.js').MixerCommand[]) => Promise<void>,
  *   isArmed: () => boolean,
+ *   viewIsFresh: () => {fresh: boolean, text: string},
  *   onError: (err: Error, context: string) => void,
  * }} deps
  * @returns {{submit: (cmds: import('./contract.js').MixerCommand[], gesture: string) => Promise<WriteResult>}}
  */
 export function createWriteGate(deps) {
-  const { sendCommands, isArmed, onError } = deps || {};
+  const { sendCommands, isArmed, viewIsFresh, onError } = deps || {};
   if (typeof sendCommands !== 'function') throw new Error('mixer: write gate needs sendCommands');
   if (typeof isArmed !== 'function') throw new Error('mixer: write gate needs isArmed');
+  // Required, not optional. An optional safety check is one a future call site
+  // omits by accident, and this one stands between a stale matrix and a live
+  // clean feed.
+  if (typeof viewIsFresh !== 'function') throw new Error('mixer: write gate needs viewIsFresh');
 
   const report = (err, context) => {
     if (typeof onError === 'function') onError(err, context);
@@ -522,6 +558,13 @@ export function createWriteGate(deps) {
       }
       if (!isArmed()) {
         return { sent: false, reason: 'the write path is disarmed - press Arm to enable changes' };
+      }
+      // Read at the moment of the write, exactly like isArmed: a plan built
+      // while the feed was live must not be sent after it stopped.
+      const fresh = viewIsFresh();
+      if (!fresh || fresh.fresh !== true) {
+        const detail = fresh && str(fresh.text) !== '' ? ` (${str(fresh.text)})` : '';
+        return { sent: false, reason: `refused: ${STALE_VIEW_REFUSAL}${detail}` };
       }
       if (!Array.isArray(cmds) || cmds.length === 0) {
         return { sent: false, reason: 'nothing to send' };
@@ -767,9 +810,32 @@ function diff(kind, target, label, field, golden, current, severity) {
   return { kind, target, label, field, golden, current, severity };
 }
 
+/**
+ * busListText renders a set of buses for an operator to READ.
+ *
+ * Every bus goes through busLabel. contract.js states the rule this
+ * implements: "Never render a raw bus name. An operator reading 'aux1' has no
+ * way to know they are looking at the clean feed." A list is the case where
+ * that bites hardest, because 'master, aux1, aux2' is the DEFAULT routing of
+ * every strip — the exact string an operator is most likely to skim past — and
+ * it is the string that says commentary is in the client's clean feed.
+ *
+ * This is also what mixer.renderBuses in internal/mixer/golden.go does, so a
+ * diff computed here and one computed by the Go Compare read identically.
+ *
+ * Empty renders as '(none)' rather than as blank: "not routed anywhere" is a
+ * statement, and a blank is an absence the operator has to interpret.
+ *
+ * @param {string[]} buses wire names
+ * @returns {string}
+ */
+export function busListText(buses) {
+  const l = names(buses);
+  return l.length === 0 ? '(none)' : l.map(busLabel).join(', ');
+}
+
 function renderBuses(list) {
-  const l = names(list);
-  return l.length === 0 ? '(none)' : l.join(', ');
+  return busListText(list);
 }
 
 function renderBoolPair(v) {

@@ -335,6 +335,162 @@ test('two crosspoints on one strip become ONE set_routing, because set_routing r
   h.drawer.destroy();
 });
 
+/* ------------------------------------------------------------------ */
+/* S2: Apply is gated on freshness and re-plans from the frame after it */
+/* ------------------------------------------------------------------ */
+
+test('Apply from a STALE view writes NOTHING, says why, and keeps the staged change', async () => {
+  // The scenario this closes. The status feed stalls — the controller carries
+  // a reconnect supervisor precisely because it does. The header reads STALE
+  // and the matrix still shows the old frame. The operator, acting on that
+  // matrix, takes commentary out of the clean feed and presses Apply.
+  //
+  // set_routing REPLACES the whole bus set, so the bus they aimed at would be
+  // correct and every OTHER bus in the command would be a forty-second-old
+  // rollback applied to a live desk.
+  const h = harness();
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+
+  const readsBefore = h.calls.getSnapshot;
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 40_000;
+    fire(buttonWithText(h.mount, 'Apply'), 'click');
+    await settle();
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.deepEqual(h.calls.sendCommands, [], 'a stale view must reach the mixer with nothing at all');
+  assert.equal(h.calls.getSnapshot, readsBefore, 'and it must refuse before it even re-reads');
+
+  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
+  assert.match(notice.textContent, /NOT SENT/);
+  assert.match(notice.textContent, /STALE/, 'the refusal names the reason');
+  assert.match(notice.textContent, /REPLACES|replaces/, 'and why staleness matters for this command');
+
+  // The intention was fine; it was the picture that was not. Discarding the
+  // staged change would make the operator re-do it under pressure.
+  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
+  assert.ok(staged, 'the staged change must be kept');
+  assert.match(staged.textContent, /OUT of the clean feed/);
+  h.drawer.destroy();
+});
+
+test('the stale refusal is a property of the apply PATH, not of the button being disabled', async () => {
+  // A disabled button is a suggestion. A keyboard activation and a
+  // programmatic click both arrive at the handler regardless, so the test
+  // fires the click on a control that is marked aria-disabled and asserts that
+  // nothing reaches the mixer anyway.
+  const h = harness();
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 40_000;
+    // Force the repaint that marks the control blocked, the way the 1 Hz
+    // stale timer does when updates stop arriving.
+    h.drawer.update(null); // ignored: not an object, so lastUpdateAt does not move
+    const apply = buttonWithText(h.mount, 'Apply');
+    fire(apply, 'click');
+    await settle();
+    assert.equal(apply.getAttribute('aria-disabled'), 'true', 'the control is marked blocked');
+    assert.match(apply.textContent, /BLOCKED/, 'and says so, with the reason');
+  } finally {
+    Date.now = realNow;
+  }
+  assert.deepEqual(h.calls.sendCommands, [], 'clicking a blocked control must still write nothing');
+  h.drawer.destroy();
+});
+
+test('Apply re-plans from the frame that arrives AFTER it, not the one on screen when pressed', async () => {
+  // The second half of S2, and the one a freshness check alone does not fix.
+  // Even a live view is up to a second old and the desk is shared.
+  //
+  // On screen: cam22-1 is master + aux1 + aux2. Between the last update() and
+  // Apply, somebody takes it off aux2 and puts it on mon1. The operator toggles
+  // aux1 off.
+  //
+  // Planning from the screen sends ["master","aux2"] — right on the bus they
+  // aimed at, and a rollback of the other two on a live desk. Planning from
+  // the frame that arrives after Apply sends ["master","mon1"].
+  let current = snapshot([strip()]);
+  const h = harness({ getSnapshot: async () => current });
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+
+  // The desk moves and the drawer is NOT told: no update() arrives.
+  current = snapshot([strip({ outputs: ['master', 'aux1', 'mon1'] })]);
+
+  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  await settle();
+
+  assert.equal(h.calls.sendCommands.length, 1);
+  assert.deepEqual(
+    h.calls.sendCommands[0][0].args.outputs,
+    ['master', 'mon1'],
+    'the unstaged buses must come from the frame that arrived after Apply, not from the stale screen',
+  );
+
+  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
+  assert.match(notice.textContent, /desk had moved/, 'and the operator is told the base moved');
+  h.drawer.destroy();
+});
+
+test('Apply sends nothing when the re-read shows the staged change is already in effect', async () => {
+  // Somebody else made the same correction in the last second. Every avoidable
+  // write to a live mixer is worth avoiding.
+  let current = snapshot([strip()]);
+  const h = harness({ getSnapshot: async () => current });
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+
+  current = snapshot([strip({ outputs: ['master', 'aux2'] })]);
+  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  await settle();
+
+  assert.deepEqual(h.calls.sendCommands, []);
+  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
+  assert.match(notice.textContent, /already in effect/);
+  h.drawer.destroy();
+});
+
+test('Apply refuses when the mixer cannot be re-read, rather than writing from the old picture', async () => {
+  let fail = false;
+  const h = harness({
+    getSnapshot: async () => {
+      if (fail) throw new Error('websocket closed');
+      return snapshot();
+    },
+  });
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+
+  fail = true;
+  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  await settle();
+
+  assert.deepEqual(h.calls.sendCommands, [], 'an unknown current routing is not a routing to replace');
+  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
+  assert.match(notice.textContent, /NOT SENT/);
+  assert.equal(h.calls.errors.length >= 1, true, 'the failure is reported, not swallowed');
+  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
+  assert.ok(staged, 'the staged change is kept');
+  h.drawer.destroy();
+});
+
 test('a strip whose name contains a space stages and sends against the right strip', async () => {
   // 'MIC 1-1' is a real strip in the captured live frame. An earlier version
   // keyed staged changes by joining the strip and bus with a space and parsing
@@ -422,6 +578,66 @@ test('a resolved send is reported as SENT, and only a later snapshot confirms it
   h.drawer.update(snapshot([strip({ outputs: ['master', 'aux2'] })]));
   awaiting = query(h.mount, (n) => (n.className || '').startsWith('mx-await '));
   assert.match(awaiting.textContent, /CONFIRMED by the mixer/);
+  h.drawer.destroy();
+});
+
+test('the confirmation panel names the clean feed and never a bare "aux1"', async () => {
+  // S4. This is the highest-stakes read in the drawer: it appears immediately
+  // after a write to a live desk and it is what the operator checks to decide
+  // the change did what they meant.
+  //
+  // "CONFIRMED: CLAUDE-COMMS -> master, aux1" reads as success while
+  // confirming that commentary is in the client's clean feed. contract.js:
+  // "Never render a raw bus name. An operator reading 'aux1' has no way to
+  // know they are looking at the clean feed."
+  let current = snapshot([strip()]);
+  const h = harness({ getSnapshot: async () => current });
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+
+  // Take the strip off aux2, leaving it on master AND the clean feed — the
+  // case where a bare list reads as success and is not.
+  fire(crosspoint(h.mount, 'cam22-1', 'aux2'), 'click');
+  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  await settle();
+
+  const check = (node, where) => {
+    assert.match(node.textContent, /aux1 \(CLN - clean feed\)/, `${where} must name the clean feed`);
+    assert.doesNotMatch(
+      node.textContent,
+      /aux1(?!\s*\(CLN)/,
+      `${where} must not render a bare bus name anywhere`,
+    );
+    assert.match(node.textContent, /master \(PGM\)/, `${where} must label master too`);
+  };
+
+  check(query(h.mount, (n) => (n.className || '').startsWith('mx-await ')), 'the awaiting line');
+
+  // And the same after the mixer reports it back, which is the line that
+  // actually says the word CONFIRMED.
+  h.drawer.update(snapshot([strip({ outputs: ['master', 'aux1'] })]));
+  const confirmed = query(h.mount, (n) => (n.className || '').startsWith('mx-await '));
+  assert.match(confirmed.textContent, /CONFIRMED by the mixer/);
+  check(confirmed, 'the confirmed line');
+  h.drawer.destroy();
+});
+
+test('the drift detail names a bus by its label, never by its wire name alone', async () => {
+  // S4, the other raw-bus render: for a bus diff the Diff target IS a bus wire
+  // name, so "aux1 muted: golden ..." described the clean feed with a string
+  // the operator cannot decode.
+  const h = harness({
+    getDiffs: async () => [
+      { kind: 'bus', target: 'aux1', label: 'aux1 (CLN - clean feed)', field: 'muted', golden: 'false', current: 'true', severity: 'critical' },
+    ],
+    getGolden: async () => snapshot(),
+  });
+  h.drawer.open();
+  await settle();
+  const detail = query(h.mount, (n) => (n.className || '').startsWith('mx-diff-detail'));
+  assert.match(detail.textContent, /aux1 \(CLN - clean feed\) muted/);
+  assert.doesNotMatch(detail.textContent, /aux1(?!\s*\(CLN)/);
   h.drawer.destroy();
 });
 
