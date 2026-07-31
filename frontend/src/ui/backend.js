@@ -52,6 +52,11 @@ export const EVENT_STATUS = 'status';
 export const EVENT_SENDER = 'sender';
 export const EVENT_ERROR = 'error';
 
+// EventStatusKeys: a []m2lx.StatusKeyCandidate, emitted while a statusKey
+// discovery is running (app.go, maybeDiscoverStatusKey). Suggestions only —
+// nothing is saved until the operator confirms one on the Settings screen.
+export const EVENT_STATUS_KEYS = 'statusKeyCandidates';
+
 // Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT constants
 // exactly. Passed to setSecret().
 export const SECRET_KEY_M2LX = 'm2lx';
@@ -363,6 +368,33 @@ export function onSender(cb) {
 /** Subscribes to the "error" event, a human-readable string. Returns an unsubscribe function. */
 export function onError(cb) {
   return subscribe(EVENT_ERROR, cb);
+}
+
+/**
+ * Subscribes to the "statusKeyCandidates" event. Returns an unsubscribe
+ * function. The payload is an array of {key, was, now, video, audioCount,
+ * afterSeconds}.
+ */
+export function onStatusKeyCandidates(cb) {
+  return subscribe(EVENT_STATUS_KEYS, cb);
+}
+
+/**
+ * Returns the switcher_status nodes that were seen to start streaming while
+ * the last discovery was running: suggestions for a statusKey the operator has
+ * not set. Always an array.
+ *
+ * The fake backend has none, and says so by returning an empty list rather
+ * than inventing a plausible "cam7" — a fabricated suggestion is exactly the
+ * thing that must not reach a Settings screen, in a dev session or anywhere
+ * else.
+ */
+export async function getStatusKeyCandidates() {
+  if (hasWails()) {
+    const got = await callGo('GetStatusKeyCandidates');
+    return Array.isArray(got) ? got : [];
+  }
+  return [];
 }
 
 /**

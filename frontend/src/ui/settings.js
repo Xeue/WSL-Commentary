@@ -1,5 +1,6 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
+import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
 
 // The Settings screen: every field of specification section 9, plus the two
 // Credential Manager secrets. Same window, swapped view — there is no
@@ -130,6 +131,29 @@ export function createSettingsView(handlers) {
   connectionHeading.textContent = 'M2L-X connection';
   form.appendChild(connectionHeading);
 
+  // The primary input: the address bar of the M2L-X GUI the operator is
+  // already looking at. Both the host and the event ID are in it, and the
+  // event ID is the one field nothing in the API can supply — there is no
+  // event-list endpoint (/api/event/list, /api/events, /api/live_operation*
+  // and /api/user/me were all checked) and it is an opaque string nobody
+  // remembers. One paste fills both fields, which stay visible and editable
+  // below so nothing here becomes un-fixable.
+  const liveURLInput = textInput('f-liveUrl');
+  liveURLInput.placeholder = 'https://m2lx-…/live-operation/…';
+  liveURLInput.autocomplete = 'off';
+  liveURLInput.spellcheck = false;
+  const liveURLRow = row(
+    'M2L-X address (paste from the browser)',
+    'f-liveUrl',
+    liveURLInput,
+    'The page you use to operate the event. The host and the event ID are read out of it into the two fields below.',
+  );
+  const liveURLNote = document.createElement('p');
+  liveURLNote.className = 'field-hint field-note';
+  liveURLNote.hidden = true;
+  liveURLRow.wrap.insertBefore(liveURLNote, liveURLRow.errorEl);
+  form.appendChild(liveURLRow.wrap);
+
   addField('m2lxHost', 'M2L-X host', textInput('f-m2lxHost'), 'Bare host, e.g. "m2lx.example.com" — no scheme.');
   addField('alias', 'Alias', textInput('f-alias'), 'The sign-in alias. Note: not "username".');
 
@@ -143,14 +167,40 @@ export function createSettingsView(handlers) {
   fields.m2lxPassword = { input: m2lxPasswordInput, errorEl: m2lxPasswordRow.errorEl };
   form.appendChild(m2lxPasswordRow.wrap);
 
-  addField('eventId', 'Event ID', textInput('f-eventId'));
+  addField(
+    'eventId',
+    'Event ID',
+    textInput('f-eventId'),
+    'The last part of the live-operation address, e.g. "dl9-5p5ah0bd-empd". Filled in by the paste above.',
+  );
+
+  // Typing in either field keeps the pasted address honest rather than leaving
+  // a stale URL sitting above two edited fields.
+  const syncLiveURL = () => {
+    liveURLInput.value = formatLiveOperationURL(fields.m2lxHost.input.value, fields.eventId.input.value);
+    hideLiveURLMessages();
+  };
+  fields.m2lxHost.input.addEventListener('input', () => {
+    syncLiveURL();
+    refreshSRTPlaceholder();
+  });
+  fields.eventId.input.addEventListener('input', syncLiveURL);
 
   // --- SRT output ---------------------------------------------------------
   const srtHeading = document.createElement('h2');
   srtHeading.textContent = 'SRT output';
   form.appendChild(srtHeading);
 
-  addField('srtHost', 'SRT host', textInput('f-srtHost'));
+  // Optional and clearly secondary: on every instance seen so far the SRT
+  // listener answers on the same name as the REST API, and the operator should
+  // not have to type it twice. internal/config.EffectiveSRTHost owns the
+  // fallback; this field is the override for an ingest published elsewhere.
+  addField(
+    'srtHost',
+    'SRT host — optional',
+    textInput('f-srtHost'),
+    'Leave blank to use the M2L-X host. Only fill this in if SRT ingest is on a different name.',
+  );
   addField('srtPort', 'SRT port', numberInput('f-srtPort'));
   addField('srtLatencyMs', 'SRT latency (ms)', numberInput('f-srtLatencyMs'), 'Default 120 — about 5x the measured median round-trip time.');
   addField(
@@ -184,7 +234,92 @@ export function createSettingsView(handlers) {
   const statusHeading = document.createElement('h2');
   statusHeading.textContent = 'Status';
   form.appendChild(statusHeading);
-  addField('statusKey', 'Status key', textInput('f-statusKey'), 'The switcher_status node for our router input, e.g. "cam7".');
+  addField(
+    'statusKey',
+    'Status key — optional',
+    textInput('f-statusKey'),
+    'The switcher_status node for our router input, e.g. "cam7". Blank is allowed: the three ' +
+      'WebSocket lamps then read NO STATUS and everything else works normally.',
+  );
+
+  // The suggestions. There is no endpoint that names this node, so the app
+  // watches switcher_status across a START and offers whatever changed. It
+  // never saves one by itself: another operator's input coming up in the same
+  // second is indistinguishable from ours, and a wrong statusKey shows three
+  // green lamps for somebody else's feed — which reads as confirmation.
+  const suggestions = document.createElement('div');
+  suggestions.className = 'suggestions';
+  const suggestionsIntro = document.createElement('p');
+  suggestionsIntro.className = 'field-hint';
+  suggestions.appendChild(suggestionsIntro);
+  const suggestionsList = document.createElement('div');
+  suggestionsList.className = 'suggestion-list';
+  suggestions.appendChild(suggestionsList);
+  form.appendChild(suggestions);
+
+  /**
+   * renderSuggestions draws the candidate list. Each entry states what it
+   * matched on, because "use cam7" with no evidence is just a different guess.
+   */
+  function renderSuggestions(candidates) {
+    const list = Array.isArray(candidates) ? candidates : [];
+    suggestionsList.textContent = '';
+
+    if (list.length === 0) {
+      suggestionsIntro.textContent =
+        'No suggestion yet. Leave this blank, go back and press START: the app watches every ' +
+        'switcher_status node and offers the one that starts streaming as your feed comes up.';
+      return;
+    }
+
+    if (list.length === 1) {
+      suggestionsIntro.textContent = 'One node started streaming as your feed came up:';
+    } else {
+      suggestionsIntro.textContent =
+        `${list.length} nodes started streaming at the same time, so the app cannot tell which is ` +
+        'yours — another operator may have started too. Choose by the video format if one matches ' +
+        'your feed, or try again when nobody else is coming up:';
+    }
+
+    for (const c of list) {
+      const item = document.createElement('div');
+      item.className = 'suggestion';
+
+      const use = document.createElement('button');
+      use.type = 'button';
+      use.className = 'btn btn-ghost btn-small';
+      use.textContent = `Use "${c.key}"`;
+      use.addEventListener('click', () => {
+        fields.statusKey.input.value = c.key;
+        fields.statusKey.input.focus();
+        setSaveMessage(`Status key set to "${c.key}". Press Save settings to keep it.`, false);
+      });
+
+      const detail = document.createElement('span');
+      detail.className = 'suggestion-detail';
+      detail.textContent = describeCandidate(c);
+
+      item.append(use, detail);
+      suggestionsList.appendChild(item);
+    }
+  }
+
+  /** describeCandidate is the evidence line: what changed, when, and to what. */
+  function describeCandidate(c) {
+    const was = c.was === 'absent' ? 'was not in the first snapshot' : `was "${c.was}"`;
+    const when = typeof c.afterSeconds === 'number' ? `${c.afterSeconds}s after START` : 'after START';
+    const parts = [`${was}, now "${c.now}" — ${when}`];
+    if (c.video) parts.push(c.video);
+    if (typeof c.audioCount === 'number') {
+      parts.push(c.audioCount === 1 ? '1 audio stream' : `${c.audioCount} audio streams`);
+    }
+    return parts.join(' · ');
+  }
+
+  // Live updates while the screen is open: a discovery runs for up to ninety
+  // seconds after START, so an operator who opens Settings during it should see
+  // the candidate appear rather than have to leave and come back.
+  backend.onStatusKeyCandidates((candidates) => renderSuggestions(candidates));
 
   // --- devices ---------------------------------------------------------
   const devicesHeading = document.createElement('h2');
@@ -207,13 +342,22 @@ export function createSettingsView(handlers) {
   const monitorHeading = document.createElement('h2');
   monitorHeading.textContent = 'Monitor';
   form.appendChild(monitorHeading);
+  // All seven audio transceivers, same list and same labels as the main
+  // screen's dropdown (home.js RETURN_BUSES). The monitor subscribes to every
+  // one of them regardless; this only picks which is routed to the headphones.
   addField(
     'returnMid',
     'Return',
     selectInput('f-returnMid', [
-      { value: 2, label: 'CLN (effects, no commentary)' },
-      { value: 1, label: 'PGM' },
+      { value: 1, label: 'mid 1 — PGM (master): programme, includes commentary' },
+      { value: 2, label: 'mid 2 — CLN (aux1): the intended return, effects without commentary' },
+      { value: 3, label: 'mid 3 — aux2' },
+      { value: 4, label: 'mid 4 — mon1' },
+      { value: 5, label: 'mid 5 — mon2' },
+      { value: 6, label: 'mid 6 — mon3' },
+      { value: 7, label: 'mid 7 — mon4 (PFL)' },
     ]),
+    'If you can hear yourself on the default, the gallery is routing commentary to that bus. Try another.',
   );
   addField(
     'returnGainDb',
@@ -270,6 +414,60 @@ export function createSettingsView(handlers) {
 
   el.append(header, form);
 
+  // --- the pasted address --------------------------------------------
+
+  function hideLiveURLMessages() {
+    liveURLNote.hidden = true;
+    liveURLNote.textContent = '';
+    liveURLRow.errorEl.hidden = true;
+    liveURLRow.errorEl.textContent = '';
+  }
+
+  /**
+   * applyLiveURL parses whatever is in the address field and fills the two
+   * fields below it. It reports what it read, so a paste is visibly a paste
+   * and not a hope, and it refuses clearly rather than silently doing nothing.
+   */
+  function applyLiveURL() {
+    const raw = liveURLInput.value.trim();
+    if (raw === '') {
+      hideLiveURLMessages();
+      return;
+    }
+
+    const parsed = parseLiveOperationURL(raw);
+    if (!parsed.ok) {
+      liveURLNote.hidden = true;
+      liveURLRow.errorEl.textContent = parsed.error;
+      liveURLRow.errorEl.hidden = false;
+      return;
+    }
+
+    liveURLRow.errorEl.hidden = true;
+    fields.m2lxHost.input.value = parsed.host;
+    fields.eventId.input.value = parsed.eventId;
+    liveURLNote.textContent = `Host "${parsed.host}", event "${parsed.eventId}".`;
+    liveURLNote.hidden = false;
+    refreshSRTPlaceholder();
+  }
+
+  // 'input' rather than 'change': a paste should fill the fields the moment it
+  // lands, not when focus leaves.
+  liveURLInput.addEventListener('input', applyLiveURL);
+  liveURLInput.addEventListener('change', applyLiveURL);
+
+  /**
+   * refreshSRTPlaceholder shows the host an empty srtHost will actually dial —
+   * the same string internal/config.EffectiveSRTHost will resolve. "Optional"
+   * without saying what the default is would just move the guesswork.
+   */
+  function refreshSRTPlaceholder() {
+    const derived = bareHost(fields.m2lxHost.input.value);
+    fields.srtHost.input.placeholder = derived
+      ? `Same as M2L-X: ${derived}`
+      : 'Same as the M2L-X host';
+  }
+
   // --- populate / collect --------------------------------------------
 
   function populate(config) {
@@ -293,6 +491,9 @@ export function createSettingsView(handlers) {
     fields.slatePath.input.value = config.slatePath || 'slate.png';
     fields.m2lxPassword.input.value = '';
     fields.srtPassphrase.input.value = '';
+    liveURLInput.value = formatLiveOperationURL(config.m2lxHost, config.eventId);
+    hideLiveURLMessages();
+    refreshSRTPlaceholder();
     refreshSecretBadges();
     clearAllErrors();
     saveMessage.hidden = true;
@@ -393,6 +594,7 @@ export function createSettingsView(handlers) {
 
   async function open() {
     saveBtn.disabled = true;
+    renderSuggestions([]);
     try {
       const config = await backend.getConfig();
       populate(config);
@@ -401,6 +603,14 @@ export function createSettingsView(handlers) {
       setSaveMessage(`Could not load the current configuration: ${err.message}`, true);
     } finally {
       saveBtn.disabled = false;
+    }
+
+    // Separately from the config load, and after it, so a failure to reach one
+    // does not blank the other.
+    try {
+      renderSuggestions(await backend.getStatusKeyCandidates());
+    } catch (err) {
+      console.error('wslcomms: could not fetch statusKey suggestions', err);
     }
   }
 

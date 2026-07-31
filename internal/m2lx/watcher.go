@@ -141,11 +141,205 @@ type connErr struct {
 	err error
 }
 
+// statusSocket owns one switcher_status connection: dialling it, tagging the
+// frames it produces with a generation, backing off when it fails, and
+// reopening it when the bearer token in its URL changes underneath it.
+//
+// It exists because there are now two readers of the same socket shape — Watch,
+// which follows one node, and WatchAll, which reports the whole document for
+// statusKey discovery — and the connection half of the state machine is
+// identical for both. The parts that differ (debounce, staleness, what is
+// emitted) stay in the two run loops.
+//
+// It is not safe for concurrent use: every method is called from the one
+// goroutine driving the loop that owns it. The only cross-goroutine traffic is
+// msgCh/errCh, written by the per-connection reader goroutine.
+type statusSocket struct {
+	w *watcher
+
+	conn      wsConn
+	lastToken string
+	// gen is bumped on every successful dial. A frame or error tagged with an
+	// older generation belongs to a connection this loop has already superseded
+	// and must be discarded rather than acted on.
+	gen int
+
+	msgCh chan connMsg
+	errCh chan connErr
+
+	backoffN    int
+	nextAttempt time.Time // zero value: attempt immediately
+}
+
+func newStatusSocket(w *watcher) *statusSocket {
+	return &statusSocket{
+		w:     w,
+		msgCh: make(chan connMsg),
+		errCh: make(chan connErr, 1),
+	}
+}
+
+// close shuts the current connection, if any. Idempotent.
+func (s *statusSocket) close() {
+	if s.conn != nil {
+		s.conn.Close()
+		s.conn = nil
+	}
+}
+
+// dial opens a connection and starts its reader goroutine. A failure leaves
+// conn nil and is not an error: the caller schedules a retry.
+func (s *statusSocket) dial(ctx context.Context) {
+	tok := s.w.client.Token()
+	c, err := s.w.dial(ctx, statusURL(s.w.status, tok))
+	if err != nil {
+		s.conn = nil
+		return
+	}
+	s.conn = c
+	s.lastToken = tok
+	s.gen++
+	gen := s.gen
+	go func(c wsConn, gen int) {
+		for {
+			_, p, err := c.ReadMessage()
+			if err != nil {
+				select {
+				case s.errCh <- connErr{gen, err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case s.msgCh <- connMsg{gen, p}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}(c, gen)
+}
+
+// dialFirst performs the opening attempt and arms the backoff if it failed.
+func (s *statusSocket) dialFirst(ctx context.Context, now time.Time) {
+	s.dial(ctx)
+	if s.conn == nil {
+		s.backoffN = 1
+		s.nextAttempt = now.Add(backoffDuration(s.backoffN))
+	}
+}
+
+// maintain is the once-per-tick connection work: drop the socket if the token
+// in its URL has been rotated out from under it, and redial when a scheduled
+// attempt has come due.
+func (s *statusSocket) maintain(ctx context.Context, now time.Time) {
+	if s.conn != nil {
+		if tok := s.w.client.Token(); tok != "" && tok != s.lastToken {
+			s.close()
+		}
+	}
+	if s.conn == nil && !now.Before(s.nextAttempt) {
+		s.dial(ctx)
+		if s.conn == nil {
+			s.backoffN++
+			s.nextAttempt = now.Add(backoffDuration(s.backoffN))
+		} else {
+			s.backoffN = 0
+		}
+	}
+}
+
+// fail handles a read error from the current connection. Errors from a
+// superseded connection are ignored.
+func (s *statusSocket) fail(ce connErr, now time.Time) {
+	if ce.gen != s.gen {
+		return
+	}
+	s.close()
+	s.backoffN++
+	s.nextAttempt = now.Add(backoffDuration(s.backoffN))
+}
+
+// accept reports whether a frame belongs to the current connection. A frame
+// that does resets the backoff ladder: the socket is demonstrably working.
+func (s *statusSocket) accept(cm connMsg) bool {
+	if cm.gen != s.gen {
+		return false
+	}
+	s.backoffN = 0
+	return true
+}
+
 // Watch implements Watcher. See run for the full state machine.
 func (w *watcher) Watch(ctx context.Context, statusKey string) <-chan Status {
 	out := make(chan Status)
 	go w.run(ctx, statusKey, out)
 	return out
+}
+
+// WatchAll implements Watcher. See runAll.
+func (w *watcher) WatchAll(ctx context.Context) <-chan Document {
+	out := make(chan Document)
+	go w.runAll(ctx, out)
+	return out
+}
+
+// runAll reads the same socket as run and emits every frame as a whole
+// Document, with no debounce, no staleness and no filtering by node.
+//
+// It exists for one job: finding the statusKey. Nothing can tell this
+// application which switcher_status node is its own router input — there is no
+// endpoint that lists them (spec open question 5) — so the only way to find it
+// is to watch every node and see which one starts streaming as our feed comes
+// up. Debouncing would blur exactly the transition being looked for, and
+// staleness is the Watch loop's business, so neither is applied here.
+//
+// A frame that is not a JSON object is dropped: unlike Watch, which has a
+// caller waiting on a specific node, there is nothing useful to say about a
+// malformed snapshot to somebody who is guessing.
+func (w *watcher) runAll(ctx context.Context, out chan<- Document) {
+	defer close(out)
+
+	sock := newStatusSocket(w)
+	defer sock.close()
+
+	sock.dialFirst(ctx, w.clk.Now())
+
+	ticker := w.clk.NewTicker(tickInterval)
+	defer ticker.Stop()
+
+	if w.started != nil {
+		w.started()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C():
+			sock.maintain(ctx, w.clk.Now())
+			if w.afterTick != nil {
+				w.afterTick()
+			}
+
+		case ce := <-sock.errCh:
+			sock.fail(ce, w.clk.Now())
+
+		case cm := <-sock.msgCh:
+			if !sock.accept(cm) {
+				continue
+			}
+			nodes, err := extractAll(cm.p)
+			if err != nil {
+				continue
+			}
+			select {
+			case out <- Document{Nodes: nodes, At: w.clk.Now()}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 }
 
 // run is the Watcher's entire state machine: connect, read, debounce
@@ -166,49 +360,8 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 	var lastVideo VideoFormat
 	lastAudio := []AudioFormat{}
 
-	var conn wsConn
-	var lastToken string
-	curGen := 0
-	msgCh := make(chan connMsg)
-	errCh := make(chan connErr, 1)
-
-	closeConn := func() {
-		if conn != nil {
-			conn.Close()
-			conn = nil
-		}
-	}
-	defer closeConn()
-
-	dialNow := func() {
-		tok := w.client.Token()
-		c, err := w.dial(ctx, statusURL(w.status, tok))
-		if err != nil {
-			conn = nil
-			return
-		}
-		conn = c
-		lastToken = tok
-		curGen++
-		gen := curGen
-		go func(c wsConn, gen int) {
-			for {
-				_, p, err := c.ReadMessage()
-				if err != nil {
-					select {
-					case errCh <- connErr{gen, err}:
-					case <-ctx.Done():
-					}
-					return
-				}
-				select {
-				case msgCh <- connMsg{gen, p}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(c, gen)
-	}
+	sock := newStatusSocket(w)
+	defer sock.close()
 
 	emit := func(s Status) bool {
 		select {
@@ -219,14 +372,7 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 		}
 	}
 
-	backoffN := 0
-	var nextAttempt time.Time // zero value: attempt immediately
-
-	dialNow()
-	if conn == nil {
-		backoffN = 1
-		nextAttempt = now.Add(backoffDuration(backoffN))
-	}
+	sock.dialFirst(ctx, now)
 
 	ticker := w.clk.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -243,20 +389,7 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 		case <-ticker.C():
 			now := w.clk.Now()
 
-			if conn != nil {
-				if tok := w.client.Token(); tok != "" && tok != lastToken {
-					closeConn()
-				}
-			}
-			if conn == nil && !now.Before(nextAttempt) {
-				dialNow()
-				if conn == nil {
-					backoffN++
-					nextAttempt = now.Add(backoffDuration(backoffN))
-				} else {
-					backoffN = 0
-				}
-			}
+			sock.maintain(ctx, now)
 
 			if sv, changed := deb.Tick(now); changed {
 				if !emit(Status{StreamState: sv, Video: lastVideo, Audio: lastAudio, At: now, Stale: false}) {
@@ -274,20 +407,15 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 				w.afterTick()
 			}
 
-		case ce := <-errCh:
-			if ce.gen == curGen {
-				closeConn()
-				backoffN++
-				nextAttempt = w.clk.Now().Add(backoffDuration(backoffN))
-			}
+		case ce := <-sock.errCh:
+			sock.fail(ce, w.clk.Now())
 
-		case cm := <-msgCh:
-			if cm.gen != curGen {
+		case cm := <-sock.msgCh:
+			if !sock.accept(cm) {
 				continue
 			}
 			now := w.clk.Now()
 			lastMsg = now
-			backoffN = 0
 
 			node, ok, err := extractNode(cm.p, statusKey)
 			if err != nil || !ok {

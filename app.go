@@ -20,25 +20,34 @@
 //
 // # The bound surface, which is frozen with the interfaces
 //
-//	ListInputDevices()        []gst.Device      caller: WP-5b
-//	GetConfig()               *config.Config    caller: WP-5b
-//	SaveConfig(c)             error             caller: WP-5b
-//	SetSecret(key, value)     error             caller: WP-5b
-//	Start() / Stop()          error             caller: WP-5b
-//	GetKVSCredentials()       kvs.Credentials   caller: WP-5a
+//	ListInputDevices()          []gst.Device               caller: WP-5b
+//	GetConfig()                 *config.Config             caller: WP-5b
+//	SaveConfig(c)               error                      caller: WP-5b
+//	SetSecret(key, value)       error                      caller: WP-5b
+//	Start() / Stop()            error                      caller: WP-5b
+//	GetKVSCredentials()         kvs.Credentials            caller: WP-5a
+//	GetStatusKeyCandidates()    []m2lx.StatusKeyCandidate  caller: WP-5b
 //
-// Wails binds every EXPORTED method of *App. Those seven are therefore the only
-// exported methods this type may ever have: adding an eighth silently widens the
-// contract with WP-5a and WP-5b. Everything internal below is lower-case for
-// that reason and not merely by habit. There is deliberately no getter for a
-// secret — a secret goes into Credential Manager and never comes back out across
-// this boundary.
+// Wails binds every EXPORTED method of *App, so this list and the set of
+// exported methods are the same thing: adding one silently widens the contract
+// with WP-5a and WP-5b. Everything internal below is lower-case for that reason
+// and not merely by habit. There is deliberately no getter for a secret — a
+// secret goes into Credential Manager and never comes back out across this
+// boundary.
+//
+// GetStatusKeyCandidates is the EIGHTH, added after the surface was declared
+// frozen, and it is called out here rather than slipped in: with no statusKey
+// the three WebSocket-derived lamps can only say NO STATUS, and no M2L-X
+// endpoint will name the node (specification open question 5). The alternative
+// to this method was leaving the operator to guess, which is what they were
+// doing. It is read-only and returns a suggestion the operator must confirm.
 //
 // # Events emitted Go to JS
 //
-//	"status"  an m2lx.Status
-//	"sender"  a sender.State
-//	"error"   a string
+//	"status"              an m2lx.Status
+//	"sender"              a sender.State
+//	"error"               a string
+//	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
 //
 // The "error" event carries first-run configuration problems, gst.Init failures,
 // sign-in failures, and — rate-limited, because the sender retries forever — the
@@ -123,6 +132,13 @@ const (
 
 	// EventError carries a human-readable error string for display.
 	EventError = "error"
+
+	// EventStatusKeys carries []m2lx.StatusKeyCandidate: the switcher_status
+	// nodes that started streaming while our feed was coming up, offered to the
+	// Settings screen as suggestions for a statusKey the operator has not set.
+	// It is emitted only while a discovery is running, and never causes anything
+	// to be saved — see App.GetStatusKeyCandidates.
+	EventStatusKeys = "statusKeyCandidates"
 )
 
 const (
@@ -148,6 +164,18 @@ const (
 	// fifteen seconds is the sum, not a guess. Past it the process exits anyway
 	// and lets the OS reclaim the audio endpoint.
 	shutdownTimeout = 15 * time.Second
+
+	// statusKeyDiscoveryWindow is how long a statusKey discovery watches
+	// switcher_status after START before giving up.
+	//
+	// It is sized from the two measured delays it has to contain: the pipeline
+	// reaches CONNECTED about 1.1 s after Start (specification section 4), and
+	// M2L-X's own status socket pushes about once a second and debounces
+	// nothing. Ninety seconds is far longer than that sum needs, deliberately:
+	// the cost of watching too long is one more candidate to choose between,
+	// and the cost of stopping too early is a discovery that finds nothing on a
+	// day when the SRT listener took a few extra seconds to accept.
+	statusKeyDiscoveryWindow = 90 * time.Second
 
 	// kvsFetchTimeout bounds one run of the M2L-X to Cognito credential chain.
 	// It is three REST calls, each of which internal/m2lx already bounds at ten
@@ -263,8 +291,26 @@ type App struct {
 	// change, which is what makes first run work without restarting the app.
 	ctlMu     sync.Mutex
 	client    m2lx.Client
+	watcher   m2lx.Watcher
+	ctlCtx    context.Context
 	ctlCancel context.CancelFunc
 	ctlWG     *sync.WaitGroup
+
+	// discovering is raised for the duration of one statusKey discovery, so a
+	// second START during the window does not start a second one. It is an
+	// atomic rather than a field under ctlMu because the goroutine lowers it as
+	// it exits, and stopControlPlaneLocked joins that goroutine while holding
+	// ctlMu — taking the same lock on the way out would deadlock the teardown.
+	discovering atomic.Bool
+
+	// discMu guards statusKeyCandidates, the most recent suggestions produced by
+	// a discovery. It is a leaf lock, like senderMu: nothing is taken while it
+	// is held.
+	//
+	// The candidates are deliberately NOT written into config.json by anything
+	// here. See runStatusKeyDiscovery.
+	discMu              sync.Mutex
+	statusKeyCandidates []m2lx.StatusKeyCandidate
 
 	// sessMu guards session and is held for the whole of Start and Stop, so a
 	// Start cannot begin while a Stop is still taking the previous pipeline to
@@ -559,7 +605,29 @@ func (a *App) SetSecret(key, value string) error {
 // it names the field. The reason a connection attempt failed reaches the
 // operator on the "error" event instead, rate-limited; see senderOpts and
 // connectErrorReporter.
+//
+// Start is a thin wrapper around startSession for two reasons. The statusKey
+// discovery it may kick off takes ctlMu, and the lock order in this file's
+// header says ctlMu is never held with either of the others — taking it under
+// sessMu would be the first exception to that and there is no reason to make
+// one. And the discovery has to be armed BEFORE the pipeline: its baseline is
+// the first switcher_status frame it sees, and a baseline taken after our feed
+// had already reached the switcher would show our own node streaming and never
+// report the transition that identifies it.
 func (a *App) Start() error {
+	stopDiscovery := a.maybeDiscoverStatusKey()
+	if err := a.startSession(); err != nil {
+		// Nothing is going to come up, so there is nothing to discover. Leaving
+		// it running would spend the whole window watching for a change that
+		// cannot happen and then report a false "nothing matched".
+		stopDiscovery()
+		return err
+	}
+	return nil
+}
+
+// startSession is Start's body: everything that happens under sessMu.
+func (a *App) startSession() error {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 
@@ -686,6 +754,27 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 	return kvs.Fetch(ctx, client, cfg.EventID)
 }
 
+// GetStatusKeyCandidates returns the switcher_status nodes that were seen to
+// start streaming while the last discovery was running: suggestions for a
+// statusKey the operator has not set.
+//
+// It returns an empty slice, never nil, when there is nothing to suggest — the
+// frontend renders a list and should not have to special-case null.
+//
+// These are SUGGESTIONS and this application never acts on one by itself.
+// Nothing distinguishes our router input coming up from another operator's
+// input coming up in the same second, seen from outside; persisting a guess
+// would point three green lamps at somebody else's feed, which reads as
+// confirmation and is the worst thing this application could get wrong. The
+// operator confirms one on the Settings screen, which is an ordinary SaveConfig.
+func (a *App) GetStatusKeyCandidates() ([]m2lx.StatusKeyCandidate, error) {
+	a.discMu.Lock()
+	defer a.discMu.Unlock()
+	out := make([]m2lx.StatusKeyCandidate, len(a.statusKeyCandidates))
+	copy(out, a.statusKeyCandidates)
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // The contribution session
 // ---------------------------------------------------------------------------
@@ -701,7 +790,12 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 // with g_object_set rather than in the URI, and must not be logged or returned
 // across the Wails boundary.
 func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
-	reporter := newConnectErrorReporter(a.emitError, cfg.SRTHost, cfg.SRTPort, time.Now)
+	// EffectiveSRTHost, not SRTHost: an empty srtHost means "the same host as
+	// M2L-X" (config.Config's field comment). The reporter is given the same
+	// resolved host, so the operator is told the name that was actually dialled
+	// rather than a blank.
+	srtHost := cfg.EffectiveSRTHost()
+	reporter := newConnectErrorReporter(a.emitError, srtHost, cfg.SRTPort, time.Now)
 
 	return sender.Opts{
 		Pipeline: gst.PipelineOpts{
@@ -715,7 +809,7 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// invent one.
 		},
 		Sink: gst.SinkOpts{
-			Host:       cfg.SRTHost,
+			Host:       srtHost,
 			Port:       cfg.SRTPort,
 			LatencyMs:  cfg.SRTLatencyMs,
 			Passphrase: passphrase,
@@ -980,6 +1074,12 @@ func (a *App) startControlPlane() {
 	wg := &sync.WaitGroup{}
 
 	a.client = client
+	// The watcher and this generation's context are kept so that a statusKey
+	// discovery started later — at START, which is the only moment the node we
+	// are looking for changes state — reuses this generation's socket
+	// machinery and dies with it.
+	a.watcher = watcher
+	a.ctlCtx = ctx
 	a.ctlCancel = cancel
 	a.ctlWG = wg
 
@@ -1001,6 +1101,105 @@ func (a *App) startControlPlane() {
 			a.forwardStatus(statuses)
 		}()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// statusKey discovery
+// ---------------------------------------------------------------------------
+
+// maybeDiscoverStatusKey starts a statusKey discovery if one is wanted and
+// possible: the operator has not set a statusKey, a control plane exists to
+// watch through, and no discovery is already running. It returns a function
+// that ends the discovery early, which is a no-op when none was started.
+//
+// It is called from Start, and only from Start, because START is the one moment
+// at which the node being looked for changes state. Specification open question
+// 5: "read one switcher_status snapshot and find the node whose stream_state
+// changes when the app starts."
+//
+// Doing nothing is the normal outcome and is never an error: a configured
+// statusKey means there is nothing to discover, and no M2L-X host means there is
+// nothing to discover it from.
+func (a *App) maybeDiscoverStatusKey() (stop func()) {
+	noop := func() {}
+
+	if a.snapshotConfig().StatusKey != "" {
+		return noop
+	}
+
+	a.ctlMu.Lock()
+	defer a.ctlMu.Unlock()
+
+	if a.watcher == nil || a.ctlCtx == nil || a.ctlWG == nil || a.closing.Load() {
+		return noop
+	}
+	if !a.discovering.CompareAndSwap(false, true) {
+		return noop
+	}
+
+	watcher := a.watcher
+	ctx, cancel := context.WithTimeout(a.ctlCtx, statusKeyDiscoveryWindow)
+	wg := a.ctlWG
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		defer a.discovering.Store(false)
+		a.runStatusKeyDiscovery(ctx, watcher)
+	}()
+	return cancel
+}
+
+// runStatusKeyDiscovery watches every switcher_status node for
+// statusKeyDiscoveryWindow and publishes the ones that start streaming.
+//
+// The first frame is the baseline — taken now, as the pipeline is being built,
+// which is why this is started from Start and not from startControlPlane. A
+// node already streaming in that baseline is somebody else's and never becomes
+// a candidate.
+//
+// Nothing here writes config.json. The candidates go to the frontend, which
+// shows them as suggestions with what they matched on; confirming one is an
+// ordinary SaveConfig by the operator. See GetStatusKeyCandidates for why that
+// distinction is not a nicety.
+func (a *App) runStatusKeyDiscovery(ctx context.Context, watcher m2lx.Watcher) {
+	disc := m2lx.NewDiscovery()
+
+	// Every discovery starts from nothing rather than adding to the last one:
+	// two STARTs an hour apart are two different pieces of evidence, and merging
+	// them would produce a list in which the older half is untestable.
+	a.setStatusKeyCandidates(nil)
+
+	for doc := range watcher.WatchAll(ctx) {
+		if !disc.Observe(doc) {
+			continue
+		}
+		candidates := disc.Candidates()
+		a.setStatusKeyCandidates(candidates)
+		a.events.send(EventStatusKeys, candidates)
+	}
+
+	// DeadlineExceeded, not merely Done: a discovery ended early because the
+	// session failed to start, or because the control plane was reconfigured
+	// underneath it, has not observed anything about M2L-X and must not report
+	// as though it had.
+	if !disc.Started() && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// No frame arrived at all in the whole window. That is a different
+		// failure from "watched and matched nothing" — the socket never
+		// delivered — and saying so stops the operator hunting for a node name
+		// when the problem is the connection.
+		a.emitError(fmt.Errorf(
+			"wslcomms: could not suggest a statusKey: no switcher_status message arrived from %s in %s — "+
+				"the status WebSocket is not delivering, so the three status lamps cannot work whatever statusKey is set",
+			a.snapshotConfig().M2LXHost, statusKeyDiscoveryWindow))
+	}
+}
+
+// setStatusKeyCandidates replaces the published suggestions.
+func (a *App) setStatusKeyCandidates(candidates []m2lx.StatusKeyCandidate) {
+	a.discMu.Lock()
+	defer a.discMu.Unlock()
+	a.statusKeyCandidates = candidates
 }
 
 // stopControlPlaneLocked unwinds the current control plane generation. ctlMu
@@ -1049,6 +1248,8 @@ func (a *App) stopControlPlaneLocked() {
 	a.ctlCancel = nil
 	a.ctlWG = nil
 	a.client = nil
+	a.watcher = nil
+	a.ctlCtx = nil
 }
 
 // signInLoop signs in to M2L-X and returns as soon as it succeeds.

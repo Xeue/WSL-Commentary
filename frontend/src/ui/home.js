@@ -1,4 +1,5 @@
-import { createLampRow } from './lamps.js';
+import { createLampRow, deriveHonestLine } from './lamps.js';
+import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 
 // The main screen: the PGM tile, the three device/return controls, the
 // START/STOP button, the five lamps and the permanent honest line.
@@ -12,17 +13,43 @@ import { createLampRow } from './lamps.js';
 // backend/monitor events, which keeps this file testable-by-eye in isolation
 // and keeps the "what does the UI show" question answered in one place.
 
-// MOSAIC_WIDTH/MOSAIC_HEIGHT are the KVS multiviewer mosaic's fixed
-// dimensions (specification section 7). They are an M2L-X constant, not
-// configuration — unlike the tile rectangle within it, which is
-// config.monitorTile and can change without a code change.
-const MOSAIC_WIDTH = 2240;
-const MOSAIC_HEIGHT = 1440;
+// The mosaic size is NOT a constant here any more. config.monitorTile is a
+// rectangle in the pixels of the mosaic it was measured against
+// (tile.js REFERENCE_MOSAIC, 2240x1440), and the live track is whatever it is;
+// the crop is computed from the size that actually arrived. See tile.js for why
+// assuming otherwise put the picture in the wrong place.
 
 const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
 
-const HONEST_LINE =
-  'Your feed is reaching the switcher. This does not confirm you are audible on the broadcast output.';
+// RETURN_BUSES is every audio transceiver the monitor subscribes to, with an
+// honest label for each. It mirrors frontend/src/monitor/buses.js's BUS_MAP,
+// which is the measured mid-to-bus map (docs/test-results.md §2.1) — mirrored
+// rather than imported because the seam with WP-5a is createMonitor and nothing
+// else (see app.js).
+//
+// It used to offer two: CLN and PGM. That was fine as long as the documented
+// routing held. It did not: the commentator on mid 2 could hear themselves
+// delayed, which means commentary IS routed to aux1 on this event — or the
+// mid-to-bus map is not what it was when it was measured. This application
+// cannot tell which and cannot fix either; what it can do is stop being a
+// two-option dropdown with no way out, and offer every bus so a clean one can
+// be found by ear in the ten seconds before kick-off.
+const RETURN_BUSES = Object.freeze([
+  { mid: 1, label: 'mid 1 — PGM (master): programme, includes commentary' },
+  { mid: 2, label: 'mid 2 — CLN (aux1): the intended return, effects without commentary' },
+  { mid: 3, label: 'mid 3 — aux2' },
+  { mid: 4, label: 'mid 4 — mon1' },
+  { mid: 5, label: 'mid 5 — mon2' },
+  { mid: 6, label: 'mid 6 — mon3' },
+  { mid: 7, label: 'mid 7 — mon4 (PFL)' },
+]);
+
+// What to do when the return has your own voice in it. It names the cause,
+// because the app is reporting a routing fact rather than hiding one: nothing
+// here can change what the gallery sends to a bus.
+const RETURN_HINT =
+  'If you can hear yourself, the gallery is routing commentary to that bus. Try another — the ' +
+  'switch is immediate and does not interrupt your feed.';
 
 /**
  * createHomeView builds the home screen and returns:
@@ -31,12 +58,14 @@ const HONEST_LINE =
  *   videoEl     the <video> the monitor mosaic attaches to (opts.videoEl)
  *   audioEl     the <audio> the monitor return plays through (opts.audioEl)
  *   lamps       the five lamps by name, as created by createLampRow
- *   setTile(tile)                       positions the PGM crop from config.monitorTile
+ *   setTile(tile)                       sets config.monitorTile; the crop is
+ *                                       computed from it and the live track size
  *   setInputDevices(devices, selected)  populates the commentary input dropdown
  *   setHeadphoneDevices(devices, sel)   populates the headphones dropdown
- *   setReturnMid(mid)                   selects CLN(2)/PGM(1) in the return dropdown
+ *   setReturnMid(mid)                   selects one of the seven buses, 1..7
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
+ *   setSenderState(state)               updates the honest line's claim
  *   setBusy(busy)                       disables the button while a call is in flight
  *   setStatusUnavailable(unavailable)   shows/hides the transient banner (Status.Stale)
  *   showError(message) / clearError()   the dismissible error banner
@@ -98,8 +127,13 @@ export function createHomeView(handlers) {
   }
 
   // --- PGM tile --------------------------------------------------------
-  const pgmWrap = document.createElement('div');
-  pgmWrap.className = 'pgm-wrap';
+  //
+  // The return is the main thing a commentator looks at, so it gets every
+  // pixel left after the controls: .pgm-stage is the flex child that grows,
+  // and .pgm-tile is sized inside it from the tile's own aspect ratio — height
+  // -limited on a wide window, width-limited on a narrow one. See main.css.
+  const pgmStage = document.createElement('div');
+  pgmStage.className = 'pgm-stage';
   const pgmTile = document.createElement('div');
   pgmTile.className = 'pgm-tile';
   const videoEl = document.createElement('video');
@@ -107,28 +141,89 @@ export function createHomeView(handlers) {
   videoEl.playsInline = true;
   videoEl.muted = true; // the mosaic video track carries no audio we want; return audio is separate
   pgmTile.appendChild(videoEl);
-  pgmWrap.appendChild(pgmTile);
+  pgmStage.appendChild(pgmTile);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
   audioEl.hidden = true;
 
+  // The tile as configured, and the mosaic as it actually arrived. Neither is
+  // authoritative on its own: the crop is what they produce together.
+  let configuredTile = { x: 0, y: 360, w: 640, h: 360 };
+  let liveMosaic = null;
+  let lastDescription = '';
+
+  function applyCrop() {
+    const crop = effectiveCrop(configuredTile, liveMosaic, REFERENCE_MOSAIC);
+
+    pgmTile.style.setProperty('--mosaic-w', String(crop.mosaic.w));
+    pgmTile.style.setProperty('--mosaic-h', String(crop.mosaic.h));
+    pgmTile.style.setProperty('--tile-x', String(crop.tile.x));
+    pgmTile.style.setProperty('--tile-y', String(crop.tile.y));
+    pgmTile.style.setProperty('--tile-w', String(crop.tile.w));
+    pgmTile.style.setProperty('--tile-h', String(crop.tile.h));
+    // Two forms of the same ratio: `aspect-ratio` wants "640 / 360", and the
+    // width calculation against the container's height wants a bare number.
+    pgmTile.style.setProperty('--tile-ar', `${crop.tile.w} / ${crop.tile.h}`);
+    pgmTile.style.setProperty('--tile-ar-num', String(crop.aspect));
+
+    // Logged, not swallowed: "the picture is in the wrong place" is
+    // undiagnosable from a screenshot without both mosaic sizes, and this is
+    // the only place both are known. Only on a change, so a track that renews
+    // its metadata every few seconds does not fill the console.
+    const line = describeCrop(crop, configuredTile);
+    if (line !== lastDescription) {
+      lastDescription = line;
+      console.info(line);
+    }
+  }
+
+  /**
+   * readMosaic takes the intrinsic size off the element. A <video> with no
+   * track yet reports 0x0, which tile.js reads as "not known" rather than as a
+   * mosaic of zero size.
+   */
+  function readMosaic() {
+    const w = videoEl.videoWidth;
+    const h = videoEl.videoHeight;
+    if (!(w > 0 && h > 0)) return;
+    if (liveMosaic && liveMosaic.w === w && liveMosaic.h === h) return;
+    liveMosaic = { w, h };
+    applyCrop();
+  }
+
+  // loadedmetadata fires when the first track's size is known; resize fires if
+  // it CHANGES mid-session, which is what a mid-match renegotiation or a
+  // reconnect to a differently-configured multiviewer looks like. Both are
+  // needed: with only the first, a track that changes size leaves the crop
+  // pointing at the old geometry for the rest of the match.
+  videoEl.addEventListener('loadedmetadata', readMosaic);
+  videoEl.addEventListener('resize', readMosaic);
+
+  // Write the custom properties once at construction, so the tile has a shape
+  // before any config has loaded and a failed getConfig cannot leave it at
+  // whatever the stylesheet's fallbacks happen to be.
+  applyCrop();
+
   function setTile(tile) {
-    pgmTile.style.setProperty('--mosaic-w', String(MOSAIC_WIDTH));
-    pgmTile.style.setProperty('--mosaic-h', String(MOSAIC_HEIGHT));
-    pgmTile.style.setProperty('--tile-x', String(tile.x));
-    pgmTile.style.setProperty('--tile-y', String(tile.y));
-    pgmTile.style.setProperty('--tile-w', String(tile.w));
-    pgmTile.style.setProperty('--tile-h', String(tile.h));
+    if (tile && typeof tile === 'object') configuredTile = tile;
+    // The element may already have a track — a Settings save mid-session does
+    // not restart the monitor — so re-read rather than waiting for an event
+    // that has already happened.
+    readMosaic();
+    applyCrop();
   }
 
   // --- controls ----------------------------------------------------------
+  //
+  // One compact row that wraps, not three stacked full-width rows: every
+  // vertical pixel these do not use goes to the picture above them.
   const controls = document.createElement('div');
   controls.className = 'controls';
 
   function makeRow(labelText, id, control) {
     const row = document.createElement('div');
-    row.className = 'control-row';
+    row.className = 'control-group';
     const label = document.createElement('label');
     label.htmlFor = id;
     label.textContent = labelText;
@@ -144,25 +239,35 @@ export function createHomeView(handlers) {
   headphoneSelect.id = 'headphone-select';
   headphoneSelect.addEventListener('change', () => handlers.onHeadphoneChange(headphoneSelect.value));
 
+  // All seven audio transceivers, honestly labelled. The monitor already
+  // subscribes to every one of them (~8.4 kbps idle for the lot), so switching
+  // is a Web Audio source swap: immediate, and the peer connection — and the
+  // programme picture riding on it — is untouched.
   const returnSelect = document.createElement('select');
   returnSelect.id = 'return-select';
-  const optCLN = document.createElement('option');
-  optCLN.value = '2';
-  optCLN.textContent = 'CLN (effects, no commentary)';
-  const optPGM = document.createElement('option');
-  optPGM.value = '1';
-  optPGM.textContent = 'PGM';
-  returnSelect.append(optCLN, optPGM);
+  for (const bus of RETURN_BUSES) {
+    const opt = document.createElement('option');
+    opt.value = String(bus.mid);
+    opt.textContent = bus.label;
+    returnSelect.appendChild(opt);
+  }
+  returnSelect.value = '2'; // mid 2, aux1/CLN, stays the default
   returnSelect.addEventListener('change', () => handlers.onReturnChange(Number(returnSelect.value)));
 
-  const returnRow = document.createElement('div');
-  returnRow.className = 'control-row';
+  const returnGroup = document.createElement('div');
+  returnGroup.className = 'control-group control-group-return';
   const returnLabel = document.createElement('label');
   returnLabel.htmlFor = 'return-select';
   returnLabel.textContent = 'Return';
+  const returnHint = document.createElement('p');
+  returnHint.className = 'control-hint';
+  returnHint.textContent = RETURN_HINT;
+  returnGroup.append(returnLabel, returnSelect, returnHint);
+
+  const levelGroup = document.createElement('div');
+  levelGroup.className = 'control-group control-group-level';
   const levelLabel = document.createElement('label');
   levelLabel.htmlFor = 'level-slider';
-  levelLabel.className = 'level-label';
   levelLabel.textContent = 'Level';
   const levelSlider = document.createElement('input');
   levelSlider.type = 'range';
@@ -172,12 +277,13 @@ export function createHomeView(handlers) {
   levelSlider.step = '1';
   levelSlider.value = '100';
   levelSlider.addEventListener('input', () => handlers.onLevelChange(Number(levelSlider.value) / 100));
-  returnRow.append(returnLabel, returnSelect, levelLabel, levelSlider);
+  levelGroup.append(levelLabel, levelSlider);
 
   controls.append(
     makeRow('Commentary input', 'input-select', inputSelect),
     makeRow('Headphones', 'headphone-select', headphoneSelect),
-    returnRow,
+    returnGroup,
+    levelGroup,
   );
 
   // --- start/stop + lamps -------------------------------------------------
@@ -200,11 +306,19 @@ export function createHomeView(handlers) {
     'STATUS UNAVAILABLE — the switcher status feed has been silent for over 15 seconds.';
   statusUnavailableBanner.hidden = true;
 
+  // The honest line. Permanent, never dismissible, never a tooltip — and its
+  // CLAIM tracks the sender state, because it was asserting "your feed is
+  // reaching the switcher" while stopped, which was simply untrue. The caveat
+  // is in every version of it. See deriveHonestLine in lamps.js.
   const honestLine = document.createElement('p');
   honestLine.className = 'honest-line';
-  honestLine.textContent = HONEST_LINE;
+  honestLine.textContent = deriveHonestLine(undefined);
 
-  el.append(header, errorBanner, pgmWrap, audioEl, controls, actionRow, statusUnavailableBanner, honestLine);
+  function setSenderState(state) {
+    honestLine.textContent = deriveHonestLine(state);
+  }
+
+  el.append(header, errorBanner, pgmStage, audioEl, controls, actionRow, statusUnavailableBanner, honestLine);
 
   // --- setters --------------------------------------------------------
 
@@ -240,7 +354,11 @@ export function createHomeView(handlers) {
   }
 
   function setReturnMid(mid) {
-    returnSelect.value = String(mid);
+    const wanted = String(mid);
+    // A mid outside 1..7 — a hand-edited config.json, an older file — would
+    // leave the <select> showing nothing at all, which reads as "no return" to
+    // somebody who is about to commentate. Fall back to the documented default.
+    returnSelect.value = RETURN_BUSES.some((b) => String(b.mid) === wanted) ? wanted : '2';
   }
 
   function setLevel(fraction) {
@@ -274,6 +392,7 @@ export function createHomeView(handlers) {
     setReturnMid,
     setLevel,
     setRunning,
+    setSenderState,
     setBusy,
     setStatusUnavailable,
     showError,

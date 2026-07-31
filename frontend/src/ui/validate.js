@@ -18,7 +18,13 @@
 // reject, not Settings'.
 
 const PBKEYLEN_VALUES = [0, 16, 32];
-const RETURN_MID_VALUES = [1, 2];
+
+// All seven audio transceiver mids, matching internal/config.Validate's 1..7
+// and frontend/src/monitor/buses.js's AUDIO_MIDS. It used to be [1, 2], which
+// meant the Settings screen refused to save any of the five buses the monitor
+// was already subscribed to — no help at all to a commentator who can hear
+// themselves on the default one.
+const RETURN_MID_VALUES = [1, 2, 3, 4, 5, 6, 7];
 
 function isBlank(v) {
   return typeof v !== 'string' || v.trim().length === 0;
@@ -57,9 +63,10 @@ export function validateConfig(config) {
     errors.eventId = 'Event ID is required.';
   }
 
-  if (isBlank(config.srtHost)) {
-    errors.srtHost = 'SRT host is required.';
-  } else if (hasScheme(config.srtHost)) {
+  // srtHost is OPTIONAL: empty means "the same host as M2L-X", which is what it
+  // is on every instance seen so far. internal/config.EffectiveSRTHost does the
+  // fallback, and it is the only place that does it.
+  if (!isBlank(config.srtHost) && hasScheme(config.srtHost)) {
     errors.srtHost = 'Enter a bare host or address — no "srt://".';
   }
 
@@ -75,12 +82,14 @@ export function validateConfig(config) {
     errors.pbkeylen = 'Key length must be 0 (no passphrase), 16 or 32.';
   }
 
-  if (isBlank(config.statusKey)) {
-    errors.statusKey = 'Status key is required, e.g. "cam7".';
-  }
+  // statusKey is OPTIONAL. It names the switcher_status node the three
+  // WebSocket-derived lamps read; with it empty they say NO STATUS, which is
+  // honest, and the feed is unaffected. Requiring it made the app unusable
+  // until the operator guessed a value nothing in the M2L-X API will tell them
+  // — the app now offers candidates after a START instead.
 
   if (!isInt(config.returnMid) || !RETURN_MID_VALUES.includes(config.returnMid)) {
-    errors.returnMid = 'Return must be CLN (2) or PGM (1).';
+    errors.returnMid = 'Return must be one of the seven audio transceivers, mid 1 to 7.';
   }
 
   if (typeof config.returnGainDb !== 'number' || !Number.isFinite(config.returnGainDb)) {

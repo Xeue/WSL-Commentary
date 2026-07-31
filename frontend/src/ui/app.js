@@ -67,6 +67,9 @@ export function mountApp(root) {
   function renderSenderLamp() {
     home.lamps.SENDING.update(deriveSenderLamp(currentSenderState));
     home.setRunning(!!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED);
+    // The honest line's claim is derived from the same state as the lamp, so
+    // the two can never disagree about whether anything is being sent.
+    home.setSenderState(currentSenderState);
   }
 
   function renderStatusLamps() {
@@ -226,6 +229,18 @@ export function mountApp(root) {
         tile: config.monitorTile,
         returnMid: config.returnMid,
         gainDb: config.returnGainDb,
+        // The PAGE owns the crop, not the monitor. Both implement it — the
+        // monitor with inline pixel sizes and a scale factor, home.js with
+        // percentages of the tile box — and running both is what put the
+        // picture in the top-left corner of a large black rectangle: the
+        // monitor's wrappers pinned the <video> at 2240x1440 inside a 640x360
+        // crop box at scale 1, and nothing ever called setScale or fitTo, so
+        // the picture stayed 640x360 however large the window was.
+        //
+        // The page's version is the one that can be responsive without being
+        // driven, so it wins and the monitor is told to touch no layout. See
+        // the "OPTING OUT" note at the top of frontend/src/monitor/video.js.
+        manageVideoLayout: false,
       });
     } catch (err) {
       console.error('wslcomms: createMonitor threw — the monitor module is unavailable', err);

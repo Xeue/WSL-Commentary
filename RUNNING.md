@@ -88,8 +88,18 @@ The frontend has its own tests, which use Node's built-in runner because
 
 ```powershell
 cd frontend
-node --test "src/monitor/*.test.js"     # 260 tests
+node --test "src/monitor/*.test.js"     # 260 tests — WP-5a, the KVS monitor
+node --test "src/ui/*.test.js"          #  40 tests — WP-5b, the shell
 ```
+
+`src/ui/` covers the two pure modules the shell cannot get subtly wrong without
+somebody noticing on air: `tile.js`, which rescales `config.monitorTile` from
+the mosaic it was measured against onto the one that actually arrived, and
+`liveurl.js`, which parses the pasted live-operation URL into a host and an
+event ID. `liveurl.js`'s `bareHost` is a mirror of `internal/config`'s
+`hostOnly` and is tested against the same cases, because if they disagree the
+Settings screen's "same as M2L-X" placeholder is telling the operator something
+untrue.
 
 Use the quoted glob. `node --test src/monitor/` — the directory form — fails on
 this Node version.

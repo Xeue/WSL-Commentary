@@ -62,6 +62,12 @@ type Config struct {
 
 	// SRTHost is the hostname or address of the M2L-X SRT listener that this
 	// application dials as a caller.
+	//
+	// It is OPTIONAL. Empty means "the same host as M2L-X": on every instance
+	// seen so far the SRT listener answers on the same name as the REST API, and
+	// asking the operator to type that name a second time is one more thing to
+	// get wrong under pressure. Read it through EffectiveSRTHost, never
+	// directly, so the fallback happens in exactly one place.
 	SRTHost string `json:"srtHost"`
 
 	// SRTPort is the port of that SRT listener.
@@ -77,6 +83,14 @@ type Config struct {
 
 	// StatusKey is the switcher_status node name for our router input, e.g.
 	// "cam7". Every WebSocket-derived status lamp reads <statusKey>.* .
+	//
+	// It is OPTIONAL and is not required to send. It names the node the three
+	// WebSocket-derived lamps read; with it empty those lamps report NO STATUS,
+	// which is honest, and the contribution feed is unaffected. Requiring it
+	// would be worse than useless: it cannot be derived from any REST endpoint,
+	// so the only way to find it is to watch switcher_status while our feed
+	// comes up (spec open question 5) — which cannot happen if the app refuses
+	// to start without it. See App.GetStatusKeyCandidates.
 	StatusKey string `json:"statusKey"`
 
 	// AudioDeviceID is the WASAPI IMMDevice endpoint ID GUID of the commentary
@@ -267,16 +281,70 @@ func (c *Config) Save() error {
 	return nil
 }
 
+// EffectiveSRTHost returns the host this application dials for SRT: SRTHost
+// when it is set, and otherwise the M2L-X host with any scheme, path and port
+// stripped off.
+//
+// Empty SRTHost is the normal case, not a misconfiguration — see the field
+// comment. An explicit SRTHost is an override for the one case that needs it,
+// an SRT ingest published under a different name, and is returned verbatim
+// apart from surrounding whitespace.
+//
+// M2LXHost may carry an explicit "http://" or "https://" prefix (internal/m2lx
+// resolveHost accepts one, and cmd/mockm2lx needs it) and a port. Neither
+// belongs in the host half of the srt:// URI internal/gst builds, so both are
+// removed. An IPv6 literal keeps its brackets, because that URI needs them.
+func (c *Config) EffectiveSRTHost() string {
+	if h := strings.TrimSpace(c.SRTHost); h != "" {
+		return h
+	}
+	return hostOnly(c.M2LXHost)
+}
+
+// hostOnly reduces a host that may carry a scheme, a port and a path to the
+// bare host. It is deliberately string surgery rather than net/url parsing: a
+// bare "m2lx.example.com" is not a URL, and url.Parse reads it as a path.
+func hostOnly(host string) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return ""
+	}
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+len("://"):]
+	}
+	if i := strings.IndexByte(h, '/'); i >= 0 {
+		h = h[:i]
+	}
+	// An IPv6 literal is bracketed: [::1] or [::1]:8890. Only a colon after the
+	// closing bracket is a port separator; the ones inside are the address.
+	if strings.HasPrefix(h, "[") {
+		if end := strings.IndexByte(h, ']'); end >= 0 {
+			return h[:end+1]
+		}
+		return h
+	}
+	if i := strings.LastIndexByte(h, ':'); i >= 0 {
+		h = h[:i]
+	}
+	return h
+}
+
 // Validate reports every reason (*Config) is not ready for Start to succeed,
 // as a single error joining one message per problem field (via errors.Join)
 // so the Settings screen can show the operator every problem at once rather
 // than one edit-rebuild-fail cycle at a time. It returns nil when c is ready.
 //
-// Required non-empty fields: m2lxHost, alias, eventId, srtHost, statusKey,
-// audioDeviceId. srtPort must be a valid TCP/UDP port, 1..65535. pbkeylen
-// must be 0 (no passphrase negotiated), 16 or 32 — the only key lengths SRT's
-// AES-CTR supports. returnMid must be 1..7, the range of transceiver mids the
-// KVS signalling channel can address.
+// Required non-empty fields: m2lxHost, alias, eventId, audioDeviceId, and an
+// EffectiveSRTHost — which m2lxHost alone satisfies. srtPort must be a valid
+// TCP/UDP port, 1..65535. pbkeylen must be 0 (no passphrase negotiated), 16 or
+// 32 — the only key lengths SRT's AES-CTR supports. returnMid must be 1..7, the
+// range of transceiver mids the KVS signalling channel can address.
+//
+// Deliberately NOT required: statusKey, which only names the node the three
+// WebSocket-derived lamps read (see the field comment), and srtHost, which
+// defaults to the M2L-X host (see EffectiveSRTHost). Neither is needed to put a
+// feed on air, and requiring statusKey in particular made the app unstartable
+// until the operator had guessed a value that nothing in the API can tell them.
 //
 // WP-1 addition beyond the WP-0 contract; see the package doc comment.
 func (c *Config) Validate() error {
@@ -289,14 +357,17 @@ func (c *Config) Validate() error {
 		{"m2lxHost", c.M2LXHost},
 		{"alias", c.Alias},
 		{"eventId", c.EventID},
-		{"srtHost", c.SRTHost},
-		{"statusKey", c.StatusKey},
 		{"audioDeviceId", c.AudioDeviceID},
 	}
 	for _, f := range required {
 		if strings.TrimSpace(f.value) == "" {
 			errs = append(errs, fmt.Errorf("%s is required", f.name))
 		}
+	}
+
+	if c.EffectiveSRTHost() == "" {
+		errs = append(errs, errors.New(
+			"srtHost is required when m2lxHost is empty: leave srtHost blank to dial the M2L-X host"))
 	}
 
 	if c.SRTPort < 1 || c.SRTPort > 65535 {

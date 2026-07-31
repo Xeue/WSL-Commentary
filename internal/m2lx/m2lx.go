@@ -228,6 +228,25 @@ type Watcher interface {
 	// after a token Refresh, since the token is in the URL — and only stops when
 	// ctx is cancelled. The channel is closed when ctx is done.
 	Watch(ctx context.Context, statusKey string) <-chan Status
+
+	// WatchAll opens the status WebSocket and returns every frame as a whole
+	// Document, with no debounce, no staleness and no filtering by node.
+	//
+	// It exists because statusKey cannot be discovered any other way: no REST
+	// endpoint lists the switcher's nodes, so the only way to learn which one is
+	// our router input is to watch all of them and see which starts streaming as
+	// our feed comes up (specification open question 5). Debouncing would blur
+	// exactly that transition, so this channel is raw.
+	//
+	// Reconnection and token rotation behave as they do for Watch. The channel
+	// is closed when ctx is done. Feed it to a Discovery; see discover.go.
+	//
+	// ADDED after the WP-0 contract was frozen, and reported under CONTRACT.md
+	// rule 3 rather than worked around: the alternative was for WP-8 to open a
+	// second WebSocket to the same endpoint behind this package's back, which
+	// would have duplicated the reconnect and token-rotation logic that is the
+	// whole point of the Watcher.
+	WatchAll(ctx context.Context) <-chan Document
 }
 
 // NewClient returns a Client for the M2L-X instance at host.

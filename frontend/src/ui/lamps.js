@@ -71,6 +71,51 @@ export function deriveSenderLamp(state) {
   }
 }
 
+// The honest line, specification section 10. It is permanent, not dismissible
+// and not a tooltip — and it must not assert something that is not true.
+//
+// The caveat NEVER changes: nothing this application can see proves the
+// commentator is audible on the broadcast output. The switcher accepting a feed
+// is not the same as the gallery having it faded up, and the app has no way to
+// tell the difference. What changes is the sentence in front of the caveat,
+// because "your feed is reaching the switcher" was being shown while STOPPED,
+// when it was simply false — and a permanent honest line that is sometimes a
+// lie is worse than no line at all.
+const HONEST_CAVEAT = 'This does not confirm you are audible on the broadcast output.';
+
+/**
+ * deriveHonestLine turns a sender.State string into the honest line's text.
+ *
+ *   deriveHonestLine('CONNECTED')  -> the feed IS reaching the switcher (+ caveat)
+ *   deriveHonestLine('CONNECTING') -> not reaching it YET (+ caveat)
+ *   deriveHonestLine('DRAINING')   -> as CONNECTING
+ *   deriveHonestLine('BACKOFF')    -> reconnecting; nothing is arriving (+ caveat)
+ *   deriveHonestLine('STOPPED')    -> nothing is being sent (+ caveat)
+ *   deriveHonestLine(undefined)    -> as STOPPED (no event has arrived yet)
+ *
+ * The claim tracks the SENDER, not the switcher lamps, because the sender is
+ * the half this process actually knows: it is our socket and our pipeline. The
+ * three WebSocket lamps report what M2L-X says, which is a different question
+ * and has its own row.
+ */
+export function deriveHonestLine(state) {
+  switch (state) {
+    case 'CONNECTED':
+      return `Your feed is reaching the switcher. ${HONEST_CAVEAT}`;
+    case 'CONNECTING':
+    case 'DRAINING':
+      return `Connecting: your feed is not reaching the switcher yet. ${HONEST_CAVEAT}`;
+    case 'BACKOFF':
+      return `Reconnecting: nothing is reaching the switcher at the moment. ${HONEST_CAVEAT}`;
+    default:
+      // STOPPED, and every state this build does not recognise. Claiming less
+      // than is true is the only safe direction to be wrong in here.
+      return `You are not sending: nothing is reaching the switcher. When you are, ${
+        HONEST_CAVEAT.charAt(0).toLowerCase() + HONEST_CAVEAT.slice(1)
+      }`;
+  }
+}
+
 const GOOD_VIDEO = { codec: 'h264', width: 1920, height: 1080, frameRate: 50 };
 const GOOD_AUDIO = { codec: 'aac', sampleRate: 48000, channels: 2 };
 

@@ -99,17 +99,36 @@ button {
 #app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  /* dvh where it exists: on a window whose chrome can move, vh alone leaves the
+     honest line under the bottom edge, and the honest line is not optional. */
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .view {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   width: 100%;
-  max-width: 1100px;
   margin: 0 auto;
-  padding: 0 1.25rem 1.75rem;
+  padding: 0 1.25rem 1rem;
+}
+
+/* Settings is a form and reads badly at 3840px wide, so it keeps the measure
+   and the scrollbar. The home view does NOT: the picture is the point, and a
+   1100px cap on a 3840px window was throwing away two thirds of it. */
+.view-settings {
+  max-width: 1100px;
+  overflow-y: auto;
+}
+
+/* auto, not hidden: when everything fits there is no scrollbar, and when the
+   window is too short to hold the controls and the honest line the operator can
+   still reach them instead of losing them under the bottom edge. */
+.view-home {
+  overflow-y: auto;
 }
 
 [hidden] {
@@ -275,35 +294,87 @@ input[type='range'] {
 }
 
 /* ------------------------------------------------------------------ */
-/* PGM tile                                                             */
+/* PGM tile — the dominant element on the screen                        */
 /*                                                                      */
-/* --mosaic-w/--mosaic-h are the fixed KVS mosaic size (spec section 7).*/
-/* --tile-x/--tile-y/--tile-w/--tile-h come from config.monitorTile and */
-/* are set in JS (home.js's setTile). Everything here is proportional,  */
-/* so it stays correct at any window width and at any tile geometry —   */
-/* no pixel value is hardcoded, unlike the spec's own worked example.   */
+/* "I want the return to expand to fill the space in the screen, it is  */
+/* the main thing commentators are looking at." So the picture takes    */
+/* every pixel left after the controls, keeps its aspect ratio, and     */
+/* leaves NO dead black margin: the tile box IS the picture's shape.    */
+/*                                                                      */
+/* --mosaic-w/--mosaic-h are the size of the video track that ACTUALLY  */
+/* ARRIVED, read from videoWidth/videoHeight; --tile-* are              */
+/* config.monitorTile rescaled onto it. Both are written by home.js     */
+/* (applyCrop) via frontend/src/ui/tile.js — see that file for why      */
+/* neither may be a compiled-in constant. Everything below is           */
+/* proportional, so one set of rules is correct at every window size.   */
 /* ------------------------------------------------------------------ */
 
-.pgm-wrap {
-  width: 100%;
-  margin: 1rem 0;
-  background: #000;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border);
-  overflow: hidden;
+/* The stage is the flex child that grows: it takes whatever height is left
+   after the topbar, the controls, the action row and the honest line, all of
+   which are flex: 0 0 auto. */
+.pgm-stage {
+  flex: 1 1 auto;
+  /* A floor, not a size. The tile's width is computed from this element's
+     height, so a stage squeezed to nothing by a very short window would compute
+     a width of nothing and the picture would vanish outright — a far worse
+     failure than a scrollbar. Below this the view scrolls instead. */
+  min-height: 200px;
+  min-width: 0;
+  margin: 0.75rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Size containment makes this element a query container for its height, so
+     the tile below can be sized against it in cqh units. */
+  container-type: size;
 }
 
+/* The one rule that does the work.
+ *
+ *   width = min(all the width there is, all the height there is x aspect)
+ *
+ * On the operator's 3840x2088 window that is roughly min(3792px, 1790 x 1.78
+ * = 3180px): height-limited, centred, black either side. On the 1024x820
+ * default it is min(984px, 430 x 1.78 = 765px): height-limited again, and no
+ * dead space below. The width only wins on a window that is narrow and tall —
+ * 800x1200, say — which is the case this arrangement exists to also get right.
+ * Height comes from `aspect-ratio` with width definite, which is the one way
+ * in which the ratio is honoured rather than ignored — setting BOTH width and
+ * height (say width:100% with max-height) makes the browser drop the ratio
+ * and stretch the picture, which is the trap this avoids. */
 .pgm-tile {
   position: relative;
-  width: 100%;
-  aspect-ratio: var(--tile-w, 640) / var(--tile-h, 360);
+  width: min(100%, calc(100cqh * var(--tile-ar-num, 1.7778)));
+  aspect-ratio: var(--tile-ar, 640 / 360);
   background: #000;
   overflow: hidden;
+  border-radius: var(--radius-lg);
+  /* No border: with box-sizing: border-box one would sit inside the aspect
+     ratio, so the video's percentage sizes would be computed against a content
+     box a couple of pixels off the tile's ratio. The picture's own edge against
+     the page background is the frame. */
+}
+
+/* Without container queries there is no way to ask "how tall is my parent" in
+   CSS, so fall back to the old width-limited behaviour: the picture fills the
+   width and the page scrolls if that makes it too tall. Chromium has had
+   container size queries since 105 and WebView2 is evergreen, so this is a
+   safety net rather than a supported path. */
+@supports not (container-type: size) {
+  .pgm-stage {
+    overflow: auto;
+  }
+
+  .pgm-tile {
+    width: 100%;
+  }
 }
 
 .pgm-tile video {
   position: absolute;
   max-width: none;
+  max-height: none;
+  display: block;
   width: calc(var(--mosaic-w, 2240) / var(--tile-w, 640) * 100%);
   height: calc(var(--mosaic-h, 1440) / var(--tile-h, 360) * 100%);
   left: calc(var(--tile-x, 0) / var(--tile-w, 640) * -100%);
@@ -314,37 +385,56 @@ input[type='range'] {
 /* Controls: input / headphones / return + level                       */
 /* ------------------------------------------------------------------ */
 
+/* One wrapping row of compact groups, label above control. Three full-width
+   stacked rows cost ~150px of height that the picture wants, and on a 3840px
+   window they were three near-empty lines. */
 .controls {
   display: flex;
-  flex-direction: column;
-  gap: 0.85rem;
-  margin: 0.5rem 0 1.25rem;
-}
-
-.control-row {
-  display: flex;
-  align-items: center;
-  gap: 0.85rem;
+  flex-direction: row;
   flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.6rem 1.25rem;
+  margin: 0 0 0.6rem;
+  flex: 0 0 auto;
 }
 
-.control-row label {
-  min-width: 160px;
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.control-group label {
   color: var(--text-muted);
-  font-size: 0.95rem;
+  font-size: 0.85rem;
 }
 
-.control-row select {
-  flex: 1 1 320px;
+.control-group select {
+  width: 100%;
 }
 
-.control-row .level-label {
-  min-width: auto;
-  margin-left: 0.5rem;
+/* The return needs room for "mid 2 — CLN (aux1): the intended return, effects
+   without commentary", which is long on purpose: a label that says only "CLN"
+   is what left the commentator with no idea which bus to try next. */
+.control-group-return {
+  flex: 2 1 380px;
 }
 
-.control-row input[type='range'] {
-  flex: 1 1 160px;
+.control-group-level {
+  flex: 0 1 200px;
+}
+
+.control-group input[type='range'] {
+  width: 100%;
+}
+
+.control-hint {
+  margin: 0.1rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--text-muted);
 }
 
 /* ------------------------------------------------------------------ */
@@ -354,9 +444,10 @@ input[type='range'] {
 .action-row {
   display: flex;
   align-items: center;
-  gap: 1.25rem;
+  gap: 1rem;
   flex-wrap: wrap;
-  margin: 0.5rem 0 1rem;
+  margin: 0 0 0.5rem;
+  flex: 0 0 auto;
 }
 
 .lamps {
@@ -461,12 +552,13 @@ input[type='range'] {
 /* ------------------------------------------------------------------ */
 
 .honest-line {
-  margin: 0.25rem 0 0;
-  padding-top: 0.9rem;
+  margin: 0;
+  padding-top: 0.6rem;
   border-top: 1px solid var(--border);
   color: var(--text-muted);
   font-size: 0.92rem;
-  line-height: 1.55;
+  line-height: 1.45;
+  flex: 0 0 auto;
 }
 
 /* ------------------------------------------------------------------ */
@@ -523,6 +615,52 @@ input[type='range'] {
   font-size: 0.82rem;
   font-weight: 700;
   color: var(--red);
+}
+
+/* What the pasted address was read as: confirmation, not an error. */
+.field-note {
+  color: var(--green);
+}
+
+/* statusKey suggestions. Deliberately not styled as a call to action: each one
+   is evidence the operator judges, and the app must not look confident about
+   which node is theirs. */
+.suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: -0.2rem 0 0.3rem;
+}
+
+.suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.suggestion-detail {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.btn-small {
+  min-height: 36px;
+  padding: 0.35rem 0.8rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
 }
 
 .secret-badge {
@@ -583,16 +721,28 @@ input[type='range'] {
 /* ------------------------------------------------------------------ */
 
 @media (max-width: 560px) {
-  .control-row label {
-    min-width: 100%;
-  }
-
-  .control-row select,
-  .control-row input[type='range'] {
+  .control-group,
+  .control-group-return,
+  .control-group-level {
     flex: 1 1 100%;
   }
 
   .tile-grid {
     grid-template-columns: repeat(2, minmax(80px, 1fr));
+  }
+}
+
+/* A short window — a half-height window on a laptop — spends too much of what
+   little height there is on the 64px START button. Shrink the furniture before
+   the picture: the picture is what the commentator is looking at. */
+@media (max-height: 620px) {
+  .btn-start {
+    min-height: 52px;
+    min-width: 130px;
+    font-size: 1.25rem;
+  }
+
+  .pgm-stage {
+    margin: 0.4rem 0;
   }
 }

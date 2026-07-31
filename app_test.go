@@ -752,26 +752,33 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 		t.Fatalf("stored %q, want %q", got, "hunter2")
 	}
 
-	// The bound surface is exactly seven methods and none of them reads a secret.
-	// Wails binds every exported method, so an eighth would silently widen the
+	// The bound surface is exactly eight methods and none of them reads a secret.
+	// Wails binds every exported method, so a ninth would silently widen the
 	// contract with WP-5a and WP-5b.
 	assertBoundSurface(t)
 }
 
-// assertBoundSurface checks that *App exports exactly the seven methods
-// CONTRACT.md declares. Wails binds every exported method of the bound object,
-// so this is the contract with the frontend, enforced.
+// assertBoundSurface checks that *App exports exactly the methods app.go's
+// header declares. Wails binds every exported method of the bound object, so
+// this is the contract with the frontend, enforced.
+//
+// It was seven. GetStatusKeyCandidates is the eighth, added deliberately and
+// documented in app.go's header: the three WebSocket-derived lamps are useless
+// without a statusKey, and no M2L-X endpoint will name one (specification open
+// question 5). This list is the place that decision has to be re-made rather
+// than drifted into, which is why the test asserts equality in both directions.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
 	want := map[string]bool{
-		"ListInputDevices":  true,
-		"GetConfig":         true,
-		"SaveConfig":        true,
-		"SetSecret":         true,
-		"Start":             true,
-		"Stop":              true,
-		"GetKVSCredentials": true,
+		"ListInputDevices":       true,
+		"GetConfig":              true,
+		"SaveConfig":             true,
+		"SetSecret":              true,
+		"Start":                  true,
+		"Stop":                   true,
+		"GetKVSCredentials":      true,
+		"GetStatusKeyCandidates": true,
 	}
 
 	got := exportedMethodsOfApp()
@@ -852,8 +859,11 @@ func TestStartRefusesAnIncompleteConfigurationAndNamesTheFields(t *testing.T) {
 		{"missing m2lxHost", func(c *config.Config) { c.M2LXHost = "" }, "m2lxHost"},
 		{"missing alias", func(c *config.Config) { c.Alias = "" }, "alias"},
 		{"missing eventId", func(c *config.Config) { c.EventID = "" }, "eventId"},
-		{"missing srtHost", func(c *config.Config) { c.SRTHost = "" }, "srtHost"},
-		{"missing statusKey", func(c *config.Config) { c.StatusKey = "" }, "statusKey"},
+		// srtHost and statusKey are deliberately absent from this list: an empty
+		// srtHost means "the same host as M2L-X" (config.EffectiveSRTHost) and an
+		// empty statusKey costs the three WebSocket lamps, not the feed. Both are
+		// covered by TestStartAcceptsAnEmptySRTHostAndStatusKey below.
+		{"missing srtHost AND m2lxHost", func(c *config.Config) { c.SRTHost = ""; c.M2LXHost = "" }, "srtHost"},
 		{"missing audioDeviceId", func(c *config.Config) { c.AudioDeviceID = "" }, "audioDeviceId"},
 		{"port zero", func(c *config.Config) { c.SRTPort = 0 }, "srtPort"},
 		{"port out of range", func(c *config.Config) { c.SRTPort = 70000 }, "srtPort"},
@@ -1859,3 +1869,332 @@ func (c *closeSpyClient) closeCount() int {
 }
 
 var _ m2lx.Client = (*closeSpyClient)(nil)
+
+// ---------------------------------------------------------------------------
+// The SRT host default
+// ---------------------------------------------------------------------------
+
+func TestStartAcceptsAnEmptySRTHostAndDialsTheM2LXHost(t *testing.T) {
+	// The operator: "I shouldn't need to specify the SRT host again, it will be
+	// the same as the m2lx host." An empty srtHost is now the normal case, and
+	// Start must not only accept it but dial the right machine.
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	cfg := validConfig()
+	cfg.M2LXHost = "http://m2lx.example.com:8080"
+	cfg.SRTHost = ""
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() with an empty srtHost error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = a.Stop() })
+
+	a.sessMu.Lock()
+	sess := a.session
+	a.sessMu.Unlock()
+	stub, ok := sess.pipe.(*gst.StubPipeline)
+	if !ok {
+		t.Fatalf("pipeline is %T, want the Gate A stub", sess.pipe)
+	}
+
+	waitFor(t, 5*time.Second, "a sink to be attached", func() bool {
+		_, attached := stub.AttachedSink()
+		return attached
+	})
+	sink, _ := stub.AttachedSink()
+	if sink.Host != "m2lx.example.com" {
+		t.Fatalf("sink dialled %q, want the M2L-X host with the scheme and port stripped", sink.Host)
+	}
+	if sink.Port != cfg.SRTPort {
+		t.Fatalf("sink port = %d, want the configured %d — only the HOST is inherited", sink.Port, cfg.SRTPort)
+	}
+}
+
+func TestStartAcceptsAnEmptyStatusKey(t *testing.T) {
+	// statusKey costs the three WebSocket-derived lamps, not the feed. Refusing
+	// to start without it made the app unusable until the operator guessed a
+	// value that nothing in the M2L-X API will tell them.
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	cfg := validConfig()
+	cfg.StatusKey = ""
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() with an empty statusKey error = %v, want nil", err)
+	}
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestSenderOptsResolvesTheSRTHostAndReportsUnderThatName(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	cfg := validConfig()
+	cfg.M2LXHost = "m2lx.example.com"
+	cfg.SRTHost = ""
+	opts := a.senderOpts(cfg, "")
+
+	if opts.Sink.Host != "m2lx.example.com" {
+		t.Fatalf("sink host = %q, want the M2L-X host", opts.Sink.Host)
+	}
+
+	// The reporter must name the host that was actually dialled: an error
+	// reading "the commentary feed to :4001" helps nobody.
+	opts.OnConnectError(errors.New("connection refused"))
+	queued := drainPump(a)
+	if len(queued) != 1 {
+		t.Fatalf("queued %d events, want one: %+v", len(queued), queued)
+	}
+	msg, _ := queued[0].data.(string)
+	if !strings.Contains(msg, "m2lx.example.com") {
+		t.Fatalf("the operator was told %q, which does not name the host that was dialled", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// statusKey discovery
+// ---------------------------------------------------------------------------
+
+// stubWatcher is an m2lx.Watcher whose WatchAll channel the test drives. Watch
+// is not used by the discovery path and returns a closed channel.
+type stubWatcher struct {
+	docs chan m2lx.Document
+}
+
+func newStubWatcher() *stubWatcher {
+	return &stubWatcher{docs: make(chan m2lx.Document, 8)}
+}
+
+func (w *stubWatcher) Watch(context.Context, string) <-chan m2lx.Status {
+	ch := make(chan m2lx.Status)
+	close(ch)
+	return ch
+}
+
+func (w *stubWatcher) WatchAll(ctx context.Context) <-chan m2lx.Document {
+	out := make(chan m2lx.Document)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case d := <-w.docs:
+				select {
+				case out <- d:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+var _ m2lx.Watcher = (*stubWatcher)(nil)
+
+// withStubControlPlane installs a control plane generation whose watcher the
+// test drives. It stands in for startControlPlane, which would open a real
+// socket to a host that does not exist.
+func withStubControlPlane(t *testing.T, a *App) *stubWatcher {
+	t.Helper()
+	w := newStubWatcher()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a.ctlMu.Lock()
+	a.watcher = w
+	a.ctlCtx = ctx
+	a.ctlCancel = cancel
+	a.ctlWG = &sync.WaitGroup{}
+	wg := a.ctlWG
+	a.ctlMu.Unlock()
+
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	return w
+}
+
+func TestStartDiscoversTheStatusKeyFromTheNodeThatStartsStreaming(t *testing.T) {
+	// Specification open question 5, mechanised: "read one switcher_status
+	// snapshot and find the node whose stream_state changes when the app
+	// starts."
+	a, _ := newTestApp(t)
+	silencePump(a)
+	w := withStubControlPlane(t, a)
+
+	cfg := validConfig()
+	cfg.StatusKey = ""
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Stop() })
+
+	now := time.Now()
+	// The baseline: cam3 is somebody else's input, already up.
+	w.docs <- m2lx.Document{At: now, Nodes: map[string]m2lx.NodeState{
+		"cam3": {StreamState: m2lx.StreamStateStreaming, Video: "h264 1920x1080 50 P", AudioCount: 1},
+		"cam7": {StreamState: m2lx.StreamStateStopped},
+	}}
+	// Our feed arrives.
+	w.docs <- m2lx.Document{At: now.Add(2 * time.Second), Nodes: map[string]m2lx.NodeState{
+		"cam3": {StreamState: m2lx.StreamStateStreaming, Video: "h264 1920x1080 50 P", AudioCount: 1},
+		"cam7": {StreamState: m2lx.StreamStateStreaming, Video: "h264 1920x1080 50 P", AudioCount: 1},
+	}}
+
+	waitFor(t, 5*time.Second, "a statusKey suggestion", func() bool {
+		got, _ := a.GetStatusKeyCandidates()
+		return len(got) > 0
+	})
+
+	got, err := a.GetStatusKeyCandidates()
+	if err != nil {
+		t.Fatalf("GetStatusKeyCandidates() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Key != "cam7" {
+		t.Fatalf("candidates = %+v, want only cam7 — cam3 was already streaming", got)
+	}
+	if got[0].Was != m2lx.StreamStateStopped || got[0].Now != m2lx.StreamStateStreaming {
+		t.Errorf("candidate transition = %q -> %q, want stopped -> streaming", got[0].Was, got[0].Now)
+	}
+
+	// The suggestion is published, and it is NOT written to the configuration.
+	var announced bool
+	for _, e := range drainPump(a) {
+		if e.name == EventStatusKeys {
+			announced = true
+			if _, ok := e.data.([]m2lx.StatusKeyCandidate); !ok {
+				t.Fatalf("the %q event carried %T, want []m2lx.StatusKeyCandidate", EventStatusKeys, e.data)
+			}
+		}
+	}
+	if !announced {
+		t.Fatalf("no %q event was queued for the frontend", EventStatusKeys)
+	}
+	if saved := a.snapshotConfig().StatusKey; saved != "" {
+		t.Fatalf("discovery wrote %q into the configuration; it must only ever suggest", saved)
+	}
+}
+
+func TestDiscoveryOffersEveryNodeThatCameUpAtOnce(t *testing.T) {
+	// Two nodes changing together is the case where picking one would be
+	// picking at random and calling it knowledge.
+	a, _ := newTestApp(t)
+	silencePump(a)
+	w := withStubControlPlane(t, a)
+
+	cfg := validConfig()
+	cfg.StatusKey = ""
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Stop() })
+
+	now := time.Now()
+	w.docs <- m2lx.Document{At: now, Nodes: map[string]m2lx.NodeState{
+		"cam7": {StreamState: m2lx.StreamStateStopped},
+		"cam9": {StreamState: m2lx.StreamStateStopped},
+	}}
+	w.docs <- m2lx.Document{At: now.Add(time.Second), Nodes: map[string]m2lx.NodeState{
+		"cam7": {StreamState: m2lx.StreamStateStreaming},
+		"cam9": {StreamState: m2lx.StreamStateStreaming},
+	}}
+
+	waitFor(t, 5*time.Second, "both statusKey suggestions", func() bool {
+		got, _ := a.GetStatusKeyCandidates()
+		return len(got) == 2
+	})
+}
+
+func TestNoDiscoveryWhenTheStatusKeyIsAlreadyConfigured(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+	w := withStubControlPlane(t, a)
+
+	// validConfig has a statusKey, so there is nothing to discover.
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Stop() })
+
+	select {
+	case w.docs <- m2lx.Document{At: time.Now(), Nodes: map[string]m2lx.NodeState{
+		"cam7": {StreamState: m2lx.StreamStateStreaming},
+	}}:
+	default:
+	}
+
+	// Nothing is reading those documents if no discovery started, so the
+	// evidence is the absence of suggestions after long enough for one to have
+	// produced some.
+	time.Sleep(200 * time.Millisecond)
+	if got, _ := a.GetStatusKeyCandidates(); len(got) != 0 {
+		t.Fatalf("candidates = %+v, want none: a statusKey is already configured", got)
+	}
+}
+
+func TestAFailedStartDoesNotLeaveADiscoveryRunning(t *testing.T) {
+	// The discovery is armed BEFORE the pipeline, so that its baseline predates
+	// our feed reaching the switcher. That means a Start which then fails
+	// validation has to unwind it, or a mistyped Settings screen leaves a
+	// ninety-second watcher running that can only ever report nothing.
+	a, _ := newTestApp(t)
+	silencePump(a)
+	withStubControlPlane(t, a)
+
+	cfg := validConfig()
+	cfg.StatusKey = ""
+	cfg.EventID = "" // fails config.Validate
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	if err := a.Start(); err == nil {
+		_ = a.Stop()
+		t.Fatal("Start() succeeded on an invalid configuration")
+	}
+
+	waitFor(t, 5*time.Second, "the discovery to unwind", func() bool {
+		return !a.discovering.Load()
+	})
+}
+
+func TestGetStatusKeyCandidatesReturnsACopyAndNeverNil(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	got, err := a.GetStatusKeyCandidates()
+	if err != nil {
+		t.Fatalf("GetStatusKeyCandidates() error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetStatusKeyCandidates() = nil; the frontend renders a list and must not have to special-case null")
+	}
+
+	a.setStatusKeyCandidates([]m2lx.StatusKeyCandidate{{Key: "cam7"}})
+	first, _ := a.GetStatusKeyCandidates()
+	first[0].Key = "mutated-by-the-caller"
+
+	second, _ := a.GetStatusKeyCandidates()
+	if second[0].Key != "cam7" {
+		t.Fatalf("a caller mutated the stored candidates: %q", second[0].Key)
+	}
+}
