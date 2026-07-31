@@ -298,7 +298,12 @@ is to comment out the filter and log `structureFieldNames(props)` for every devi
 
 ### 4.10 The queue re-arm destroys every sticky event, and puts them back by hand
 
-**This is the highest-risk unverified thing in the file. Verify it first at Gate B.**
+> **VERIFIED AT GATE C, 2026-07-31. THE REPAIR WORKS.** Both halves were measured against the
+> live M2L-X dev instance, driving this package's own `Pipeline`. Verdict, evidence and the run
+> recipe are in section 8.2. Nothing below needed changing; it is kept as written because it is
+> the reasoning the repair was built from, and it turned out to be correct in every particular.
+
+**This was the highest-risk unverified thing in the file. It is now settled — see section 8.2.**
 
 `rearmQueueLocked` relies on `gst_queue_src_activate_mode` resetting `srcresult` to
 `GST_FLOW_OK`, flushing the queued data and restarting the loop task — which is what gstqueue.c
@@ -534,6 +539,14 @@ Both are argued in full in the file comment at the top of `gst_cgo.go`.
    handshake. The resolution is a *gate*: a probe that drops buffers while a flag is set. Dropping
    during an outage is what `leaky=downstream` already does (specification section 6.2), so no
    behaviour is lost.
+
+   > **CORRECTION, 2026-07-31.** "holds the pad blocked only for the duration of its callback" is
+   > **false**, and believing it produced the defect in section 8.3 — a gate that could close and
+   > never open, with no media leaving this package at all. A `GST_PAD_PROBE_TYPE_BLOCK` probe
+   > holds the pad blocked for its whole lifetime; the callback's return value is what releases
+   > each item, and only `DROP` and `PASS` release the streaming thread. `OK` does not. The
+   > conclusion above is unaffected — a gate is still the right shape, and the slow work still
+   > cannot live in the callback — but the mechanism is `PASS`, not `OK`. Measured; see 8.3.
 
 2. **There are two probes, not one, and the mask is narrower.** A probe on `srtq`'s **sink** pad
    was added so that `mpegtsmux` never enters `gst_queue_chain` while the queue is unhealthy —
@@ -872,14 +885,302 @@ Run it on a machine that **also** has a system-wide GStreamer installed, or the 
 Install the 1.28.5 runtime MSI system-wide, set `GST_PLUGIN_SYSTEM_PATH` machine-wide to its plugin
 directory, and confirm the assertion still passes.
 
-### 8.2 The sticky events survive a reconnect
+### 8.2 The sticky events survive a reconnect — DONE, 2026-07-31. THE RESTORE WORKS.
 
-§4.10, and it is the one to do first. The reproduction and the two log lines to grep for are there.
+§4.10, settled at Gate C against the live M2L-X dev instance (`m2lx-wslstudios-matcht.etapsiota.com`,
+event `dl9-5p5ah0bd-empd`, router input 22) with `internal/gst/live_test.go`.
 
-### 8.3 The H.264 encoder actually chosen
+#### How to run it
 
-Record the `gst: H.264 encoder resolved by rank: ... (rank N)` line. That is the answer to
-specification open question 3 and it belongs in `docs/test-results.md`, not in someone's memory.
+`live_test.go` carries `//go:build live && cgo && !gststub`, so it never runs in a normal suite.
+Everything is an environment variable with the values above as defaults; only the password has no
+default, on purpose, so that no credential lives in the repository.
+
+**Build and run must use DIFFERENT `PATH` orders. This is not optional — see section 8.4.**
+
+```bash
+# BUILD: MSYS2 first, because gcc/ld need their own libstdc++ and libgcc.
+export PATH="/c/msys64/mingw64/bin:/c/gstreamer/1.0/mingw_x86_64/bin:$PATH"
+export CGO_ENABLED=1
+export PKG_CONFIG_PATH="C:/gstreamer/1.0/mingw_x86_64/lib/pkgconfig"
+export CGO_LDFLAGS="-LC:/msys64/mingw64/x86_64-w64-mingw32/lib -LC:/msys64/mingw64/lib"
+go test -tags live -c -o /tmp/gstlive.test.exe ./internal/gst/
+
+# RUN: GStreamer first, and NOT from the build shell.
+export PATH="/c/gstreamer/1.0/mingw_x86_64/bin:$PATH"
+export GST_DEBUG="2,basesink:4,GST_PADS:5,queue:5"
+export GST_DEBUG_NO_COLOR=1
+export WSLCOMMS_LIVE_M2LX_PASSWORD='...'          # required; nothing else is
+export WSLCOMMS_LIVE_APP_DIR="$PWD/build/bin"     # must contain gst\lib\gstreamer-1.0
+export WSLCOMMS_LIVE_SLATE="$PWD/assets/slate.png"
+export WSLCOMMS_LIVE_SRT_HOST="34.242.91.248"     # an IP LITERAL, not the hostname - section 8.5
+/tmp/gstlive.test.exe -test.v -test.run TestLiveReconnectPreservesStickyEvents \
+    -test.timeout 20m > live.log 2>&1
+```
+
+Do not use PowerShell for the run: 5.1 mangles a native executable's stderr into
+`NativeCommandError`. Redirect to a file from bash, as above.
+
+The other variables are `WSLCOMMS_LIVE_M2LX_HOST`, `_M2LX_EVENT`, `_M2LX_ALIAS`, `_SRT_PORT`,
+`_INPUT_ID`, `_AUDIO_DEVICE`, `_KILLABLE_PORT`.
+
+**`TestLiveGateProbeDoesNotBlockWhenOpen` in the same file needs none of that** — no M2L-X, no
+capture hardware, no network, `fakesrc ! queue ! fakesink` out of the bundle. Run it first; it is
+three seconds and it is what catches section 8.3's defect.
+
+#### What to grep for, and what it said
+
+```
+$ grep -c "without a new-segment"        live.log      # 1
+$ grep    "without a new-segment"        live.log
+0:00:02.428170900 WARN videodecoder gstvideodecoder.c:2833:gst_video_decoder_chain:<pngdec0> \
+    Received buffer without a new-segment. Assuming timestamps start from 0.
+```
+
+**That one hit is not ours.** It is `<pngdec0>`, a `GstVideoDecoder` message on the slate branch at
+2.4 s, before the first connect, and it is about `filesrc ! pngdec`, not about a sink. **Grep for
+the element, not just the string** — the string that matters is the same warning from
+`gstbasesink.c` naming `srtout-N`. There were **zero** of those, across four reconnects. Every
+`basesink` line naming a sink in the whole 2.5 MB log was the benign
+
+```
+FIXME basesink gstbasesink.c:3397:<srtout-4> stream-start event without group-id
+```
+
+which is itself confirmation: each fresh sink did receive a `STREAM_START`.
+
+#### The destruction and the repair, separately, as §4.10 asked
+
+Both on `srtq:src`, microseconds apart, inside one `rearmQueueLocked`:
+
+```
+0:01:08.109280600 DEBUG GST_PADS gstpad.c:1073:post_activate:<srtq:src> stopped streaming
+0:01:08.109326900 DEBUG GST_PADS gstpad.c:475:remove_events:<srtq:src> notify caps
+0:01:08.109385600 DEBUG GST_PADS gstpad.c:1125:gst_pad_set_active:<srtq:src> activating pad from none
+0:01:08.109614400 DEBUG GST_PADS gstpad.c:5569:store_sticky_event:<srtq:src> notify caps
+2026/07/31 01:26:28 gst: restored 3 sticky event(s) on srtq:src after re-arming
+```
+
+`remove_events` fires. The destruction is real on GStreamer 1.28.5, exactly as §4.10 read it out of
+`gstpad.c`. `store_sticky_event` puts them back.
+
+They are then delivered to the fresh sink by the ordinary path, which is the other thing §4.10
+predicted:
+
+```
+0:01:15.191174400 INFO  GST_PADS gstpad.c:2644:gst_pad_link_full: linked srtq:src and srtout-4:sink, successful
+0:01:15.201787800 DEBUG GST_PADS gstpad.c:4227:check_sticky:<srtq:src> pushing all sticky events
+0:01:15.202187900 DEBUG GST_PADS gstpad.c:4162:push_sticky:<srtq:src> event stream-start marked received
+0:01:15.202500000 DEBUG GST_PADS gstpad.c:4162:push_sticky:<srtq:src> event caps marked received
+0:01:15.202621000 DEBUG GST_PADS gstpad.c:4162:push_sticky:<srtq:src> event segment marked received
+```
+
+#### The assertion that actually settles it
+
+The log is corroboration. The proof is in-process, and it is stronger than the log because it
+excludes the failure the log cannot see — a *fresh* `SEGMENT` appearing from somewhere else, which
+would look identical in `push_sticky` and would still restart the far end's clock.
+
+`live_test.go` snapshots `stickyEventsOf(srtq:src)` immediately before `RemoveSink` and immediately
+after it, and compares **GstEvent seqnums**. `rearmQueueLocked` stores back the very objects it
+snapshotted, so equal seqnums mean the originals are back. Across all four cycles, eight snapshots:
+
+```
+EventStreamStart  idx=0 seqnum=236  stream-id=agg-f8c06db9
+EventCaps         idx=0 seqnum=242  video/mpegts, systemstream=true, packetsize=188, streamheader=<...>
+EventSegment      idx=0 seqnum=227  running-time(10s)=10000000000
+```
+
+Identical every time. **Not one seqnum changed and not one event went missing.**
+
+#### The re-arm really ran, on the real trigger
+
+Three of the four cycles took it, each on a genuine `GST_FLOW_ERROR` out of a real `srtsink`
+`render()` whose peer had gone:
+
+```
+2026/07/31 01:26:28 gst: srtq stopped with FlowError; re-arming its loop
+2026/07/31 01:26:28 gst: restored 3 sticky event(s) on srtq:src after re-arming
+```
+
+Cycle 1 was an orderly `RemoveSink`/`ReplaceSink` with the gate closed first; its last flow return
+was `FlowOK` and `rearmQueueLocked` correctly did nothing. That is the healthy path §4.10 describes,
+and it confirms the re-arm is not running when it should not.
+
+M2L-X returned to `status: "online"` after every reconnect, in 2.2–2.3 s, reporting
+`h264 1920x1080@50` and `aac/48000` unchanged from the baseline, with `status_message_id` empty
+throughout.
+
+#### A synthetic poison was tried and must not be reinstated
+
+Unlinking `srtq:src`, or lifting its gate probe, while the gate is open does poison the queue — and
+roughly 4.6 ms later `mpegtsmux`'s next push takes that same `NOT_LINKED` out of `gst_queue_chain`,
+`GstAggregator` answers with `GST_ELEMENT_FLOW_ERROR` naming `mux`, and the capture chain is down.
+Go cannot close the gate inside that window. **Only `srtsink`'s own error can**, because
+`onBusMessage` runs synchronously on the streaming thread still inside `render()`, before the
+queue's `srcresult` is set. §4.2's assumption is therefore not merely true, it is load-bearing, and
+this is the measurement that says so.
+
+#### What M2L-X does NOT expose
+
+There is no `error_packet_count`, and no packet or error counter of any kind, anywhere in
+`GET /api/input/router/list/{event}` — the record has exactly 21 fields and they are listed in
+`docs/test-results.md`. `GET /api/input/router/{event}/{id}`, `.../detail/...`, `.../status/...` and
+`.../statistics/...` all return **HTTP 404**. The `switcher_status` WebSocket carries only
+`stream_state` and `streams.video.format` / `streams.audio[].format` (`internal/m2lx/wire.go`).
+The only error channel M2L-X offers for a router input is `status_message_id`, which stayed empty
+across every reconnect. **Do not promise a caller a packet-loss figure from this API.**
+
+### 8.3 THE GATE NEVER OPENED — a defect found and fixed at Gate C
+
+**Read this before section 8.2's result, because until 2026-07-31 no media had ever left this
+package and §4.10 could not be reached.**
+
+`gateProbe` returned `GST_PAD_PROBE_OK` when the gate was open. `gateProbeMask` contains
+`GST_PAD_PROBE_TYPE_BLOCK` (§4.4, deliberately). `gst_pad_add_probe` sets `GST_PAD_FLAG_BLOCKED` for
+the whole life of any probe whose mask contains it, and `do_probe_callbacks` then parks the
+streaming thread in `GST_PAD_BLOCK_WAIT` **after** the callbacks have run — unless a callback
+answered `DROP` (item discarded, thread returns) or `PASS` (item delivered, thread returns, probe
+consulted again next item). `OK` means "no opinion", and the pad stays blocked.
+
+Section 5's deviation 1 says "a GStreamer blocking probe holds the pad blocked only for the duration
+of its callback". **That sentence is false**, and it is the reason the defect was written. The
+correction does not change the deviation's conclusion — the gate is still a drop-gate, not a hold —
+only the mechanism by which it lets data through.
+
+Measured by `TestLiveGateProbeDoesNotBlockWhenOpen`, 300 ms of free-running `fakesrc` through
+`fakesrc ! queue ! fakesink sync=false async=false` with this exact mask:
+
+| callback returns | gate probe calls | buffers reaching the sink | `pad.IsBlocking()` |
+|---|---|---|---|
+| `PadProbeDrop` | 126555 | **0** | false |
+| `PadProbeOK` | **1** | **0** | **true** |
+| `PadProbePass` | 56980 | **56980** | false |
+
+`async=false` on the sink matters: with the gate shut nothing reaches it, so an asynchronous sink
+would never preroll and the state change, not the probe, would be what the test measured.
+
+**Field symptom, which is the thing to recognise.** `Start` succeeds. `ReplaceSink` returns nil and
+logs `srtout-1 connected`. M2L-X accepts the SRT session. And then the entire pipeline stops dead
+within milliseconds: `mux`'s srcpad task blocks in the `srtq:sink` probe, `GstAggregator`'s sink
+queues fill, `wasapi2src` stops producing, and M2L-X sits at `status: "offline"` for ever —
+a connected peer that never locks. Every indicator in the application reads healthy. It is the
+false green this package was written to prevent, arriving by a route nobody had considered.
+
+The fix is one line in `gateProbe`, `PadProbeOK` → `PadProbePass`, with the measurement recorded in
+the comment above it. Do not "simplify" it back.
+
+### 8.4 `C:\msys64\mingw64\bin` on `PATH` ahead of GStreamer's `bin` breaks `wasapi2`
+
+`build\env.ps1` puts MSYS2 first, which is correct **for building** and wrong for **running**. Any
+binary run from that shell fails to load `libgstwasapi2.dll`:
+
+```
+GStreamer-WARNING **: Failed to load plugin '...\libgstwasapi2.dll':
+    The specified procedure could not be found.
+gst: ListInputDevices: gst_device_monitor_start failed; falling back to a one-shot probe
+```
+
+and `ListInputDevices` returns **zero** devices — which reads exactly like a broken bundle and is
+not one. Reversing it breaks the toolchain instead: with GStreamer's `bin` first, `ld` exits 57
+linking anything with cgo. **The two directories are mutually incompatible and each must lead only
+for its own job.** Build with MSYS2 first; run with GStreamer first.
+
+Reproduced outside Go, so it is not a Go or cgo effect: `gst-inspect-1.0 wasapi2src` fails with
+MSYS2 first on `PATH` and succeeds with it last or absent — but only when the executable is run
+from a directory that is not GStreamer's own `bin`, since an executable's own directory outranks
+`PATH`. That is why `gst-inspect` in place never shows it, and why **the shipped
+`build\bin\wslcomms.exe` is not affected**: it sits next to its own DLLs.
+
+Not narrowed to a single DLL. Copying all seventeen of MSYS2's `mingw64\bin` DLLs into a shadow
+directory ahead of GStreamer's `bin` does **not** reproduce it, so it is not simple name shadowing
+of `libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`, `libiconv-2` or `libintl-8`. It was not
+chased further because the operational rule is unambiguous and costs nothing.
+
+### 8.5 A hostname in the srtsink URI aborts the process on teardown
+
+Taking a **connected** `srtsink` to `NULL` kills the process outright:
+
+```
+>>>> cycle 1: RemoveSink
+0:00:17.656553500 DEBUG GST_PADS gstpad.c:1139:gst_pad_set_active:<srtout-1:sink> deactivating pad from push mode
+GLib-GIO:ERROR:../gio/gthreadedresolver.c:1487:cancelled_cb: assertion failed: (g_cancellable_is_cancelled (cancellable))
+Bail out! GLib-GIO:ERROR:../gio/gthreadedresolver.c:1487:cancelled_cb: assertion failed: (g_cancellable_is_cancelled (cancellable))
+```
+
+A GLib assertion aborts; there is no catching it. Reproduced on the **first** `RemoveSink` of two
+separate runs against `srt://m2lx-wslstudios-matcht.etapsiota.com:40022`.
+
+**It does not happen with an IP literal.** The same test against `srt://34.242.91.248:40022` ran
+four full reconnect cycles and shut down cleanly. `gstsrtobject.c` resolves a hostname through
+`GResolver`, which leaves a `cancelled_cb` on the `GCancellable` that `srtsink` cancels and resets
+around every open/close; an IP literal needs no resolver and installs no handler.
+
+**This is a ship-blocker on its own and it is not in this package.** It is on the path
+`internal/sender` takes on every mid-match reconnect, and the operator will be typing a hostname
+into the settings screen. Two things are needed and neither is a change to `gst_cgo.go`'s design:
+resolve the host to an address in the caller and hand `SinkOpts.Host` a literal, and/or confirm
+against a newer GLib. Until then a hostname in the settings screen is a process abort during a
+match.
+
+### 8.6 An event reaching `srtq` while its `srcresult` is bad kills the capture chain
+
+One of the three genuine peer losses (cycle 4 of 4) produced this cascade, in this order, within
+one 21 ms window:
+
+```
+gst: srtout-7: Failed to write to SRT socket: Error on SRT socket: Connection timeout (16)
+    (gstsrtsink.c(240): gst_srt_sink_render ())
+gst: srtq:        Internal data stream error. (gstqueue.c(1083): gst_queue_handle_sink_event ())
+gst: asrc:        Internal data stream error. (gstbasesrc.c(3187): gst_base_src_loop ())
+gst: aq:          Internal data stream error. (gstqueue.c(1083): gst_queue_handle_sink_event ())
+gst: imagefreeze0:Internal data stream error. (gstimagefreeze.c(1294): gst_image_freeze_src_loop ())
+gst: vq:          Internal data stream error. (gstqueue.c(1083): gst_queue_handle_sink_event ())
+```
+
+`asrc` is not sink-sourced, so `markFatal` fired and every subsequent `ReplaceSink` returned
+`gst: pipeline-fatal: ... GstWasapi2Src:asrc`. **The capture chain — the one thing this file exists
+to keep in PLAYING for the life of the process — was down, and only Stop/New/Start recovers it.**
+
+The mechanism is `gst_queue_handle_sink_event`, not `gst_queue_chain`, and that is the whole point:
+**the gate does not cover events.** §4.4 excludes `EVENT_DOWNSTREAM` from `gateProbeMask`
+deliberately and for a good reason, so a downstream event from `mpegtsmux` — a caps update when the
+PMT is rewritten, a tag — reaches `srtq:sink` even with the gate shut. If `srcresult` is already
+`GST_FLOW_ERROR` when it arrives, the queue posts `GST_ELEMENT_ERROR(STREAM, FAILED)` and returns
+FALSE, `gst_pad_push_event` fails back into the aggregator, and the whole capture chain unwinds.
+
+This is the residual race section 5 flags for WP-9's soak, **found**, with a concrete mechanism and
+a different source than predicted: `srtq` and `asrc`, not `mux`. Observed rate 1 in 3 genuine peer
+losses. It needs a design answer, not a retry, and it is not §4.10's problem — §4.10's repair
+worked on this very cycle, sticky events intact.
+
+### 8.7 mpegtsmux's streamheader caps can be audio-only, and never updates
+
+On one run the audio branch reached `mux` 29 ms before the video branch, `mpegtsmux` wrote its first
+PMT with one elementary stream, and the sticky `CAPS` on `srtq:src` still carried that audio-only
+`streamheader` ten seconds later (`0002b0120001c10000e042f0000fe042f000`: one ES, type `0x0f`, no
+`0x1b`). It is cosmetic for us — `srtsink` writes bytes and does not read `streamheader`, the
+in-band PMT is rewritten, and M2L-X locked normally — but it is worth knowing before someone reads
+that caps event and concludes the video is missing.
+
+### 8.8 The H.264 encoder actually chosen — ANSWERED, 2026-07-31
+
+Specification open question 3. On this host, every run:
+
+```
+gst: H.264 encoder mfh264enc chosen by preference (rank 128), from 5 candidates
+gst: encoder mfh264enc: applied bitrate=2000 rc-mode=cbr gop-size=100 low-latency=true cabac=true;
+     not supported:
+```
+
+`mfh264enc`, rank 128, chosen on the preference tie-break rather than outright by rank, out of five
+candidates the factory query returned — so §3.2's `1 << 49` constant is right, the query is finding
+encoders, and the `h264EncoderFallbacks` by-name path was NOT taken. Every one of the six encoder
+properties applied; the "not supported" list is empty, which also settles that `mfh264enc` in
+1.28.5 has `cabac` and `low-latency` even though it has no `bframes` (docs/windows-app-spec.md §5).
+
+`mux` is fed by a Media Foundation NVIDIA MFT: the tag event carries
+`encoder="Media Foundation NVIDIA H.264 Encoder MFT"`. This belongs in `docs/test-results.md`.
 
 ---
 

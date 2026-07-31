@@ -1301,11 +1301,36 @@ const gateProbeMask = gogst.PadProbeTypeBlock | gogst.PadProbeTypeBuffer | gogst
 // waiting: a pad probe that waits is a media pipeline that deadlocks. All of
 // the slow work of a sink swap happens on the goroutine that called
 // ReplaceSink.
+// The open case returns GST_PAD_PROBE_PASS, NOT GST_PAD_PROBE_OK. That is not
+// a style choice and it is the difference between this package sending media
+// and sending nothing at all.
+//
+// gst_pad_add_probe sets GST_PAD_FLAG_BLOCKED on the pad for the whole life of
+// any probe whose mask contains GST_PAD_PROBE_TYPE_BLOCK — which gateProbeMask
+// does, deliberately, for the reason in BUILD-NOTES.md section 4.4.
+// do_probe_callbacks then parks the streaming thread in GST_PAD_BLOCK_WAIT
+// after the callbacks have run, unless a callback answered DROP (item
+// discarded, thread returns) or PASS (item delivered, thread returns, and the
+// probe is consulted again for the next item). OK means "I have no opinion",
+// and the pad stays blocked.
+//
+// Measured at Gate C on 2026-07-31, 300 ms of free-running fakesrc through
+// `fakesrc ! queue ! fakesink sync=false async=false` with this exact mask:
+//
+//	DROP:  126555 probe calls,     0 buffers delivered   (gate shut)
+//	OK:         1 probe call,      0 buffers delivered   (pad blocked for ever)
+//	PASS:   56980 probe calls, 56980 buffers delivered   (gate open, 1:1)
+//
+// TestLiveGateProbeDoesNotBlockWhenOpen in live_test.go is that measurement.
+// With OK the pipeline wedges the instant ReplaceSink opens the gate: mux's
+// srcpad task blocks in the srtq:sink probe, aggregator's sink queues fill,
+// wasapi2src stops, and M2L-X reports a connected peer that never locks. Do
+// not "simplify" this back to OK.
 func (p *cgoPipeline) gateProbe(_ gogst.Pad, _ *gogst.PadProbeInfo) gogst.PadProbeReturn {
 	if p.gateClosed.Load() {
 		return gogst.PadProbeDrop
 	}
-	return gogst.PadProbeOK
+	return gogst.PadProbePass
 }
 
 // onBusMessage is the bus sync handler.
