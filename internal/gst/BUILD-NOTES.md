@@ -1097,7 +1097,7 @@ directory ahead of GStreamer's `bin` does **not** reproduce it, so it is not sim
 of `libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`, `libiconv-2` or `libintl-8`. It was not
 chased further because the operational rule is unambiguous and costs nothing.
 
-### 8.5 A hostname in the srtsink URI aborts the process on teardown
+### 8.5 A hostname in the srtsink URI aborts the process on teardown — FIXED, 2026-07-31
 
 Taking a **connected** `srtsink` to `NULL` kills the process outright:
 
@@ -1116,12 +1116,54 @@ four full reconnect cycles and shut down cleanly. `gstsrtobject.c` resolves a ho
 `GResolver`, which leaves a `cancelled_cb` on the `GCancellable` that `srtsink` cancels and resets
 around every open/close; an IP literal needs no resolver and installs no handler.
 
-**This is a ship-blocker on its own and it is not in this package.** It is on the path
-`internal/sender` takes on every mid-match reconnect, and the operator will be typing a hostname
-into the settings screen. Two things are needed and neither is a change to `gst_cgo.go`'s design:
-resolve the host to an address in the caller and hand `SinkOpts.Host` a literal, and/or confirm
-against a newer GLib. Until then a hostname in the settings screen is a process abort during a
-match.
+**This was a ship-blocker on the path `internal/sender` takes on every mid-match reconnect, and the
+operator types a hostname into the settings screen because a hostname is what M2L-X gives them.**
+
+#### The fix, and where it lives
+
+`resolveSinkHost` in `gst_cgo.go`. `ReplaceSink` resolves `SinkOpts.Host` in **Go** and puts an IP
+literal in the URI, so GLib never runs a resolver and there is no `cancelled_cb` to assert. The
+decision to fix it inside this package rather than in the caller is deliberate: this package owns
+the URI, and a caller that resolved the name would still be one edit away from someone passing the
+name straight through.
+
+Properties that are load-bearing, all of them stated in the function's comment:
+
+- **The lookup is on every `ReplaceSink`, never once at `Start`.** M2L-X is in AWS behind a name
+  that can move, and a process that lives for a whole match must not pin an address it resolved
+  ninety minutes ago.
+- **It happens BEFORE `removeSinkLocked`.** A lookup failure then leaves a working sink working
+  instead of trading a live feed for a DNS hiccup, and the up-to-3 s it can cost is spent while the
+  old socket is still carrying commentary rather than added to the time off air.
+- **An IP literal — bracketed or not — is returned untouched and no lookup happens.**
+- **IPv4 first**, then IPv6; a name with several A records is tried in order and the log says which
+  answered. Addresses with a zone (`fe80::1%eth0`) are skipped: they cannot be written into a URI
+  libsrt will parse.
+- **Bounded**, `hostResolveTimeout` = 3 s. Go's Windows resolver runs `getaddrinfo` on its own
+  goroutine and abandons it when the context expires, so this is a real bound, unlike the
+  state-change constants in §4.13. It has to stay well inside `sender.BackoffLadder`'s 7 s rung.
+- **`opts.Host` is what appears in every log line and every error message.** An operator reading
+  "connect failed" needs the name they typed. `dialledEndpointForLog` adds the address alongside it,
+  which is the only way to tell "the name resolves to something that is not listening" from "the
+  name does not resolve".
+
+#### Verified live, 2026-07-31
+
+`TestLiveReconnectPreservesStickyEvents` run against `m2lx-wslstudios-matcht.etapsiota.com`, i.e.
+the HOSTNAME, the input that reproduced the abort twice:
+
+```
+gst: srtout-1 connected to srt://m2lx-wslstudios-matcht.etapsiota.com:40022 (address 34.242.91.248)
+...
+--- PASS: TestLiveReconnectPreservesStickyEvents (184.18s)
+$ grep -c "Bail out\|assertion failed\|cancelled_cb" B1-hostname.log
+0
+```
+
+Eight sinks installed, five of them configured with the hostname, every one torn down by a
+`RemoveSink` or by the next `ReplaceSink`. Zero GLib assertions. §4.10's sticky-event seqnum
+comparison passed unchanged on all four cycles, and M2L-X returned to `online` with
+`h264 1920x1080@50 / aac/48000` every time, ending `offline` with the listener free.
 
 ### 8.6 An event reaching `srtq` while its `srcresult` is bad kills the capture chain
 
@@ -1142,17 +1184,129 @@ gst: vq:          Internal data stream error. (gstqueue.c(1083): gst_queue_handl
 `gst: pipeline-fatal: ... GstWasapi2Src:asrc`. **The capture chain — the one thing this file exists
 to keep in PLAYING for the life of the process — was down, and only Stop/New/Start recovers it.**
 
-The mechanism is `gst_queue_handle_sink_event`, not `gst_queue_chain`, and that is the whole point:
-**the gate does not cover events.** §4.4 excludes `EVENT_DOWNSTREAM` from `gateProbeMask`
-deliberately and for a good reason, so a downstream event from `mpegtsmux` — a caps update when the
-PMT is rewritten, a tag — reaches `srtq:sink` even with the gate shut. If `srcresult` is already
-`GST_FLOW_ERROR` when it arrives, the queue posts `GST_ELEMENT_ERROR(STREAM, FAILED)` and returns
-FALSE, `gst_pad_push_event` fails back into the aggregator, and the whole capture chain unwinds.
+> **CORRECTION AND PARTIAL FIX, 2026-07-31. The paragraph that used to follow this one named the
+> wrong events, and the source proves it.** The event gate described below is implemented and
+> verified; the cascade's FIRST MOVER is still not identified, and this section stays open. Read
+> all of it before acting on any part of it.
 
-This is the residual race section 5 flags for WP-9's soak, **found**, with a concrete mechanism and
-a different source than predicted: `srtq` and `asrc`, not `mux`. Observed rate 1 in 3 genuine peer
-losses. It needs a design answer, not a retry, and it is not §4.10's problem — §4.10's repair
-worked on this very cycle, sticky events intact.
+#### What the source actually says (gstqueue.c 1.28.5, read line by line)
+
+`gst_queue_handle_sink_event` is the pad's **event-FULL** function: it returns a `GstFlowReturn`,
+not a `gboolean`. When `srcresult` is not `GST_FLOW_OK` it does exactly three things, and only
+three:
+
+```c
+if (queue->srcresult != GST_FLOW_OK) {
+  if (!GST_EVENT_IS_STICKY (event)) {
+    GST_QUEUE_MUTEX_UNLOCK (queue);
+    goto out_flow_error;                                   /* returns queue->srcresult */
+  } else if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
+    if (queue->srcresult == GST_FLOW_NOT_LINKED || queue->srcresult < GST_FLOW_EOS) {
+      GST_QUEUE_MUTEX_UNLOCK (queue);
+      GST_ELEMENT_FLOW_ERROR (queue, queue->srcresult);    /* <-- line 1083 */
+    } else {
+      GST_QUEUE_MUTEX_UNLOCK (queue);
+    }
+    goto out_flow_error;
+  }
+}
+/* a STICKY, non-EOS event falls through here and is enqueued normally */
+```
+
+**Line 1083 is inside the `GST_EVENT_EOS` branch.** So:
+
+1. **The old explanation — "a caps update when the PMT is rewritten, a tag" — is impossible.** CAPS
+   and TAG are sticky and are not EOS, so they fall through and are enqueued normally even when
+   `srcresult` is `GST_FLOW_ERROR`. They cannot produce line 1083 and they cannot produce a flow
+   error. Do not go looking for them.
+2. Only **EOS** produces `Internal data stream error` from a queue's sink event handler.
+3. A **serialized non-sticky** event is refused quietly, by handing `GST_FLOW_ERROR` back to
+   whoever pushed it — a real door into `mpegtsmux`, with no message to say so.
+
+`gstbasesrc.c(3187)` is the other half, and it is a VICTIM path, not an origin:
+
+```c
+} else if (ret == GST_FLOW_NOT_LINKED || ret <= GST_FLOW_EOS) {
+  event = gst_event_new_eos ();
+  GST_ELEMENT_FLOW_ERROR (src, ret);        /* <-- line 3187 */
+  gst_pad_push_event (pad, event);          /* and then it pushes EOS downstream */
+}
+```
+
+`asrc` posted because something downstream had already handed it a flow error, and it then pushed
+EOS. **That EOS is the amplifier**: it travels into every queue in the pipeline, and each one whose
+`srcresult` is already bad answers it at line 1083. It is why the recorded cascade names five
+elements and the same source line three times — `srtq`, `aq` and `vq` are all reacting to one EOS.
+
+#### The fix that is implemented: `eventGateProbe`
+
+A second probe on `srtq`'s SINK pad, mask `GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM` and nothing else,
+which drops a downstream event **only while `srtq:src`'s last flow return is not `GST_FLOW_OK`**.
+That closes both doors above at the one place they open.
+
+Three things about it that are load-bearing:
+
+- **Sink pad only.** §4.4's reasoning is about the SRC pad, where a dropped event would be marked
+  received by a sink that never saw it and §4.10's restore depends on real delivery. Nothing on
+  `srtq:src` changed, and `TestLiveReconnectPreservesStickyEvents` still passes with its seqnum
+  comparison intact.
+- **Keyed on the flow return, not on `gateClosed`.** The gate is shut from `Start` until the first
+  `ReplaceSink` succeeds, which is exactly when `mpegtsmux` delivers `STREAM_START`, `CAPS` and
+  `SEGMENT` for the first time. A gate that dropped events would throw them away before `srtq:src`
+  ever recorded them, leaving `rearmQueueLocked` nothing to snapshot. The flow-return condition can
+  only become true after media has already flowed.
+- **No `_BLOCK` bit in the mask**, so §8.3's trap does not apply and `GST_PAD_PROBE_OK` is safe.
+
+Cost: an event `mpegtsmux` emits during an outage is lost. Cosmetic — §8.7 already records that the
+streamheader caps never update, and `srtsink` writes bytes and does not read caps.
+
+#### Verified live, 2026-07-31, A/B
+
+`TestLivePeerLossDoesNotKillTheCaptureChain` in `live_test.go`. It drives `cmd/mockm2lx` and uses
+`POST /control/drop-srt` for a **deliberate** peer loss at a chosen instant, which is far better
+than killing a `gst-launch` listener — see §8.9. Each cycle pushes both refused kinds of event into
+the poisoned queue so that the mechanism is exercised every time instead of one time in three.
+
+With `WSLCOMMS_LIVE_LIFT_EVENT_GATE=1`, which removes the probe and is the code as it stood, 4 of 4
+cycles reproduced the recorded signature exactly:
+
+```
+gst: srtq: Internal data stream error. (../plugins/elements/gstqueue.c(1083):
+    gst_queue_handle_sink_event (): /GstPipeline:pipeline0/GstQueue:srtq:
+    streaming stopped, reason error (-5))
+```
+
+With the probe installed, 12 of 12 deliberate peer losses, all 12 poisoning the queue, 36 events
+dropped by the probe, **zero** `Internal data stream error` from anything, and every element in
+`asrc, venc, mux, srtq` still `PLAYING` after every loss and after every `RemoveSink`.
+
+```
+--- PASS: TestLivePeerLossDoesNotKillTheCaptureChain (196.22s)
+```
+
+#### WHAT IS STILL OPEN — read this before closing the section
+
+**The first mover is not identified and this fix does not claim to be it.** Three measurements say
+so, and they should be believed rather than argued with:
+
+1. With the gate LIFTED, neither door reached the capture chain. A refused event handed
+   `GST_FLOW_ERROR` back to its pusher — including when the pusher was `mpegtsmux` itself, driven
+   by handing the aggregator a serialized event on `mux:sink_66` to forward — and **no `asrc`,
+   `aq`, `vq` or `imagefreeze` error ever appeared.** The event door produces the `srtq` line of
+   the recorded cascade and, on 1.28.5, nothing above it.
+2. Across 12 controlled peer losses with a 2 s poisoned window, `mpegtsmux` emitted **zero**
+   downstream events of its own into that window. All 36 drops were the test's injections. So the
+   natural trigger did not occur here at all, let alone at 1 in 3.
+3. The buffer-path race §5 documents is the obvious remaining candidate and the arithmetic is
+   against it: it needs `gst_queue_chain` to be blocked on the queue mutex for the microsecond in
+   which the loop stores the failure, against a 4.6 ms buffer period. That is nearer 1 in 5000 than
+   1 in 3.
+
+So something else gave the capture chain its first bad flow return in that run. It remains a WP-9
+soak item (§9.2). **The next person to see it should capture `GST_DEBUG=2,queue:5,GST_PADS:5,
+basesrc:5` and find the FIRST `GST_ELEMENT_FLOW_ERROR` in time order** — the recorded order in this
+section is the order the app's error channel delivered them, and those come from different
+streaming threads, so it is not evidence of causal order and was probably read as if it were.
 
 ### 8.7 mpegtsmux's streamheader caps can be audio-only, and never updates
 
@@ -1181,6 +1335,35 @@ properties applied; the "not supported" list is empty, which also settles that `
 
 `mux` is fed by a Media Foundation NVIDIA MFT: the tag event carries
 `encoder="Media Foundation NVIDIA H.264 Encoder MFT"`. This belongs in `docs/test-results.md`.
+
+### 8.9 Use `cmd/mockm2lx` as the killable peer, not `gst-launch`'s `srtsrc`
+
+§8.2's recipe starts a `gst-launch-1.0 srtsrc mode=listener ! fakesink` on 127.0.0.1 and kills it.
+**On this host that listener loses its SRT session on its own, roughly 3.5 to 4 s after the caller
+connects**, every time, with the caller reporting
+
+```
+Failed to write to SRT socket: Error on SRT socket: Connection timeout (16)
+    (gstsrtsink.c(240): gst_srt_sink_render ())
+```
+
+while the listener process is still alive and its own log shows no error at all. Reproduced outside
+this package with two bare `gst-launch` pipelines, so it is not ours. The consequence for a test is
+that the peer loss happens before the kill, at a time nobody chose, and a test that samples its
+error count at the moment of the kill sees nothing new and concludes wrongly that no loss occurred.
+
+`cmd/mockm2lx` does not do this. Its `gosrt` listener held a real 2.3 Mbit/s session for as long as
+it was asked to, and `POST /control/drop-srt` disconnects the caller at an instant the test chooses,
+leaving the listener alive to be reconnected to. It also reproduces M2L-X's one-peer and
+re-accept-refusal behaviour, which is what `sender.BackoffLadder` is sized against.
+
+```
+go build -o mockm2lx.exe ./cmd/mockm2lx
+./mockm2lx.exe -addr 127.0.0.1:8099 -srt-addr 127.0.0.1:9002
+```
+
+`TestLivePeerLossDoesNotKillTheCaptureChain` skips with these instructions if it is not answering.
+It needs no M2L-X and no credential: the fault it tests is entirely local.
 
 ---
 

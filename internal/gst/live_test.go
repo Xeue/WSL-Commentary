@@ -90,6 +90,13 @@ const (
 	defaultSlatePath    = "../../assets/slate.png"
 	defaultKillPeerPort = 9001
 
+	// cmd/mockm2lx, started by hand before the peer-loss test. Its
+	// POST /control/drop-srt is a deliberate peer loss at an instant the test
+	// chooses, with the listener still alive afterwards, which a killed
+	// gst-launch listener cannot offer.
+	defaultMockControl = "http://127.0.0.1:8099"
+	defaultMockSRTPort = 9002
+
 	// backoffRung is specification section 6.2's first backoff rung. It must
 	// stay >= 6 s: an M2L-X SRT listener accepts exactly one peer and refuses
 	// re-accept for roughly five seconds after the incumbent goes away.
@@ -940,7 +947,7 @@ func TestLiveGateProbeDoesNotBlockWhenOpen(t *testing.T) {
 		ret  gogst.PadProbeReturn
 	}{
 		{"PadProbeDrop (the gate CLOSED)", gogst.PadProbeDrop},
-		{"PadProbeOK (the gate OPEN, as gateProbe returns today)", gogst.PadProbeOK},
+		{"PadProbeOK (the trap: looks open, holds the thread)", gogst.PadProbeOK},
 		{"PadProbePass", gogst.PadProbePass},
 	}
 
@@ -1016,24 +1023,478 @@ func TestLiveGateProbeDoesNotBlockWhenOpen(t *testing.T) {
 				"in 300 ms; pad.IsBlocked()=%v pad.IsBlocking()=%v lastFlowReturn=%s",
 				tc.ret, n, got, pad.IsBlocked(), pad.IsBlocking(), pad.GetLastFlowReturn())
 
+			// Each case asserts the behaviour that was MEASURED, so this test
+			// passes and stays a guard. Writing it to assert what the three
+			// returns were assumed to do made it fail permanently on the OK
+			// case, which reads as a regression and trains people to ignore it.
 			switch tc.ret {
 			case gogst.PadProbeDrop:
+				// The gate CLOSED. The callback keeps being invoked — the
+				// streaming thread runs, it just discards — so a high call
+				// count with nothing delivered is the signature.
 				if got != 0 {
 					t.Errorf("PadProbeDrop delivered %d buffer(s); the gate is not closing", got)
 				}
-			default:
 				if n <= 1 {
-					t.Errorf("returning %s from a probe whose mask contains "+
-						"GST_PAD_PROBE_TYPE_BLOCK stops the pad after %d call(s): the streaming "+
-						"thread is held blocked, not passed through", tc.ret, n)
+					t.Errorf("PadProbeDrop was called only %d time(s); it should be called "+
+						"for every buffer, not block the thread", n)
+				}
+
+			case gogst.PadProbeOK:
+				// The trap. With GST_PAD_PROBE_TYPE_BLOCK in the mask the pad
+				// stays flagged blocked for the probe's lifetime, and OK parks
+				// the streaming thread instead of letting the buffer through.
+				// Measured: 1 call, 0 buffers, against Pass's ~57000 of each.
+				//
+				// This is asserted rather than merely logged because it is the
+				// whole reason gateProbe returns Pass. If a future GStreamer
+				// changes it so that OK does pass buffers, this fails and
+				// someone re-reads the decision — which is the right outcome.
+				if got != 0 {
+					t.Errorf("PadProbeOK delivered %d buffer(s); GStreamer's behaviour has changed "+
+						"and gateProbe's use of PadProbePass should be revisited", got)
+				}
+				if n > 1 {
+					t.Errorf("PadProbeOK was called %d times; it was measured to be called once "+
+						"and then hold the thread", n)
+				}
+
+			case gogst.PadProbePass:
+				// What gateProbe actually returns: the pad's block flag is
+				// ignored for this buffer and the thread runs on.
+				if n <= 1 {
+					t.Errorf("PadProbePass stopped the pad after %d call(s); the streaming thread "+
+						"is being held blocked, which is what Pass exists to avoid", n)
 				}
 				if got == 0 {
-					t.Errorf("returning %s delivered NOTHING to the sink; the gate does not open",
-						tc.ret)
+					t.Errorf("PadProbePass delivered NOTHING to the sink; the gate does not open, " +
+						"and no media would ever leave this package")
 				}
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// BUILD-NOTES.md section 8.6 — a peer loss must not take the capture chain down
+// ---------------------------------------------------------------------------
+
+// captureChainElements are the elements that must NEVER leave PLAYING for the
+// life of the process (specification section 6.1). srtq is included because a
+// queue whose loop task has been stopped by a flow error is the first domino;
+// the sink is deliberately absent, because replacing it is the whole design.
+var captureChainElements = []string{nameAudioSrc, nameVideoEncod, nameMux, nameSRTQueue}
+
+// assertCaptureChainPlaying reads the real GstState of every element that must
+// stay in PLAYING, rather than trusting the absence of a bus message.
+//
+// A pipeline-fatal error is the loud symptom, but it is not the definition: an
+// element whose task has stopped can sit in PLAYING with nothing running, and
+// an element that has actually left PLAYING is unambiguous. Both are checked —
+// the state here, p.fatalError() at the call site.
+func assertCaptureChainPlaying(t *testing.T, p *cgoPipeline, when string) {
+	t.Helper()
+	if p.pipeline == nil {
+		t.Fatalf("%s: the pipeline is gone", when)
+	}
+	state, pending, ret := p.pipeline.GetState(0)
+	if state != gogst.StatePlaying {
+		t.Errorf("SHIP-BLOCKER %s: the PIPELINE is in %s (pending %s, %s), not PLAYING",
+			when, state, pending, ret)
+	}
+	for _, name := range captureChainElements {
+		el := p.pipeline.GetByName(name)
+		if el == nil {
+			t.Errorf("SHIP-BLOCKER %s: element %s has vanished from the pipeline", when, name)
+			continue
+		}
+		state, pending, ret := el.GetState(0)
+		if state != gogst.StatePlaying {
+			t.Errorf("SHIP-BLOCKER %s: %s is in %s (pending %s, %s), not PLAYING — "+
+				"the capture chain is down and only Stop/New/Start recovers it",
+				when, name, state, pending, ret)
+		}
+	}
+}
+
+// nonStickyPoisonEvent is a SERIALIZED, NON-STICKY downstream event.
+//
+// It is one of exactly two things gstqueue.c refuses when srcresult is bad,
+// and it is the cheaper of the two to reason about. From gstqueue.c 1.28.5,
+// gst_queue_handle_sink_event:
+//
+//	if (queue->srcresult != GST_FLOW_OK) {
+//	  if (!GST_EVENT_IS_STICKY (event)) {
+//	    GST_QUEUE_MUTEX_UNLOCK (queue);
+//	    goto out_flow_error;                 // returns queue->srcresult
+//	  } else if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
+//	    ...
+//	    GST_ELEMENT_FLOW_ERROR (queue, queue->srcresult);   // line 1083
+//	    goto out_flow_error;
+//	  }
+//	}
+//
+// gst_queue_handle_sink_event returns a GstFlowReturn, not a gboolean, so
+// out_flow_error hands GST_FLOW_ERROR back to whoever pushed the event.
+func nonStickyPoisonEvent(n int) *gogst.Event {
+	s := gogst.NewStructureEmpty("WSLCommsPoisonProbe")
+	if s == nil {
+		return nil
+	}
+	s.SetValue("cycle", uint32(n))
+	return gogst.NewEventCustom(gogst.EventCustomDownstream, s)
+}
+
+// muxSinkPad returns the mpegtsmux request pad that the named branch queue is
+// linked to. mpegtsmux's sink pads are request pads with generated names, so
+// they are found through the peer rather than by name.
+func muxSinkPad(p *cgoPipeline, branchQueue string) gogst.Pad {
+	q := p.pipeline.GetByName(branchQueue)
+	if q == nil {
+		return nil
+	}
+	src := q.GetStaticPad("src")
+	if src == nil {
+		return nil
+	}
+	return src.GetPeer()
+}
+
+// dropMockSRT asks cmd/mockm2lx to disconnect its current SRT caller.
+//
+// This is a DELIBERATE peer loss, at an instant of the test's choosing, with
+// the listener process still alive afterwards so the next cycle can reconnect
+// to it. It is what WP-7's fault injection exists for, and it is a better
+// provocation than killing a gst-launch listener: killing a process leaves the
+// timing of the loss to the operating system, and this does not.
+func dropMockSRT(t *testing.T, control string) bool {
+	t.Helper()
+	resp, err := http.Post(control+"/control/drop-srt", "application/json", nil)
+	if err != nil {
+		t.Logf("POST %s/control/drop-srt: %v", control, err)
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("POST %s/control/drop-srt returned HTTP %d: %s", control, resp.StatusCode, body)
+		return false
+	}
+	return strings.Contains(string(body), "true")
+}
+
+// TestLivePeerLossDoesNotKillTheCaptureChain is the Gate C verification of
+// BUILD-NOTES.md section 8.6.
+//
+// # What section 8.6 recorded, and what it got wrong
+//
+// It recorded, on one of three genuine peer losses:
+//
+//	gst: srtq:        Internal data stream error. (gstqueue.c(1083):
+//	    gst_queue_handle_sink_event ())
+//	gst: asrc:        Internal data stream error. (gstbasesrc.c(3187):
+//	    gst_base_src_loop ())
+//	gst: aq / imagefreeze0 / vq: Internal data stream error.
+//
+// and proposed the mechanism as "a caps update when the PMT is rewritten, a
+// tag". THAT PART IS WRONG, and the source says so. gstqueue.c 1.28.5 line 1083
+// sits inside `else if (GST_EVENT_TYPE (event) == GST_EVENT_EOS)`; a STICKY
+// non-EOS event — which is what a caps update and a tag both are — falls
+// through and is enqueued normally even when srcresult is bad. Only two kinds
+// of event are refused: EOS, which is refused loudly with
+// GST_ELEMENT_FLOW_ERROR, and any serialized NON-sticky event, which is
+// refused quietly by returning GST_FLOW_ERROR to the pusher.
+//
+// gstbasesrc.c:3187 is basesrc's pause path, which posts GST_ELEMENT_FLOW_ERROR
+// and then PUSHES EOS DOWNSTREAM. That is the amplifier: one flow error
+// anywhere becomes an EOS travelling into every queue in the pipeline, and each
+// queue that is already poisoned answers it at line 1083. It is why the
+// recorded cascade names five elements and the same source line three times.
+//
+// # What this test does
+//
+//  1. Connects to cmd/mockm2lx's SRT listener and lets real media flow.
+//  2. Asks the mock to drop the session — a deliberate peer loss at a chosen
+//     instant. srtsink's render() fails, GST_ELEMENT_ERROR is posted and the
+//     queue's loop stores GST_FLOW_ERROR: the production condition.
+//  3. While the queue is poisoned, pushes BOTH refused kinds of event into
+//     srtq:sink — a serialized non-sticky one and an EOS — so that every cycle
+//     exercises the mechanism instead of one in three.
+//  4. Asserts no pipeline-fatal error, no "Internal data stream error" anywhere,
+//     and every element that must never leave PLAYING still in PLAYING.
+//  5. RemoveSink, backoff past the mock's re-accept refusal window, repeat.
+//
+// A final phase then sends a REAL end-to-end EOS through the pipeline while the
+// queue is poisoned, so the EOS arrives at srtq:sink from mpegtsmux rather than
+// from the test. That is the full recorded cascade, and it is destructive, so
+// it runs once at the end.
+//
+// # Proving the test can fail
+//
+// WSLCOMMS_LIVE_LIFT_EVENT_GATE=1 makes the same binary remove eventGateProbe
+// from srtq:sink at the start of every cycle, which is the code as it stood
+// when section 8.6 was written. That run MUST fail. A green run with the gate
+// lifted means this test is not measuring what it claims to.
+func TestLivePeerLossDoesNotKillTheCaptureChain(t *testing.T) {
+	appDir, err := filepath.Abs(env("WSLCOMMS_LIVE_APP_DIR", defaultAppDir))
+	if err != nil {
+		t.Fatalf("resolving the app directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, "gst", "lib", "gstreamer-1.0")); err != nil {
+		t.Skipf("no bundled GStreamer under %s: %v", appDir, err)
+	}
+	slate, err := filepath.Abs(env("WSLCOMMS_LIVE_SLATE", defaultSlatePath))
+	if err != nil {
+		t.Fatalf("resolving the slate: %v", err)
+	}
+
+	control := env("WSLCOMMS_LIVE_MOCK_CONTROL", defaultMockControl)
+	srtPort := envInt("WSLCOMMS_LIVE_MOCK_SRT_PORT", defaultMockSRTPort)
+	if resp, err := http.Get(control + "/control"); err != nil {
+		t.Skipf("cmd/mockm2lx is not answering on %s (%v). Start it first:\n"+
+			"    go build -o mockm2lx.exe ./cmd/mockm2lx\n"+
+			"    ./mockm2lx.exe -addr 127.0.0.1:8099 -srt-addr 127.0.0.1:%d", control, err, srtPort)
+	} else {
+		resp.Body.Close()
+	}
+
+	liftGate := os.Getenv("WSLCOMMS_LIVE_LIFT_EVENT_GATE") == "1"
+	cycles := envInt("WSLCOMMS_LIVE_PEER_LOSS_CYCLES", 12)
+
+	if err := Init(appDir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	devID := env("WSLCOMMS_LIVE_AUDIO_DEVICE", defaultAudioDevice)
+
+	pipe, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p, ok := pipe.(*cgoPipeline)
+	if !ok {
+		t.Fatalf("New returned a %T, not a *cgoPipeline", pipe)
+	}
+	errs := newErrRecorder(pipe)
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = pipe.Stop()
+		}
+	})
+
+	mark(t, "Start(slate=%s device=%s); %d peer-loss cycles against %s; event gate %s",
+		slate, devID, cycles, control,
+		map[bool]string{true: "LIFTED (expecting the section 8.6 fault)", false: "installed"}[liftGate])
+	if err := pipe.Start(PipelineOpts{SlatePath: slate, AudioDeviceID: devID}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	assertCaptureChainPlaying(t, p, "immediately after Start")
+
+	local := SinkOpts{Host: "127.0.0.1", Port: srtPort, LatencyMs: DefaultSRTLatencyMs}
+	deliberateLosses, poisoned, dropped := 0, 0, int64(0)
+
+	liftIfAsked := func() {
+		if liftGate && p.sinkEventProbeID != 0 {
+			p.srtqSinkPad.RemoveProbe(p.sinkEventProbeID)
+			p.sinkEventProbeID = 0
+		}
+	}
+	restoreIfLifted := func() {
+		if liftGate && p.sinkEventProbeID == 0 {
+			srtqSrc := p.srtqSrcPad
+			p.sinkEventProbeID = p.srtqSinkPad.AddProbe(eventGateProbeMask,
+				func(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+					return p.eventGateProbe(srtqSrc, info)
+				})
+		}
+	}
+
+	for n := 1; n <= cycles; n++ {
+		mark(t, "=========== PEER-LOSS CYCLE %d/%d ===========", n, cycles)
+		liftIfAsked()
+		if liftGate {
+			mark(t, "cycle %d: eventGateProbe REMOVED from %s:sink (fault-demonstration mode)",
+				n, nameSRTQueue)
+		}
+
+		if err := pipe.ReplaceSink(local); err != nil {
+			t.Fatalf("cycle %d: ReplaceSink to the mock: %v", n, err)
+		}
+		_ = pipe.ForceKeyUnit()
+
+		// Real media on the wire before it is taken away, so that there is a
+		// push in flight to fail.
+		time.Sleep(6 * time.Second)
+
+		before := errs.count()
+		droppedBefore := p.eventsDropped.Load()
+		mark(t, "cycle %d: asking the mock to drop the SRT session", n)
+		if !dropMockSRT(t, control) {
+			t.Errorf("cycle %d: the mock did not report dropping a session; "+
+				"this cycle has no peer loss in it", n)
+		} else {
+			deliberateLosses++
+		}
+
+		if got := errs.waitForNew(before, 40*time.Second); len(got) == 0 {
+			t.Errorf("cycle %d: no bus error arrived within 40 s of the drop", n)
+		} else {
+			for _, e := range got {
+				t.Logf("cycle %d: bus error: %s", n, e)
+			}
+		}
+
+		// The queue's loop must actually be poisoned, or nothing below is a
+		// test of anything. It is set by gst_pad_push a moment before
+		// gst_queue_loop copies it into srcresult, so poll rather than assume.
+		lastFlow := gogst.FlowOK
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if lastFlow = p.srtqSrcPad.GetLastFlowReturn(); lastFlow != gogst.FlowOK {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		mark(t, "cycle %d: %s:src last flow return is %s", n, nameSRTQueue, lastFlow)
+
+		if lastFlow == gogst.FlowOK {
+			t.Errorf("cycle %d: the queue was NOT poisoned by this peer loss, so nothing in "+
+				"this cycle can exercise section 8.6", n)
+		} else {
+			poisoned++
+
+			// Both refused kinds, in the order of increasing consequence.
+			if ev := nonStickyPoisonEvent(n); ev != nil {
+				accepted := p.srtqSinkPad.SendEvent(ev)
+				mark(t, "cycle %d: pushed a serialized NON-STICKY downstream event into %s:sink "+
+					"while it was %s; gst_pad_send_event returned %v (false means the queue "+
+					"answered out_flow_error and handed GST_FLOW_ERROR back to the pusher)",
+					n, nameSRTQueue, lastFlow, accepted)
+			}
+			accepted := p.srtqSinkPad.SendEvent(gogst.NewEventEOS())
+			mark(t, "cycle %d: pushed an EOS into %s:sink while it was %s; "+
+				"gst_pad_send_event returned %v (false means gstqueue.c line 1083 ran)",
+				n, nameSRTQueue, lastFlow, accepted)
+
+			// The same event again, but handed to MPEGTSMUX rather than to the
+			// queue, so that the refusal has somewhere real to propagate.
+			// GstAggregator queues a serialized event on its sink pad and
+			// forwards it downstream from its own thread, which makes the push
+			// into srtq:sink mux's push and not the test's. If a refused event
+			// can reach the capture chain at all, this is how.
+			if muxSink := muxSinkPad(p, "aq"); muxSink != nil {
+				if ev := nonStickyPoisonEvent(n + 1000); ev != nil {
+					accepted := muxSink.SendEvent(ev)
+					mark(t, "cycle %d: handed %s:%s a serialized non-sticky downstream event "+
+						"to forward into the poisoned queue; gst_pad_send_event returned %v",
+						n, nameMux, muxSink.GetName(), accepted)
+				}
+			}
+		}
+
+		// Hold the poisoned window open. internal/sender reaches RemoveSink
+		// within microseconds of reading the error, so two seconds is a harder
+		// test than the field.
+		time.Sleep(2 * time.Second)
+
+		if d := p.eventsDropped.Load() - droppedBefore; d > 0 {
+			dropped += d
+			mark(t, "cycle %d: eventGateProbe dropped %d downstream event(s)", n, d)
+		}
+
+		if err := p.fatalError(); err != nil {
+			t.Fatalf("SHIP-BLOCKER cycle %d: the pipeline is fatal after a peer loss, which "+
+				"means the capture chain is down and only Stop/New/Start recovers it: %v", n, err)
+		}
+		assertCaptureChainPlaying(t, p, fmt.Sprintf("cycle %d, after the peer loss", n))
+
+		if err := pipe.RemoveSink(); err != nil {
+			t.Fatalf("cycle %d: RemoveSink: %v", n, err)
+		}
+		assertCaptureChainPlaying(t, p, fmt.Sprintf("cycle %d, after RemoveSink", n))
+		restoreIfLifted()
+
+		// BACKOFF. The mock refuses re-accept for 6 s after a disconnect, the
+		// same one-peer behaviour M2L-X has, so this must outlast it.
+		time.Sleep(backoffRung)
+	}
+
+	mark(t, "%d/%d cycles produced a deliberate peer loss; %d of them poisoned the queue; "+
+		"eventGateProbe dropped %d downstream event(s) in total",
+		deliberateLosses, cycles, poisoned, dropped)
+
+	// ---- Final phase: a REAL EOS from mpegtsmux, not from the test. --------
+	//
+	// gst_element_send_event on a GstBin routes a downstream event to the bin's
+	// SOURCE elements, and GstBaseSrc turns EOS into a forced end-of-stream from
+	// its own streaming thread. So this is the ordinary "-e" shutdown path:
+	// slate and asrc go EOS, both branches drain, mpegtsmux forwards EOS to
+	// srtq:sink. With the queue poisoned that is section 8.6's exact cascade —
+	// srtq answers at line 1083 and hands GST_FLOW_ERROR back to the aggregator.
+	//
+	// It ends the stream either way, so it is last.
+	mark(t, "FINAL PHASE: poison the queue once more, then send a real end-to-end EOS")
+	liftIfAsked()
+	if err := pipe.ReplaceSink(local); err != nil {
+		t.Fatalf("final phase: ReplaceSink: %v", err)
+	}
+	_ = pipe.ForceKeyUnit()
+	time.Sleep(6 * time.Second)
+
+	beforeEOS := errs.count()
+	if !dropMockSRT(t, control) {
+		t.Error("final phase: the mock did not report dropping a session")
+	}
+	errs.waitForNew(beforeEOS, 40*time.Second)
+
+	lastFlow := gogst.FlowOK
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if lastFlow = p.srtqSrcPad.GetLastFlowReturn(); lastFlow != gogst.FlowOK {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mark(t, "final phase: %s:src last flow return is %s; sending EOS into the pipeline",
+		nameSRTQueue, lastFlow)
+	if lastFlow == gogst.FlowOK {
+		t.Error("final phase: the queue was not poisoned, so the EOS proves nothing")
+	}
+
+	if !p.pipeline.SendEvent(gogst.NewEventEOS()) {
+		t.Log("final phase: gst_element_send_event(pipeline, EOS) returned FALSE")
+	}
+	time.Sleep(6 * time.Second)
+
+	if err := p.fatalError(); err != nil {
+		t.Errorf("SHIP-BLOCKER final phase: an end-to-end EOS reaching a poisoned %s made the "+
+			"pipeline fatal — the capture chain is down: %v", nameSRTQueue, err)
+	}
+	assertCaptureChainPlaying(t, p, "after an end-to-end EOS with the queue poisoned")
+
+	// ---- The whole-run verdict --------------------------------------------
+	//
+	// "Internal data stream error." is GST_ELEMENT_FLOW_ERROR's message and is
+	// the entire signature of section 8.6. Not one of them may appear, from any
+	// element, at any point in the run.
+	for _, line := range errs.since(0) {
+		if strings.Contains(line, "Internal data stream error") {
+			t.Errorf("SHIP-BLOCKER: section 8.6's signature appeared: %s", line)
+		}
+		for _, name := range []string{nameAudioSrc, nameVideoEncod, nameMux, "imagefreeze", "aq", "vq"} {
+			if strings.Contains(line, "gst: "+name+":") {
+				t.Errorf("SHIP-BLOCKER: an error names %s, which is upstream of the gate: %s",
+					name, line)
+			}
+		}
+	}
+
+	mark(t, "teardown: RemoveSink, Stop")
+	_ = pipe.RemoveSink()
+	if err := pipe.Stop(); err != nil {
+		t.Errorf("Stop: %v", err)
+	}
+	stopped = true
 }
 
 // provokeGenuine kills a real SRT listener while media is flowing into it. This
