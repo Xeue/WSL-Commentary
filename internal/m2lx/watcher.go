@@ -2,6 +2,7 @@ package m2lx
 
 import (
 	"context"
+	"log"
 	"net/url"
 	"time"
 
@@ -296,6 +297,17 @@ func (w *watcher) WatchAll(ctx context.Context) <-chan Document {
 // A frame that is not a JSON object is dropped: unlike Watch, which has a
 // caller waiting on a specific node, there is nothing useful to say about a
 // malformed snapshot to somebody who is guessing.
+//
+// A frame carrying no whole-node states is dropped too, and that is not an
+// optimisation. The socket is snapshot-then-delta (wire.go): after the opening
+// snapshot, all but a handful of the ~21 frames a second are audio-meter
+// updates for a node that is not a router input, and they yield an EMPTY
+// Document. Emitting those would be worse than useless — Discovery takes its
+// baseline from the first Document it is given, and an empty baseline makes
+// every already-streaming input on the switcher look like a node that appeared
+// from nowhere and started streaming, i.e. a candidate. That is exactly the
+// "three green lamps against somebody else's feed" failure discover.go exists
+// to prevent.
 func (w *watcher) runAll(ctx context.Context, out chan<- Document) {
 	defer close(out)
 
@@ -330,7 +342,7 @@ func (w *watcher) runAll(ctx context.Context, out chan<- Document) {
 				continue
 			}
 			nodes, err := extractAll(cm.p)
-			if err != nil {
+			if err != nil || len(nodes) == 0 {
 				continue
 			}
 			select {
@@ -360,6 +372,27 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 	var lastVideo VideoFormat
 	lastAudio := []AudioFormat{}
 
+	// The statusKey-mismatch report. Deciding a statusKey is wrong takes the
+	// SNAPSHOT that opens a connection, never a delta: a delta mentions one
+	// node and says nothing about the other 35 (wire.go). So the run loop
+	// remembers, per connection, what the snapshot enumerated.
+	//
+	//   inputs      every router input seen at path "/" on this connection,
+	//               by node name. Set from the opening snapshot and merged
+	//               from any later whole-node state, so an input created
+	//               mid-session is picked up.
+	//   enumerated  true once a frame carrying whole-node states has been
+	//               seen. Until then nothing is known and nothing is claimed.
+	//   keyErr      the report currently standing, "" when the key matches.
+	//               Held so it is logged and emitted on the transition and on
+	//               a heartbeat, not at the 21 frames a second the socket
+	//               actually delivers.
+	inputs := map[string]NodeChoice{}
+	enumerated := false
+	keyErr := ""
+	var keyErrNext time.Time
+	sockGen := 0
+
 	sock := newStatusSocket(w)
 	defer sock.close()
 
@@ -370,6 +403,34 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 		case <-ctx.Done():
 			return false
 		}
+	}
+
+	// reportKeyErr publishes the standing statusKey report. It logs and emits
+	// on the transition, and thereafter only on a StaleAfter heartbeat, so a
+	// misconfiguration costs one log line rather than twenty-one a second —
+	// while a page that loaded after the first report still learns within
+	// fifteen seconds why its lamps are grey.
+	reportKeyErr := func(msg string, now time.Time) bool {
+		if msg == keyErr && now.Before(keyErrNext) {
+			return true
+		}
+		if msg != keyErr {
+			log.Print(msg)
+		}
+		keyErr = msg
+		keyErrNext = now.Add(StaleAfter)
+		return emit(Status{Stale: true, KeyError: msg, At: now})
+	}
+
+	// availableInputs renders what has been enumerated on this connection, for
+	// the report.
+	availableInputs := func() []NodeChoice {
+		out := make([]NodeChoice, 0, len(inputs))
+		for _, c := range inputs {
+			out = append(out, c)
+		}
+		sortChoices(out)
+		return out
 	}
 
 	sock.dialFirst(ctx, now)
@@ -397,8 +458,20 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 				}
 			}
 
-			if now.Sub(lastMsg) >= StaleAfter {
-				if !emit(Status{Stale: true, At: now}) {
+			switch {
+			case now.Sub(lastMsg) >= StaleAfter:
+				// The socket itself has gone quiet. A statusKey report
+				// still standing rides along: it is still true, and it is
+				// the more actionable of the two facts.
+				keyErrNext = now.Add(StaleAfter)
+				if !emit(Status{Stale: true, KeyError: keyErr, At: now}) {
+					return
+				}
+			case keyErr != "":
+				// The socket is delivering perfectly and the key still
+				// matches nothing. Staleness will therefore never fire,
+				// which is precisely why this failure used to be silent.
+				if !reportKeyErr(keyErr, now) {
 					return
 				}
 			}
@@ -417,15 +490,64 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 			now := w.clk.Now()
 			lastMsg = now
 
-			node, ok, err := extractNode(cm.p, statusKey)
-			if err != nil || !ok {
-				// Malformed frame, or a snapshot that does not mention
-				// our statusKey this time: lastMsg above already proves
-				// the socket is alive, so this is not staleness — there
-				// is just nothing new for our node in this message.
+			// A new connection begins a new snapshot. What the last one
+			// enumerated says nothing about this one — the switcher may
+			// have been reconfigured while we were away.
+			if cm.gen != sockGen {
+				sockGen = cm.gen
+				inputs = map[string]NodeChoice{}
+				enumerated = false
+			}
+
+			look, err := lookupNode(cm.p, statusKey)
+			if err != nil {
+				// A frame this package cannot read at all, or our own
+				// node in a shape it does not understand. lastMsg above
+				// already proves the socket is alive, so this is not
+				// staleness — there is just nothing usable in this
+				// message. It is also NOT evidence about the statusKey:
+				// claiming it were would send an operator hunting for a
+				// node name over a dropped frame.
 				continue
 			}
 
+			// Only a frame carrying whole-node states enumerates anything.
+			// Every delta measured carried none (wire.go).
+			for _, c := range look.Inputs {
+				inputs[c.Key] = c
+			}
+			if len(look.Inputs) > 0 {
+				enumerated = true
+			}
+
+			if !look.Found {
+				_, known := inputs[statusKey]
+				switch {
+				case look.NotAnInput:
+					// Conclusive from this frame alone: the node is
+					// there, at path "/", and has no stream_state.
+				case enumerated && !known:
+					// The opening snapshot listed the switcher and our
+					// key was not on it.
+				default:
+					// A delta about somebody else, or a connection whose
+					// snapshot has not arrived yet. Neither says anything
+					// about our node, so neither is reported.
+					continue
+				}
+				msg := (&StatusKeyNotFoundError{
+					Key:        statusKey,
+					NotAnInput: look.NotAnInput,
+					Available:  availableInputs(),
+				}).Error()
+				if !reportKeyErr(msg, now) {
+					return
+				}
+				continue
+			}
+			keyErr = ""
+
+			node := look.Node
 			video := parseVideoFormat(node.Streams.Video.Format)
 			audio := make([]AudioFormat, 0, len(node.Streams.Audio))
 			for _, a := range node.Streams.Audio {

@@ -3,7 +3,7 @@ package m2lx
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -251,16 +251,17 @@ func expectNoStatus(t *testing.T, ch <-chan Status) {
 	}
 }
 
-func statusPayload(statusKey, streamState, videoFmt string, audioFmts ...string) []byte {
-	audio := ""
-	for i, a := range audioFmts {
-		if i > 0 {
-			audio += ","
-		}
-		audio += fmt.Sprintf(`{"format":%q}`, a)
-	}
-	return []byte(fmt.Sprintf(`{%q:{"stream_state":%q,"streams":{"video":{"format":%q},"audio":[%s]}}}`,
-		statusKey, streamState, videoFmt, audio))
+// statusPayload builds a switcher_status frame carrying one router input, in
+// the shape measured on the live instance (see wire.go): a "status" ARRAY of
+// {node, path, state} entries, with everything the lamps read nested under
+// "state" and the formats as structured objects.
+//
+// videoFmt and audioFmts are raw JSON — pass liveVideoFormat / liveAudioFormat
+// for the measured healthy shapes, or "null" for a stopped input. Passing no
+// audio formats at all produces an empty audio array: the MP2/AC-3 silent-drop
+// signature.
+func statusPayload(statusKey, state, videoFmt string, audioFmts ...string) []byte {
+	return frame(entry(statusKey, streamState(statusKey+" DISPLAY", state, videoFmt, audioFmts...)))
 }
 
 func TestWatcher_ConnectAndReceiveMessage(t *testing.T) {
@@ -278,7 +279,7 @@ func TestWatcher_ConnectAndReceiveMessage(t *testing.T) {
 	conn := newFakeConn()
 	tw.nextConn <- wsConnOrErr{conn: conn}
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 
 	s := recvStatus(t, out)
 	if s.Stale {
@@ -306,7 +307,7 @@ func TestWatcher_EmptyAudioArraySurvivesAsEmptySlice(t *testing.T) {
 	conn := newFakeConn()
 	tw.nextConn <- wsConnOrErr{conn: conn}
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat))
 
 	s := recvStatus(t, out)
 	if s.Audio == nil {
@@ -329,7 +330,7 @@ func TestWatcher_DebouncesFlappingStreamState(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn}
 	tw.waitStarted(t)
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s := recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("first StreamState = %q", s.StreamState)
@@ -337,13 +338,13 @@ func TestWatcher_DebouncesFlappingStreamState(t *testing.T) {
 
 	// A momentary drop, well inside the 4s DebounceWindow: must not surface
 	// as a change.
-	conn.push(statusPayload("cam7", "stopped", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "stopped", liveVideoFormat, liveAudioFormat))
 	s = recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("StreamState during a momentary flap = %q, want it to stay streaming", s.StreamState)
 	}
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s = recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("StreamState after recovery = %q", s.StreamState)
@@ -370,13 +371,13 @@ func TestWatcher_DebouncedChangeCommitsAndIsEmitted(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn}
 	tw.waitStarted(t)
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out) // consume the initial "streaming"
 
 	// stream_state goes bad and STAYS bad: after DebounceWindow (4s, i.e. 4
 	// ticks at tickInterval=1s) the commit must surface even with no
 	// further message, via the ticker's Tick path.
-	conn.push(statusPayload("cam7", "stopped", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "stopped", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out) // the message itself, still reporting "streaming" (pending)
 
 	for i := 0; i < 3; i++ {
@@ -406,7 +407,7 @@ func TestWatcher_StaleAfterSilence(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn}
 	tw.waitStarted(t)
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out)
 
 	// Fewer than StaleAfter (15s) ticks: must not go stale yet.
@@ -435,7 +436,7 @@ func TestWatcher_StaleAfterSilence(t *testing.T) {
 	}
 
 	// Recovery: a fresh message must clear staleness immediately.
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s = recvStatus(t, out)
 	if s.Stale {
 		t.Fatalf("Stale = true after a fresh message arrived")
@@ -496,7 +497,7 @@ func TestWatcher_ReconnectsAfterConnectionDrop(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn1}
 	tw.waitStarted(t)
 
-	conn1.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn1.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out)
 
 	// Simulate the connection dropping. The read error surfaces on the
@@ -564,7 +565,7 @@ func TestWatcher_ReconnectsAfterConnectionDrop(t *testing.T) {
 		t.Fatalf("no redial observed after dropping the connection")
 	}
 
-	conn2.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn2.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s := recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("StreamState after reconnect = %q", s.StreamState)
@@ -586,7 +587,7 @@ func TestWatcher_ReopensSocketOnTokenRotation(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn1}
 	tw.waitStarted(t)
 
-	conn1.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn1.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out)
 
 	// Client refreshed: the token in the URL is now stale, and nothing
@@ -603,7 +604,7 @@ func TestWatcher_ReopensSocketOnTokenRotation(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn2}
 	wait()
 
-	conn2.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn2.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s := recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("StreamState after token rotation reconnect = %q", s.StreamState)
@@ -621,7 +622,7 @@ func TestWatcher_MalformedFrameDoesNotCrashOrResetStaleness(t *testing.T) {
 	conn := newFakeConn()
 	tw.nextConn <- wsConnOrErr{conn: conn}
 
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	recvStatus(t, out)
 
 	// A malformed frame must not panic the watcher goroutine and must not
@@ -631,11 +632,311 @@ func TestWatcher_MalformedFrameDoesNotCrashOrResetStaleness(t *testing.T) {
 
 	// The watcher must still be alive and processing subsequent good
 	// frames.
-	conn.push(statusPayload("cam7", "streaming", "h264 1920x1080 50 P", "aac 48000 2ch"))
+	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
 	s := recvStatus(t, out)
 	if s.StreamState != "streaming" {
 		t.Fatalf("StreamState after a malformed frame = %q", s.StreamState)
 	}
+}
+
+func TestWatcher_WrongStatusKeyIsReportedRatherThanSilentlyIgnored(t *testing.T) {
+	// THE failure this rewrite exists to close. A wrong statusKey used to be
+	// indistinguishable from a blank one: no Status was emitted at all, and
+	// the staleness rule never fired — frames WERE arriving, just not about
+	// the node we asked for — so the three lamps read "NO STATUS" for the
+	// whole session and nothing anywhere said why.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam99")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(
+		entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+		entry("cam7", streamState("REPLAY 1 CLN", StreamStateStopped, `null`, `null`)),
+		entry("router", `{"connections":{}}`),
+	))
+
+	s := recvStatus(t, out)
+	if !s.Stale {
+		t.Error("Stale = false; the lamps must be greyed, not left showing values for a node we are not watching")
+	}
+	if s.KeyError == "" {
+		t.Fatal("KeyError is empty; a statusKey that matches nothing must be reported, not swallowed")
+	}
+	for _, want := range []string{
+		`"cam99"`,      // what was looked for
+		`"cam22"`,      // what is there instead
+		"CLAUDE-COMMS", // by the name the operator would recognise
+		`"cam7"`,
+		"REPLAY 1 CLN",
+	} {
+		if !strings.Contains(s.KeyError, want) {
+			t.Errorf("KeyError does not mention %q:\n%s", want, s.KeyError)
+		}
+	}
+	// "router" carries no stream_state, so offering it would be offering a
+	// statusKey that can never work.
+	if strings.Contains(s.KeyError, "router") {
+		t.Errorf("KeyError offers a node that is not a router input:\n%s", s.KeyError)
+	}
+	if s.StreamState != "" || s.Video != (VideoFormat{}) || len(s.Audio) != 0 {
+		t.Errorf("Status carries values for a node we never found: %+v", s)
+	}
+
+	// It does NOT repeat itself per frame. The socket delivers about twenty
+	// frames a second (wire.go), so a report per frame would be a Status
+	// storm and a log flood.
+	conn.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	expectNoStatus(t, out)
+
+	// But it does keep saying so on a heartbeat, at the same StaleAfter
+	// cadence as staleness itself: a page that loaded after the first report
+	// must still learn why its lamps are grey.
+	for i := 0; i < int(StaleAfter/tickInterval)-1; i++ {
+		tw.tickPlain()
+		expectNoStatus(t, out)
+	}
+	wait := tw.tick()
+	again := recvStatus(t, out)
+	wait()
+	if !again.Stale || again.KeyError != s.KeyError {
+		t.Errorf("heartbeat produced %+v; the misconfiguration has not gone away", again)
+	}
+}
+
+func TestWatcher_DeltaFramesAreNotEvidenceAboutTheStatusKey(t *testing.T) {
+	// The trap the live capture alone could not show. The socket is
+	// snapshot-then-delta: after the opening snapshot it sends about twenty
+	// frames a second, each about ONE node's subtree, and a delta about
+	// somebody else's audio meters says nothing whatever about our node.
+	//
+	// Treating that silence as "your statusKey is wrong" would condemn a
+	// perfectly good configuration twenty times a second; treating a
+	// "/statistics" delta about our OWN node as a node state would report the
+	// one input that is working as "not a router input".
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(
+		entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+		entry("cam1", streamState("Input 1", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+	))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStreaming || s.KeyError != "" {
+		t.Fatalf("opening snapshot produced %+v, want a healthy streaming Status", s)
+	}
+
+	// Verbatim off the wire, both of them.
+	conn.push(readFixture(t, liveDeltaLevels))
+	expectNoStatus(t, out)
+	conn.push(readFixture(t, liveDeltaStatistics))
+	expectNoStatus(t, out)
+	// And one about our own node, which is the nastier half of the trap.
+	conn.push(frame(deltaEntry("cam22", "/statistics", `{"bitrate":507.4,"packet_count":3374}`)))
+	expectNoStatus(t, out)
+}
+
+func TestWatcher_AKeyErrorIsOnlyDecidedFromASnapshot(t *testing.T) {
+	// A connection whose first frame is a delta has enumerated nothing. It
+	// must stay silent rather than guess, because guessing here means telling
+	// an operator their configuration is wrong on no evidence at all.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(readFixture(t, liveDeltaLevels))
+	expectNoStatus(t, out)
+	conn.push(readFixture(t, liveDeltaStatistics))
+	expectNoStatus(t, out)
+
+	// The snapshot arrives, and only now is there anything to conclude.
+	conn.push(frame(entry("cam1", streamState("Input 1", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	s := recvStatus(t, out)
+	if !s.Stale || s.KeyError == "" {
+		t.Fatalf("Status = %+v, want the report once a snapshot has been seen", s)
+	}
+}
+
+func TestWatcher_ReconnectingForgetsTheOldConnectionsSnapshot(t *testing.T) {
+	// Every connection begins with its own snapshot (wire.go), and what the
+	// LAST one enumerated says nothing about this one — the switcher may have
+	// been reconfigured while we were away.
+	//
+	// If that knowledge were carried across, an input deleted from the
+	// switcher during the outage would still count as "known", the report
+	// would never be raised, and the operator would be back to lamps that read
+	// grey for ever with no explanation: the exact failure being closed here,
+	// reintroduced by the back door.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn1 := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn1}
+	tw.waitStarted(t)
+
+	conn1.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStreaming || s.KeyError != "" {
+		t.Fatalf("first Status = %+v, want a healthy streaming one", s)
+	}
+
+	conn1.Close()
+	conn2 := newFakeConn()
+	for i := 0; i < 5; i++ {
+		tw.nextConn <- wsConnOrErr{conn: conn2}
+	}
+
+	// See TestWatcher_ReconnectsAfterConnectionDrop for why the redial loop
+	// needs a generous budget and a drain: identical mechanics.
+	drainStop := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case <-out:
+			case <-drainStop:
+				return
+			}
+		}
+	}()
+	var redialled bool
+	for i := 0; i < 30 && !redialled; i++ {
+		tw.tick()()
+		select {
+		case <-tw.dials:
+			redialled = true
+		default:
+		}
+	}
+	close(drainStop)
+	<-drainDone
+	if !redialled {
+		t.Fatal("no redial observed after dropping the connection")
+	}
+
+	// The new connection's snapshot no longer has cam22: it was deleted from
+	// the switcher while we were away.
+	conn2.push(frame(entry("cam1", streamState("Input 1", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	s := recvStatus(t, out)
+	if !s.Stale || s.KeyError == "" {
+		t.Fatalf("Status = %+v, want the report: the new snapshot does not carry cam22", s)
+	}
+	if strings.Contains(s.KeyError, "CLAUDE-COMMS") {
+		t.Errorf("the report still lists a node from the previous connection:\n%s", s.KeyError)
+	}
+}
+
+func TestWatcher_AStatusKeyNamingANonRouterNodeIsReportedDistinctly(t *testing.T) {
+	// Typing "mixer" is a different mistake from typing "cam99". Both leave
+	// the lamps dead; an operator should not have to guess which they made.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "mixer")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(
+		entry("mixer", `{"program":{"source":"cam1"},"transition":{"rate":25}}`),
+		entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+	))
+
+	s := recvStatus(t, out)
+	if !s.Stale || s.KeyError == "" {
+		t.Fatalf("Status = %+v, want a greyed, explained one", s)
+	}
+	if !strings.Contains(s.KeyError, "no stream_state") {
+		t.Errorf("KeyError does not say why %q can never work:\n%s", "mixer", s.KeyError)
+	}
+}
+
+func TestWatcher_RecoversWhenTheStatusKeyStartsMatching(t *testing.T) {
+	// A node that is not in the frame yet — an input the gallery has not
+	// created — must not poison the watcher: the moment it appears, the lamps
+	// come back with real values and no KeyError.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(entry("cam7", streamState("REPLAY 1 CLN", StreamStateStopped, `null`, `null`))))
+	if s := recvStatus(t, out); !s.Stale || s.KeyError == "" {
+		t.Fatalf("Status = %+v, want a greyed, explained one", s)
+	}
+
+	conn.push(frame(
+		entry("cam7", streamState("REPLAY 1 CLN", StreamStateStopped, `null`, `null`)),
+		entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+	))
+	s := recvStatus(t, out)
+	if s.Stale {
+		t.Error("Stale = true after the node appeared")
+	}
+	if s.KeyError != "" {
+		t.Errorf("KeyError = %q, want it cleared once the key matched", s.KeyError)
+	}
+	if s.StreamState != StreamStateStreaming {
+		t.Errorf("StreamState = %q, want streaming", s.StreamState)
+	}
+	if s.Video.Codec != "h264" || s.Video.Width != 1920 || s.Video.Height != 1080 || s.Video.FrameRate != 50 {
+		t.Errorf("Video = %+v", s.Video)
+	}
+}
+
+func TestWatcher_AMalformedFrameIsNotAWrongStatusKey(t *testing.T) {
+	// The two must never be conflated. A frame this package cannot read says
+	// nothing about whether the statusKey is right, so claiming it does would
+	// send an operator hunting for a node name over a dropped packet.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam7")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push([]byte(`{not valid json`))
+	expectNoStatus(t, out)
+
+	conn.push([]byte(`{"status":"not an array"}`))
+	expectNoStatus(t, out)
 }
 
 func TestWatcher_ChannelClosedOnContextCancellation(t *testing.T) {

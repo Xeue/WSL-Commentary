@@ -48,16 +48,28 @@ const (
 var ErrNotSignedIn = errors.New("m2lx: not signed in")
 
 // VideoFormat is the detected video format of our router input, parsed from
-// <statusKey>.streams.video.format on the status WebSocket.
+// the streams.video.format OBJECT on the status WebSocket (wire.go, format.go).
 //
 // These are DETECTED values. The REST width/height/frame_rate/codec fields are
 // the CONFIGURED values and will cheerfully report 1080p50 over a 720p25 stream;
 // they must not be used for the VIDEO OK lamp.
 type VideoFormat struct {
-	// Raw is the format string verbatim, as measured: "h264 1920x1080 50 P".
-	// It is kept so that the parse below can be checked against reality at
-	// Gate C, and so a format the parser does not understand can still be shown
-	// to the user instead of silently reading as zero.
+	// Raw is a rendering of the format object, as key=<JSON value> pairs. The
+	// measured healthy shape is:
+	//
+	//	codec="h264" width=1920 height=1080 frame_rate="50" scan_type="P"
+	//	bit_depth=8 color_space="YCbCr" sample_format="420"
+	//
+	// It is not the format "verbatim" — there is no verbatim to keep, because
+	// what arrives is an object, not a string. It is kept because it is the
+	// only thing that can make an unexpected format VISIBLE: the fields below
+	// go to zero when they cannot be parsed, the lamps read zero as red, and
+	// without Raw the operator would be told "not 1080p50" with no way to find
+	// out what it actually was. It is also what carries the fields this type
+	// does not model at all — colour space, bit depth, chroma sampling.
+	//
+	// Empty when the node reports no format, which is the measured shape of
+	// every stopped input.
 	Raw string `json:"raw"`
 
 	// Codec is the detected codec, e.g. "h264".
@@ -67,13 +79,23 @@ type VideoFormat struct {
 	// Height in pixels. Good state is 1080.
 	Height int `json:"height"`
 	// FrameRate in frames per second. Good state is 50.
+	//
+	// It arrives as the STRING "50" on the wire, beside width and height which
+	// arrive as numbers. See parseFrameRate.
 	FrameRate float64 `json:"frameRate"`
 }
 
-// AudioFormat is one detected audio stream of our router input, parsed from an
-// element of <statusKey>.streams.audio.
+// AudioFormat is one detected audio stream of our router input, parsed from the
+// format OBJECT of an element of streams.audio.
 type AudioFormat struct {
-	// Raw is the format string verbatim, as measured: "aac 48000 2ch".
+	// Raw is a rendering of the format object; see VideoFormat.Raw for the
+	// rule and why it exists. The measured healthy shape is:
+	//
+	//	codec="aac" sample_rate=48000 channel_count=2 bit_depth=0
+	//
+	// bit_depth really is 0 on a healthy AAC stream. That is why it is here
+	// and not a field: a zero meaning "not applicable to this codec" would
+	// read as a fault in any lamp that used it.
 	Raw string `json:"raw"`
 
 	// Codec is the detected codec. Good state is "aac".
@@ -111,11 +133,32 @@ type Status struct {
 	// staleness was declared.
 	At time.Time `json:"at"`
 
-	// Stale is true when no WebSocket message has arrived for StaleAfter. The
-	// three WebSocket-derived lamps must then be greyed and STATUS UNAVAILABLE
-	// shown rather than the last known values held green. The next live message
-	// produces a Status with Stale false.
+	// Stale is true when the three WebSocket-derived lamps must be greyed and
+	// STATUS UNAVAILABLE shown rather than the last known values held green.
+	// There are two causes, and both mean the same thing to the operator —
+	// this application cannot presently see its input:
+	//
+	//   - no WebSocket message has arrived for StaleAfter. The next live
+	//     message produces a Status with Stale false.
+	//   - the configured statusKey names no router input in the frames that
+	//     ARE arriving. KeyError then says so; see below.
+	//
+	// Greying is the only honest rendering of either. Emitting values would
+	// mean showing lamps for a node this application is not actually watching.
 	Stale bool `json:"stale"`
+
+	// KeyError, when non-empty, is why this Status is Stale despite the
+	// WebSocket working perfectly: the configured statusKey matches nothing.
+	// It names what was looked for and lists every node that could have been
+	// meant, with its display name and stream_state.
+	//
+	// It exists because a WRONG statusKey used to be indistinguishable from a
+	// blank one: no Status was emitted at all, and the staleness rule never
+	// fired because frames WERE arriving — so the lamps read "NO STATUS"
+	// forever and nothing anywhere said why. That is the failure this field
+	// closes. Empty on every healthy Status, so the common payload is
+	// unchanged.
+	KeyError string `json:"keyError,omitempty"`
 }
 
 // ChannelKeyPGM is the key under which the programme mosaic's signalling

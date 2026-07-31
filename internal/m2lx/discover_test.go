@@ -2,6 +2,7 @@ package m2lx
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 )
@@ -18,6 +19,12 @@ func streaming(video string, audio int) NodeState {
 
 func stopped() NodeState {
 	return NodeState{StreamState: StreamStateStopped}
+}
+
+// named is streaming/stopped's counterpart for the tests that are about
+// display_name — the field an operator actually picks a statusKey on.
+func named(displayName, state string) NodeState {
+	return NodeState{DisplayName: displayName, StreamState: state}
 }
 
 // ---------------------------------------------------------------------------
@@ -219,46 +226,221 @@ func TestDiscoveryClampsABackwardsClock(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// extractAll
+// Discovery — choosing by display_name
 // ---------------------------------------------------------------------------
 
-func TestExtractAllReadsEveryNode(t *testing.T) {
-	payload := []byte(`{
-		"cam7": {"stream_state":"streaming","streams":{"video":{"format":"h264 1920x1080 50 P"},"audio":[{"format":"aac 48000 2ch"}]}},
-		"cam8": {"stream_state":"stopped","streams":{"video":{"format":""},"audio":[]}}
-	}`)
+func TestDiscoveryCarriesTheDisplayNameOntoTheCandidate(t *testing.T) {
+	// The transition is the hint; the name is what the operator answers on.
+	d := NewDiscovery()
+	d.Observe(doc(0, map[string]NodeState{"cam22": named("CLAUDE-COMMS", StreamStateStopped)}))
+	d.Observe(doc(2*time.Second, map[string]NodeState{"cam22": named("CLAUDE-COMMS", StreamStateStreaming)}))
 
-	nodes, err := extractAll(payload)
-	if err != nil {
-		t.Fatalf("extractAll() error = %v", err)
+	got := d.Candidates()
+	if len(got) != 1 {
+		t.Fatalf("Candidates() = %+v, want one", got)
 	}
-	if len(nodes) != 2 {
-		t.Fatalf("extractAll() = %+v, want two nodes", nodes)
-	}
-	if nodes["cam7"].StreamState != StreamStateStreaming {
-		t.Errorf("cam7 stream_state = %q", nodes["cam7"].StreamState)
-	}
-	if nodes["cam7"].Video != "h264 1920x1080 50 P" {
-		t.Errorf("cam7 video = %q, want the format verbatim", nodes["cam7"].Video)
-	}
-	if nodes["cam7"].AudioCount != 1 {
-		t.Errorf("cam7 audioCount = %d, want 1", nodes["cam7"].AudioCount)
-	}
-	if nodes["cam8"].AudioCount != 0 {
-		t.Errorf("cam8 audioCount = %d, want 0", nodes["cam8"].AudioCount)
+	if got[0].DisplayName != "CLAUDE-COMMS" {
+		t.Errorf("candidate displayName = %q, want CLAUDE-COMMS", got[0].DisplayName)
 	}
 }
 
-func TestExtractAllSkipsWhatIsNotANode(t *testing.T) {
-	// A snapshot that carries a type tag, a timestamp or any other non-node key
-	// must still yield its nodes. Discovery is impossible on an instance whose
-	// frames have one extra field if one extra field throws the frame away.
-	payload := []byte(`{
-		"type": "switcher_status",
-		"seq": 41,
-		"meta": {"generated_at": "2026-07-31T12:00:00Z"},
-		"cam7": {"stream_state":"streaming","streams":{"video":{"format":"h264"},"audio":[]}}
-	}`)
+func TestDiscoveryChoicesOfferEveryNodeNotJustTheOnesThatChanged(t *testing.T) {
+	// Candidates answers "which came up when I did?", which can point at
+	// somebody else's input just as easily as at ours. Choices answers "which
+	// of these is mine?", which a human can settle by reading a name they
+	// chose themselves — including when nothing transitioned at all because
+	// the operator started the app after their feed was already up.
+	d := NewDiscovery()
+	d.Observe(doc(0, map[string]NodeState{
+		"cam1":  named("Input 1", StreamStateStreaming),
+		"cam22": named("CLAUDE-COMMS", StreamStateStopped),
+		"cam7":  named("REPLAY 1 CLN", StreamStateStopped),
+	}))
+
+	if got := d.Candidates(); len(got) != 0 {
+		t.Fatalf("Candidates() = %+v, want none — nothing has changed yet", got)
+	}
+	choices := d.Choices()
+	if len(choices) != 3 {
+		t.Fatalf("Choices() = %+v, want all three nodes", choices)
+	}
+	// Nothing transitioned, so the streaming node leads, then by display name.
+	wantOrder := []string{"cam1", "cam22", "cam7"}
+	for i, want := range wantOrder {
+		if choices[i].Key != want {
+			t.Errorf("Choices()[%d].Key = %q, want %q (got %+v)", i, choices[i].Key, want, choices)
+		}
+	}
+	if choices[0].DisplayName != "Input 1" || choices[0].StreamState != StreamStateStreaming {
+		t.Errorf("Choices()[0] = %+v, want Input 1 / streaming", choices[0])
+	}
+	for _, c := range choices {
+		if c.Transitioned {
+			t.Errorf("Choices() marks %q as transitioned, but discovery has only seen a baseline", c.Key)
+		}
+	}
+}
+
+func TestDiscoveryChoicesPutTheTransitionEvidenceFirst(t *testing.T) {
+	d := NewDiscovery()
+	d.Observe(doc(0, map[string]NodeState{
+		"cam1":  named("Input 1", StreamStateStreaming),
+		"cam22": named("CLAUDE-COMMS", StreamStateStopped),
+		"cam7":  named("REPLAY 1 CLN", StreamStateStopped),
+	}))
+	d.Observe(doc(3*time.Second, map[string]NodeState{
+		"cam1":  named("Input 1", StreamStateStreaming),
+		"cam22": named("CLAUDE-COMMS", StreamStateStreaming),
+		"cam7":  named("REPLAY 1 CLN", StreamStateStopped),
+	}))
+
+	choices := d.Choices()
+	if len(choices) != 3 {
+		t.Fatalf("Choices() = %+v, want three", choices)
+	}
+	if choices[0].Key != "cam22" || !choices[0].Transitioned || choices[0].AfterSeconds != 3 {
+		t.Errorf("Choices()[0] = %+v, want cam22 transitioned at 3s", choices[0])
+	}
+	// cam1 was already streaming when we arrived: it is offered, because it
+	// might still be ours, but never as the transition evidence.
+	if choices[1].Key != "cam1" || choices[1].Transitioned {
+		t.Errorf("Choices()[1] = %+v, want cam1 untransitioned", choices[1])
+	}
+}
+
+func TestDiscoveryChoicesMergeDeltaFramesOntoTheSnapshot(t *testing.T) {
+	// The socket is snapshot-then-delta (wire.go). The first Document is the
+	// whole switcher; later ones name only the nodes whose whole state was
+	// re-sent. Replacing rather than merging would throw the switcher away on
+	// the first delta and leave the operator one node to pick from.
+	d := NewDiscovery()
+	d.Observe(doc(0, map[string]NodeState{
+		"cam7":  named("REPLAY 1 CLN", StreamStateStopped),
+		"cam22": named("CLAUDE-COMMS", StreamStateStopped),
+	}))
+	d.Observe(doc(time.Second, map[string]NodeState{
+		"cam22": named("CLAUDE-COMMS", StreamStateStreaming),
+	}))
+
+	choices := d.Choices()
+	if len(choices) != 2 {
+		t.Fatalf("Choices() = %+v, want both: the delta said nothing about cam7, which is not the same as cam7 being gone", choices)
+	}
+	if choices[0].Key != "cam22" || choices[0].StreamState != StreamStateStreaming {
+		t.Errorf("Choices()[0] = %+v, want cam22 with the delta's newer state", choices[0])
+	}
+	if choices[1].Key != "cam7" || choices[1].StreamState != StreamStateStopped {
+		t.Errorf("Choices()[1] = %+v, want cam7 still at its snapshot state", choices[1])
+	}
+}
+
+func TestDiscoveryChoicesAreNeverNil(t *testing.T) {
+	if got := NewDiscovery().Choices(); got == nil {
+		t.Error("Choices() = nil before any frame; a caller rendering a list must not have to special-case it")
+	}
+}
+
+func TestDiscoveryChoicesAgainstTheLiveFrame(t *testing.T) {
+	// End to end on the real capture: the operator's node is offered, by the
+	// name they gave it, alongside the one that is not theirs.
+	nodes, err := extractAll(liveFrame(t))
+	if err != nil {
+		t.Fatalf("extractAll() error = %v", err)
+	}
+	d := NewDiscovery()
+	d.Observe(doc(0, nodes))
+
+	choices := d.Choices()
+	if len(choices) != 24 {
+		t.Fatalf("Choices() offered %d nodes, want the capture's 24 router inputs", len(choices))
+	}
+	byKey := make(map[string]NodeChoice, len(choices))
+	for _, c := range choices {
+		byKey[c.Key] = c
+	}
+	if got := byKey["cam22"]; got.DisplayName != "CLAUDE-COMMS" || got.StreamState != StreamStateStreaming {
+		t.Errorf("cam22 = %+v, want CLAUDE-COMMS / streaming", got)
+	}
+	if got := byKey["cam1"]; got.DisplayName != "Input 1" || got.StreamState != StreamStateStreaming {
+		t.Errorf("cam1 = %+v, want Input 1 / streaming", got)
+	}
+	// The two that are up lead the list, ordered by the name the operator
+	// reads: "CLAUDE-COMMS" before "Input 1". Everything after them is
+	// stopped.
+	if choices[0].Key != "cam22" || choices[1].Key != "cam1" {
+		t.Errorf("Choices() leads with %q, %q; want the two streaming nodes by display name",
+			choices[0].Key, choices[1].Key)
+	}
+	for _, c := range choices[2:] {
+		if c.StreamState == StreamStateStreaming {
+			t.Errorf("Choices() has a streaming node (%q) after the stopped ones", c.Key)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractAll
+// ---------------------------------------------------------------------------
+
+func TestExtractAllReadsEveryRouterInputInTheLiveFrame(t *testing.T) {
+	nodes, err := extractAll(liveFrame(t))
+	if err != nil {
+		t.Fatalf("extractAll() error = %v", err)
+	}
+
+	// 24 of the capture's 36 entries carry a stream_state. The other 12 are
+	// not router inputs and must be absent, not present-and-blank: a blank
+	// entry in this map is a statusKey suggestion that can never work.
+	if len(nodes) != 24 {
+		t.Fatalf("extractAll() found %d nodes, want the 24 router inputs in the capture; got %v", len(nodes), sortedKeys(nodes))
+	}
+	for _, notANode := range []string{
+		"router", "tally", "mixer", "lipsync", "advanced_audio_mixer",
+		"discovery1", "live_recorder", "media_transfer", "output_recorder",
+		// These three carry a display_name but no streams: display_name alone
+		// does not make an entry a router input.
+		"replay1", "vtr1", "vtr2",
+	} {
+		if _, ok := nodes[notANode]; ok {
+			t.Errorf("extractAll() offered %q, which carries no stream_state", notANode)
+		}
+	}
+
+	cases := []struct {
+		key  string
+		want NodeState
+	}{
+		{"cam22", NodeState{DisplayName: "CLAUDE-COMMS", StreamState: StreamStateStreaming, Video: liveVideoRaw, AudioCount: 1}},
+		{"cam1", NodeState{DisplayName: "Input 1", StreamState: StreamStateStreaming, Video: liveVideoRaw, AudioCount: 1}},
+		{"cam7", NodeState{DisplayName: "REPLAY 1 CLN", StreamState: StreamStateStopped, Video: "", AudioCount: 1}},
+		{"MIC 3", NodeState{DisplayName: "CLAUDE-TEST-MIC", StreamState: StreamStateStopped, Video: "", AudioCount: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			if got := nodes[tc.key]; got != tc.want {
+				t.Errorf("nodes[%q]:\n got %+v\nwant %+v", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractAllSkipsWhatIsNotARouterInput(t *testing.T) {
+	// Discovery is impossible on a real instance if one unreadable entry
+	// throws the frame away — the live capture has twelve entries that are
+	// objects of an entirely unrelated shape, and a future firmware could
+	// add worse.
+	payload := frame(
+		`42`,
+		`"nonsense"`,
+		`null`,
+		`{"node":"router","path":"/","state":{"connections":{"cam1":["pgm"]}}}`,
+		`{"node":"tally","path":"/","state":{"program_sources":[]}}`,
+		`{"node":42,"state":{"stream_state":"streaming"}}`,
+		`{"node":"noState","path":"/"}`,
+		`{"node":"scalarState","path":"/","state":7}`,
+		entry("", streamState("", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+		entry("cam7", streamState("MY FEED", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+	)
 
 	nodes, err := extractAll(payload)
 	if err != nil {
@@ -267,15 +449,36 @@ func TestExtractAllSkipsWhatIsNotANode(t *testing.T) {
 	if len(nodes) != 1 {
 		t.Fatalf("extractAll() = %+v, want only cam7", nodes)
 	}
-	if _, ok := nodes["cam7"]; !ok {
-		t.Errorf("extractAll() lost cam7: %+v", nodes)
+	want := NodeState{DisplayName: "MY FEED", StreamState: StreamStateStreaming, Video: liveVideoRaw, AudioCount: 1}
+	if got := nodes["cam7"]; got != want {
+		t.Errorf("nodes[cam7]:\n got %+v\nwant %+v", got, want)
 	}
 }
 
-func TestExtractAllRejectsAPayloadThatIsNotAnObject(t *testing.T) {
-	if _, err := extractAll([]byte(`["cam7"]`)); err == nil {
-		t.Error("extractAll() on a JSON array: error = nil, want non-nil")
+func TestExtractAllRejectsAPayloadThatIsNotAFrame(t *testing.T) {
+	cases := map[string]string{
+		"a JSON array":                    `["cam7"]`,
+		"not JSON":                        `not json`,
+		"empty":                           ``,
+		"the old assumed top-level shape": `{"cam7":{"stream_state":"streaming"}}`,
+		"status is not an array":          `{"status":{},"timestamp":1}`,
 	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := extractAll([]byte(body)); err == nil {
+				t.Errorf("extractAll(%s) error = nil, want non-nil", body)
+			}
+		})
+	}
+}
+
+func sortedKeys(m map[string]NodeState) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +501,7 @@ func TestWatchAllEmitsWholeDocumentsWithoutDebouncing(t *testing.T) {
 	tw.nextConn <- wsConnOrErr{conn: conn}
 	tw.waitStarted(t)
 
-	conn.push([]byte(`{"cam7":{"stream_state":"stopped","streams":{"video":{"format":""},"audio":[]}}}`))
+	conn.push(frame(entry("cam7", streamState("MY FEED", StreamStateStopped, `null`, `null`))))
 	first := recvDoc(t, docs)
 	if first.Nodes["cam7"].StreamState != StreamStateStopped {
 		t.Fatalf("first document = %+v, want cam7 stopped", first.Nodes)
@@ -306,13 +509,17 @@ func TestWatchAllEmitsWholeDocumentsWithoutDebouncing(t *testing.T) {
 
 	// Immediately afterwards, with no clock advance at all: a debouncing reader
 	// would hold this back.
-	conn.push([]byte(`{"cam7":{"stream_state":"streaming","streams":{"video":{"format":"h264 1920x1080 50 P"},"audio":[{"format":"aac 48000 2ch"}]}}}`))
+	conn.push(frame(entry("cam7", streamState("MY FEED", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
 	second := recvDoc(t, docs)
 	if second.Nodes["cam7"].StreamState != StreamStateStreaming {
 		t.Fatalf("second document = %+v, want cam7 streaming with no debounce delay", second.Nodes)
 	}
 	if second.Nodes["cam7"].AudioCount != 1 {
 		t.Errorf("second document cam7 audioCount = %d, want 1", second.Nodes["cam7"].AudioCount)
+	}
+	if second.Nodes["cam7"].DisplayName != "MY FEED" {
+		t.Errorf("second document cam7 displayName = %q, want the name the operator would recognise",
+			second.Nodes["cam7"].DisplayName)
 	}
 }
 
@@ -363,11 +570,52 @@ func TestWatchAllDropsAMalformedFrameAndKeepsReading(t *testing.T) {
 	tw.waitStarted(t)
 
 	conn.push([]byte(`not json at all`))
-	conn.push([]byte(`{"cam7":{"stream_state":"streaming","streams":{"video":{"format":"h264"},"audio":[]}}}`))
+	conn.push(frame(entry("cam7", streamState("MY FEED", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
 
 	got := recvDoc(t, docs)
 	if got.Nodes["cam7"].StreamState != StreamStateStreaming {
 		t.Fatalf("document after a malformed frame = %+v, want cam7 streaming", got.Nodes)
+	}
+}
+
+func TestWatchAllDropsDeltaOnlyFramesSoTheBaselineIsNeverEmpty(t *testing.T) {
+	// This is a safety property, not an optimisation. The socket is
+	// snapshot-then-delta (wire.go): the opening snapshot is followed by ~20
+	// frames a second that carry no whole-node state at all. If those were
+	// emitted, a Discovery started a moment late would take an EMPTY baseline
+	// — and then every input already streaming on the switcher would look
+	// like a node that appeared from nowhere and started streaming, i.e. a
+	// candidate. That is precisely the "three green lamps against somebody
+	// else's feed" failure discover.go exists to prevent.
+	tw := newTestWatcher(&fakeClientToken{token: "tok"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	docs := tw.w.WatchAll(ctx)
+
+	conn := newFakeConn()
+	<-tw.dials
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	// Both deltas verbatim off the wire, then the snapshot.
+	conn.push(readFixture(t, liveDeltaLevels))
+	conn.push(readFixture(t, liveDeltaStatistics))
+	conn.push(frame(
+		entry("cam1", streamState("Input 1", StreamStateStreaming, liveVideoFormat, liveAudioFormat)),
+		entry("cam22", streamState("CLAUDE-COMMS", StreamStateStopped, `null`, `null`)),
+	))
+
+	got := recvDoc(t, docs)
+	if len(got.Nodes) != 2 {
+		t.Fatalf("first document = %+v, want the snapshot's two nodes and neither delta", got.Nodes)
+	}
+
+	// And the safety property itself, stated as the caller would meet it.
+	d := NewDiscovery()
+	d.Observe(got)
+	if c := d.Candidates(); len(c) != 0 {
+		t.Fatalf("Candidates() = %+v after only a baseline; cam1 was already streaming and is not ours", c)
 	}
 }
 

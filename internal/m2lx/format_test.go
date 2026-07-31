@@ -1,6 +1,23 @@
 package m2lx
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
+// liveVideoFormat and liveAudioFormat are cam22's format objects copied byte
+// for byte out of testdata/switcher_status-live-2026-07-31.json. The table
+// below asserts against them so that "what the switcher sends" and "what the
+// parser expects" cannot drift apart silently.
+const (
+	liveVideoFormat = `{"bit_depth":8,"codec":"h264","color_space":"YCbCr","frame_rate":"50",` +
+		`"height":1080,"sample_format":"420","scan_type":"P","width":1920}`
+	liveAudioFormat = `{"bit_depth":0,"channel_count":2,"codec":"aac","sample_rate":48000}`
+
+	liveVideoRaw = `codec="h264" width=1920 height=1080 frame_rate="50" scan_type="P" ` +
+		`bit_depth=8 color_space="YCbCr" sample_format="420"`
+	liveAudioRaw = `codec="aac" sample_rate=48000 channel_count=2 bit_depth=0`
+)
 
 func TestParseVideoFormat(t *testing.T) {
 	cases := []struct {
@@ -9,66 +26,111 @@ func TestParseVideoFormat(t *testing.T) {
 		want VideoFormat
 	}{
 		{
-			name: "measured good state",
-			raw:  "h264 1920x1080 50 P",
-			want: VideoFormat{Raw: "h264 1920x1080 50 P", Codec: "h264", Width: 1920, Height: 1080, FrameRate: 50},
+			// The whole point of the capture. frame_rate is a STRING here
+			// while width and height beside it are numbers.
+			name: "measured good state, live frame verbatim",
+			raw:  liveVideoFormat,
+			want: VideoFormat{Raw: liveVideoRaw, Codec: "h264", Width: 1920, Height: 1080, FrameRate: 50},
 		},
 		{
-			name: "fractional frame rate",
-			raw:  "h264 1280x720 29.97 I",
-			want: VideoFormat{Raw: "h264 1280x720 29.97 I", Codec: "h264", Width: 1280, Height: 720, FrameRate: 29.97},
+			// Measured on all 22 stopped nodes: null, not absent, not {}.
+			name: "stopped node sends null",
+			raw:  `null`,
+			want: VideoFormat{},
 		},
 		{
-			name: "no scan indicator",
-			raw:  "h264 1920x1080 50",
-			want: VideoFormat{Raw: "h264 1920x1080 50", Codec: "h264", Width: 1920, Height: 1080, FrameRate: 50},
+			name: "field absent entirely",
+			raw:  ``,
+			want: VideoFormat{},
 		},
 		{
-			name: "codec only",
-			raw:  "h264",
-			want: VideoFormat{Raw: "h264", Codec: "h264"},
+			name: "empty object",
+			raw:  `{}`,
+			want: VideoFormat{},
 		},
 		{
-			name: "empty string",
-			raw:  "",
-			want: VideoFormat{Raw: ""},
+			name: "fractional frame rate as a string",
+			raw:  `{"codec":"h264","width":1280,"height":720,"frame_rate":"29.97","scan_type":"I"}`,
+			want: VideoFormat{
+				Raw:   `codec="h264" width=1280 height=720 frame_rate="29.97" scan_type="I"`,
+				Codec: "h264", Width: 1280, Height: 720, FrameRate: 29.97,
+			},
 		},
 		{
-			name: "whitespace only",
-			raw:  "   ",
-			want: VideoFormat{Raw: "   "},
+			// Tolerated deliberately, and tested so the tolerance is earned
+			// rather than accidental: a firmware that corrects frame_rate to a
+			// number must not blank the VIDEO lamp.
+			name: "frame rate as a JSON number is tolerated",
+			raw:  `{"codec":"h264","width":1920,"height":1080,"frame_rate":50}`,
+			want: VideoFormat{
+				Raw:   `codec="h264" width=1920 height=1080 frame_rate=50`,
+				Codec: "h264", Width: 1920, Height: 1080, FrameRate: 50,
+			},
 		},
 		{
-			name: "malformed dimensions - no x",
-			raw:  "h264 19201080 50 P",
-			want: VideoFormat{Raw: "h264 19201080 50 P", Codec: "h264", FrameRate: 50},
+			// The synthetic case the live frame cannot produce: every field
+			// the wrong type. Nothing parses, and Raw shows why — with the
+			// quoting intact, so "1920 arrived as a string" is legible.
+			name: "unexpected types are zeroed and visible in Raw",
+			raw:  `{"codec":123,"width":"wide","height":null,"frame_rate":true}`,
+			want: VideoFormat{Raw: `codec=123 width="wide" height=null frame_rate=true`},
 		},
 		{
-			name: "malformed dimensions - non numeric",
-			raw:  "h264 fullhd 50 P",
-			want: VideoFormat{Raw: "h264 fullhd 50 P", Codec: "h264", FrameRate: 50},
+			name: "numeric strings are NOT accepted for numeric fields",
+			raw:  `{"codec":"h264","width":"1920","height":"1080","frame_rate":"50"}`,
+			want: VideoFormat{
+				Raw:   `codec="h264" width="1920" height="1080" frame_rate="50"`,
+				Codec: "h264", FrameRate: 50,
+			},
 		},
 		{
-			name: "non numeric frame rate",
-			raw:  "h264 1920x1080 fast P",
-			want: VideoFormat{Raw: "h264 1920x1080 fast P", Codec: "h264", Width: 1920, Height: 1080},
+			name: "non-integer dimensions are rejected rather than truncated",
+			raw:  `{"codec":"h264","width":1920.5,"height":1080}`,
+			want: VideoFormat{Raw: `codec="h264" width=1920.5 height=1080`, Codec: "h264", Height: 1080},
 		},
 		{
-			name: "completely unrecognised text still preserves Raw",
-			raw:  "some garbage the parser has never seen",
-			want: VideoFormat{Raw: "some garbage the parser has never seen", Codec: "some"},
+			name: "unparseable frame rate string",
+			raw:  `{"codec":"h264","width":1920,"height":1080,"frame_rate":"50/1"}`,
+			want: VideoFormat{
+				Raw:   `codec="h264" width=1920 height=1080 frame_rate="50/1"`,
+				Codec: "h264", Width: 1920, Height: 1080,
+			},
 		},
 		{
-			name: "uppercase X separator",
-			raw:  "h264 1920X1080 50 P",
-			want: VideoFormat{Raw: "h264 1920X1080 50 P", Codec: "h264", Width: 1920, Height: 1080, FrameRate: 50},
+			// A field nobody has seen must appear in Raw, not vanish. Known
+			// keys keep their order; unknown ones follow, sorted.
+			name: "unknown fields are rendered after the known ones, sorted",
+			raw:  `{"zulu":1,"codec":"h264","alpha":"a","width":1920}`,
+			want: VideoFormat{Raw: `codec="h264" width=1920 alpha="a" zulu=1`, Codec: "h264", Width: 1920},
+		},
+		{
+			// The shape docs/architecture.md line 406 claimed. If a firmware
+			// ever really sends it, it must read as itself on the lamp.
+			name: "a bare string format renders unquoted",
+			raw:  `"h264 1920x1080 50 P"`,
+			want: VideoFormat{Raw: "h264 1920x1080 50 P"},
+		},
+		{
+			name: "a scalar format is visible rather than silent",
+			raw:  `42`,
+			want: VideoFormat{Raw: "42"},
+		},
+		{
+			name: "an array format is visible rather than silent",
+			raw:  `["h264"]`,
+			want: VideoFormat{Raw: `["h264"]`},
+		},
+		{
+			name: "server whitespace is not inherited",
+			raw:  "{\n  \"codec\" : \"h264\" ,\n  \"width\" : 1920\n}",
+			want: VideoFormat{Raw: `codec="h264" width=1920`, Codec: "h264", Width: 1920},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseVideoFormat(tc.raw)
+			got := parseVideoFormat(json.RawMessage(tc.raw))
 			if got != tc.want {
-				t.Fatalf("parseVideoFormat(%q) = %+v, want %+v", tc.raw, got, tc.want)
+				t.Fatalf("parseVideoFormat(%s):\n got %+v\nwant %+v", tc.raw, got, tc.want)
 			}
 		})
 	}
@@ -81,104 +143,147 @@ func TestParseAudioFormat(t *testing.T) {
 		want AudioFormat
 	}{
 		{
-			name: "measured good state",
-			raw:  "aac 48000 2ch",
-			want: AudioFormat{Raw: "aac 48000 2ch", Codec: "aac", SampleRate: 48000, Channels: 2},
+			name: "measured good state, live frame verbatim",
+			raw:  liveAudioFormat,
+			want: AudioFormat{Raw: liveAudioRaw, Codec: "aac", SampleRate: 48000, Channels: 2},
+		},
+		{
+			name: "stopped node sends null",
+			raw:  `null`,
+			want: AudioFormat{},
+		},
+		{
+			name: "field absent entirely",
+			raw:  ``,
+			want: AudioFormat{},
 		},
 		{
 			name: "mono",
-			raw:  "aac 48000 1ch",
-			want: AudioFormat{Raw: "aac 48000 1ch", Codec: "aac", SampleRate: 48000, Channels: 1},
+			raw:  `{"codec":"aac","sample_rate":48000,"channel_count":1,"bit_depth":0}`,
+			want: AudioFormat{
+				Raw:   `codec="aac" sample_rate=48000 channel_count=1 bit_depth=0`,
+				Codec: "aac", SampleRate: 48000, Channels: 1,
+			},
 		},
 		{
-			name: "uppercase channel suffix",
-			raw:  "aac 48000 2CH",
-			want: AudioFormat{Raw: "aac 48000 2CH", Codec: "aac", SampleRate: 48000, Channels: 2},
+			// bit_depth 0 is the healthy AAC value. It must stay in Raw and
+			// out of any field a lamp reads.
+			name: "a codec this app does not want still parses fully",
+			raw:  `{"codec":"mp2","sample_rate":48000,"channel_count":2,"bit_depth":16}`,
+			want: AudioFormat{
+				Raw:   `codec="mp2" sample_rate=48000 channel_count=2 bit_depth=16`,
+				Codec: "mp2", SampleRate: 48000, Channels: 2,
+			},
 		},
 		{
-			name: "codec only",
-			raw:  "aac",
-			want: AudioFormat{Raw: "aac", Codec: "aac"},
+			name: "unexpected types are zeroed and visible in Raw",
+			raw:  `{"codec":[],"sample_rate":"48kHz","channel_count":"stereo"}`,
+			want: AudioFormat{Raw: `codec=[] sample_rate="48kHz" channel_count="stereo"`},
 		},
 		{
-			name: "empty string",
-			raw:  "",
-			want: AudioFormat{Raw: ""},
+			name: "unknown fields are rendered after the known ones, sorted",
+			raw:  `{"language":"eng","codec":"aac","bit_rate":128000}`,
+			want: AudioFormat{Raw: `codec="aac" bit_rate=128000 language="eng"`, Codec: "aac"},
 		},
 		{
-			name: "missing ch suffix",
-			raw:  "aac 48000 2",
-			want: AudioFormat{Raw: "aac 48000 2", Codec: "aac", SampleRate: 48000, Channels: 2},
-		},
-		{
-			name: "non numeric sample rate - later fields still parse independently",
-			raw:  "aac fast 2ch",
-			want: AudioFormat{Raw: "aac fast 2ch", Codec: "aac", Channels: 2},
-		},
-		{
-			name: "non numeric channel count",
-			raw:  "aac 48000 manych",
-			want: AudioFormat{Raw: "aac 48000 manych", Codec: "aac", SampleRate: 48000},
-		},
-		{
-			name: "unrecognised text still preserves Raw",
-			raw:  "totally unknown shape",
-			want: AudioFormat{Raw: "totally unknown shape", Codec: "totally"},
+			name: "a bare string format renders unquoted",
+			raw:  `"aac 48000 2ch"`,
+			want: AudioFormat{Raw: "aac 48000 2ch"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseAudioFormat(tc.raw)
+			got := parseAudioFormat(json.RawMessage(tc.raw))
 			if got != tc.want {
-				t.Fatalf("parseAudioFormat(%q) = %+v, want %+v", tc.raw, got, tc.want)
+				t.Fatalf("parseAudioFormat(%s):\n got %+v\nwant %+v", tc.raw, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestParseDimensions(t *testing.T) {
-	cases := []struct {
-		name   string
-		in     string
-		wantW  int
-		wantH  int
-		wantOK bool
-	}{
-		{"good", "1920x1080", 1920, 1080, true},
-		{"uppercase", "1920X1080", 1920, 1080, true},
-		{"no separator", "19201080", 0, 0, false},
-		{"non numeric width", "wxh", 0, 0, false},
-		{"empty", "", 0, 0, false},
-		{"extra separators", "1920x1080x50", 0, 0, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			w, h, ok := parseDimensions(tc.in)
-			if w != tc.wantW || h != tc.wantH || ok != tc.wantOK {
-				t.Fatalf("parseDimensions(%q) = (%d,%d,%v), want (%d,%d,%v)", tc.in, w, h, ok, tc.wantW, tc.wantH, tc.wantOK)
-			}
-		})
-	}
-}
-
-func TestParseChannelCount(t *testing.T) {
+func TestJSONInt(t *testing.T) {
 	cases := []struct {
 		name   string
 		in     string
 		want   int
 		wantOK bool
 	}{
-		{"good", "2ch", 2, true},
-		{"uppercase", "8CH", 8, true},
-		{"bare number", "2", 2, true},
-		{"non numeric", "stereo", 0, false},
-		{"empty", "", 0, false},
+		{"integer", `1920`, 1920, true},
+		{"zero", `0`, 0, true},
+		{"negative", `-1`, -1, true},
+		{"numeric string is not a number", `"1920"`, 0, false},
+		{"float", `1920.5`, 0, false},
+		{"null", `null`, 0, false},
+		{"absent", ``, 0, false},
+		{"bool", `true`, 0, false},
+		{"object", `{}`, 0, false},
+		// Anything that would not survive the trip through int on a 32-bit
+		// build is refused rather than silently wrapping into a plausible
+		// width.
+		{"beyond int32", `4294967296`, 0, false},
+		{"exponent form is not an integer literal", `1.92e3`, 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := parseChannelCount(tc.in)
+			got, ok := jsonInt(json.RawMessage(tc.in))
 			if got != tc.want || ok != tc.wantOK {
-				t.Fatalf("parseChannelCount(%q) = (%d,%v), want (%d,%v)", tc.in, got, ok, tc.want, tc.wantOK)
+				t.Fatalf("jsonInt(%s) = (%d,%v), want (%d,%v)", tc.in, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestParseFrameRate(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   float64
+		wantOK bool
+	}{
+		{"the measured shape, a string", `"50"`, 50, true},
+		{"fractional string", `"29.97"`, 29.97, true},
+		{"a number is tolerated", `50`, 50, true},
+		{"fractional number", `59.94`, 59.94, true},
+		{"rational notation is not understood", `"50/1"`, 0, false},
+		{"words", `"fifty"`, 0, false},
+		{"empty string", `""`, 0, false},
+		{"null", `null`, 0, false},
+		{"absent", ``, 0, false},
+		{"bool", `true`, 0, false},
+		// strconv.ParseFloat accepts these; a frame rate must not be either.
+		{"infinity", `"Inf"`, 0, false},
+		{"not a number", `"NaN"`, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseFrameRate(json.RawMessage(tc.in))
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("parseFrameRate(%s) = (%v,%v), want (%v,%v)", tc.in, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestJSONString(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"string", `"h264"`, "h264", true},
+		{"empty string", `""`, "", true},
+		{"escaped", `"a\"b"`, `a"b`, true},
+		{"number", `123`, "", false},
+		{"null", `null`, "", false},
+		{"absent", ``, "", false},
+		{"array", `["h264"]`, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := jsonString(json.RawMessage(tc.in))
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("jsonString(%s) = (%q,%v), want (%q,%v)", tc.in, got, ok, tc.want, tc.wantOK)
 			}
 		})
 	}
