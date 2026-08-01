@@ -1,7 +1,7 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
 import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
-import { RETURN_BUSES, RETURN_HINT, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 
 // THE MIXER DRAWER IS NOT HERE ANY MORE. It moved to a button beside Settings
 // on the main screen, at the operator's request — reaching the clean-feed
@@ -249,7 +249,7 @@ export function createSettingsView(handlers) {
     'Status key — optional',
     textInput('f-statusKey'),
     'The switcher_status node for our router input, e.g. "cam7". Blank is allowed: the three ' +
-      'WebSocket lamps then read NO STATUS and everything else works normally.',
+    'WebSocket lamps then read NO STATUS and everything else works normally.',
   );
 
   // The suggestions. There is no endpoint that names this node, so the app
@@ -362,8 +362,7 @@ export function createSettingsView(handlers) {
     selectInput(
       'f-returnMid',
       RETURN_BUSES.map((b) => ({ value: b.mid, label: b.label })),
-    ),
-    RETURN_HINT,
+    )
   );
   addField(
     'returnGainDb',

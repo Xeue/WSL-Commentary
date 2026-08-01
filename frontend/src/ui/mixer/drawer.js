@@ -428,7 +428,21 @@ export function createMixerDrawer(opts) {
           state: 'pending',
         },
       ];
-      cellNote(key, 'SENT - waiting for the mixer to report it back.', 'warn');
+      // CLEAR the cell note on the SUCCESS path, including the "Reading the
+      // mixer before writing..." one set on the way in.
+      //
+      // Nothing is printed under the row for a send that worked. The awaiting
+      // panel above already says a change is in flight and the notice line
+      // says what it was, and a banner shoving the matrix around on every
+      // click — for something that resolves in about a second — was noise on
+      // the one screen that must stay readable under pressure.
+      //
+      // Cell notes remain for REFUSALS and FAILURES. Those are the cases where
+      // nothing was written and the operator would otherwise have no idea why,
+      // and a notice at the top of a fifty-four-row scrolled matrix is not
+      // somewhere they would see it.
+      state.cellNote = null;
+
       const movedWord = moved
         ? ' The desk had moved since the view you clicked on: your change was planned onto the routing that is ' +
           'actually there, so no other bus was rolled back.'

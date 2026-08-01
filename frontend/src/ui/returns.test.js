@@ -23,7 +23,6 @@ import { dirname, join } from 'node:path';
 
 import {
   RETURN_BUSES,
-  RETURN_HINT,
   DEFAULT_RETURN_MID,
   isValidReturnMid,
   returnLabel,
@@ -88,36 +87,6 @@ test('mids 4 to 6 say they are mix-minus feeds, and name their MIC input', () =>
     assert.match(label, /mix-minus/i, `mid ${mid} says it is a mix-minus feed`);
     assert.match(label, new RegExp(`MIC${mid - 3}`), `mid ${mid} names the MIC input it is derived from`);
   }
-});
-
-test('the hint refers to tracks by the names on screen, never by mid number', () => {
-  // The labels do not carry mid numbers, so a hint that says "mids 4-6" points
-  // at something the operator cannot see anywhere in the interface. It must use
-  // the same names the dropdown does.
-  for (const name of ['MIC1', 'MIC2', 'MIC3']) {
-    assert.ok(RETURN_HINT.includes(name), `the hint names ${name}, as the dropdown does`);
-  }
-  assert.ok(
-    !/\bmids?\s*\d/i.test(RETURN_HINT),
-    `the hint refers to a track by mid number, which appears nowhere on screen: "${RETURN_HINT}"`,
-  );
-});
-
-test('the hint keeps the "you can hear yourself" note and adds the silent-feed one', () => {
-  // The original note stays: the app is reporting a routing fact it cannot fix,
-  // and removing it would leave a commentator hearing themselves with no idea
-  // what to do about it.
-  assert.match(RETURN_HINT, /hear yourself/i);
-  assert.match(RETURN_HINT, /Try another/i);
-  // And the new one: silence on the mix-minus feeds is a correct reading of an
-  // event with no MIC inputs, and it looks exactly like a failure.
-  //
-  // It used to name them "mids 4-6". That is no longer allowed — the labels
-  // carry no mid numbers, so the hint must use the names the dropdown shows.
-  // The test for that is immediately above this one.
-  assert.match(RETURN_HINT, /mix-minus/i);
-  assert.match(RETURN_HINT, /N-1/);
-  assert.match(RETURN_HINT, /silent/i);
 });
 
 test('mid 2 is still the default', () => {

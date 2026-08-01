@@ -588,8 +588,10 @@ test('a strip whose name contains a space is written against the right strip', a
   assert.deepEqual(h.calls.sendCommands[0], [
     { kind: 'setRouting', args: { matrix: 'output', input: 'MIC 1-1', outputs: ['master', 'aux2'] } },
   ]);
-  // And the note landed on the cell that was clicked, not on the other strip's.
-  assert.equal(noteIn(h.mount, 'MIC 1-1', 'aux1').hidden, false);
+  // A send that WORKED prints nothing under any cell, so there is no note here
+  // to place. That a note lands on the clicked cell rather than a neighbour is
+  // pinned by the refusal tests, which are the cases notes now exist for.
+  assert.equal(noteIn(h.mount, 'MIC 1-1', 'aux1').hidden, true);
   assert.equal(noteIn(h.mount, 'cam22-1', 'aux1').hidden, true);
   h.drawer.destroy();
 });
@@ -656,7 +658,16 @@ test('a resolved send is reported as SENT, and only a later snapshot confirms it
   await settle();
 
   assert.match(noticeText(h.mount), /SENT IS NOT APPLIED/);
-  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /SENT - waiting/);
+  // A send that WORKED prints nothing under the row. The awaiting panel and the
+  // notice line carry it; a banner appearing under the clicked cell on every
+  // click shoved the matrix around for something that resolves in a second.
+  // The note set on the way in ("Reading the mixer before writing...") must be
+  // cleared too, or the success path leaves a stale line behind it.
+  assert.equal(
+    noteIn(h.mount, 'cam22-1', 'aux1').hidden,
+    true,
+    'a successful send leaves no note under the cell, including the pre-write one',
+  );
   let awaiting = query(h.mount, (n) => (n.className || '').startsWith('mx-await '));
   assert.match(awaiting.textContent, /awaiting confirmation/);
 

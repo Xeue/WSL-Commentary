@@ -261,7 +261,7 @@ export function createHomeView(handlers) {
   returnGroup.className = 'control-group control-group-return';
   const returnLabel = document.createElement('label');
   returnLabel.htmlFor = 'return-select';
-  returnLabel.textContent = 'Return';
+  returnLabel.textContent = 'Return Audio';
   const returnHint = document.createElement('p');
   returnHint.className = 'control-hint';
   returnHint.textContent = RETURN_HINT;

@@ -159,11 +159,30 @@
   flex: 0 0 auto;
 }
 
+/* The body is a flex COLUMN that does not scroll itself: the notice, the
+ * awaiting-confirmation box and the filter row keep their natural height, and
+ * .mx-matrix-wrap takes everything that is left and owns the only scrollbar.
+ *
+ * It used to be overflow-y: auto, which scrolled the whole body instead. That
+ * put the scrollbar outside the matrix, so the sticky column header scrolled
+ * away with the rows it was labelling — and, combined with the old 62vh cap on
+ * the matrix, left a large empty band under a table that had more to show.
+ */
 .mx-body {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  padding: 0.9rem 1.1rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0.9rem 1.1rem 1.1rem;
+}
+
+/* Everything above the matrix keeps its own height and does not stretch. */
+.mx-body > .mx-notice,
+.mx-body > .mx-awaitbox,
+.mx-body > .mx-tools,
+.mx-body > .mx-legend {
+  flex: 0 0 auto;
 }
 
 /* ------------------------------------------------------------------ */
@@ -356,9 +375,20 @@
 /* The matrix                                                          */
 /* ------------------------------------------------------------------ */
 
+/* The matrix takes every pixel left after the header and the controls above
+ * it, rather than being capped at a fraction of the viewport. A 62vh cap left
+ * a third of a 2000px-tall window empty while the table it was capping had
+ * fifty-four rows to show.
+ *
+ * flex: 1 1 auto with min-height: 0 is the pair that matters: without the
+ * min-height override a flex item refuses to shrink below its content, the
+ * wrapper grows to the full table height, and the scrollbar moves to the
+ * window instead of staying inside the matrix — which loses the sticky header.
+ */
 .mx-matrix-wrap {
   margin-top: 0.4rem;
-  max-height: 62vh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   border: 1px solid var(--mx-border);
   border-radius: 10px;
