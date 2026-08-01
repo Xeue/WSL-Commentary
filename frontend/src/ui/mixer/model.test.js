@@ -27,6 +27,7 @@ import {
   busListText,
   changeSeverity,
   compareSnapshots,
+  compareStripsForDisplay,
   createWriteGate,
   crosspointCommand,
   describeCrosspointChange,
@@ -803,4 +804,69 @@ test('viewFreshness stops claiming the view is current once updates stop', () =>
   const never = viewFreshness(null, now);
   assert.equal(never.fresh, false);
   assert.match(never.text, /no state received yet/);
+});
+
+/* ------------------------------------------------------------------ */
+/* Display order                                                       */
+/* ------------------------------------------------------------------ */
+
+test('inputs sort numerically, not byte-wise, with the MIC block last', () => {
+  // The wire names sort byte-wise into the classic wrong order — cam1, cam10,
+  // cam11 ... cam19, cam2 — because "1" precedes "2" one character at a time.
+  // These are the real strip names from the captured live frame.
+  const wire = [
+    'MIC 1-1', 'MIC 2-1', 'MIC 3-1',
+    'cam1-1', 'cam2-1', 'cam3-1', 'cam9-1', 'cam10-1', 'cam14-1', 'cam20-1', 'cam22-1',
+    'replay1-1', 'vtr1-1', 'vtr2-1',
+  ];
+
+  // Byte order is what we are fixing: assert it really is wrong, so this test
+  // cannot quietly pass because the input happened to be ordered already.
+  const byteOrder = [...wire].sort();
+  assert.ok(
+    byteOrder.indexOf('cam10-1') < byteOrder.indexOf('cam2-1'),
+    'precondition: a plain sort puts cam10 before cam2',
+  );
+  assert.ok(
+    byteOrder.indexOf('MIC 1-1') < byteOrder.indexOf('cam1-1'),
+    'precondition: a plain sort puts the MICs above the cameras',
+  );
+
+  assert.deepEqual([...wire].sort(compareStripsForDisplay), [
+    'cam1-1', 'cam2-1', 'cam3-1', 'cam9-1', 'cam10-1', 'cam14-1', 'cam20-1', 'cam22-1',
+    'replay1-1', 'vtr1-1', 'vtr2-1',
+    'MIC 1-1', 'MIC 2-1', 'MIC 3-1',
+  ]);
+});
+
+test('the strip suffix sorts numerically too, and the order is total', () => {
+  assert.deepEqual(
+    ['cam9-2', 'cam9-1', 'cam10-1'].sort(compareStripsForDisplay),
+    ['cam9-1', 'cam9-2', 'cam10-1'],
+  );
+  // Total and stable: equal names compare 0, so the matrix cannot reshuffle
+  // itself between 1 Hz updates.
+  assert.equal(compareStripsForDisplay('cam1-1', 'cam1-1'), 0);
+});
+
+test('an unrecognised family sorts above the MICs, not below them', () => {
+  // If Sony adds a device type it must appear somewhere an operator will see
+  // it, not under the block everyone has learned to skip past.
+  const sorted = ['MIC 1-1', 'newthing1-1', 'cam1-1'].sort(compareStripsForDisplay);
+  assert.deepEqual(sorted, ['cam1-1', 'newthing1-1', 'MIC 1-1']);
+});
+
+test('buildMatrixModel applies the display order to its rows', () => {
+  const model = buildMatrixModel({
+    strips: [
+      { name: 'MIC 1-1', input: 'MIC 1', displayName: 'MIC 1', outputs: ['master'] },
+      { name: 'cam10-1', input: 'cam10', displayName: 'Input 10', outputs: ['master'] },
+      { name: 'cam2-1', input: 'cam2', displayName: 'Input 2', outputs: ['master'] },
+    ],
+    buses: [],
+  });
+  assert.deepEqual(
+    model.rows.map((r) => r.name),
+    ['cam2-1', 'cam10-1', 'MIC 1-1'],
+  );
 });

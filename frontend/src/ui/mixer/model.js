@@ -402,12 +402,90 @@ export function faderText(strip) {
 }
 
 /**
+ * STRIP_GROUPS ranks a strip's family. Lower sorts first; MIC is deliberately
+ * last, at the operator's instruction — the MIC inputs are not what anyone is
+ * looking for in a hurry, and they are the only family whose names sort into
+ * the middle of the cameras on a byte comparison.
+ *
+ * An unrecognised family sorts just above MIC rather than at the very bottom:
+ * if Sony adds a device type, it should appear somewhere an operator will
+ * notice it, not below the block everyone has learned to ignore.
+ */
+const STRIP_GROUPS = Object.freeze([
+  { rank: 0, test: /^cam/i },
+  { rank: 1, test: /^replay/i },
+  { rank: 2, test: /^vtr/i },
+  { rank: 4, test: /^MIC/i },
+]);
+
+/** stripGroupRank returns a strip's family rank; 3 for anything unrecognised. */
+function stripGroupRank(name) {
+  for (const g of STRIP_GROUPS) {
+    if (g.test.test(name)) return g.rank;
+  }
+  return 3;
+}
+
+/**
+ * compareStripsForDisplay orders strips the way an operator reads them.
+ *
+ * The wire names sort byte-wise into the classic wrong order — cam1, cam10,
+ * cam11 … cam19, cam2, cam20 — because "1" precedes "2" one character at a
+ * time. This compares runs of digits as NUMBERS, so cam2 precedes cam10, and
+ * ranks the families first so the MIC block sits at the bottom.
+ *
+ * It also fixes the strip suffix for free: "-2" is a number, so cam9-2 sorts
+ * after cam9-1 rather than wherever a byte comparison would put it.
+ *
+ * DISPLAY ONLY. Snapshot.Strips stays in byte order on the Go side, because
+ * Snapshot.lookupStrip binary-searches it; re-sorting there would silently
+ * break every lookup. This is why the ordering lives here and not in
+ * internal/mixer.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {number}
+ */
+export function compareStripsForDisplay(a, b) {
+  const ra = stripGroupRank(a);
+  const rb = stripGroupRank(b);
+  if (ra !== rb) return ra - rb;
+
+  // Split each name into alternating text and number runs and walk them in
+  // step: text compared case-insensitively, digits compared numerically.
+  const chunk = (s) => String(s).match(/\d+|\D+/g) || [];
+  const ca = chunk(a);
+  const cb = chunk(b);
+
+  for (let i = 0; i < Math.min(ca.length, cb.length); i += 1) {
+    const x = ca[i];
+    const y = cb[i];
+    const bothNumeric = /^\d/.test(x) && /^\d/.test(y);
+    if (bothNumeric) {
+      const nx = Number(x);
+      const ny = Number(y);
+      if (nx !== ny) return nx - ny;
+      continue;
+    }
+    const lx = x.toLowerCase();
+    const ly = y.toLowerCase();
+    if (lx !== ly) return lx < ly ? -1 : 1;
+  }
+
+  if (ca.length !== cb.length) return ca.length - cb.length;
+  // Identical under the rules above: fall back to the raw name so the order is
+  // total and stable, and the matrix cannot reshuffle between 1 Hz updates.
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
  * buildMatrixModel turns a MixerSnapshot into everything the matrix renders.
  *
- * Rows keep the snapshot's order, and columns are always ALL_BUSES, so the
- * drawer does not reorder itself between 1 Hz updates. A null or malformed
- * snapshot yields hasData:false rather than an empty-looking mixer: "no state"
- * and "nothing is routed" must never look the same.
+ * Rows are ordered by compareStripsForDisplay — numerically within a family,
+ * with the MIC block last — and columns are always ALL_BUSES, so the drawer
+ * does not reorder itself between 1 Hz updates. A null or malformed snapshot
+ * yields hasData:false rather than an empty-looking mixer: "no state" and
+ * "nothing is routed" must never look the same.
  *
  * @param {import('./contract.js').MixerSnapshot|null|undefined} snapshot
  * @returns {MatrixModel}
@@ -430,6 +508,8 @@ export function buildMatrixModel(snapshot) {
 
   const rows = strips
     .filter((s) => s && typeof s === 'object' && str(s.name) !== '')
+    .slice()
+    .sort((a, b) => compareStripsForDisplay(str(a.name), str(b.name)))
     .map((s) => {
       const outputs = names(s.outputs);
       const peakHold = pair(s.peakHold);

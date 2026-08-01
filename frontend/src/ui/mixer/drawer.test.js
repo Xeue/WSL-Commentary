@@ -1066,9 +1066,11 @@ test('a "-2" strip is hidden, unless it is AUDIBLE on the clean feed', async () 
   h.drawer.open();
   await settle();
 
+  // cam1-2 precedes cam22-1: rows are in display order (numeric within a
+  // family, MICs last), not in the order the snapshot happened to list them.
   assert.deepEqual(
     visibleRows(h.mount).map((tr) => tr.getAttribute('data-strip')),
-    ['cam22-1', 'cam1-2'],
+    ['cam1-2', 'cam22-1'],
     'the muted -2 strip is hidden; the unmuted one is in the clean feed and must be seen',
   );
   const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
