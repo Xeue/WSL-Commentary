@@ -1,5 +1,6 @@
 import { createLampRow, deriveHonestLine } from './lamps.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
+import { RETURN_BUSES, RETURN_HINT, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 
 // The main screen: the PGM tile, the three device/return controls, the
 // START/STOP button, the five lamps and the permanent honest line.
@@ -21,35 +22,17 @@ import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 
 const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
 
-// RETURN_BUSES is every audio transceiver the monitor subscribes to, with an
-// honest label for each. It mirrors frontend/src/monitor/buses.js's BUS_MAP,
-// which is the measured mid-to-bus map (docs/test-results.md §2.1) — mirrored
-// rather than imported because the seam with WP-5a is createMonitor and nothing
-// else (see app.js).
+// The Return dropdown offers all seven audio tracks. It used to offer two, CLN
+// and PGM. That was fine as long as the documented routing held. It did not:
+// the commentator on mid 2 could hear themselves delayed, which means
+// commentary IS routed to aux1 on this event. This application cannot fix that;
+// what it can do is stop being a two-option dropdown with no way out, and offer
+// every track so a clean one can be found by ear in the ten seconds before
+// kick-off.
 //
-// It used to offer two: CLN and PGM. That was fine as long as the documented
-// routing held. It did not: the commentator on mid 2 could hear themselves
-// delayed, which means commentary IS routed to aux1 on this event — or the
-// mid-to-bus map is not what it was when it was measured. This application
-// cannot tell which and cannot fix either; what it can do is stop being a
-// two-option dropdown with no way out, and offer every bus so a clean one can
-// be found by ear in the ten seconds before kick-off.
-const RETURN_BUSES = Object.freeze([
-  { mid: 1, label: 'mid 1 — PGM (master): programme, includes commentary' },
-  { mid: 2, label: 'mid 2 — CLN (aux1): the intended return, effects without commentary' },
-  { mid: 3, label: 'mid 3 — aux2' },
-  { mid: 4, label: 'mid 4 — mon1' },
-  { mid: 5, label: 'mid 5 — mon2' },
-  { mid: 6, label: 'mid 6 — mon3' },
-  { mid: 7, label: 'mid 7 — mon4 (PFL)' },
-]);
-
-// What to do when the return has your own voice in it. It names the cause,
-// because the app is reporting a routing fact rather than hiding one: nothing
-// here can change what the gallery sends to a bus.
-const RETURN_HINT =
-  'If you can hear yourself, the gallery is routing commentary to that bus. Try another — the ' +
-  'switch is immediate and does not interrupt your feed.';
+// The table and the hint live in ./returns.js and are shared with the Settings
+// screen, because they were duplicated here and there and both copies were
+// wrong for mids 3 to 7 in the same way. See that file.
 
 /**
  * createHomeView builds the home screen and returns:
@@ -251,7 +234,7 @@ export function createHomeView(handlers) {
     opt.textContent = bus.label;
     returnSelect.appendChild(opt);
   }
-  returnSelect.value = '2'; // mid 2, aux1/CLN, stays the default
+  returnSelect.value = String(DEFAULT_RETURN_MID); // mid 2, CLN, stays the default
   returnSelect.addEventListener('change', () => handlers.onReturnChange(Number(returnSelect.value)));
 
   const returnGroup = document.createElement('div');
@@ -354,11 +337,10 @@ export function createHomeView(handlers) {
   }
 
   function setReturnMid(mid) {
-    const wanted = String(mid);
     // A mid outside 1..7 — a hand-edited config.json, an older file — would
     // leave the <select> showing nothing at all, which reads as "no return" to
     // somebody who is about to commentate. Fall back to the documented default.
-    returnSelect.value = RETURN_BUSES.some((b) => String(b.mid) === wanted) ? wanted : '2';
+    returnSelect.value = isValidReturnMid(mid) ? String(mid) : String(DEFAULT_RETURN_MID);
   }
 
   function setLevel(fraction) {

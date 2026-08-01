@@ -717,6 +717,39 @@ input[type='range'] {
 }
 
 /* ------------------------------------------------------------------ */
+/* The mixer drawer's entry point                                       */
+/* ------------------------------------------------------------------ */
+
+/* The drawer itself is styled entirely by src/ui/mixer/mixer.css, scoped under
+   .mx-*, and renders as a fixed full-window overlay — so nothing here
+   positions it and nothing here may style it. This is only the section on the
+   Settings screen that opens it, and the container it mounts into. */
+.settings-mixer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.6rem;
+  max-width: 640px;
+  padding-bottom: 2.5rem;
+}
+
+.settings-mixer h2 {
+  width: 100%;
+  font-size: 1.02rem;
+  margin: 0;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.mixer-status {
+  margin: 0;
+}
+
+.mixer-status-error {
+  color: #fecaca;
+}
+
+/* ------------------------------------------------------------------ */
 /* Narrow windows                                                       */
 /* ------------------------------------------------------------------ */
 

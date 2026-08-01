@@ -28,6 +28,15 @@
 //	GetKVSCredentials()         kvs.Credentials            caller: WP-5a
 //	GetStatusKeyCandidates()    []m2lx.StatusKeyCandidate  caller: WP-5b
 //
+// and the six added for the mixer drawer, which live in app_mixer.go:
+//
+//	GetMixerSnapshot()          mixer.Snapshot             caller: WP-M4
+//	ArmMixer()                  MixerArmState              caller: WP-M4
+//	DisarmMixer()               error                      caller: WP-M4
+//	SendMixerCommands(cmds)     error                      caller: WP-M4
+//	GetMixerGolden()            *mixer.Snapshot            caller: WP-M4
+//	SetMixerGolden(snapshot)    error                      caller: WP-M4
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
@@ -41,6 +50,23 @@
 // endpoint will name the node (specification open question 5). The alternative
 // to this method was leaving the operator to guess, which is what they were
 // doing. It is read-only and returns a suggestion the operator must confirm.
+//
+// The six mixer methods are the NINTH to FOURTEENTH, and the count was kept
+// down on purpose: they are the smallest set that lets the drawer read state,
+// open and shut the Go-side write window, write, and keep a golden baseline.
+// Three of them are read-only. Of the three that are not, two only move the arm
+// gate — which changes nothing on the mixer, it only permits a later write —
+// and exactly ONE, SendMixerCommands, can change a live desk. That method
+// reaches the mixer solely through mixer.Controller.Send, which refuses with
+// mixer.ErrDisarmed unless ArmMixer has opened an unexpired window; there is no
+// second path, and app_mixer.go says why adding one would be a bug rather than
+// a feature. SetMixerGolden writes a local file and never touches the mixer.
+//
+// The event list below is deliberately NOT extended for the mixer. Mixer
+// snapshots are pulled by GetMixerSnapshot rather than pushed, because the
+// status socket only carries a complete document once per connection and a
+// pushed "latest known" frame would be exactly the cached stale frame the
+// drawer's freshness gate is built to reject. See app_mixer.go.
 //
 // # Events emitted Go to JS
 //
@@ -68,11 +94,14 @@
 //     control plane behind the teardown that has just walked past them;
 //  1. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
 //     endpoint and the SRT socket are released before anything else moves;
-//  2. the status watcher — its context is cancelled and its goroutines joined;
-//  3. the token refresh — the m2lx client's own background goroutine, which is
-//     bounded by a context of the client's own and so survives step 2; only
+//  2. the mixer write path — it is closed BEFORE the control plane, because a
+//     Send in flight is a write to a live desk and must not be left racing a
+//     teardown; Close also disarms, so the gate is shut whatever happens next;
+//  3. the status watcher — its context is cancelled and its goroutines joined;
+//  4. the token refresh — the m2lx client's own background goroutine, which is
+//     bounded by a context of the client's own and so survives step 3; only
 //     m2lx.Client.Close stops it (see stopControlPlaneLocked);
-//  4. the root context, then a WaitGroup join of everything left.
+//  5. the root context, then a WaitGroup join of everything left.
 //
 // Step 0 is what makes the order deterministic rather than merely usual. Both
 // races it closes are decided the same way whichever goroutine wins the lock:
@@ -83,14 +112,21 @@
 // The whole sequence is bounded by shutdownTimeout. A process that will not exit
 // is a support call, so a wedged pipeline loses the race rather than the window.
 //
-// # Four locks, in this order
+// # Five locks, in this order
 //
 //	sessMu -> cfgMu     (Start reads the config while holding the session lock)
 //	ctlMu               (never held with either of the others)
 //	senderMu            (leaf; never held while any other lock is taken)
+//	mixMu               (leaf; never held while any other lock is taken)
 //
-// No goroutine started here takes any of the four, so the WaitGroup joins
+// No goroutine started here takes any of the five, so the WaitGroup joins
 // performed under ctlMu and sessMu cannot deadlock against their own workers.
+//
+// mixMu is a leaf by construction rather than by luck: every mixer method needs
+// the m2lx client or the configuration, and reads both — under ctlMu and cfgMu
+// respectively — and releases them BEFORE taking mixMu. The one call made while
+// holding mixMu that can block is mixer.Controller.Close during teardown, and
+// nothing that runs under any other lock ever waits on it.
 //
 // connectErrorReporter has a fifth, but it belongs to one session's reporter
 // rather than to the App: it is taken only by report, on the sender's own
@@ -114,6 +150,7 @@ import (
 	"wslcomms/internal/gst"
 	"wslcomms/internal/kvs"
 	"wslcomms/internal/m2lx"
+	"wslcomms/internal/mixer"
 	"wslcomms/internal/secrets"
 	"wslcomms/internal/sender"
 )
@@ -330,6 +367,26 @@ type App struct {
 	senderMu   sync.Mutex
 	lastSender sender.State
 
+	// mixMu guards mixCtl, the mixer write path. It is a leaf lock: nothing
+	// else is taken while it is held, and the two facts ArmMixer needs from
+	// elsewhere — the m2lx client and the configuration — are read and
+	// released before it is acquired. See app_mixer.go.
+	mixMu sync.Mutex
+
+	// mixCtl is the arm-gated switcher_controller socket, or nil when the
+	// operator has not armed the mixer drawer.
+	//
+	// It is nil for the whole of a normal session. NewController opens a socket
+	// that can change a live clean feed, so it is built by ArmMixer and torn
+	// down by DisarmMixer — never on application start.
+	mixCtl mixer.Controller
+
+	// mixerDial builds the mixer write controller. It is mixer.NewController in
+	// the application and a fake in the tests, which is the only way to
+	// exercise the arm gate without a live switcher_controller socket. Nil
+	// means the real one; see App.dialMixerController.
+	mixerDial func(host, token string) (mixer.Controller, error)
+
 	// closing is raised by teardown before it stops anything, so that a bound
 	// method already running on a Wails message-handler goroutine cannot build a
 	// new session or control plane behind it. See step 0 of the shutdown order
@@ -503,7 +560,7 @@ func (a *App) teardown() {
 }
 
 // teardownOrdered is teardown's body: raise the closing flag, then sender,
-// watcher, token refresh, join.
+// mixer write path, watcher, token refresh, join.
 //
 // The flag is raised before anything is stopped, which is what makes the order
 // hold against a bound method that is already running. See step 0 of the
@@ -514,6 +571,8 @@ func (a *App) teardownOrdered() {
 	if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
 		log.Printf("wslcomms: stopping the sender during shutdown: %v", err)
 	}
+
+	a.closeMixerController()
 
 	a.ctlMu.Lock()
 	a.stopControlPlaneLocked()

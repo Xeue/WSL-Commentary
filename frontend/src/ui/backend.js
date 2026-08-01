@@ -407,3 +407,88 @@ export async function getStatusKeyCandidates() {
 export function isSecretSetThisSession(key) {
   return !!secretSetThisSession[key];
 }
+
+// ---------------------------------------------------------------------------
+// The mixer drawer
+// ---------------------------------------------------------------------------
+//
+// Six bindings, mirroring app_mixer.go. They are thin on purpose: every safety
+// property of the mixer path lives in internal/mixer and in the drawer, and a
+// helpful adapter in the middle is how one of them gets lost.
+//
+// THERE IS NO FAKE MIXER. Every function below rejects when there is no Wails
+// runtime, rather than answering with plausible-looking state. A fabricated
+// mixer snapshot renders as a routing matrix an operator can read, and the most
+// likely fabrication — an empty one — reads as "nothing is in the clean feed",
+// which is the single most dangerous false statement this application can make.
+// A dev session that wants to see the drawer has one:
+// frontend/src/ui/mixer/demo.html, which drives it from a captured live frame
+// and is explicitly a demo.
+
+const NO_MIXER_IN_FAKE =
+  'the mixer is only available against a real M2L-X. This session is running on the in-memory ' +
+  'fake backend, which has no mixer state and will not invent any — open ' +
+  'src/ui/mixer/demo.html to see the drawer against a captured frame.';
+
+function requireWails() {
+  if (!hasWails()) throw new Error(`wslcomms: ${NO_MIXER_IN_FAKE}`);
+}
+
+/**
+ * Reads the mixer now. NEVER a cached frame: the Go side opens a fresh status
+ * connection for every call, because the switcher_status socket only carries a
+ * complete document once per connection. The drawer's freshness gate depends on
+ * that, so nothing here may cache either.
+ *
+ * @returns {Promise<import('./mixer/contract.js').MixerSnapshot>}
+ */
+export async function getMixerSnapshot() {
+  requireWails();
+  return callGo('GetMixerSnapshot');
+}
+
+/**
+ * Opens the Go-side write window and returns {armed, armedUntil, windowSeconds}.
+ * Arming changes nothing on the mixer; it only permits a later write. The
+ * window closes on its own after windowSeconds whatever anybody forgets to do.
+ */
+export async function armMixer() {
+  requireWails();
+  return callGo('ArmMixer');
+}
+
+/** Shuts the write window and releases the control socket. Idempotent. */
+export async function disarmMixer() {
+  requireWails();
+  return callGo('DisarmMixer');
+}
+
+/**
+ * THE WRITE PATH TO A LIVE MIXER. Refused on the Go side with ErrDisarmed
+ * unless armMixer has opened a window that has not expired — the second of the
+ * two independent gates, the first being createWriteGate in mixer/model.js.
+ *
+ * Resolving means SENT, not applied. Confirmation comes from the next snapshot.
+ *
+ * @param {import('./mixer/contract.js').MixerCommand[]} cmds
+ */
+export async function sendMixerCommands(cmds) {
+  requireWails();
+  return callGo('SendMixerCommands', cmds);
+}
+
+/**
+ * Loads the saved golden snapshot, or null when none has ever been saved. Null
+ * is a normal state and the drawer renders it as "no golden saved" — never as
+ * "no differences", which is a claim it cannot make.
+ */
+export async function getMixerGolden() {
+  requireWails();
+  return callGo('GetMixerGolden');
+}
+
+/** Saves a snapshot as the golden baseline. Writes a local file only. */
+export async function setMixerGolden(snapshot) {
+  requireWails();
+  return callGo('SetMixerGolden', snapshot);
+}

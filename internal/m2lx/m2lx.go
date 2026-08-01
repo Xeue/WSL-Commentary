@@ -290,6 +290,35 @@ type Watcher interface {
 	// would have duplicated the reconnect and token-rotation logic that is the
 	// whole point of the Watcher.
 	WatchAll(ctx context.Context) <-chan Document
+
+	// RawSnapshot opens a FRESH status connection, returns the first frame
+	// that carries a whole document, and closes the connection again.
+	//
+	// It exists because of the protocol, not because a caller wanted a
+	// convenience. The socket is SNAPSHOT-THEN-DELTA (wire.go): the first
+	// frame after a connection opens carries all 36 nodes at path "/", and
+	// every frame after it carries ONE SUBTREE of one node. So a complete
+	// reading of any node that Watch and WatchAll do not model — the
+	// advanced_audio_mixer node behind the mixer drawer is the one that
+	// matters — exists exactly once per connection, and the only honest way
+	// to get a current one is to open a connection.
+	//
+	// THE COST IS ONE DIAL PER CALL, and it is deliberate. A cached last-good
+	// frame would be cheaper and would be wrong: internal/mixer's write path
+	// (set_routing) REPLACES a strip's whole bus set from whatever routing the
+	// caller is holding, so a stale frame turns one intended change into a
+	// rollback of every other bus on that strip, applied to a live desk.
+	// Callers that need this at a repeating rate must decide that rate knowing
+	// what it costs; nothing here caches on their behalf.
+	//
+	// The bytes are the raw frame, suitable for mixer.ParseSnapshot. The
+	// call is READ-ONLY — this package never writes to the status socket.
+	//
+	// Errors: ErrNotSignedIn when there is no bearer token yet,
+	// ErrNoSnapshotFrame when frames arrived but none carried a whole
+	// document, and a wrapped context error on timeout. No error ever
+	// contains the token.
+	RawSnapshot(ctx context.Context) ([]byte, error)
 }
 
 // NewClient returns a Client for the M2L-X instance at host.

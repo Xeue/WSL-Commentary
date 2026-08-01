@@ -1,6 +1,14 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
 import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
+import { RETURN_BUSES, RETURN_HINT, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+
+// The mixer drawer. Imported STATICALLY, not behind a dynamic import, for two
+// reasons: it must be in the production bundle unconditionally — nothing
+// imported it before this line existed, so none of it shipped — and this is the
+// import that pulls frontend/src/ui/mixer/mixer.css into the stylesheet, since
+// index.js is the only module allowed to import it.
+import { createMixerDrawer } from './mixer/index.js';
 
 // The Settings screen: every field of specification section 9, plus the two
 // Credential Manager secrets. Same window, swapped view — there is no
@@ -106,7 +114,7 @@ export function createSettingsView(handlers) {
   backBtn.type = 'button';
   backBtn.className = 'btn btn-ghost';
   backBtn.textContent = '‹ Back';
-  backBtn.addEventListener('click', () => handlers.onBack());
+  backBtn.addEventListener('click', () => leaveSettings());
   const title = document.createElement('h1');
   title.textContent = 'Settings';
   header.append(backBtn, title);
@@ -342,22 +350,18 @@ export function createSettingsView(handlers) {
   const monitorHeading = document.createElement('h2');
   monitorHeading.textContent = 'Monitor';
   form.appendChild(monitorHeading);
-  // All seven audio transceivers, same list and same labels as the main
-  // screen's dropdown (home.js RETURN_BUSES). The monitor subscribes to every
-  // one of them regardless; this only picks which is routed to the headphones.
+  // All seven audio tracks, from the one shared table in ./returns.js — the
+  // same object the main screen's dropdown iterates, not a copy of it. The
+  // monitor subscribes to every track regardless; this only picks which one is
+  // routed to the headphones.
   addField(
     'returnMid',
     'Return',
-    selectInput('f-returnMid', [
-      { value: 1, label: 'mid 1 — PGM (master): programme, includes commentary' },
-      { value: 2, label: 'mid 2 — CLN (aux1): the intended return, effects without commentary' },
-      { value: 3, label: 'mid 3 — aux2' },
-      { value: 4, label: 'mid 4 — mon1' },
-      { value: 5, label: 'mid 5 — mon2' },
-      { value: 6, label: 'mid 6 — mon3' },
-      { value: 7, label: 'mid 7 — mon4 (PFL)' },
-    ]),
-    'If you can hear yourself on the default, the gallery is routing commentary to that bus. Try another.',
+    selectInput(
+      'f-returnMid',
+      RETURN_BUSES.map((b) => ({ value: b.mid, label: b.label })),
+    ),
+    RETURN_HINT,
   );
   addField(
     'returnGainDb',
@@ -408,11 +412,255 @@ export function createSettingsView(handlers) {
   cancelBtn.type = 'button';
   cancelBtn.className = 'btn btn-ghost';
   cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', () => handlers.onBack());
+  cancelBtn.addEventListener('click', () => leaveSettings());
   actions.append(saveBtn, cancelBtn);
   form.append(saveMessage, actions);
 
-  el.append(header, form);
+  // --- the mixer drawer ---------------------------------------------------
+  //
+  // The drawer lives BEHIND SETTINGS and nowhere else. An engineer sets the
+  // desk up with it before a match; a commentator never opens it. Putting a
+  // control that can change a live clean feed on the commentary screen — beside
+  // START, in the ten seconds before kick-off — would be the wrong screen for
+  // the right tool.
+  //
+  // It mounts into a container this file owns and renders as a full-window
+  // overlay (mixer.css .mx-root is position:fixed), so it is outside <form>:
+  // its own buttons all carry type="button", but a write path that depends on
+  // that is a write path one careless element away from a form submit.
+
+  const mixerSection = document.createElement('section');
+  mixerSection.className = 'settings-mixer';
+
+  const mixerHeading = document.createElement('h2');
+  mixerHeading.textContent = 'Audio mixer';
+  mixerSection.appendChild(mixerHeading);
+
+  const mixerIntro = document.createElement('p');
+  mixerIntro.className = 'field-hint';
+  mixerIntro.textContent =
+    'Shows which channel strips are in the CLEAN FEED — the bus M2L-X calls "AUX" on the mixer ' +
+    'surface and "cln" on the output list, which are the same bus. Every strip defaults to being ' +
+    'in it. Read-only until you arm it inside the drawer, and both the app and the switcher have ' +
+    'to be armed before anything can be written.';
+  mixerSection.appendChild(mixerIntro);
+
+  const mixerBtn = document.createElement('button');
+  mixerBtn.type = 'button';
+  mixerBtn.className = 'btn btn-ghost';
+  mixerBtn.textContent = 'Open the mixer';
+  mixerSection.appendChild(mixerBtn);
+
+  const mixerStatus = document.createElement('p');
+  mixerStatus.className = 'field-hint mixer-status';
+  mixerStatus.hidden = true;
+  mixerSection.appendChild(mixerStatus);
+
+  const mixerMount = document.createElement('div');
+  mixerMount.className = 'mixer-mount';
+  mixerSection.appendChild(mixerMount);
+
+  el.append(header, form, mixerSection);
+
+  /**
+   * MIXER_POLL_MS is how often the host re-reads the mixer while the drawer is
+   * open, and it is a cost, not a preference.
+   *
+   * The switcher_status socket is snapshot-then-delta: a COMPLETE document
+   * arrives exactly once per connection, and it is not yet known whether a
+   * routing change is pushed as a whole-node state or as a subtree delta
+   * (internal/m2lx/wire.go). So there is nothing to subscribe to, and every
+   * refresh is App.GetMixerSnapshot opening a fresh connection. That is
+   * deliberate — a cached frame would make an old matrix look live, and
+   * set_routing REPLACES a strip's whole bus set from whatever matrix the
+   * drawer is holding.
+   *
+   * One second is the rate the drawer's contract names, and it leaves margin
+   * against model.js's STALE_AFTER_MS (3.5 s): one missed poll still leaves the
+   * view live. It only runs while the drawer is OPEN.
+   */
+  const MIXER_POLL_MS = 1000;
+
+  let mixerDrawer = null;
+  let mixerPollTimer = null;
+  let mixerPollInFlight = false;
+
+  function setMixerStatus(message, isError) {
+    if (!message) {
+      mixerStatus.hidden = true;
+      mixerStatus.textContent = '';
+      return;
+    }
+    mixerStatus.textContent = message;
+    mixerStatus.hidden = false;
+    mixerStatus.classList.toggle('mixer-status-error', !!isError);
+  }
+
+  /**
+   * syncMixerArm mirrors the drawer's armed state onto the Go arm gate.
+   *
+   * THE TWO GATES ARE INDEPENDENT AND BOTH MUST BE OPEN. The drawer's own gate
+   * (createWriteGate in mixer/model.js) is the outer layer; App.ArmMixer opens
+   * the inner one, which is where mixer.Controller.Send refuses with
+   * ErrDisarmed. This function does not decide anything — it forwards a gesture
+   * the operator already made inside the drawer.
+   *
+   * If arming the Go side FAILS, the drawer is disarmed again rather than left
+   * looking armed. A drawer that says ARMED while the write path is shut sends
+   * the operator to Apply to find out.
+   */
+  async function syncMixerArm(armed) {
+    let failed = false;
+    try {
+      if (armed) {
+        const state = await backend.armMixer();
+        const until = state && state.armedUntil ? new Date(state.armedUntil) : null;
+        const when = until && !Number.isNaN(until.getTime()) ? until.toLocaleTimeString() : 'shortly';
+        setMixerStatus(
+          `Write path armed in the application too; the window closes at ${when} on its own. ` +
+            'Arming changes nothing on the mixer by itself.',
+          false,
+        );
+      } else {
+        await backend.disarmMixer();
+        setMixerStatus('Write path disarmed. The application has released the control socket.', false);
+      }
+    } catch (err) {
+      failed = true;
+      console.error('wslcomms: mixer arm/disarm failed', err);
+      setMixerStatus(
+        `${armed ? 'Could not arm' : 'Could not disarm'} the application's write path: ${err?.message || err}`,
+        true,
+      );
+    }
+    // Outside the try, and after the await, so that the resulting
+    // onArmedChange(false) runs a clean disarm rather than re-entering this
+    // call. setArmed is a no-op when the state already matches.
+    if (failed && armed && mixerDrawer) mixerDrawer.setArmed(false);
+  }
+
+  function ensureMixerDrawer() {
+    if (mixerDrawer) return mixerDrawer;
+    mixerDrawer = createMixerDrawer({
+      mount: mixerMount,
+      // Read-only, and never cached on the Go side: see App.GetMixerSnapshot,
+      // which opens a fresh status connection for every call because that is
+      // the only way the protocol yields a complete, current document.
+      getSnapshot: () => backend.getMixerSnapshot(),
+      // The single write path. It reaches the mixer only through the armed
+      // mixer.Controller; there is deliberately no second binding that could
+      // write without the gate.
+      sendCommands: (cmds) => backend.sendMixerCommands(cmds),
+      getGolden: () => backend.getMixerGolden(),
+      setGolden: (snapshot) => backend.setMixerGolden(snapshot),
+      onArmedChange: (armed) => {
+        void syncMixerArm(armed);
+      },
+      onError: (err, context) => {
+        console.error(`wslcomms: ${context}`, err);
+        const message = String(err?.message || err);
+        // The Go arm window closes on its own after mixer.ArmWindow, without
+        // anybody calling Disarm — that is the point of it. When it does, the
+        // drawer is still showing ARMED, because the drawer's own gate is a
+        // separate gate and IS still open. Saying so is better than leaving the
+        // operator to read "disarmed" off a drawer that says ARMED.
+        if (message.includes('disarmed')) {
+          setMixerStatus(
+            "Nothing was written: the application's own write window has closed. It closes by " +
+              'itself a couple of minutes after arming, so that a drawer left armed cannot reach ' +
+              'the desk later. Press Arm to shut the drawer gate and Arm again to reopen both.',
+            true,
+          );
+          return;
+        }
+        setMixerStatus(`${context}: ${message}`, true);
+      },
+    });
+    return mixerDrawer;
+  }
+
+  /**
+   * pollMixer feeds the drawer one fresh snapshot.
+   *
+   * A failure is NOT swallowed and nothing stale is re-fed: the drawer simply
+   * stops receiving update(), declares its view STALE after STALE_AFTER_MS and
+   * blocks its own Apply path. That is the correct behaviour for a mixer that
+   * cannot presently be read, and it is reached honestly rather than simulated.
+   */
+  async function pollMixer() {
+    if (!mixerDrawer || mixerPollInFlight) return;
+    if (!mixerDrawer.isOpen()) {
+      // The operator closed the drawer from inside it — its Close button, the
+      // scrim or Escape — none of which the host is told about directly.
+      stopMixerPolling();
+      return;
+    }
+    mixerPollInFlight = true;
+    try {
+      const snapshot = await backend.getMixerSnapshot();
+      if (mixerDrawer) mixerDrawer.update(snapshot);
+      setMixerStatus('', false);
+    } catch (err) {
+      console.error('wslcomms: could not read the mixer', err);
+      setMixerStatus(
+        `The mixer could not be read: ${err?.message || err}. The drawer will show its view as ` +
+          'STALE and refuse to write until it can be read again.',
+        true,
+      );
+    } finally {
+      mixerPollInFlight = false;
+    }
+  }
+
+  function startMixerPolling() {
+    if (mixerPollTimer !== null) return;
+    // No immediate call: drawer.open() reads a snapshot itself, and a second
+    // read in the same tick would be a second connection for nothing.
+    mixerPollTimer = setInterval(() => {
+      void pollMixer();
+    }, MIXER_POLL_MS);
+  }
+
+  function stopMixerPolling() {
+    if (mixerPollTimer === null) return;
+    clearInterval(mixerPollTimer);
+    mixerPollTimer = null;
+  }
+
+  /**
+   * closeMixer shuts the drawer and everything behind it. Called when leaving
+   * the Settings screen by any route, and when entering it, so a drawer is
+   * never left running behind another view.
+   *
+   * The drawer disarms itself on close and tells us through onArmedChange, so
+   * the Go-side window and the control socket are released by that path rather
+   * than by a second, separate call here.
+   */
+  function closeMixer() {
+    stopMixerPolling();
+    if (mixerDrawer && mixerDrawer.isOpen()) mixerDrawer.close();
+    setMixerStatus('', false);
+  }
+
+  mixerBtn.addEventListener('click', () => {
+    const drawer = ensureMixerDrawer();
+    if (drawer.isOpen()) {
+      closeMixer();
+      return;
+    }
+    drawer.open();
+    startMixerPolling();
+  });
+
+  /**
+   * leaveSettings is the only way out of this screen. It shuts the drawer
+   * first, so that an armed write path cannot survive behind the commentary
+   * screen where nobody is looking at it.
+   */
+  function leaveSettings() {
+    closeMixer();
+    handlers.onBack();
+  }
 
   // --- the pasted address --------------------------------------------
 
@@ -481,7 +729,9 @@ export function createSettingsView(handlers) {
     fields.statusKey.input.value = config.statusKey || '';
     fields.audioDeviceId.input.value = config.audioDeviceId || '';
     fields.headphoneDeviceId.input.value = config.headphoneDeviceId || '';
-    fields.returnMid.input.value = String(config.returnMid ?? 2);
+    fields.returnMid.input.value = String(
+      isValidReturnMid(config.returnMid) ? config.returnMid : DEFAULT_RETURN_MID,
+    );
     fields.returnGainDb.input.value = String(config.returnGainDb ?? 18);
     const tile = config.monitorTile || { x: 0, y: 360, w: 640, h: 360 };
     fields['monitorTile.x'].input.value = String(tile.x ?? 0);
@@ -584,6 +834,9 @@ export function createSettingsView(handlers) {
       }
       refreshSecretBadges();
       setSaveMessage('Settings saved.', false);
+      // Saving leaves the Settings screen, so the drawer goes with it — see
+      // leaveSettings.
+      closeMixer();
       handlers.onSaved(config);
     } catch (err) {
       setSaveMessage(`Could not save settings: ${err.message}`, true);
@@ -594,6 +847,10 @@ export function createSettingsView(handlers) {
 
   async function open() {
     saveBtn.disabled = true;
+    // A drawer left over from a previous visit is not restored: reopening
+    // Settings must not silently put a mixer view on screen, and certainly not
+    // one whose snapshot is minutes old.
+    closeMixer();
     renderSuggestions([]);
     try {
       const config = await backend.getConfig();

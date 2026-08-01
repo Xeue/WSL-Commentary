@@ -752,9 +752,9 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 		t.Fatalf("stored %q, want %q", got, "hunter2")
 	}
 
-	// The bound surface is exactly eight methods and none of them reads a secret.
-	// Wails binds every exported method, so a ninth would silently widen the
-	// contract with WP-5a and WP-5b.
+	// None of the bound methods reads a secret, and the surface is exactly the
+	// list app.go's header documents. Wails binds every exported method, so one
+	// more would silently widen the contract with WP-5a and WP-5b.
 	assertBoundSurface(t)
 }
 
@@ -767,6 +767,12 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // without a statusKey, and no M2L-X endpoint will name one (specification open
 // question 5). This list is the place that decision has to be re-made rather
 // than drifted into, which is why the test asserts equality in both directions.
+//
+// The six mixer methods are the ninth to fourteenth, added when the mixer
+// drawer was wired to Settings and documented in the same header. They are
+// listed second here so the original eight stay legible as one group. Their
+// shapes and their safety properties are asserted in app_mixer_test.go; this
+// list exists only to make an addition a decision rather than an accident.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -779,6 +785,13 @@ func assertBoundSurface(t *testing.T) {
 		"Stop":                   true,
 		"GetKVSCredentials":      true,
 		"GetStatusKeyCandidates": true,
+
+		"GetMixerSnapshot":  true,
+		"ArmMixer":          true,
+		"DisarmMixer":       true,
+		"SendMixerCommands": true,
+		"GetMixerGolden":    true,
+		"SetMixerGolden":    true,
 	}
 
 	got := exportedMethodsOfApp()
@@ -1969,10 +1982,41 @@ func TestSenderOptsResolvesTheSRTHostAndReportsUnderThatName(t *testing.T) {
 // is not used by the discovery path and returns a closed channel.
 type stubWatcher struct {
 	docs chan m2lx.Document
+
+	// raw is what RawSnapshot returns, and rawErr what it fails with. rawCalls
+	// counts the calls, which is how the "GetMixerSnapshot never serves a
+	// cache" property is asserted: two calls must produce two reads.
+	rawMu    sync.Mutex
+	raw      []byte
+	rawErr   error
+	rawCalls int
 }
 
 func newStubWatcher() *stubWatcher {
 	return &stubWatcher{docs: make(chan m2lx.Document, 8)}
+}
+
+// setRaw installs the frame RawSnapshot will return.
+func (w *stubWatcher) setRaw(raw []byte, err error) {
+	w.rawMu.Lock()
+	defer w.rawMu.Unlock()
+	w.raw, w.rawErr = raw, err
+}
+
+func (w *stubWatcher) rawSnapshotCalls() int {
+	w.rawMu.Lock()
+	defer w.rawMu.Unlock()
+	return w.rawCalls
+}
+
+func (w *stubWatcher) RawSnapshot(context.Context) ([]byte, error) {
+	w.rawMu.Lock()
+	defer w.rawMu.Unlock()
+	w.rawCalls++
+	if w.rawErr != nil {
+		return nil, w.rawErr
+	}
+	return w.raw, nil
 }
 
 func (w *stubWatcher) Watch(context.Context, string) <-chan m2lx.Status {
