@@ -118,6 +118,22 @@ function noteIn(mount, stripName, bus) {
 
 const noticeText = (mount) => query(mount, (n) => (n.className || '').startsWith('mx-notice')).textContent;
 
+/**
+ * visibleRows is the matrix as the OPERATOR sees it: rows that are built but
+ * hidden do not count. Every input has a second '-2' strip on the wire and the
+ * drawer shows one row per input, so "how many rows are there" and "how many
+ * rows can be seen" are now different questions.
+ */
+const visibleRows = (mount) =>
+  queryAll(mount, (n) => n.tagName === 'TR' && (n.className || '').startsWith('mx-row') && n.hidden !== true);
+
+/** meterBars returns the two peak-hold bars of the first meter cell. */
+const meterBars = (mount) => queryAll(mount, (n) => (n.className || '') === 'mx-meter-bar');
+
+/** stageWidths reports how full each of a bar's three stages is, as numbers. */
+const stageWidths = (bar) =>
+  bar.childNodes.map((seg) => Number(String(seg.firstChild.style.width).replace('%', '')));
+
 /* ------------------------------------------------------------------ */
 /* Lifecycle                                                           */
 /* ------------------------------------------------------------------ */
@@ -849,8 +865,118 @@ test('a meterless strip is drawn as absent, not as full scale', async () => {
   await settle();
   const meter = query(h.mount, (n) => (n.className || '').includes('mx-meter-text'));
   assert.equal(meter.textContent, 'no meter');
-  const fill = query(h.mount, (n) => (n.className || '').includes('mx-meter-fill'));
-  assert.equal(fill.style.width, '0%');
+  for (const bar of meterBars(h.mount)) {
+    assert.deepEqual(stageWidths(bar), [0, 0, 0], 'no reading draws nothing at all');
+  }
+  h.drawer.destroy();
+});
+
+/* ------------------------------------------------------------------ */
+/* The meters: the BAR is coloured, the number is not                  */
+/* ------------------------------------------------------------------ */
+
+test('the bar shows every stage the peak has passed through, per channel', async () => {
+  // A staged broadcast meter: green to -18, amber to -6, red above it. A peak at
+  // -3 is green, then amber, then half the red — not one flat colour picked
+  // from the peak. The two channels are metered independently.
+  const h = harness({ getSnapshot: async () => snapshot([strip({ peakHold: [-3, -30] })]) });
+  h.drawer.open();
+  await settle();
+
+  const [left, right] = meterBars(h.mount);
+  assert.deepEqual(stageWidths(left), [100, 100, 50], '-3 dBFS lights green, amber and half the red');
+  assert.deepEqual(stageWidths(right), [71.4, 0, 0], '-30 dBFS is part-way through the green stage, and no further');
+  assert.deepEqual(
+    left.childNodes.map((seg) => seg.firstChild.className),
+    ['mx-meter-fill mx-meter-fill--green', 'mx-meter-fill mx-meter-fill--amber', 'mx-meter-fill mx-meter-fill--red'],
+    'the colour is a property of the stage, so it cannot follow the level about',
+  );
+  // The stages are fixed slices of the scale: -18 and -6 are always at 70% and
+  // 90% of the bar, whatever the reading.
+  assert.deepEqual(
+    left.childNodes.map((seg) => seg.style.width),
+    ['70%', '20%', '10%'],
+  );
+  h.drawer.destroy();
+});
+
+test('the bus meter in the column heading is staged the same way', async () => {
+  // One meter language. A flat green bar on master — which sums at unity with
+  // NO LIMITER — reads as "fine" at -1 dBFS.
+  const snap = snapshot();
+  snap.buses = snap.buses.map((b) => (b.name === 'master' ? { ...b, peakHold: [-3, -3] } : b));
+  const h = harness({ getSnapshot: async () => snap });
+  h.drawer.open();
+  await settle();
+  const busBar = query(h.mount, (n) => (n.className || '') === 'mx-busmeter');
+  assert.deepEqual(stageWidths(busBar), [100, 100, 50]);
+  h.drawer.destroy();
+});
+
+test('the dB text is never recoloured, at any level', async () => {
+  // The operator's complaint: the number under the meter changed colour. It is
+  // now plain foreground at every level, and colour is still not the only
+  // signal because the number itself is the reading.
+  for (const [peak, want] of [
+    [-3, '-3.0 dB'],
+    [-30, '-30.0 dB'],
+    [-100, 'silent'],
+  ]) {
+    const h = harness({ getSnapshot: async () => snapshot([strip({ peakHold: [peak, peak] })]) });
+    h.drawer.open();
+    await settle();
+    const text = query(h.mount, (n) => (n.className || '').includes('mx-meter-text'));
+    assert.equal(text.textContent, want);
+    assert.equal(text.className, 'mx-meter-text', `${peak} dBFS must not add a colour class to the number`);
+    h.drawer.destroy();
+  }
+});
+
+test('an overload is still spelled out in words beside the number', async () => {
+  // It used to be a red ::after on a red number. Removing the colour must not
+  // remove the warning with it.
+  const h = harness({ getSnapshot: async () => snapshot([strip({ peakHold: [-0.5, -0.5] })]) });
+  h.drawer.open();
+  await settle();
+  const text = query(h.mount, (n) => (n.className || '').includes('mx-meter-text'));
+  assert.match(text.textContent, /OVER/);
+  assert.match(text.textContent, /-0\.5 dB/, 'and the reading is still there');
+  h.drawer.destroy();
+});
+
+/* ------------------------------------------------------------------ */
+/* The prose the operator asked to be rid of                           */
+/* ------------------------------------------------------------------ */
+
+test('the legend is the glyph key and nothing else', async () => {
+  const h = harness();
+  h.drawer.open();
+  await settle();
+  const legend = query(h.mount, (n) => (n.className || '') === 'mx-legend');
+  // The glyphs stay: ■ □ ◆ ◇ are not self-explanatory.
+  for (const glyph of ['■', '□', '◆', '◇', 'dashed outline']) {
+    assert.ok(legend.textContent.includes(glyph), `the key must keep ${glyph}`);
+  }
+  for (const prose of ['SENT IMMEDIATELY', 'Apply step', 'peak hold', 'read-only here']) {
+    assert.ok(!legend.textContent.includes(prose), `the legend must not carry "${prose}" any more`);
+  }
+  h.drawer.destroy();
+});
+
+test('the sentence above the matrix is gone, and nothing it said is lost', async () => {
+  const h = harness();
+  h.drawer.open();
+  await settle();
+  assert.equal(query(h.mount, (n) => n.tagName === 'CAPTION'), null, 'the caption is removed outright');
+  const all = h.mount.textContent;
+  assert.ok(!all.includes('Rows are inputs'), 'and its text is nowhere else either');
+  // What it explained is carried by the screen itself.
+  assert.ok(query(h.mount, (n) => (n.className || '').includes('mx-th--strip')).textContent === 'Input');
+  assert.ok(buttonWithText(h.mount, 'Show all buses'), 'the control still names what it does');
+  const cln = queryAll(h.mount, (n) => n.tagName === 'TH' && (n.className || '').includes('mx-th--bus')).find(
+    (th) => th.getAttribute('data-bus') === 'aux1',
+  );
+  assert.equal(cln.getAttribute('title'), 'aux1 (CLN - clean feed)', 'the full bus name is still a hover away');
   h.drawer.destroy();
 });
 
@@ -884,6 +1010,11 @@ test('the drawer renders the captured live frame and shows CLAUDE-COMMS in the c
 
   const rows = queryAll(h.mount, (n) => (n.className || '').startsWith('mx-row'));
   assert.equal(rows.length, 54, 'one row per strip in the live frame');
+  // ...but the operator sees one row per INPUT. 27 of the 54 are the '-2' half
+  // of an input and none of them is audible on the clean feed, so all 27 are
+  // hidden. They are hidden, not absent: the row is still built, so a '-2'
+  // strip that becomes audible mid-session appears without a rebuild.
+  assert.equal(visibleRows(h.mount).length, 27, 'the "-2" strips are not shown');
 
   const comms = crosspoint(h.mount, 'cam22-1', 'aux1');
   assert.equal(comms.getAttribute('aria-checked'), 'true', 'the live routing puts commentary in the clean feed');
@@ -893,6 +1024,73 @@ test('the drawer renders the captured live frame and shows CLAUDE-COMMS in the c
   // cam22-1 was muted in the captured frame, so it is not counted as audible.
   assert.match(line.getAttribute('title'), /muted/);
   assert.deepEqual(h.calls.sendCommands, [], 'rendering a real frame writes nothing');
+  h.drawer.destroy();
+});
+
+test('the clean-feed count agrees with the rows the operator can actually see', async () => {
+  // 48 of the live frame's strips are routed to aux1 and 24 of those are '-2'
+  // strips, hidden and every one of them muted. A header reading "48 routed"
+  // over 24 visible rows is a number nobody can reconcile with the screen, so
+  // the count is taken from the drawn rows.
+  const h = harness({ getSnapshot: async () => LIVE_FIXTURE });
+  h.drawer.open();
+  await settle();
+
+  const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
+  assert.match(line.textContent, /CLN: 24 routed, 1 unmuted/);
+
+  const shown = visibleRows(h.mount).filter(
+    (tr) => crosspoint(tr, tr.getAttribute('data-strip'), 'aux1').getAttribute('aria-checked') === 'true',
+  );
+  assert.equal(shown.length, 24, 'and that is exactly how many lit CLN crosspoints are on screen');
+
+  // The hidden ones are NOT dropped from the drawer's answer: they are still
+  // routed to the client's clean feed and the title says so by name.
+  assert.match(line.getAttribute('title'), /not shown as rows \(second-channel "-2" strips\)/);
+  assert.match(line.getAttribute('title'), /cam22-2/);
+  h.drawer.destroy();
+});
+
+test('a "-2" strip is hidden, unless it is AUDIBLE on the clean feed', async () => {
+  // The exception is not a nicety. Hiding a row whose audio is reaching the
+  // client would make the header count — the one number this drawer exists to
+  // report — a lie, in exactly the case where it matters.
+  const h = harness({
+    getSnapshot: async () =>
+      snapshot([
+        strip({ name: 'cam22-1', displayName: 'CLAUDE-COMMS', muted: true }),
+        strip({ name: 'cam22-2', displayName: 'CLAUDE-COMMS', muted: true }),
+        strip({ name: 'cam1-2', displayName: 'CAM 1', muted: false }),
+      ]),
+  });
+  h.drawer.open();
+  await settle();
+
+  assert.deepEqual(
+    visibleRows(h.mount).map((tr) => tr.getAttribute('data-strip')),
+    ['cam22-1', 'cam1-2'],
+    'the muted -2 strip is hidden; the unmuted one is in the clean feed and must be seen',
+  );
+  const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
+  assert.match(line.textContent, /CLN: 2 routed, 1 unmuted/);
+  assert.match(line.getAttribute('title'), /IN THE CLEAN FEED AND UNMUTED: CAM 1/);
+  h.drawer.destroy();
+});
+
+test('a hidden "-2" strip stays hidden under every filter chip', async () => {
+  const h = harness({
+    getSnapshot: async () => snapshot([strip({ name: 'cam22-1' }), strip({ name: 'cam22-2', muted: true })]),
+  });
+  h.drawer.open();
+  await settle();
+  for (const chip of ['All strips', 'In clean feed', 'Unmuted or audible']) {
+    fire(buttonWithText(h.mount, chip), 'click');
+    assert.deepEqual(
+      visibleRows(h.mount).map((tr) => tr.getAttribute('data-strip')),
+      ['cam22-1'],
+      `"${chip}" must not bring the hidden strip back`,
+    );
+  }
   h.drawer.destroy();
 });
 

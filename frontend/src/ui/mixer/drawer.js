@@ -16,6 +16,15 @@
  * behind "Show all buses"; they cannot put commentary on air, so they do not get
  * a column by default.
  *
+ * ONE ROW PER INPUT. Each input has two strips on the wire, 'cam22-1' and
+ * 'cam22-2'; the second is hidden, at the operator's instruction that it will
+ * never exist in practice. That is a DISPLAY filter — the strips are still in
+ * the snapshot, still in the model and still compared for drift — and it has one
+ * exception, a '-2' strip that is audible on the clean feed. The rule is
+ * isDisplayedStrip in ./model.js and it is applied in exactly two places here:
+ * matchesFilter, and the clean-feed count in the header, which is counted from
+ * the drawn rows so that the number and the matrix can never disagree.
+ *
  * ======================= WHAT IT WILL AND WILL NOT WRITE ====================
  *
  * The only write this drawer offers is set_routing on a crosspoint, and it is
@@ -52,12 +61,14 @@
 import { ALL_BUSES, CLEAN_FEED_BUS, busLabel } from './contract.js';
 import {
   METER_FLOOR_DB,
+  METER_STAGES,
   buildMatrixModel,
   busListText,
   createWriteGate,
   describeCrosspointChange,
   formatDb,
-  meterPercent,
+  meterStageFills,
+  meterStageWidths,
   meterZone,
   routingAfterToggle,
   routingCommand,
@@ -519,9 +530,19 @@ export function createMixerDrawer(opts) {
       l.setAttribute('title', 'This drawer cannot tell you what is in the clean feed: no state has been received.');
       return;
     }
-    const routed = state.model.cleanFeed;
+    // COUNTED FROM THE ROWS THAT ARE DRAWN, not from every strip in the
+    // snapshot. The '-2' half of each input is hidden (see isDisplayedStrip),
+    // and a header reading "48 routed" above 24 visible rows is a number the
+    // operator cannot reconcile with what is in front of them.
+    //
+    // Nothing dangerous can hide behind that: a strip that is in the clean feed
+    // and UNMUTED is always displayed, so the audible count below is the whole
+    // truth. The hidden ones are all muted, and they are still named in the
+    // title rather than dropped.
+    const routed = state.model.cleanFeedDisplayed;
+    const hidden = state.model.cleanFeed.filter((r) => !r.displayed);
     const audible = routed.filter((r) => !r.muted);
-    if (routed.length === 0) {
+    if (routed.length === 0 && hidden.length === 0) {
       l.className = 'mx-cleanline mx-cleanline--ok';
       l.textContent = `${GLYPHS.notRoutedClean} CLN: nothing routed`;
       l.setAttribute('title', `Nothing is routed to ${busLabel(CLEAN_FEED_BUS)}, the CLN output the client receives.`);
@@ -529,9 +550,13 @@ export function createMixerDrawer(opts) {
     }
     const muted = routed.filter((r) => r.muted);
     l.className = audible.length > 0 ? 'mx-cleanline mx-cleanline--alert' : 'mx-cleanline mx-cleanline--warn';
+    // The one case where the count alone would be a false statement: every
+    // strip in the clean feed is a hidden one, so a bare "0 routed" would read
+    // as an empty clean feed. Said on the line itself, not only in the title.
+    const hiddenWord = routed.length === 0 && hidden.length > 0 ? ` (+${hidden.length} hidden, all muted)` : '';
     l.textContent =
       `${audible.length > 0 ? GLYPHS.routedClean : GLYPHS.notRoutedClean} ` +
-      `CLN: ${routed.length} routed, ${audible.length} unmuted`;
+      `CLN: ${routed.length} routed, ${audible.length} unmuted${hiddenWord}`;
     // BOTH groups, always. A strip that is in the clean feed but muted is one
     // un-mute away from being in it audibly, and the captured live frame is
     // exactly that case: CLAUDE-COMMS is routed to aux1 and muted. Naming only
@@ -539,6 +564,16 @@ export function createMixerDrawer(opts) {
     const parts = [];
     if (audible.length > 0) parts.push(`IN THE CLEAN FEED AND UNMUTED: ${audible.map((r) => r.label).join(', ')}.`);
     if (muted.length > 0) parts.push(`Routed to the clean feed but muted: ${muted.map((r) => r.label).join(', ')}.`);
+    // The hidden second-channel strips are counted here and nowhere else on
+    // screen. They are all muted — an audible one is never hidden — but they
+    // ARE routed to the client's clean feed, so they are stated rather than
+    // quietly dropped from the drawer's answer.
+    if (hidden.length > 0) {
+      parts.push(
+        `Also routed to the clean feed, muted, and not shown as rows (second-channel "-2" strips): ` +
+          `${hidden.map((r) => r.name).join(', ')}.`,
+      );
+    }
     parts.push(`${busLabel(CLEAN_FEED_BUS)} is the CLN output the client receives.`);
     l.setAttribute('title', parts.join(' '));
   }
@@ -667,12 +702,13 @@ export function createMixerDrawer(opts) {
       th.appendChild(el(doc, 'span', { className: 'mx-th-name', text: columnLabel(bus) }));
       const sub = el(doc, 'span', { className: 'mx-th-sub' });
       th.appendChild(sub);
-      const meter = el(doc, 'span', { className: 'mx-busmeter' });
-      const fill = el(doc, 'span', { className: 'mx-busmeter-fill' });
-      meter.appendChild(fill);
-      th.appendChild(meter);
+      // The bus meter is staged like the strip meters. It was a flat green bar,
+      // which on master — which sums at unity with NO LIMITER — would have read
+      // as "fine" at -1 dBFS. One meter language for both.
+      const stages = [];
+      th.appendChild(buildMeterBar(doc, stages, 'mx-busmeter'));
       hr.appendChild(th);
-      busEls.set(bus, { sub, fill });
+      busEls.set(bus, { sub, stages });
     }
     ui.thead.appendChild(hr);
 
@@ -688,14 +724,10 @@ export function createMixerDrawer(opts) {
 
       const meterCell = el(doc, 'td', { className: 'mx-cell mx-cell--meter' });
       const meterBox = el(doc, 'span', { className: 'mx-meter' });
-      const barL = el(doc, 'span', { className: 'mx-meter-bar' });
-      const fillL = el(doc, 'span', { className: 'mx-meter-fill' });
-      barL.appendChild(fillL);
-      const barR = el(doc, 'span', { className: 'mx-meter-bar' });
-      const fillR = el(doc, 'span', { className: 'mx-meter-fill' });
-      barR.appendChild(fillR);
-      meterBox.appendChild(barL);
-      meterBox.appendChild(barR);
+      const stagesL = [];
+      const stagesR = [];
+      meterBox.appendChild(buildMeterBar(doc, stagesL));
+      meterBox.appendChild(buildMeterBar(doc, stagesR));
       const meterText = el(doc, 'span', { className: 'mx-meter-text' });
       meterCell.appendChild(meterBox);
       meterCell.appendChild(meterText);
@@ -735,7 +767,7 @@ export function createMixerDrawer(opts) {
       }
 
       ui.tbody.appendChild(tr);
-      rowEls.set(row.name, { tr, label, wire, fillL, fillR, meterText, muteEl, faderEl, cells });
+      rowEls.set(row.name, { tr, label, wire, stagesL, stagesR, meterText, muteEl, faderEl, cells });
     }
   }
 
@@ -752,7 +784,7 @@ export function createMixerDrawer(opts) {
       if (busView.metered) bits.push(`peak ${formatDb(busView.peakMax)}`);
       else bits.push('no meter');
       refs.sub.textContent = bits.join(' · ');
-      refs.fill.style.width = `${busView.metered ? meterPercent(busView.peakMax) : 0}%`;
+      paintMeter(refs.stages, busView.metered ? busView.peakMax : null);
     }
 
     for (const row of state.model.rows) {
@@ -768,18 +800,25 @@ export function createMixerDrawer(opts) {
       refs.wire.textContent = row.name;
 
       if (row.metered) {
-        refs.fillL.style.width = `${meterPercent(row.peakHold[0])}%`;
-        refs.fillR.style.width = `${meterPercent(row.peakHold[1])}%`;
+        // The BAR carries the colour, in stages, exactly as a broadcast meter
+        // does: everything the peak has passed through is lit. The NUMBER does
+        // not — it stays in the ordinary foreground colour. It used to be
+        // recoloured (and given a background) by zone, which is what the
+        // operator asked to stop.
+        //
+        // Colour is still not the only signal: the number is the reading, and
+        // an overload is spelled out in words beside it.
+        paintMeter(refs.stagesL, row.peakHold[0]);
+        paintMeter(refs.stagesR, row.peakHold[1]);
         const zone = meterZone(row.peakMax);
-        refs.fillL.className = `mx-meter-fill mx-zone--${meterZone(row.peakHold[0])}`;
-        refs.fillR.className = `mx-meter-fill mx-zone--${meterZone(row.peakHold[1])}`;
-        refs.meterText.textContent = zone === 'silence' ? 'silent' : formatDb(row.peakMax);
-        refs.meterText.className = `mx-meter-text mx-zone--${zone}`;
+        refs.meterText.textContent =
+          zone === 'silence' ? 'silent' : `${formatDb(row.peakMax)}${zone === 'over' ? ' OVER' : ''}`;
+        refs.meterText.className = 'mx-meter-text';
       } else {
         // metered:false means NO METER DATA. Drawing the default would show
         // full scale, which is a lie an operator would act on.
-        refs.fillL.style.width = '0%';
-        refs.fillR.style.width = '0%';
+        paintMeter(refs.stagesL, null);
+        paintMeter(refs.stagesR, null);
         refs.meterText.textContent = 'no meter';
         refs.meterText.className = 'mx-meter-text mx-meter-text--absent';
       }
@@ -793,6 +832,21 @@ export function createMixerDrawer(opts) {
         if (!cRefs) continue;
         paintCrosspoint(cRefs, row, cell);
       }
+    }
+  }
+
+  /**
+   * paintMeter lights one bar for a reading: every stage the peak has passed
+   * through is full, the stage it lands in is partial, the rest are empty.
+   * db of null (or a strip with no meter at all) leaves the bar dark.
+   *
+   * @param {Array} fills the three stage fills, in METER_STAGES order
+   * @param {number|null} db
+   */
+  function paintMeter(fills, db) {
+    const pcts = meterStageFills(db);
+    for (let i = 0; i < fills.length; i += 1) {
+      fills[i].style.width = `${pcts[i]}%`;
     }
   }
 
@@ -840,6 +894,11 @@ export function createMixerDrawer(opts) {
   }
 
   function matchesFilter(row) {
+    // The '-2' half of each input, first and regardless of the chosen filter:
+    // the operator sees one row per input. The rule and its single exception
+    // are in model.js; this is the only place row visibility is decided, so a
+    // hidden row cannot reappear through a filter chip. See isDisplayedStrip.
+    if (!row.displayed) return false;
     if (state.filter === 'clean') return row.inCleanFeed;
     // "Unmuted or audible" keeps a strip that is muted but still producing a
     // reading: that combination is worth a second look, not a hidden row.
@@ -1083,27 +1142,34 @@ function buildShell(doc) {
   tools.appendChild(busToggle);
   body.appendChild(tools);
 
+  // The GLYPH KEY, and nothing else. The prose that used to follow it — the
+  // instant-write warning, the meter scale and the read-only note — was removed
+  // at the operator's request: none of it is anything a glyph cannot say, and
+  // every line above the matrix is a row of strips they cannot see. What the
+  // words carried is still said where it is needed: the header states READ-ONLY
+  // or WRITES LIVE, and arming announces that a click is sent immediately.
+  //
+  // The key itself stays, because ■ □ ◆ ◇ are not self-explanatory.
   const legend = el(doc, 'p', { className: 'mx-legend' });
   legend.textContent =
     `${GLYPHS.routed} routed · ${GLYPHS.notRouted} not routed · ` +
     `${GLYPHS.routedClean} routed to the CLEAN FEED · ${GLYPHS.notRoutedClean} not on the clean feed · ` +
-    'dashed outline = locked, changes are not allowed. ' +
-    'While changes are allowed a click is SENT IMMEDIATELY - there is no Apply step. ' +
-    'Meters are peak hold, two channels, scaled -60 to 0 dBFS. Mute and fader are read-only here.';
+    'dashed outline = locked';
   body.appendChild(legend);
 
   const matrixNote = el(doc, 'p', { className: 'mx-matrix-note', text: 'No mixer state to show.' });
   body.appendChild(matrixNote);
 
   const wrap = el(doc, 'div', { className: 'mx-matrix-wrap', attrs: { tabindex: '0', role: 'region', 'aria-label': 'Routing matrix' } });
+  // No <caption>. The sentence that used to sit here ("Rows are inputs. PGM is
+  // the programme output; CLN is the clean feed the client receives...") was
+  // removed at the operator's request. Nothing it said is lost from the screen:
+  // the row header is "Input", the columns are headed PGM and CLN with the full
+  // bus label on hover, and the clean-feed line in the header names the bus in
+  // full. The matrix is still announced — the wrapper is a labelled region.
   const table = el(doc, 'table', { className: 'mx-matrix' });
-  const caption = el(doc, 'caption', { className: 'mx-caption' });
-  caption.textContent =
-    'Rows are inputs. PGM is the programme output; CLN is the clean feed the client receives ' +
-    `(${busLabel(CLEAN_FEED_BUS)}). "Show all buses" adds the five that do not leave the building.`;
   const thead = el(doc, 'thead');
   const tbody = el(doc, 'tbody');
-  table.appendChild(caption);
   table.appendChild(thead);
   table.appendChild(tbody);
   wrap.appendChild(table);
@@ -1131,6 +1197,42 @@ function buildShell(doc) {
     thead,
     tbody,
   };
+}
+
+/**
+ * buildMeterBar creates one peak-hold bar as THREE STACKED SEGMENTS — green,
+ * amber, red — and pushes each segment's fill onto `outFills` for the update
+ * path to size at 1 Hz.
+ *
+ * Three segments rather than one gradient-filled bar, because the fill's own
+ * width is what varies: a gradient painted on it would slide and squash its
+ * colour stops with the level, so a quiet signal would show red at its tip.
+ * Here each segment is a fixed slice of the scale (70 / 20 / 10 percent, from
+ * METER_STAGES) and only the fill INSIDE it moves, so -18 dBFS is always at the
+ * same place on the bar and the boundaries never move.
+ *
+ * The widths come from the model, not from the stylesheet, so the paint cannot
+ * disagree with the dB thresholds it claims to be showing.
+ *
+ * @param {Document} doc
+ * @param {Array} outFills collects the three fill elements, bottom stage first
+ * @param {string} [className] the bar element's class; the bus header's meter is
+ *                 the same instrument at a smaller size and uses the same stages
+ * @returns {HTMLElement}
+ */
+function buildMeterBar(doc, outFills, className = 'mx-meter-bar') {
+  const bar = el(doc, 'span', { className });
+  const widths = meterStageWidths();
+  METER_STAGES.forEach((stage, i) => {
+    const seg = el(doc, 'span', { className: `mx-meter-seg mx-meter-seg--${stage.zone}` });
+    seg.style.width = `${widths[i]}%`;
+    const fill = el(doc, 'span', { className: `mx-meter-fill mx-meter-fill--${stage.zone}` });
+    fill.style.width = '0%';
+    seg.appendChild(fill);
+    bar.appendChild(seg);
+    outFills.push(fill);
+  });
+  return bar;
 }
 
 /**

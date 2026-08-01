@@ -132,9 +132,89 @@ export function meterPercent(db) {
 }
 
 /**
+ * METER_AMBER_DB and METER_RED_DB are the STAGE BOUNDARIES OF THE DRAWN BAR:
+ * green up to -18 dBFS, amber from there to -6, red above -6.
+ *
+ * These are the conventional stages of a broadcast meter and they are NOT the
+ * same question as meterZone below, which classifies one reading in words. A
+ * bar shows every stage it has passed THROUGH — a peak at -3 is green, then
+ * amber, then red along its length, the way a real meter is read at a glance —
+ * so the bar needs boundaries, not a single zone for the peak value.
+ *
+ * They are deliberately separate constants from OVER_DB/HOT_DB/NOMINAL_DB.
+ * Those are thresholds for a spoken judgement about a level (-1 dBFS is an
+ * overload on a bus that sums at unity with no limiter); these are where the
+ * paint changes.
+ */
+export const METER_AMBER_DB = -18;
+export const METER_RED_DB = -6;
+
+/**
+ * METER_STAGES are the drawn bar's three coloured stages, bottom first. Their
+ * widths and fills are derived from these dB bounds by the two functions below,
+ * so the paint cannot drift from the scale it claims to be showing.
+ *
+ * @type {ReadonlyArray<{zone: 'green'|'amber'|'red', fromDb: number, toDb: number}>}
+ */
+export const METER_STAGES = Object.freeze([
+  Object.freeze({ zone: 'green', fromDb: METER_FLOOR_DB, toDb: METER_AMBER_DB }),
+  Object.freeze({ zone: 'amber', fromDb: METER_AMBER_DB, toDb: METER_RED_DB }),
+  Object.freeze({ zone: 'red', fromDb: METER_RED_DB, toDb: METER_CEIL_DB }),
+]);
+
+/**
+ * meterStageWidths is each stage's share of the whole bar, in percent, in
+ * METER_STAGES order. On the -60..0 scale that is 70 / 20 / 10.
+ *
+ * Computed rather than written down so that moving a boundary moves the paint
+ * with it: a hard-coded 70% beside a -18 dB constant is two facts that can
+ * disagree, and the one that would be wrong is the one the operator can see.
+ *
+ * @returns {number[]} percentages summing to 100
+ */
+export function meterStageWidths() {
+  return METER_STAGES.map((s) => round1((meterFraction(s.toDb) - meterFraction(s.fromDb)) * 100));
+}
+
+/**
+ * meterStageFills is how full each stage is for one reading, in percent OF THAT
+ * STAGE, in METER_STAGES order.
+ *
+ * A stage below the reading is 100 (fully lit), the stage containing it is
+ * partial, and every stage above it is 0. So -3 dBFS returns [100, 100, 50] —
+ * green and amber lit in full, half the red — and -30 returns [71.4, 0, 0].
+ *
+ * A missing or non-numeric reading returns zeros: nothing is drawn. Absence of
+ * a meter must be reported through MixerStrip.metered, never inferred from a
+ * bar that happens to be empty.
+ *
+ * @param {unknown} db dBFS
+ * @returns {number[]} three percentages, 0..100
+ */
+export function meterStageFills(db) {
+  const f = meterFraction(db);
+  return METER_STAGES.map((s) => {
+    const from = meterFraction(s.fromDb);
+    const to = meterFraction(s.toDb);
+    const span = to - from;
+    if (span <= 0) return 0;
+    const filled = (f - from) / span;
+    return round1(Math.max(0, Math.min(1, filled)) * 100);
+  });
+}
+
+function round1(n) {
+  return Math.round(n * 10) / 10;
+}
+
+/**
  * meterZone classifies a reading for presentation. Returned as a word, not a
  * colour: the drawer pairs it with a glyph and a number so it survives a dim
  * room, a monochrome monitor and a colourblind operator.
+ *
+ * Still used, and deliberately not merged into the bar's stages: this is what
+ * decides whether the number under the meter reads 'silent' and whether it is
+ * followed by OVER. The bar is painted from METER_STAGES.
  *
  * @param {unknown} db dBFS
  * @returns {'silence'|'low'|'nominal'|'hot'|'over'}
@@ -191,6 +271,7 @@ export function formatDb(db, opts = {}) {
  * @property {boolean} muted
  * @property {boolean} inCleanFeed  routed to CLEAN_FEED_BUS
  * @property {boolean} audibleOnCleanFeed  in the clean feed AND not muted
+ * @property {boolean} displayed  drawn on screen; see isDisplayedStrip
  * @property {string[]} outputs
  * @property {MatrixCell[]} cells one per bus, in ALL_BUSES order
  * @property {boolean} metered
@@ -208,7 +289,9 @@ export function formatDb(db, opts = {}) {
  * @property {MatrixRow[]} rows
  * @property {Object[]} buses     per-bus header state
  * @property {string} takenAt
- * @property {MatrixRow[]} cleanFeed  rows routed to CLEAN_FEED_BUS
+ * @property {MatrixRow[]} cleanFeed  rows routed to CLEAN_FEED_BUS, hidden ones
+ *                                included
+ * @property {MatrixRow[]} cleanFeedDisplayed  the subset that is drawn
  * @property {string} structureKey  changes only when the set of strips or buses
  *                                changes; lets the drawer update in place at
  *                                1 Hz instead of rebuilding and stealing focus
@@ -233,6 +316,64 @@ export function stripLabel(strip) {
   if (input !== '') return input;
   const name = str(strip.name);
   return name !== '' ? name : '(unnamed strip)';
+}
+
+/**
+ * isSecondChannelStrip reports whether a strip is the '-2' half of an input.
+ *
+ * Every input on this desk carries two strips, 'cam22-1' and 'cam22-2'. The
+ * operator's instruction is that the second will never exist in practice, so
+ * the drawer shows one row per input rather than two.
+ *
+ * IT MATCHES THE NAME'S TRAILING '-2' AND NOTHING ELSE. Not a channel count,
+ * not a position in the list, not "every other row": those are assumptions
+ * about the desk's shape that would silently hide the WRONG row the first time
+ * an input arrives with one strip or three. The name is the only fact the
+ * snapshot actually states. Note that a name is not always a bare word —
+ * 'MIC 1-2' has a space in it — which is another reason to test the suffix
+ * rather than parse the name.
+ *
+ * This is the ONE place the rule is written. See isDisplayedStrip.
+ *
+ * @param {unknown} name strip wire name
+ * @returns {boolean}
+ */
+export function isSecondChannelStrip(name) {
+  return /-2$/.test(str(name));
+}
+
+/**
+ * isDisplayedStrip decides whether a row is DRAWN. It is a display filter and
+ * nothing more: every strip stays in the snapshot, in MatrixModel.rows and in
+ * everything drift compares, so nothing that reasons about the mixer loses
+ * sight of a '-2' strip.
+ *
+ * ======================= THE ONE EXCEPTION, AND WHY ========================
+ *
+ * A '-2' strip that is ROUTED TO THE CLEAN FEED AND UNMUTED is drawn anyway.
+ *
+ * Hiding it would be the single failure this drawer exists to prevent: audio
+ * reaching the client's clean feed from a row the operator cannot see, on a
+ * screen whose header line claims to count exactly that. "They will never exist
+ * in practice" is a statement about this desk today, and if one ever is audible
+ * on the clean feed then the assumption has already failed — which is precisely
+ * when the operator needs to see the row.
+ *
+ * Routed but MUTED is not the exception: that is the state 24 of the 27 '-2'
+ * strips are in on the live frame, it is inaudible, and hiding those is the
+ * whole point of the change. They are still counted in MatrixModel.cleanFeed.
+ *
+ * The consequence worth knowing: the "unmuted" half of the clean-feed count can
+ * never be reduced by this filter, because anything it would count is displayed
+ * by definition.
+ *
+ * @param {{name: string, inCleanFeed: boolean, muted: boolean}} row
+ * @returns {boolean}
+ */
+export function isDisplayedStrip(row) {
+  if (!row || typeof row !== 'object') return false;
+  if (!isSecondChannelStrip(row.name)) return true;
+  return row.inCleanFeed === true && row.muted !== true;
 }
 
 /**
@@ -282,6 +423,7 @@ export function buildMatrixModel(snapshot) {
       buses: busHeaders([]),
       takenAt: '',
       cleanFeed: [],
+      cleanFeedDisplayed: [],
       structureKey: '',
     };
   }
@@ -293,13 +435,17 @@ export function buildMatrixModel(snapshot) {
       const peakHold = pair(s.peakHold);
       const muted = s.muted === true;
       const inCleanFeed = outputs.includes(CLEAN_FEED_BUS);
+      const name = str(s.name);
       return {
-        name: str(s.name),
+        name,
         input: str(s.input),
         label: stripLabel(s),
         muted,
         inCleanFeed,
         audibleOnCleanFeed: inCleanFeed && !muted,
+        // A DISPLAY flag, not a filter applied to the data: the row is here
+        // either way, and everything that reasons about routing still sees it.
+        displayed: isDisplayedStrip({ name, inCleanFeed, muted }),
         outputs,
         cells: ALL_BUSES.map((bus) => ({
           bus,
@@ -317,12 +463,20 @@ export function buildMatrixModel(snapshot) {
       };
     });
 
+  const cleanFeed = rows.filter((r) => r.inCleanFeed);
   return {
     hasData: true,
     rows,
     buses: busHeaders(busStates),
     takenAt: str(snapshot.takenAt),
-    cleanFeed: rows.filter((r) => r.inCleanFeed),
+    // EVERY strip routed to the clean feed, hidden ones included: this is the
+    // model's answer to "what is in the clean feed" and it must not be filtered
+    // by what happens to be on screen.
+    cleanFeed,
+    // What the operator can SEE of it. The drawer's header count is drawn from
+    // this so that the number and the rows can never disagree; the difference
+    // between the two lists is reported rather than swallowed.
+    cleanFeedDisplayed: cleanFeed.filter((r) => r.displayed),
     structureKey: JSON.stringify(rows.map((r) => r.name)),
   };
 }

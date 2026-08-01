@@ -101,7 +101,7 @@ button {
   flex-direction: column;
   height: 100vh;
   /* dvh where it exists: on a window whose chrome can move, vh alone leaves the
-     honest line under the bottom edge, and the honest line is not optional. */
+     bottom row of controls under the bottom edge. */
   height: 100dvh;
   overflow: hidden;
 }
@@ -125,8 +125,8 @@ button {
 }
 
 /* auto, not hidden: when everything fits there is no scrollbar, and when the
-   window is too short to hold the controls and the honest line the operator can
-   still reach them instead of losing them under the bottom edge. */
+   window is too short to hold the controls the operator can still reach them
+   instead of losing them under the bottom edge. */
 .view-home {
   overflow-y: auto;
 }
@@ -272,7 +272,7 @@ input[type='range'] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Dismissible error banner — NOT the permanent honest line             */
+/* Dismissible error banner                                             */
 /* ------------------------------------------------------------------ */
 
 .error-banner {
@@ -320,8 +320,8 @@ input[type='range'] {
 /* ------------------------------------------------------------------ */
 
 /* The stage is the flex child that grows: it takes whatever height is left
-   after the topbar, the controls, the action row and the honest line, all of
-   which are flex: 0 0 auto. */
+   after the topbar, the controls and the action row, all of which are
+   flex: 0 0 auto. */
 .pgm-stage {
   flex: 1 1 auto;
   /* A floor, not a size. The tile's width is computed from this element's
@@ -440,12 +440,8 @@ input[type='range'] {
   width: 100%;
 }
 
-.control-hint {
-  margin: 0.1rem 0 0;
-  font-size: 0.78rem;
-  line-height: 1.35;
-  color: var(--text-muted);
-}
+/* .control-hint is gone with the sentence under the Return dropdown, which the
+   operator removed. Settings' own hints use .field-hint and are unaffected. */
 
 /* ------------------------------------------------------------------ */
 /* Start/stop + lamps                                                   */
@@ -557,19 +553,9 @@ input[type='range'] {
   font-size: 0.9rem;
 }
 
-/* ------------------------------------------------------------------ */
-/* The honest line — permanent, not dismissible, always visible         */
-/* ------------------------------------------------------------------ */
-
-.honest-line {
-  margin: 0;
-  padding-top: 0.6rem;
-  border-top: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 0.92rem;
-  line-height: 1.45;
-  flex: 0 0 auto;
-}
+/* The .honest-line rule that used to live here is gone with the element it
+   styled: the permanent caveat under the lamps was withdrawn from the GUI at
+   the operator's request. deriveHonestLine is still in src/ui/lamps.js. */
 
 /* ------------------------------------------------------------------ */
 /* Settings                                                             */

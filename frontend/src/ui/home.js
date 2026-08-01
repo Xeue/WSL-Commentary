@@ -1,12 +1,25 @@
-import { createLampRow, deriveHonestLine } from './lamps.js';
+import { createLampRow } from './lamps.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
-import { RETURN_BUSES, RETURN_HINT, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 
 // The main screen: the PGM tile, the three device/return controls, the
-// START/STOP button, the five lamps and the permanent honest line.
-// Specification section 10, verbatim layout.
+// START/STOP button and the five lamps. Specification section 10 layout, less
+// the honest line.
 //
 // Owner: WP-5b.
+//
+// ======================= THE HONEST LINE IS WITHDRAWN =======================
+//
+// The permanent caveat under the lamps ("Your feed is reaching the switcher.
+// This does not confirm you are audible on the broadcast output.") is GONE FROM
+// THIS GUI at the operator's request. That is a deliberate change to
+// specification section 8, not a tidy-up.
+//
+// Nothing behind it has been removed or weakened: deriveHonestLine and its
+// per-state wording are untouched in ./lamps.js, exactly as the golden/drift
+// machinery was kept when the drift panel was withdrawn from the mixer drawer.
+// What changed is that this file no longer renders it, so putting it back is a
+// change to this file alone.
 //
 // This module only builds DOM and exposes setters; it holds no backend
 // knowledge and calls nothing in backend.js or the monitor module directly.
@@ -48,7 +61,6 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   setReturnMid(mid)                   selects one of the seven buses, 1..7
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
- *   setSenderState(state)               updates the honest line's claim
  *   setBusy(busy)                       disables the button while a call is in flight
  *   setStatusUnavailable(unavailable)   shows/hides the transient banner (Status.Stale)
  *   showError(message) / clearError()   the dismissible error banner
@@ -262,10 +274,7 @@ export function createHomeView(handlers) {
   const returnLabel = document.createElement('label');
   returnLabel.htmlFor = 'return-select';
   returnLabel.textContent = 'Return Audio';
-  const returnHint = document.createElement('p');
-  returnHint.className = 'control-hint';
-  returnHint.textContent = RETURN_HINT;
-  returnGroup.append(returnLabel, returnSelect, returnHint);
+  returnGroup.append(returnLabel, returnSelect);
 
   const levelGroup = document.createElement('div');
   levelGroup.className = 'control-group control-group-level';
@@ -309,19 +318,7 @@ export function createHomeView(handlers) {
     'STATUS UNAVAILABLE — the switcher status feed has been silent for over 15 seconds.';
   statusUnavailableBanner.hidden = true;
 
-  // The honest line. Permanent, never dismissible, never a tooltip — and its
-  // CLAIM tracks the sender state, because it was asserting "your feed is
-  // reaching the switcher" while stopped, which was simply untrue. The caveat
-  // is in every version of it. See deriveHonestLine in lamps.js.
-  const honestLine = document.createElement('p');
-  honestLine.className = 'honest-line';
-  honestLine.textContent = deriveHonestLine(undefined);
-
-  function setSenderState(state) {
-    honestLine.textContent = deriveHonestLine(state);
-  }
-
-  el.append(header, errorBanner, pgmStage, audioEl, controls, actionRow, statusUnavailableBanner, honestLine);
+  el.append(header, errorBanner, pgmStage, audioEl, controls, actionRow, statusUnavailableBanner);
 
   // --- setters --------------------------------------------------------
 
@@ -394,7 +391,6 @@ export function createHomeView(handlers) {
     setReturnMid,
     setLevel,
     setRunning,
-    setSenderState,
     setBusy,
     setStatusUnavailable,
     showError,

@@ -401,15 +401,8 @@
   font-variant-numeric: tabular-nums;
 }
 
-.mx-caption {
-  caption-side: top;
-  text-align: left;
-  padding: 0.5rem 0.6rem;
-  font-size: 0.8rem;
-  color: var(--mx-muted);
-  background: var(--mx-bg-alt);
-  border-bottom: 1px solid var(--mx-border);
-}
+/* The .mx-caption rule is gone with the <caption> it styled — the sentence
+   above the matrix was removed at the operator's request. See buildShell. */
 
 /* ---- the sticky header, and why it is layered the way it is --------
    The header row must stay ABOVE every column as the matrix scrolls under it.
@@ -469,20 +462,17 @@
   max-width: 9rem;
 }
 
+/* The bus meter in the column heading is the same instrument as the strip
+   meters, smaller: same stages, same colours, built by the same helper. It used
+   to be a flat green bar, which on master — which sums at unity with NO LIMITER
+   — read as "fine" at -1 dBFS. */
 .mx-busmeter {
-  display: block;
+  display: flex;
   height: 4px;
   margin-top: 3px;
   background: #10151b;
   border-radius: 2px;
   overflow: hidden;
-}
-
-.mx-busmeter-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  background: var(--mx-green);
 }
 
 .mx-row:nth-child(even) .mx-cell {
@@ -531,8 +521,22 @@
   width: 8rem;
 }
 
+/* ---- the peak-hold bars -------------------------------------------
+   A classic staged broadcast meter: green to -18 dBFS, amber to -6, red above
+   it, on the -60..0 scale the whole drawer uses. THE BAR CARRIES THE COLOUR AND
+   THE NUMBER DOES NOT — the dB text used to be recoloured and backgrounded by
+   zone, which the operator asked to stop.
+
+   Three fixed segments, not a gradient on the fill: the fill's width is what
+   moves, so a gradient would drag its own colour stops along with the level and
+   a quiet signal would show red at its tip. Each .mx-meter-seg is a fixed slice
+   of the scale — its width comes from METER_STAGES via drawer.js, so the paint
+   cannot drift from the dB thresholds — and only the fill inside it moves.
+
+   Colour is not the only signal: the reading is printed beside the bar and an
+   overload is spelled out in words. */
 .mx-meter-bar {
-  display: block;
+  display: flex;
   height: 6px;
   margin-bottom: 2px;
   background: #10151b;
@@ -540,54 +544,48 @@
   overflow: hidden;
 }
 
+.mx-meter-seg {
+  display: block;
+  height: 100%;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+/* A hairline between the stages, so the -18 and -6 boundaries are readable as
+   POSITIONS even on a monochrome monitor or with the bar dark. */
+.mx-meter-seg + .mx-meter-seg {
+  box-shadow: inset 1px 0 0 #0a0e12;
+}
+
 .mx-meter-fill {
   display: block;
   height: 100%;
   width: 0;
+}
+
+.mx-meter-fill--green {
   background: var(--mx-green);
 }
 
-.mx-zone--silence {
-  background: #2c343d;
-}
-
-.mx-zone--low {
-  background: #2f7d54;
-}
-
-.mx-zone--nominal {
-  background: var(--mx-green);
-}
-
-.mx-zone--hot {
+.mx-meter-fill--amber {
   background: var(--mx-amber);
 }
 
-.mx-zone--over {
+.mx-meter-fill--red {
   background: var(--mx-red);
 }
 
+/* The plain foreground, at every level. Not the muted grey the rest of this
+   cell uses: the hot and over readings used to be the bright ones, and leaving
+   every number dimmed would trade one complaint for a harder-to-read meter. */
 .mx-meter-text {
   font-size: 0.75rem;
-  color: var(--mx-muted);
-}
-
-.mx-meter-text.mx-zone--over,
-.mx-meter-text.mx-zone--hot {
-  background: none;
-  color: var(--mx-amber);
-  font-weight: 700;
-}
-
-.mx-meter-text.mx-zone--over {
-  color: var(--mx-red);
-}
-
-.mx-meter-text.mx-zone--over::after {
-  content: ' OVER';
+  color: var(--mx-text);
+  font-variant-numeric: tabular-nums;
 }
 
 .mx-meter-text--absent {
+  color: var(--mx-muted);
   font-style: italic;
 }
 

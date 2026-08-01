@@ -47,10 +47,6 @@ test('the seven tracks are the M2L-X bundle enum, in mid order', () => {
     assert.equal(bus.mid, want[i].mid, `entry ${i} is mid ${want[i].mid}`);
     assert.equal(bus.name, want[i].name, `mid ${want[i].mid} is ${want[i].name}`);
     assert.ok(bus.label.includes(bus.name), `mid ${bus.mid} label names ${bus.name}`);
-    // The label does NOT carry the mid number: the operator shortened these by
-    // hand and the number is not their vocabulary. This is asserted rather than
-    // merely allowed, because it is what the RETURN_HINT test below depends on
-    // — the hint must not point at a number that appears nowhere on screen.
     assert.ok(
       !/^mid\s/i.test(bus.label),
       `mid ${bus.mid} label "${bus.label}" leads with its mid number; the labels are name-only`,
@@ -79,9 +75,6 @@ test('no label carries the mixer bus names that used to be here', () => {
 });
 
 test('mids 4 to 6 say they are mix-minus feeds, and name their MIC input', () => {
-  // The label says "mix-minus"; RETURN_HINT carries "N-1" and the explanation
-  // of why one of these can be legitimately silent. The two share the work so
-  // that the dropdown itself stays short, which is what the operator asked for.
   for (const mid of [4, 5, 6]) {
     const label = returnLabel(mid);
     assert.match(label, /mix-minus/i, `mid ${mid} says it is a mix-minus feed`);

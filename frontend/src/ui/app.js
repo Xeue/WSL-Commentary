@@ -99,9 +99,10 @@ export function mountApp(root) {
   function renderSenderLamp() {
     home.lamps.SENDING.update(deriveSenderLamp(currentSenderState));
     home.setRunning(!!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED);
-    // The honest line's claim is derived from the same state as the lamp, so
-    // the two can never disagree about whether anything is being sent.
-    home.setSenderState(currentSenderState);
+    // The honest line used to be updated from here as well, so that its claim
+    // and the lamp could never disagree about whether anything was being sent.
+    // It is no longer rendered — see the header of home.js — and the SENDING
+    // lamp is now the only thing this state reaches.
   }
 
   function renderStatusLamps() {

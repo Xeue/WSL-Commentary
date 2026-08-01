@@ -17,8 +17,11 @@ import assert from 'node:assert/strict';
 
 import { ALL_BUSES, CLEAN_FEED_BUS, busLabel } from './contract.js';
 import {
+  METER_AMBER_DB,
   METER_CEIL_DB,
   METER_FLOOR_DB,
+  METER_RED_DB,
+  METER_STAGES,
   MUTE_FADER_DB,
   buildMatrixModel,
   busListText,
@@ -31,8 +34,12 @@ import {
   faderText,
   formatDb,
   isDigitalSilence,
+  isDisplayedStrip,
+  isSecondChannelStrip,
   meterFraction,
   meterPercent,
+  meterStageFills,
+  meterStageWidths,
   meterZone,
   renderedHasBus,
   routingAfterToggle,
@@ -161,6 +168,53 @@ test('meterZone classifies readings in words, not colours', () => {
   }
 });
 
+test('the drawn bar is staged green / amber / red at -18 and -6', () => {
+  assert.equal(METER_AMBER_DB, -18);
+  assert.equal(METER_RED_DB, -6);
+  assert.deepEqual(
+    METER_STAGES.map((s) => s.zone),
+    ['green', 'amber', 'red'],
+    'bottom stage first, so index order is bar order',
+  );
+  // The stage widths are the boundaries expressed as a share of the -60..0
+  // scale. They are computed, not written down, so this is what pins them.
+  assert.deepEqual(meterStageWidths(), [70, 20, 10]);
+  assert.equal(
+    meterStageWidths().reduce((a, b) => a + b, 0),
+    100,
+    'the three stages are the whole bar and nothing else',
+  );
+});
+
+test('a peak shows every stage it has passed THROUGH, not one flat colour', () => {
+  // This is the whole point of staging it: a real meter at -3 dBFS reads green,
+  // then amber, then red along its length. Colouring the bar by the zone of the
+  // peak alone would paint the entire bar red, which says nothing about level.
+  assert.deepEqual(meterStageFills(-3), [100, 100, 50], '-3 dBFS: green and amber full, half the red');
+  assert.deepEqual(meterStageFills(-6), [100, 100, 0], 'exactly at the red boundary lights no red');
+  assert.deepEqual(meterStageFills(-12), [100, 50, 0], 'halfway through amber');
+  assert.deepEqual(meterStageFills(-18), [100, 0, 0], 'exactly at the amber boundary lights no amber');
+  assert.deepEqual(meterStageFills(0), [100, 100, 100], 'full scale fills the bar');
+  assert.deepEqual(meterStageFills(-39), [50, 0, 0], 'halfway through green');
+});
+
+test('nothing is drawn for silence, the floor, or a reading that is not a number', () => {
+  // A bar that draws something for "no reading" is a level an operator would
+  // act on. Absence is reported through MixerStrip.metered, never inferred.
+  for (const db of [-100, -99.99999237060547, METER_FLOOR_DB, -87.7, null, undefined, NaN, 'loud']) {
+    assert.deepEqual(meterStageFills(db), [0, 0, 0], `meterStageFills(${String(db)})`);
+  }
+});
+
+test('a stage fill is a percentage safe to write into a CSS width', () => {
+  for (const db of [-19.999, -5.317, -0.0001, -59.99]) {
+    for (const pct of meterStageFills(db)) {
+      assert.ok(pct >= 0 && pct <= 100, `${pct} is within the bar`);
+      assert.ok(String(pct).length <= 5, `${pct} is not a seventeen-digit float rewritten every second`);
+    }
+  }
+});
+
 test('formatDb turns the two magic values into words', () => {
   const cases = [
     [MUTE_FADER_DB, 'mute'],
@@ -228,6 +282,68 @@ test('buildMatrixModel separates muted from audible in the clean feed', () => {
   const m = buildMatrixModel(snapshot([strip({ muted: true })]));
   assert.equal(m.rows[0].inCleanFeed, true);
   assert.equal(m.rows[0].audibleOnCleanFeed, false);
+});
+
+/* ------------------------------------------------------------------ */
+/* One row per input: the '-2' strips                                  */
+/* ------------------------------------------------------------------ */
+
+test('isSecondChannelStrip matches the name, not a channel count or a position', () => {
+  // The rule is the trailing '-2' and nothing else. Anything inferred from the
+  // shape of the list hides the wrong row the first time an input arrives with
+  // one strip or three.
+  for (const name of ['cam22-2', 'cam1-2', 'MIC 1-2', 'replay1-2', 'vtr2-2']) {
+    assert.equal(isSecondChannelStrip(name), true, `${name} is a second-channel strip`);
+  }
+  for (const name of ['cam22-1', 'cam2-1', 'MIC 1-1', 'cam2', 'cam12-21', 'cam2-20', '', undefined, null, 2]) {
+    assert.equal(isSecondChannelStrip(name), false, `${String(name)} is not a second-channel strip`);
+  }
+});
+
+test('a "-2" strip is hidden, but never one that is AUDIBLE on the clean feed', () => {
+  // The exception is the whole safety of the change: hiding a row whose audio
+  // is reaching the client's clean feed is the single failure this drawer
+  // exists to prevent, and it would also make the header count a lie.
+  const cases = [
+    { name: 'cam22-1', inCleanFeed: true, muted: false, want: true, why: 'a -1 strip is always shown' },
+    { name: 'cam22-1', inCleanFeed: false, muted: true, want: true, why: 'even muted and unrouted' },
+    { name: 'cam22-2', inCleanFeed: false, muted: false, want: false, why: 'not in the clean feed: hidden' },
+    { name: 'cam22-2', inCleanFeed: true, muted: true, want: false, why: 'routed but muted: inaudible, hidden' },
+    { name: 'cam22-2', inCleanFeed: true, muted: false, want: true, why: 'ROUTED AND UNMUTED: it must be visible' },
+  ];
+  for (const c of cases) {
+    assert.equal(isDisplayedStrip(c), c.want, `${c.name} (${c.why})`);
+  }
+});
+
+test('buildMatrixModel flags the hidden rows without removing them from anything', () => {
+  const m = buildMatrixModel(
+    snapshot([
+      strip({ name: 'cam22-1' }),
+      strip({ name: 'cam22-2', muted: true }),
+      strip({ name: 'MIC 1-2', muted: true }),
+    ]),
+  );
+  assert.equal(m.rows.length, 3, 'every strip is still in the model; this is a display flag only');
+  assert.deepEqual(
+    m.rows.map((r) => r.displayed),
+    [true, false, false],
+  );
+  // cleanFeed is the model's answer to "what is in the clean feed" and stays
+  // complete. cleanFeedDisplayed is what the operator can see of it, and it is
+  // what the drawer's header count is drawn from.
+  assert.deepEqual(m.cleanFeed.map((r) => r.name), ['cam22-1', 'cam22-2', 'MIC 1-2']);
+  assert.deepEqual(m.cleanFeedDisplayed.map((r) => r.name), ['cam22-1']);
+});
+
+test('a "-2" strip that is audible on the clean feed stays in both lists', () => {
+  const m = buildMatrixModel(snapshot([strip({ name: 'cam22-2', muted: false })]));
+  assert.equal(m.rows[0].displayed, true);
+  assert.deepEqual(m.cleanFeedDisplayed.map((r) => r.name), ['cam22-2']);
+  // The invariant that makes the count safe: anything counted as unmuted in the
+  // clean feed is displayed, so hiding rows can never shrink that number.
+  const audible = m.cleanFeed.filter((r) => !r.muted);
+  assert.ok(audible.every((r) => r.displayed), 'nothing audible on the clean feed is ever hidden');
 });
 
 test('buildMatrixModel flags aux2 as reaching nothing', () => {

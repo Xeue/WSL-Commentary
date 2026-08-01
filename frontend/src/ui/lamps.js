@@ -71,6 +71,20 @@ export function deriveSenderLamp(state) {
   }
 }
 
+// ======================= WITHDRAWN FROM THE GUI, NOT DELETED ================
+//
+// The honest line is NO LONGER RENDERED. home.js stopped appending it at the
+// operator's request, which is a deliberate change to specification section 8
+// rather than a tidy-up.
+//
+// deriveHonestLine and its wording stay here, complete and tested in
+// lamps.test.js, exactly as internal/mixer's golden/Compare machinery stayed
+// when the drift panel was withdrawn from the mixer drawer. It has no caller in
+// this build. That is expected: putting the line back is a change to home.js
+// alone, and nothing here needs to be rewritten first.
+//
+// The description below is what it says WHEN SHOWN, and is unchanged.
+//
 // The honest line, specification section 10. It is permanent, not dismissible
 // and not a tooltip — and it must not assert something that is not true.
 //

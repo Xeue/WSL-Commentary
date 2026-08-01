@@ -61,11 +61,7 @@ export const DEFAULT_RETURN_MID = 2;
 // The labels are deliberately short: they name the track and nothing else.
 //
 // The mid number is NOT in them, so nothing else in the interface may refer to
-// a track by its number. RETURN_HINT below names MIC1/MIC2/MIC3 rather than
-// "mids 4-6" for exactly that reason — a hint pointing at numbers the operator
-// cannot see anywhere is worse than no hint. The mid remains what
-// config.returnMid stores and what the monitor subscribes to; it is simply not
-// the operator's vocabulary.
+// a track by its number.
 export const RETURN_BUSES = Object.freeze([
   Object.freeze({
     mid: 1,
@@ -103,23 +99,6 @@ export const RETURN_BUSES = Object.freeze([
     label: 'PFL (pre-fade listen)',
   }),
 ]);
-
-/**
- * RETURN_HINT is the sentence shown under the dropdown on both screens.
- *
- * The first half is the original note and is deliberately kept: the app is
- * reporting a routing fact rather than hiding one, because nothing here can
- * change what the gallery sends to a bus.
- *
- * The second half is the mix-minus warning. Silence on mid 4, 5 or 6 is a
- * normal, correct reading of an event with no MIC inputs, and it looks exactly
- * like a failure.
- */
-export const RETURN_HINT =
-  'If you can hear yourself, the gallery is routing commentary to that bus. Try another — the ' +
-  'switch is immediate and does not interrupt your feed. MIC1, MIC2 and MIC3 are mix-minus (N-1) feeds ' +
-  'derived from the MIC inputs, so on an event that uses none of them they are silent: hearing ' +
-  'nothing there means that feed does not exist, not that your headphones have failed.';
 
 /**
  * isValidReturnMid reports whether mid names one of the seven audio tracks.
