@@ -101,9 +101,19 @@ const drawer = createMixerDrawer({
 
 document.querySelector('#open').addEventListener('click', () => drawer.open());
 
+// THESE TWO CONTROLS CURRENTLY SHOW NOTHING, AND THAT IS EXPECTED.
+//
+// The drift panel has been withdrawn from the drawer's interface at the
+// operator's request, so this build never calls getGolden and never renders a
+// diff. Everything behind it is intact — internal/mixer/golden.go, Compare and
+// their tests, and compareSnapshots / sortDiffs / diffHeadline in ./model.js
+// and theirs — so these buttons still stock the fake correctly and will start
+// showing something again the moment the panel is restored in drawer.js. They
+// are kept for exactly that reason.
+
 document.querySelector('#golden-clean').addEventListener('click', () => {
   // A golden in which the commentary strip is NOT in the clean feed. The live
-  // state is, so the drawer should raise one CRITICAL.
+  // state is, so the drawer would raise one CRITICAL if the panel were shown.
   const g = clone(mixer.state);
   const comms = g.strips.find((s) => s.name === 'cam22-1');
   if (comms) comms.outputs = ['master'];

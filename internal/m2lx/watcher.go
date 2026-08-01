@@ -47,6 +47,46 @@ func backoffDuration(n int) time.Duration {
 // (15 s) so neither is detected late.
 const tickInterval = 1 * time.Second
 
+// resyncInterval is how often the Watch loop closes a perfectly healthy status
+// socket and opens a new one, purely to be handed a fresh whole-document
+// snapshot.
+//
+// THIS IS A BACKSTOP AGAINST AN UNPROVEN ASSUMPTION, and it should be deleted
+// as soon as the assumption is settled. document.go now merges subtree deltas,
+// so IF a stream_state change is pushed — at "/" or at any subtree path — the
+// lamps follow it within a frame and this costs a dial a minute for nothing.
+// But nobody has ever observed an input change state on this socket: the 150 s
+// / 3180 frame measurement that established the protocol (wire.go) caught no
+// transition, because none happened, and making one happen means starting or
+// stopping a feed on a live switcher. So it is genuinely NOT KNOWN whether a
+// transition is pushed at all. If it is only ever in the opening snapshot,
+// merging deltas cannot help and only a reconnect can — hence this.
+//
+// TO REMOVE IT: watch the socket across a real transition, record the (node,
+// path) of every frame it produces, write that into wire.go beside the rest of
+// the measurement, and delete this constant and statusSocket.resync with it.
+// If the transition turns out to arrive as a delta, nothing else changes; if it
+// arrives only at "/", this becomes the mechanism rather than the backstop and
+// should be documented as such rather than left looking incidental.
+//
+// WHY THIRTY SECONDS. It has to be well clear of both timing rules so a resync
+// can never be mistaken for one of them: it is 7.5x DebounceWindow (4 s), so a
+// resync cannot land inside a pending debounce and resolve it, and 2x
+// StaleAfter (15 s), so the two cadences never beat against each other. A
+// successful resync is invisible to staleness anyway — the gap it opens is one
+// dial, and the fresh connection's first act is to push the snapshot — while a
+// resync whose redial FAILS falls into the ordinary backoff ladder and lets
+// staleness fire at 15 s, which is the correct and honest outcome.
+//
+// It is not longer than that because thirty seconds is also the worst case for
+// how long a lamp can lie if the assumption above turns out to be true, and a
+// lamp that says the operator is off air while they are talking is the whole
+// complaint. It is not shorter because the cost is one TLS handshake and one
+// 84 KB frame each time; at 30 s that is under 3 KB/s against a socket already
+// pushing about 21 frames a second, which is noise, but at 5 s it would start
+// to look like an attack on the switcher.
+const resyncInterval = 30 * time.Second
+
 // wsConn is the subset of *websocket.Conn the Watcher uses. The status
 // socket is push-only (windows-app-spec.md §8, CONTRACT.md: "never write
 // to it, and do not expect a reply to anything"), so only reading and
@@ -249,6 +289,35 @@ func (s *statusSocket) maintain(ctx context.Context, now time.Time) {
 	}
 }
 
+// resync closes a HEALTHY connection and immediately opens a new one, so that
+// the next frame is a fresh whole-document snapshot rather than another
+// subtree delta. See resyncInterval for why this exists and when to delete it.
+//
+// It does nothing when there is no connection: a socket that is already down
+// is going to be redialled by maintain, and that redial produces exactly the
+// same fresh snapshot. Redialling on top of it would only fight the backoff
+// ladder.
+//
+// The redial is immediate rather than scheduled, because the socket was
+// demonstrably working a moment ago and this loop is the one that broke it. If
+// the redial nevertheless fails, the ordinary ladder takes over from rung one
+// and staleness fires at StaleAfter if it keeps failing — the resync must not
+// be able to leave the loop in a state the normal reconnect path does not
+// already handle.
+func (s *statusSocket) resync(ctx context.Context, now time.Time) {
+	if s.conn == nil {
+		return
+	}
+	s.close()
+	s.dial(ctx)
+	if s.conn == nil {
+		s.backoffN++
+		s.nextAttempt = now.Add(backoffDuration(s.backoffN))
+		return
+	}
+	s.backoffN = 0
+}
+
 // fail handles a read error from the current connection. Errors from a
 // superseded connection are ignored.
 func (s *statusSocket) fail(ce connErr, now time.Time) {
@@ -354,6 +423,43 @@ func (w *watcher) runAll(ctx context.Context, out chan<- Document) {
 	}
 }
 
+// lampView is exactly the three things the WebSocket-derived lamps read:
+// stream_state, streams.video.format and streams.audio (CONTRACT.md,
+// windows-app-spec.md §8). Nothing else belongs in it — adding a field would
+// make the Watch loop emit on frames the UI has no use for, and adding
+// statistics.bitrate in particular would emit about once a second per input
+// while advertising a number that freezes on a dead feed (see the warnings on
+// wireNode and Status).
+//
+// It is the "has anything actually changed?" comparison, not a payload; the
+// Status the caller receives is built from the same values beside it.
+type lampView struct {
+	state string
+	video VideoFormat
+	audio []AudioFormat
+}
+
+// equal reports whether two readings would light the lamps identically.
+//
+// It compares the PARSED formats rather than the raw JSON, because parsed is
+// what the lamps read: a firmware that reorders the keys of the format object
+// between frames has changed nothing an operator can see, and should not
+// produce an event saying it has. VideoFormat and AudioFormat are all scalar
+// fields, so == is the whole comparison; only the audio slice needs a loop,
+// and its LENGTH matters as much as its contents — an empty audio array is the
+// MP2/AC-3 silent-drop signature (see Status.Audio).
+func (l lampView) equal(o lampView) bool {
+	if l.state != o.state || l.video != o.video || len(l.audio) != len(o.audio) {
+		return false
+	}
+	for i := range l.audio {
+		if l.audio[i] != o.audio[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // run is the Watcher's entire state machine: connect, read, debounce
 // stream_state, detect staleness, reconnect with backoff on drop, and
 // reopen the socket when the client's token changes underneath it (the
@@ -393,10 +499,39 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 	var keyErrNext time.Time
 	sockGen := 0
 
+	// The mirrored document, and the last lamp reading taken from it.
+	//
+	//   doc         the opening snapshot with every subsequent subtree delta
+	//               merged in (document.go). Without it the lamps freeze at
+	//               the state of the first frame, which is the bug this
+	//               replaced; a delta is only meaningful against a baseline.
+	//   lamps       the last values EMITTED for the three WebSocket-derived
+	//               lamps. The socket pushes about 21 frames a second and
+	//               roughly fifteen of them are audio meters, so a Status per
+	//               frame would be pure noise on the Wails event bus: a Status
+	//               is emitted only when one of these three actually moves.
+	//   lampsKnown  false before the first reading, and again after any Stale
+	//               Status, so coming back from grey always re-emits even if
+	//               nothing changed while the socket was quiet.
+	doc := newDocument()
+	var lamps lampView
+	lampsKnown := false
+
+	// resyncAt is when to close a healthy socket and take a fresh snapshot.
+	// See resyncInterval: it is a backstop against an assumption nobody has
+	// been able to test, not a routine part of the protocol.
+	resyncAt := now.Add(resyncInterval)
+
 	sock := newStatusSocket(w)
 	defer sock.close()
 
 	emit := func(s Status) bool {
+		if s.Stale {
+			// A grey lamp is not a reading, so the next real one must be
+			// emitted whatever it says: the UI has to be told to come out of
+			// grey even when the values underneath never moved.
+			lampsKnown = false
+		}
 		select {
 		case out <- s:
 			return true
@@ -450,6 +585,14 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 		case <-ticker.C():
 			now := w.clk.Now()
 
+			// Before maintain, so a resync whose redial fails schedules its
+			// retry on the ladder and maintain does not immediately dial a
+			// second time in the same tick.
+			if !now.Before(resyncAt) {
+				resyncAt = now.Add(resyncInterval)
+				sock.resync(ctx, now)
+			}
+
 			sock.maintain(ctx, now)
 
 			if sv, changed := deb.Tick(now); changed {
@@ -492,22 +635,41 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 
 			// A new connection begins a new snapshot. What the last one
 			// enumerated says nothing about this one — the switcher may
-			// have been reconfigured while we were away.
+			// have been reconfigured while we were away. The document goes
+			// with it: merging this connection's deltas into the last
+			// connection's baseline would be merging into a document that
+			// may describe a switcher that no longer exists.
 			if cm.gen != sockGen {
 				sockGen = cm.gen
 				inputs = map[string]NodeChoice{}
 				enumerated = false
+				doc = newDocument()
+				lamps, lampsKnown = lampView{}, false
+				// The snapshot this connection is about to deliver IS a
+				// resync, however it was caused, so the clock restarts here
+				// rather than running free from whenever the last one was.
+				resyncAt = now.Add(resyncInterval)
+			}
+
+			// Merge before reading anything. After the opening snapshot every
+			// frame is a SUBTREE delta (wire.go) and means nothing on its own;
+			// it is only the merged document that has a whole node in it.
+			eff, err := doc.apply(cm.p)
+			if err != nil {
+				// Not a switcher_status frame at all. The document is
+				// untouched — see apply — and lastMsg above already proves
+				// the socket is alive, so this is not staleness either. It
+				// is also NOT evidence about the statusKey: claiming it were
+				// would send an operator hunting for a node name over a
+				// dropped frame.
+				continue
 			}
 
 			look, err := lookupNode(cm.p, statusKey)
 			if err != nil {
-				// A frame this package cannot read at all, or our own
-				// node in a shape it does not understand. lastMsg above
-				// already proves the socket is alive, so this is not
-				// staleness — there is just nothing usable in this
-				// message. It is also NOT evidence about the statusKey:
-				// claiming it were would send an operator hunting for a
-				// node name over a dropped frame.
+				// Our own node, at path "/", in a shape this package does
+				// not understand. Same reasoning as above: nothing usable,
+				// and nothing said about the statusKey.
 				continue
 			}
 
@@ -520,7 +682,14 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 				enumerated = true
 			}
 
-			if !look.Found {
+			// Whether this frame said anything about OUR node. Two ways it
+			// can: it carried the node whole (the snapshot), or one of its
+			// deltas merged into it (a "/statistics" update on our own
+			// input). doc.streamNode is the reading either way, so the lamps
+			// have exactly one source and a merged node and a freshly
+			// snapshotted one cannot drift apart.
+			node, haveNode := doc.streamNode(statusKey)
+			if !haveNode || !eff.Touched[statusKey] {
 				_, known := inputs[statusKey]
 				switch {
 				case look.NotAnInput:
@@ -530,9 +699,10 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 					// The opening snapshot listed the switcher and our
 					// key was not on it.
 				default:
-					// A delta about somebody else, or a connection whose
-					// snapshot has not arrived yet. Neither says anything
-					// about our node, so neither is reported.
+					// A delta about somebody else, a delta before any
+					// snapshot, or a connection whose snapshot has not
+					// arrived yet. None says anything about our node, so
+					// none is reported.
 					continue
 				}
 				msg := (&StatusKeyNotFoundError{
@@ -547,15 +717,31 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 			}
 			keyErr = ""
 
-			node := look.Node
 			video := parseVideoFormat(node.Streams.Video.Format)
 			audio := make([]AudioFormat, 0, len(node.Streams.Audio))
 			for _, a := range node.Streams.Audio {
 				audio = append(audio, parseAudioFormat(a.Format))
 			}
+			// Held for the ticker's debounce-commit path, which emits a
+			// stream_state change with no fresh frame to read formats from.
 			lastVideo, lastAudio = video, audio
 
-			sv, _ := deb.Observe(node.StreamState, now)
+			sv, committed := deb.Observe(node.StreamState, now)
+
+			// The emit gate. "/levels" arrives about fifteen times a second
+			// and carries nothing any lamp reads; "/statistics" carries a
+			// bitrate this package deliberately does not read at all. Emitting
+			// on every merge would put ~21 events a second on the Wails bus to
+			// say nothing. So a Status goes out only when one of the three
+			// values the lamps actually read has moved — or when the debounce
+			// committed one, or when there is no previous reading to compare
+			// against, which includes every recovery from a Stale Status.
+			cur := lampView{state: node.StreamState, video: video, audio: audio}
+			if lampsKnown && !committed && cur.equal(lamps) {
+				continue
+			}
+			lamps, lampsKnown = cur, true
+
 			if !emit(Status{StreamState: sv, Video: video, Audio: audio, At: now, Stale: false}) {
 				return
 			}

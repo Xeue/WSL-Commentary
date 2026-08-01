@@ -16,8 +16,10 @@
  *     can write.
  *   - system fonts only. The facility has no outbound web access, so nothing
  *     here fetches or bundles a webfont.
- *   - the only animation is the staged-change outline, and it is switched off
- *     under prefers-reduced-motion.
+ *   - the only animation is the drawer slide-in, and it is switched off under
+ *     prefers-reduced-motion.
+ *   - "Allow changes" is RED when it is ON. A crosspoint click writes to a live
+ *     desk immediately, so the state worth noticing is the permissive one.
  *
  * Custom properties fall back to literals so the drawer renders correctly on
  * its own — see demo.html, which loads this file with no application CSS.
@@ -104,7 +106,8 @@
 .mx-titles {
   display: flex;
   align-items: baseline;
-  gap: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
   min-width: 0;
 }
 
@@ -124,6 +127,38 @@
   font-weight: 700;
 }
 
+/* The one line left of the clean-feed banner. The banner was a block at the top
+   of the body and it was removed as clutter; this is not decoration, it is the
+   only place the drawer can say it does NOT KNOW what is in the clean feed —
+   an empty matrix would otherwise read as "nothing is". */
+.mx-cleanline {
+  font-size: 0.8rem;
+  color: var(--mx-muted);
+  white-space: nowrap;
+}
+
+.mx-cleanline--alert {
+  color: var(--mx-clean);
+  font-weight: 800;
+}
+
+.mx-cleanline--warn {
+  color: var(--mx-amber);
+  font-weight: 700;
+}
+
+.mx-cleanline--unknown {
+  color: var(--mx-amber);
+  font-style: italic;
+}
+
+.mx-headctl {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex: 0 0 auto;
+}
+
 .mx-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -132,61 +167,23 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Clean-feed banner: the first thing on screen                        */
+/* The write permission, in the header                                 */
 /* ------------------------------------------------------------------ */
-
-.mx-banner {
-  margin: 0 0 0.9rem;
-  padding: 0.7rem 0.85rem;
-  border-radius: 10px;
-  border: 1px solid var(--mx-border);
-  background: var(--mx-bg-alt);
-  font-size: 0.98rem;
-}
-
-.mx-banner--alert {
-  border: 2px solid var(--mx-clean);
-  background: rgba(176, 115, 255, 0.12);
-  font-weight: 700;
-}
-
-.mx-banner--warn {
-  border-color: var(--mx-amber);
-}
-
-.mx-banner--ok {
-  border-color: #1e5c37;
-}
-
-.mx-banner--unknown {
-  color: var(--mx-muted);
-  border-style: dashed;
-}
-
-/* ------------------------------------------------------------------ */
-/* Arm bar                                                             */
-/* ------------------------------------------------------------------ */
-
-.mx-armbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-  padding: 0.6rem 0.7rem;
-  border: 1px solid var(--mx-border);
-  border-radius: 10px;
-  background: var(--mx-bg-alt);
-}
 
 .mx-armstate {
   font-size: 0.85rem;
   color: var(--mx-muted);
-  letter-spacing: 0.01em;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .mx-armstate--armed {
+  color: var(--mx-red);
+}
+
+.mx-armstate--blocked {
   color: var(--mx-amber);
-  font-weight: 700;
 }
 
 .mx-btn {
@@ -211,15 +208,29 @@
   font-size: 0.85rem;
 }
 
-.mx-btn--armed {
-  border-color: var(--mx-amber);
-  color: #1a1206;
-  background: var(--mx-amber);
+/* "Allow changes". Distinctive when off so it can be found, and RED when ON,
+   because the state worth noticing is the one where a click reaches a live
+   desk. Colour is never the only signal: the label carries ○ / ● and the word
+   beside it reads READ-ONLY or WRITES LIVE. */
+.mx-allow {
+  border-color: var(--mx-focus);
+  background: #1d2b41;
+  color: #cfe2ff;
 }
 
-.mx-btn--danger {
-  border-color: var(--mx-red);
-  background: #3a1414;
+.mx-allow:hover {
+  background: #24364f;
+}
+
+.mx-allow--on {
+  border-color: #ff8a8a;
+  background: var(--mx-red);
+  color: #fff;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.35);
+}
+
+.mx-allow--on:hover {
+  background: #f05a5a;
 }
 
 .mx-btn[aria-disabled='true'] {
@@ -254,25 +265,12 @@
   color: var(--mx-muted);
 }
 
-.mx-stagedbox,
-.mx-awaitbox,
-.mx-drift {
+.mx-awaitbox {
   margin-top: 0.9rem;
   padding: 0.65rem 0.75rem;
   border: 1px solid var(--mx-border);
   border-radius: 10px;
   background: var(--mx-bg-alt);
-}
-
-.mx-drift-head {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  flex-wrap: wrap;
-}
-
-.mx-drift-head .mx-h3 {
-  margin-right: auto;
 }
 
 .mx-list {
@@ -284,26 +282,12 @@
   gap: 0.35rem;
 }
 
-.mx-staged,
-.mx-await,
-.mx-diff {
+.mx-await {
   padding: 0.4rem 0.55rem;
   border-radius: 7px;
-  border-left: 4px solid var(--mx-border);
+  border-left: 4px solid var(--mx-amber);
   background: #1a2028;
   font-size: 0.9rem;
-}
-
-.mx-sev--critical {
-  border-left-color: var(--mx-red);
-}
-
-.mx-sev--warn {
-  border-left-color: var(--mx-amber);
-}
-
-.mx-sev--info {
-  border-left-color: var(--mx-muted);
 }
 
 .mx-await--failed {
@@ -313,66 +297,6 @@
 
 .mx-await--confirmed {
   border-left-color: var(--mx-green);
-}
-
-.mx-diff {
-  display: grid;
-  grid-template-columns: 5.5rem 1fr;
-  gap: 0.1rem 0.6rem;
-}
-
-.mx-diff-badge {
-  grid-row: span 2;
-  align-self: start;
-  font-size: 0.7rem;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-  padding: 0.15rem 0.35rem;
-  border: 1px solid currentColor;
-  border-radius: 4px;
-  text-align: center;
-}
-
-.mx-sev--critical .mx-diff-badge {
-  color: var(--mx-red);
-}
-
-.mx-sev--warn .mx-diff-badge {
-  color: var(--mx-amber);
-}
-
-.mx-sev--info .mx-diff-badge {
-  color: var(--mx-muted);
-}
-
-.mx-diff-head {
-  font-weight: 600;
-}
-
-.mx-diff-detail {
-  font-size: 0.8rem;
-  color: var(--mx-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.mx-drift-summary {
-  margin: 0.5rem 0 0;
-  font-size: 0.9rem;
-}
-
-.mx-drift-summary--alert {
-  color: var(--mx-red);
-  font-weight: 700;
-}
-
-.mx-drift-summary--warn {
-  color: var(--mx-amber);
-  font-weight: 600;
-}
-
-.mx-drift-summary--none,
-.mx-drift-summary--ok {
-  color: var(--mx-muted);
 }
 
 /* ------------------------------------------------------------------ */
@@ -457,23 +381,49 @@
   border-bottom: 1px solid var(--mx-border);
 }
 
+/* ---- the sticky header, and why it is layered the way it is --------
+   The header row must stay ABOVE every column as the matrix scrolls under it.
+   Two things used to break that in the CLN column specifically:
+
+     1. TRANSPARENCY. .mx-col-clean set `background: var(--mx-clean-band)
+        !important`, and that band is rgba(...,0.14). Applied to a <th> it
+        REPLACED the opaque header background, so the CLN header cell became
+        86% see-through and the rows scrolled visibly through it. A sticky
+        element with a translucent background is not a header, it is a window.
+     2. STACKING. .mx-cell--name is sticky-left at z-index 1 and the header sat
+        at 2, which left no room above the header for the sticky corner.
+
+   So: the header is z-index 3 (its sticky-left corner 4), every header cell is
+   opaque, and the CLN header gets its band as a background IMAGE composited
+   over the opaque header colour rather than as a replacement for it. */
 .mx-th {
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: 3;
   padding: 0.4rem 0.5rem;
   text-align: left;
   vertical-align: bottom;
   font-size: 0.76rem;
   font-weight: 700;
-  background: var(--mx-bg-alt);
+  background-color: var(--mx-bg-alt);
   border-bottom: 1px solid var(--mx-border);
   white-space: nowrap;
+}
+
+.mx-th--strip {
+  position: sticky;
+  left: 0;
+  z-index: 4;
 }
 
 .mx-th--bus {
   text-align: center;
   min-width: 7.5rem;
+}
+
+.mx-th-name {
+  font-size: 0.95rem;
+  letter-spacing: 0.06em;
 }
 
 .mx-th-name,
@@ -669,11 +619,26 @@
 
 /* The clean-feed column. Banded, ruled on both edges, and lit cells get a
    diamond instead of a square plus the word CLN — a cell lit here is audio
-   going to the client, and it must be unmistakable at a glance. */
+   going to the client, and it must be unmistakable at a glance.
+
+   The ruling is shared by the header cell and the body cells; the BAND is not.
+   See the .mx-th note above: painting a translucent band over a sticky header
+   is what let the column show through it. */
 .mx-col-clean {
-  background: var(--mx-clean-band) !important;
   border-left: 2px solid var(--mx-clean);
   border-right: 2px solid var(--mx-clean);
+}
+
+/* !important because .mx-row:nth-child(even) .mx-cell out-specifies a single
+   class. It is scoped to the body cell, so it can no longer reach the header. */
+.mx-cell.mx-col-clean {
+  background: var(--mx-clean-band) !important;
+}
+
+/* Opaque: the band as an image over the header's own colour, not instead of
+   it. background-color is inherited from .mx-th. */
+.mx-th.mx-col-clean {
+  background-image: linear-gradient(var(--mx-clean-band), var(--mx-clean-band));
 }
 
 .mx-x--clean.mx-x--on {
@@ -693,27 +658,37 @@
   color: var(--mx-muted);
 }
 
-.mx-x--staged {
-  outline: 2px dashed var(--mx-amber);
+/* A refused click. There is no Apply button any more, so there is no longer one
+   place a refusal can be shown — it belongs in the cell that was clicked, where
+   the operator is already looking, and it must survive a matrix scrolled well
+   past the notice line at the top. Outline (a SHAPE) as well as colour. */
+.mx-x--refused {
+  outline: 2px solid var(--mx-red);
   outline-offset: -2px;
-  animation: mx-pulse 1.6s ease-in-out infinite;
 }
 
-@keyframes mx-pulse {
-  50% {
-    outline-color: #ffd48a;
-  }
+.mx-x-note {
+  display: block;
+  margin-top: 0.15rem;
+  padding: 0.15rem 0.25rem;
+  border-radius: 5px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  line-height: 1.25;
+  white-space: normal;
+  color: var(--mx-muted);
+  background: #10151b;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .mx-x--staged {
-    animation: none;
-  }
+.mx-x-note--warn {
+  color: #ffd9d9;
+  background: #3a1414;
+  border: 1px solid var(--mx-red);
 }
 
-/* Disarmed: dashed, dimmed, and not-allowed. A SHAPE change, so it survives
+/* Locked: dashed, dimmed, and not-allowed. A SHAPE change, so it survives
    greyscale — and the cell still shows its true routing, because reading the
-   matrix must not require arming the write path. */
+   matrix must not require allowing changes. */
 .mx-x--locked {
   border-style: dashed;
   opacity: 0.72;

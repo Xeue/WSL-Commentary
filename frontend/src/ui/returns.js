@@ -58,41 +58,49 @@ export const DEFAULT_RETURN_MID = 2;
  *
  * @type {ReadonlyArray<{mid: number, name: string, label: string}>}
  */
+// The labels are deliberately short: they name the track and nothing else.
+//
+// The mid number is NOT in them, so nothing else in the interface may refer to
+// a track by its number. RETURN_HINT below names MIC1/MIC2/MIC3 rather than
+// "mids 4-6" for exactly that reason — a hint pointing at numbers the operator
+// cannot see anywhere is worse than no hint. The mid remains what
+// config.returnMid stores and what the monitor subscribes to; it is simply not
+// the operator's vocabulary.
 export const RETURN_BUSES = Object.freeze([
   Object.freeze({
     mid: 1,
     name: 'PGM',
-    label: 'mid 1 — PGM (master): programme, includes commentary',
+    label: 'PGM (master)',
   }),
   Object.freeze({
     mid: 2,
     name: 'CLN',
-    label: 'mid 2 — CLN (aux1): the intended return, effects without commentary',
+    label: 'CLN (aux1)',
   }),
   Object.freeze({
     mid: 3,
     name: 'MON',
-    label: 'mid 3 — MON: the monitor track',
+    label: 'MON (monitor)',
   }),
   Object.freeze({
     mid: 4,
     name: 'MIC1',
-    label: 'mid 4 — MIC1: mix-minus (N-1) derived from the MIC 1 input',
+    label: 'MIC1 (mix-minus)',
   }),
   Object.freeze({
     mid: 5,
     name: 'MIC2',
-    label: 'mid 5 — MIC2: mix-minus (N-1) derived from the MIC 2 input',
+    label: 'MIC2 (mix-minus)',
   }),
   Object.freeze({
     mid: 6,
     name: 'MIC3',
-    label: 'mid 6 — MIC3: mix-minus (N-1) derived from the MIC 3 input',
+    label: 'MIC3 (mix-minus)',
   }),
   Object.freeze({
     mid: 7,
     name: 'PFL',
-    label: 'mid 7 — PFL: pre-fade listen',
+    label: 'PFL (pre-fade listen)',
   }),
 ]);
 
@@ -109,7 +117,7 @@ export const RETURN_BUSES = Object.freeze([
  */
 export const RETURN_HINT =
   'If you can hear yourself, the gallery is routing commentary to that bus. Try another — the ' +
-  'switch is immediate and does not interrupt your feed. Mids 4–6 are mix-minus (N-1) feeds ' +
+  'switch is immediate and does not interrupt your feed. MIC1, MIC2 and MIC3 are mix-minus (N-1) feeds ' +
   'derived from the MIC inputs, so on an event that uses none of them they are silent: hearing ' +
   'nothing there means that feed does not exist, not that your headphones have failed.';
 

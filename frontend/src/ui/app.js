@@ -2,6 +2,11 @@ import * as backend from './backend.js';
 import { deriveSenderLamp, deriveStatusLamps, deriveMonitorLamp } from './lamps.js';
 import { createHomeView } from './home.js';
 import { createSettingsView } from './settings.js';
+// The mixer host. Imported STATICALLY: it is the only module that imports
+// ./mixer/index.js, which is the only module that imports mixer.css, so this
+// line is what puts the whole drawer and its stylesheet in the bundle. A
+// dynamic import would build and would ship nothing until a code path ran.
+import { createMixerHost } from './mixerhost.js';
 
 // The frontend seam (fixed by CONTRACT.md, not negotiable by either side):
 // WP-5a's module exports one factory, createMonitor(opts) -> Monitor, with
@@ -40,6 +45,7 @@ export function mountApp(root) {
 
   const home = createHomeView({
     onSettings: showSettings,
+    onMixer: () => mixerHost.toggle(),
     onStartStop: onStartStopClick,
     onInputChange: onInputChange,
     onHeadphoneChange: onHeadphoneChange,
@@ -47,11 +53,37 @@ export function mountApp(root) {
     onLevelChange: onLevelChange,
   });
 
+  // The drawer mounts at the TOP LEVEL, not inside home.el.
+  //
+  // It paints as a fixed full-window overlay, but `hidden` on an ancestor takes
+  // it with it: mounted inside the home view it would vanish the moment
+  // somebody opened Settings behind it. Mounted here it survives a view swap —
+  // and showSettings closes it anyway, so an armed write path cannot be left
+  // running behind a screen nobody is looking at.
+  const mixerMount = document.createElement('div');
+  mixerMount.className = 'mixer-mount';
+
   root.textContent = '';
-  root.append(home.el, settings.el);
+  root.append(home.el, settings.el, mixerMount);
   home.setDevBadge(backend.usingFakeBackend);
 
+  const mixerHost = createMixerHost({
+    mount: mixerMount,
+    onStatus: (message, isError) => {
+      if (!message) return;
+      // The host's own failures — arming, polling — reach the operator through
+      // the home screen's error banner. The drawer shows its own refusals in
+      // the cell that was clicked; these are the ones it cannot know about.
+      if (isError) home.showError(`Mixer: ${message}`);
+      else console.info(`wslcomms: mixer: ${message}`);
+    },
+  });
+
   function showSettings() {
+    // Settings must not be opened behind a live mixer drawer: the drawer is
+    // modal, and one that outlived the screen it was opened from is a write
+    // path nobody can see.
+    mixerHost.close();
     home.el.hidden = true;
     settings.el.hidden = false;
     settings.open();

@@ -7,13 +7,20 @@
  *
  * What these prove is the safety model: that the rendered drawer writes NOTHING
  * on open, close, update, arm or destroy; that a crosspoint click while
- * disarmed reaches nothing; that even armed, a click only stages and a separate
- * Apply sends; and that a sent change is not reported as applied until a
- * following snapshot shows it.
+ * disarmed reaches nothing; that an armed click is INSTANT but is still planned
+ * from a frame fetched by that click rather than from the screen; and that a
+ * sent change is not reported as applied until a following snapshot shows it.
+ *
+ * The Apply button is gone — a click is the write now — so every assertion that
+ * used to be made about Apply is made about the click instead. In particular
+ * the stale-view refusal, which used to be shown on the Apply control, is now
+ * asserted IN THE CELL THAT WAS CLICKED: removing the button removed the only
+ * place that refusal had to live.
  *
  * What they do NOT prove is appearance. ./testdom.js is a stand-in with no
  * layout and no CSS — see its header, and see demo.html for how the drawer is
- * actually looked at.
+ * actually looked at. In particular it cannot see the sticky-header stacking
+ * fix in mixer.css.
  */
 
 import test from 'node:test';
@@ -94,8 +101,22 @@ function harness(over = {}) {
   return { doc, mount, drawer, calls };
 }
 
-/** settle lets the drawer's own async refresh on open finish. */
+/** settle lets the drawer's own async work finish. A crosspoint click is now
+ * async — it re-reads before it writes — so every click that is expected to
+ * reach the mixer is followed by one of these. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** allow presses the header control that permits writes. */
+const allow = (mount) => fire(buttonWithText(mount, 'Allow changes'), 'click');
+
+/** noteIn returns the refusal/result note rendered inside one crosspoint cell. */
+function noteIn(mount, stripName, bus) {
+  const btn = crosspoint(mount, stripName, bus);
+  const td = btn.parentNode;
+  return query(td, (n) => (n.className || '').startsWith('mx-x-note'));
+}
+
+const noticeText = (mount) => query(mount, (n) => (n.className || '').startsWith('mx-notice')).textContent;
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle                                                           */
@@ -171,7 +192,7 @@ test('the close control closes the drawer', async () => {
   h.drawer.destroy();
 });
 
-test('closing always disarms, and says so rather than doing it silently', async () => {
+test('closing always locks changes again, and says so rather than doing it silently', async () => {
   const h = harness();
   h.drawer.open();
   await settle();
@@ -179,13 +200,13 @@ test('closing always disarms, and says so rather than doing it silently', async 
   assert.deepEqual(h.calls.armed, [true]);
   h.drawer.close();
   assert.deepEqual(h.calls.armed, [true, false], 'the host must not be left believing it is still armed');
-  assert.deepEqual(h.calls.sendCommands, [], 'disarming is not a write');
+  assert.deepEqual(h.calls.sendCommands, [], 'locking is not a write');
 
-  // And it is still armed-off when reopened: opening never arms.
+  // And it is still locked when reopened: opening never arms.
   h.drawer.open();
   await settle();
-  const armBtn = buttonWithText(h.mount, 'Arm write path');
-  assert.ok(armBtn, 'the arm control reads "Arm write path" again');
+  const armBtn = buttonWithText(h.mount, 'Allow changes');
+  assert.ok(armBtn, 'the control still reads "Allow changes"');
   assert.equal(armBtn.getAttribute('aria-pressed'), 'false');
   h.drawer.destroy();
 });
@@ -221,28 +242,62 @@ test('destroy removes the drawer, restores the mount and writes nothing', async 
 /* The clean feed, which is the whole point                            */
 /* ------------------------------------------------------------------ */
 
-test('the drawer names the strips that are in the clean feed, in words', async () => {
+test('the drawer says how much is in the clean feed, and names it in the title', async () => {
+  // The block banner that used to carry this was removed as clutter. What it
+  // must NOT lose is the ability to say so at all: this line is what is left,
+  // and it still counts the unmuted ones separately.
   const h = harness();
   h.drawer.open();
   await settle();
-  const banner = query(h.mount, (n) => (n.className || '').startsWith('mx-banner'));
-  assert.match(banner.textContent, /IN THE CLEAN FEED AND UNMUTED: CLAUDE-COMMS/);
-  assert.match(banner.textContent, /CLN output the client receives/);
+  const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
+  assert.match(line.textContent, /CLN: 1 routed, 1 unmuted/);
+  assert.match(line.getAttribute('title'), /IN THE CLEAN FEED AND UNMUTED: CLAUDE-COMMS/);
+  assert.match(line.getAttribute('title'), /CLN output the client receives/);
   h.drawer.destroy();
 });
 
-test('the clean feed column is labelled as the clean feed, never as aux1 alone', async () => {
+test('the big clean-feed banner is gone', async () => {
   const h = harness();
   h.drawer.open();
   await settle();
-  const headers = queryAll(h.mount, (n) => n.tagName === 'TH' && (n.className || '').includes('mx-th--bus'));
-  assert.equal(headers.length, 7, 'seven stereo buses');
-  const clean = headers.find((th) => th.textContent.includes('aux1'));
-  assert.match(clean.textContent, /CLN - clean feed/);
-  assert.ok(
-    headers.find((th) => th.textContent.includes('aux2') && th.textContent.includes('no egress')),
-    'aux2 must be marked undeliverable',
+  assert.equal(query(h.mount, (n) => (n.className || '').startsWith('mx-banner')), null);
+  h.drawer.destroy();
+});
+
+test('only PGM and CLN are columns until the operator asks for the rest', async () => {
+  const h = harness();
+  h.drawer.open();
+  await settle();
+
+  let headers = queryAll(h.mount, (n) => n.tagName === 'TH' && (n.className || '').includes('mx-th--bus'));
+  assert.deepEqual(
+    headers.map((th) => th.getAttribute('data-bus')),
+    ['master', 'aux1'],
+    'the default columns are exactly the two buses that leave the building',
   );
+  const names = headers.map((th) => query(th, (n) => (n.className || '') === 'mx-th-name').textContent);
+  assert.deepEqual(names, ['PGM', 'CLN'], 'and they are labelled the way an operator says them');
+  // The full name is still one hover away, so nothing is LOST by the short one.
+  assert.equal(headers[1].getAttribute('title'), 'aux1 (CLN - clean feed)');
+  assert.equal(crosspoint(h.mount, 'cam22-1', 'mon1'), null, 'the monitor buses have no crosspoints yet');
+
+  fire(buttonWithText(h.mount, 'Show all buses'), 'click');
+  headers = queryAll(h.mount, (n) => n.tagName === 'TH' && (n.className || '').includes('mx-th--bus'));
+  assert.equal(headers.length, 7, 'all seven stereo buses once asked for');
+  // And the extra ones keep the fuller labels, where the extra words earn it.
+  const aux2 = headers.find((th) => th.getAttribute('data-bus') === 'aux2');
+  assert.match(aux2.textContent, /aux2/);
+  assert.match(aux2.textContent, /no egress/, 'aux2 must be marked undeliverable');
+  assert.ok(crosspoint(h.mount, 'cam22-1', 'mon1'), 'and the monitor crosspoints appear');
+  h.drawer.destroy();
+});
+
+test('the input column is headed "Input", not "Strip"', async () => {
+  const h = harness();
+  h.drawer.open();
+  await settle();
+  const th = query(h.mount, (n) => (n.className || '').includes('mx-th--strip'));
+  assert.equal(th.textContent, 'Input', '"strip" is desk jargon; the rest of this application says input');
   h.drawer.destroy();
 });
 
@@ -251,7 +306,8 @@ test('a lit crosspoint carries a glyph, not only a colour', async () => {
   h.drawer.open();
   await settle();
   const lit = crosspoint(h.mount, 'cam22-1', 'aux1');
-  const unlit = crosspoint(h.mount, 'cam22-1', 'mon1');
+  const unlit = crosspoint(h.mount, 'cam22-1', 'master');
+  h.drawer.update(snapshot([strip({ outputs: ['aux1'] })]));
   assert.equal(lit.getAttribute('aria-checked'), 'true');
   assert.equal(unlit.getAttribute('aria-checked'), 'false');
   assert.match(lit.textContent, /◆/, 'the clean-feed column uses a filled diamond when lit');
@@ -265,7 +321,7 @@ test('a lit crosspoint carries a glyph, not only a colour', async () => {
 /* The armed gate, at the rendered control                             */
 /* ------------------------------------------------------------------ */
 
-test('a crosspoint click while DISARMED reaches nothing and stages nothing', async () => {
+test('a crosspoint click while LOCKED reaches nothing, and says so in the cell', async () => {
   const h = harness();
   h.drawer.open();
   await settle();
@@ -275,17 +331,19 @@ test('a crosspoint click while DISARMED reaches nothing and stages nothing', asy
   assert.match(cell.className, /mx-x--locked/, 'and it is visibly non-interactive');
 
   fire(cell, 'click');
+  await settle();
 
-  assert.deepEqual(h.calls.sendCommands, [], 'nothing may reach the mixer while disarmed');
-  const apply = buttonWithText(h.mount, 'Apply');
-  assert.equal(apply.hidden, true, 'there is no Apply control to press while disarmed');
+  assert.deepEqual(h.calls.sendCommands, [], 'nothing may reach the mixer while locked');
+  assert.equal(h.calls.getSnapshot, 1, 'and a locked click does not even re-read');
   assert.equal(cell.getAttribute('aria-checked'), 'true', 'the crosspoint did not change');
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /disarmed/, 'the click is explained, not silently ignored');
+  // The refusal is IN THE CELL. There is no Apply button to put it on any more,
+  // and a notice at the top of a scrolled 54-row matrix is one nobody reads.
+  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /LOCKED/);
+  assert.match(noticeText(h.mount), /Locked/, 'and it is explained in full, not silently ignored');
   h.drawer.destroy();
 });
 
-test('arming by itself sends nothing', async () => {
+test('allowing changes by itself sends nothing', async () => {
   const h = harness();
   h.drawer.open();
   await settle();
@@ -294,71 +352,103 @@ test('arming by itself sends nothing', async () => {
   h.drawer.destroy();
 });
 
-test('a crosspoint click while ARMED only stages; Apply is what sends', async () => {
+test('the header control allows and locks the write path, and is RED while live', async () => {
+  const h = harness();
+  h.drawer.open();
+  await settle();
+
+  const btn = buttonWithText(h.mount, 'Allow changes');
+  assert.match(btn.textContent, /○/, 'locked carries an open circle, not only a colour');
+  assert.equal(
+    query(h.mount, (n) => (n.className || '').startsWith('mx-armstate')).textContent,
+    'READ-ONLY',
+  );
+
+  allow(h.mount);
+  assert.deepEqual(h.calls.armed, [true]);
+  assert.match(btn.className, /mx-allow--on/, 'red when active: writes are live');
+  assert.match(btn.textContent, /●/, 'and a filled circle, so colour is never the only signal');
+  assert.equal(btn.getAttribute('aria-pressed'), 'true');
+  assert.equal(
+    query(h.mount, (n) => (n.className || '').startsWith('mx-armstate')).textContent,
+    'WRITES LIVE',
+  );
+  assert.equal(crosspoint(h.mount, 'cam22-1', 'aux1').getAttribute('aria-disabled'), 'false');
+
+  allow(h.mount);
+  assert.deepEqual(h.calls.armed, [true, false]);
+  assert.deepEqual(h.calls.sendCommands, [], 'neither allowing nor locking is a write');
+  h.drawer.destroy();
+});
+
+/* ------------------------------------------------------------------ */
+/* Instant actions: one click, one write                               */
+/* ------------------------------------------------------------------ */
+
+test('a crosspoint click while allowed is sent immediately - there is no Apply', async () => {
   const h = harness();
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
 
+  assert.equal(buttonWithText(h.mount, 'Apply'), null, 'there is no Apply control at all any more');
+
   fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  assert.deepEqual(h.calls.sendCommands, [], 'a crosspoint click is not a write');
-
-  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
-  assert.match(staged.textContent, /CLAUDE-COMMS OUT of the clean feed/, 'and it says what it will do');
-
-  const apply = buttonWithText(h.mount, 'Apply 1 change');
-  assert.ok(apply, 'the Apply control counts the staged changes');
-  fire(apply, 'click');
   await settle();
 
-  assert.equal(h.calls.sendCommands.length, 1);
+  assert.equal(h.calls.sendCommands.length, 1, 'the click IS the write');
   assert.deepEqual(h.calls.sendCommands[0], [
     { kind: 'setRouting', args: { matrix: 'output', input: 'cam22-1', outputs: ['master', 'aux2'] } },
   ]);
   h.drawer.destroy();
 });
 
-test('two crosspoints on one strip become ONE set_routing, because set_routing replaces', async () => {
-  // Two commands would have the second undo the first.
-  const h = harness();
+test('a click sends the strip\'s WHOLE bus set, including the columns that are hidden', async () => {
+  // set_routing is an absolute replace and only two buses have columns. If the
+  // hidden five were dropped from the outgoing set, every click would silently
+  // un-route the strip from aux2 and the monitors.
+  const h = harness({
+    getSnapshot: async () => snapshot([strip({ outputs: ['master', 'aux1', 'aux2', 'mon2'] })]),
+  });
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
+
   fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  fire(crosspoint(h.mount, 'cam22-1', 'aux2'), 'click');
-  fire(buttonWithText(h.mount, 'Apply 2 change'), 'click');
   await settle();
 
-  assert.equal(h.calls.sendCommands.length, 1);
-  assert.equal(h.calls.sendCommands[0].length, 1, 'one command for one strip');
-  assert.deepEqual(h.calls.sendCommands[0][0].args.outputs, ['master']);
+  assert.deepEqual(
+    h.calls.sendCommands[0][0].args.outputs,
+    ['master', 'aux2', 'mon2'],
+    'the buses with no column on screen must survive the write',
+  );
   h.drawer.destroy();
 });
 
 /* ------------------------------------------------------------------ */
-/* S2: Apply is gated on freshness and re-plans from the frame after it */
+/* S2: the click is gated on freshness and planned from a fresh frame  */
 /* ------------------------------------------------------------------ */
 
-test('Apply from a STALE view writes NOTHING, says why, and keeps the staged change', async () => {
+test('a click on a STALE view writes NOTHING and the refusal appears in the clicked cell', async () => {
   // The scenario this closes. The status feed stalls — the controller carries
   // a reconnect supervisor precisely because it does. The header reads STALE
   // and the matrix still shows the old frame. The operator, acting on that
-  // matrix, takes commentary out of the clean feed and presses Apply.
+  // matrix, clicks commentary out of the clean feed.
   //
   // set_routing REPLACES the whole bus set, so the bus they aimed at would be
   // correct and every OTHER bus in the command would be a forty-second-old
-  // rollback applied to a live desk.
+  // rollback applied to a live desk. Removing the Apply step removed a delay,
+  // not this hazard.
   const h = harness();
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
 
   const readsBefore = h.calls.getSnapshot;
   const realNow = Date.now;
   try {
     Date.now = () => realNow() + 40_000;
-    fire(buttonWithText(h.mount, 'Apply'), 'click');
+    fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
     await settle();
   } finally {
     Date.now = realNow;
@@ -367,85 +457,80 @@ test('Apply from a STALE view writes NOTHING, says why, and keeps the staged cha
   assert.deepEqual(h.calls.sendCommands, [], 'a stale view must reach the mixer with nothing at all');
   assert.equal(h.calls.getSnapshot, readsBefore, 'and it must refuse before it even re-reads');
 
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /NOT SENT/);
-  assert.match(notice.textContent, /STALE/, 'the refusal names the reason');
-  assert.match(notice.textContent, /REPLACES|replaces/, 'and why staleness matters for this command');
+  // The refusal's new home: the cell that was clicked.
+  const note = noteIn(h.mount, 'cam22-1', 'aux1');
+  assert.equal(note.hidden, false, 'the refusal must be visible at the point of the click');
+  assert.match(note.textContent, /NOT SENT/);
+  assert.match(note.textContent, /STALE/, 'and it names the reason where the operator is looking');
+  assert.match(crosspoint(h.mount, 'cam22-1', 'aux1').className, /mx-x--refused/, 'shape, not only colour');
+  assert.match(crosspoint(h.mount, 'cam22-1', 'aux1').getAttribute('aria-label'), /NOT SENT/);
 
-  // The intention was fine; it was the picture that was not. Discarding the
-  // staged change would make the operator re-do it under pressure.
-  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
-  assert.ok(staged, 'the staged change must be kept');
-  assert.match(staged.textContent, /OUT of the clean feed/);
+  // And in full, with the reason staleness matters for this particular command.
+  assert.match(noticeText(h.mount), /NOT SENT/);
+  assert.match(noticeText(h.mount), /STALE/);
+  assert.match(noticeText(h.mount), /replaces/i);
   h.drawer.destroy();
 });
 
-test('the stale refusal is a property of the apply PATH, not of the button being disabled', async () => {
-  // A disabled button is a suggestion. A keyboard activation and a
-  // programmatic click both arrive at the handler regardless, so the test
-  // fires the click on a control that is marked aria-disabled and asserts that
-  // nothing reaches the mixer anyway.
+test('the stale refusal is a property of the click PATH, not of any disabled attribute', async () => {
+  // A disabled attribute is a suggestion. A keyboard activation and a
+  // programmatic click both arrive at the handler regardless, so the test fires
+  // the click anyway and asserts that nothing reaches the mixer.
   const h = harness();
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
 
   const realNow = Date.now;
   try {
     Date.now = () => realNow() + 40_000;
-    // Force the repaint that marks the control blocked, the way the 1 Hz
-    // stale timer does when updates stop arriving.
+    // Force the repaint that marks the header blocked, the way the 1 Hz stale
+    // timer does when updates stop arriving.
     h.drawer.update(null); // ignored: not an object, so lastUpdateAt does not move
-    const apply = buttonWithText(h.mount, 'Apply');
-    fire(apply, 'click');
+    const state = query(h.mount, (n) => (n.className || '').startsWith('mx-armstate'));
+    assert.match(state.textContent, /BLOCKED/, 'the header says a click will be refused, with the reason');
+    fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
     await settle();
-    assert.equal(apply.getAttribute('aria-disabled'), 'true', 'the control is marked blocked');
-    assert.match(apply.textContent, /BLOCKED/, 'and says so, with the reason');
   } finally {
     Date.now = realNow;
   }
-  assert.deepEqual(h.calls.sendCommands, [], 'clicking a blocked control must still write nothing');
+  assert.deepEqual(h.calls.sendCommands, [], 'clicking anyway must still write nothing');
   h.drawer.destroy();
 });
 
-test('Apply re-plans from the frame that arrives AFTER it, not the one on screen when pressed', async () => {
+test('a click plans from the frame IT fetches, not from the one on screen', async () => {
   // The second half of S2, and the one a freshness check alone does not fix.
   // Even a live view is up to a second old and the desk is shared.
   //
   // On screen: cam22-1 is master + aux1 + aux2. Between the last update() and
-  // Apply, somebody takes it off aux2 and puts it on mon1. The operator toggles
-  // aux1 off.
+  // the click, somebody takes it off aux2 and puts it on mon1.
   //
   // Planning from the screen sends ["master","aux2"] — right on the bus they
-  // aimed at, and a rollback of the other two on a live desk. Planning from
-  // the frame that arrives after Apply sends ["master","mon1"].
+  // aimed at, and a rollback of the other two on a live desk. Planning from the
+  // frame this click fetched sends ["master","mon1"].
   let current = snapshot([strip()]);
   const h = harness({ getSnapshot: async () => current });
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
 
   // The desk moves and the drawer is NOT told: no update() arrives.
   current = snapshot([strip({ outputs: ['master', 'aux1', 'mon1'] })]);
 
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
   await settle();
 
   assert.equal(h.calls.sendCommands.length, 1);
   assert.deepEqual(
     h.calls.sendCommands[0][0].args.outputs,
     ['master', 'mon1'],
-    'the unstaged buses must come from the frame that arrived after Apply, not from the stale screen',
+    'the unclicked buses must come from the frame the click fetched, not from the stale screen',
   );
-
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /desk had moved/, 'and the operator is told the base moved');
+  assert.match(noticeText(h.mount), /desk had moved/, 'and the operator is told the base moved');
   h.drawer.destroy();
 });
 
-test('Apply sends nothing when the re-read shows the staged change is already in effect', async () => {
+test('a click sends nothing when the re-read shows the change is already in effect', async () => {
   // Somebody else made the same correction in the last second. Every avoidable
   // write to a live mixer is worth avoiding.
   let current = snapshot([strip()]);
@@ -453,19 +538,17 @@ test('Apply sends nothing when the re-read shows the staged change is already in
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
 
   current = snapshot([strip({ outputs: ['master', 'aux2'] })]);
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
   await settle();
 
   assert.deepEqual(h.calls.sendCommands, []);
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /already in effect/);
+  assert.match(noticeText(h.mount), /already in effect/);
   h.drawer.destroy();
 });
 
-test('Apply refuses when the mixer cannot be re-read, rather than writing from the old picture', async () => {
+test('a click refuses when the mixer cannot be re-read, rather than writing from the old picture', async () => {
   let fail = false;
   const h = harness({
     getSnapshot: async () => {
@@ -476,25 +559,22 @@ test('Apply refuses when the mixer cannot be re-read, rather than writing from t
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
 
   fail = true;
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
   await settle();
 
   assert.deepEqual(h.calls.sendCommands, [], 'an unknown current routing is not a routing to replace');
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /NOT SENT/);
+  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /NOT SENT/);
+  assert.match(noticeText(h.mount), /could not be re-read/);
   assert.equal(h.calls.errors.length >= 1, true, 'the failure is reported, not swallowed');
-  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
-  assert.ok(staged, 'the staged change is kept');
   h.drawer.destroy();
 });
 
-test('a strip whose name contains a space stages and sends against the right strip', async () => {
+test('a strip whose name contains a space is written against the right strip', async () => {
   // 'MIC 1-1' is a real strip in the captured live frame. An earlier version
-  // keyed staged changes by joining the strip and bus with a space and parsing
-  // them back out, which turned 'MIC 1-1' + 'aux1' into the strip 'MIC'.
+  // keyed changes by joining the strip and bus with a space and parsing them
+  // back out, which turned 'MIC 1-1' + 'aux1' into the strip 'MIC'.
   const h = harness({
     getSnapshot: async () =>
       snapshot([strip({ name: 'MIC 1-1', input: 'MIC 1', displayName: 'CLAUDE-TEST-MIC' }), strip()]),
@@ -504,55 +584,62 @@ test('a strip whose name contains a space stages and sends against the right str
   h.drawer.setArmed(true);
 
   fire(crosspoint(h.mount, 'MIC 1-1', 'aux1'), 'click');
-  const staged = query(h.mount, (n) => (n.className || '').startsWith('mx-staged'));
-  assert.match(staged.textContent, /CLAUDE-TEST-MIC OUT of the clean feed/);
-
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
   await settle();
   assert.deepEqual(h.calls.sendCommands[0], [
     { kind: 'setRouting', args: { matrix: 'output', input: 'MIC 1-1', outputs: ['master', 'aux2'] } },
   ]);
+  // And the note landed on the cell that was clicked, not on the other strip's.
+  assert.equal(noteIn(h.mount, 'MIC 1-1', 'aux1').hidden, false);
+  assert.equal(noteIn(h.mount, 'cam22-1', 'aux1').hidden, true);
   h.drawer.destroy();
 });
 
-test('clicking a staged crosspoint again un-stages it, and Apply then sends nothing', async () => {
+test('locking discards nothing because nothing is ever held: the next click is a fresh write', async () => {
+  // There is no staging to discard any more. What must still hold is that a
+  // click made while locked cannot become a write when the path is unlocked
+  // later.
   const h = harness();
   h.drawer.open();
   await settle();
+  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
+  await settle();
   h.drawer.setArmed(true);
+  await settle();
+  assert.deepEqual(h.calls.sendCommands, [], 'a click made while locked must not be replayed on unlock');
+  h.drawer.destroy();
+});
+
+test('a second click while the first is still in flight is refused, not queued', async () => {
+  // Two set_routing commands for one strip built from two different re-reads
+  // race, and set_routing REPLACES, so the loser silently reasserts the bus set
+  // the winner just changed.
+  let release;
+  const inFlight = new Promise((r) => {
+    release = r;
+  });
+  const h = harness({
+    // A send that does not resolve until the test lets it, so the second click
+    // lands while the first is still open.
+    sendCommands: async (cmds) => {
+      h.calls.sendCommands.push(cmds);
+      await inFlight;
+    },
+  });
+  h.drawer.open();
+  await settle();
+  h.drawer.setArmed(true);
+
   const cell = crosspoint(h.mount, 'cam22-1', 'aux1');
   fire(cell, 'click');
+  await settle();
+  assert.equal(h.calls.sendCommands.length, 1, 'the first click is in flight');
+
   fire(cell, 'click');
-  fire(buttonWithText(h.mount, 'Apply'), 'click');
-  await settle();
-  assert.deepEqual(h.calls.sendCommands, [], 'nothing was staged, so nothing may be sent');
-  h.drawer.destroy();
-});
+  assert.equal(h.calls.sendCommands.length, 1, 'the second click must not become a second write');
+  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /another change is still being sent/);
 
-test('disarming discards staged changes rather than leaving them primed', async () => {
-  const h = harness();
-  h.drawer.open();
+  release();
   await settle();
-  h.drawer.setArmed(true);
-  fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  h.drawer.setArmed(false);
-  h.drawer.setArmed(true);
-  fire(buttonWithText(h.mount, 'Apply'), 'click');
-  await settle();
-  assert.deepEqual(h.calls.sendCommands, []);
-  h.drawer.destroy();
-});
-
-test('the arm control in the drawer arms and disarms the write path', async () => {
-  const h = harness();
-  h.drawer.open();
-  await settle();
-  fire(buttonWithText(h.mount, 'Arm write path'), 'click');
-  assert.deepEqual(h.calls.armed, [true]);
-  assert.equal(crosspoint(h.mount, 'cam22-1', 'aux1').getAttribute('aria-disabled'), 'false');
-  fire(buttonWithText(h.mount, 'Disarm write path'), 'click');
-  assert.deepEqual(h.calls.armed, [true, false]);
-  assert.deepEqual(h.calls.sendCommands, [], 'neither arming nor disarming is a write');
   h.drawer.destroy();
 });
 
@@ -566,11 +653,10 @@ test('a resolved send is reported as SENT, and only a later snapshot confirms it
   await settle();
   h.drawer.setArmed(true);
   fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
   await settle();
 
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /SENT IS NOT APPLIED/);
+  assert.match(noticeText(h.mount), /SENT IS NOT APPLIED/);
+  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /SENT - waiting/);
   let awaiting = query(h.mount, (n) => (n.className || '').startsWith('mx-await '));
   assert.match(awaiting.textContent, /awaiting confirmation/);
 
@@ -586,20 +672,22 @@ test('the confirmation panel names the clean feed and never a bare "aux1"', asyn
   // after a write to a live desk and it is what the operator checks to decide
   // the change did what they meant.
   //
-  // "CONFIRMED: CLAUDE-COMMS -> master, aux1" reads as success while
-  // confirming that commentary is in the client's clean feed. contract.js:
-  // "Never render a raw bus name. An operator reading 'aux1' has no way to
-  // know they are looking at the clean feed."
+  // "CONFIRMED: CLAUDE-COMMS -> master, aux1" reads as success while confirming
+  // that commentary is in the client's clean feed. contract.js: "Never render a
+  // raw bus name. An operator reading 'aux1' has no way to know they are
+  // looking at the clean feed." The two-letter COLUMN headings do not weaken
+  // this: a column carries its meaning in the band, the ruling and the diamond;
+  // a sentence carries it only in the words.
   let current = snapshot([strip()]);
   const h = harness({ getSnapshot: async () => current });
   h.drawer.open();
   await settle();
   h.drawer.setArmed(true);
+  fire(buttonWithText(h.mount, 'Show all buses'), 'click');
 
   // Take the strip off aux2, leaving it on master AND the clean feed — the
   // case where a bare list reads as success and is not.
   fire(crosspoint(h.mount, 'cam22-1', 'aux2'), 'click');
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
   await settle();
 
   const check = (node, where) => {
@@ -623,24 +711,6 @@ test('the confirmation panel names the clean feed and never a bare "aux1"', asyn
   h.drawer.destroy();
 });
 
-test('the drift detail names a bus by its label, never by its wire name alone', async () => {
-  // S4, the other raw-bus render: for a bus diff the Diff target IS a bus wire
-  // name, so "aux1 muted: golden ..." described the clean feed with a string
-  // the operator cannot decode.
-  const h = harness({
-    getDiffs: async () => [
-      { kind: 'bus', target: 'aux1', label: 'aux1 (CLN - clean feed)', field: 'muted', golden: 'false', current: 'true', severity: 'critical' },
-    ],
-    getGolden: async () => snapshot(),
-  });
-  h.drawer.open();
-  await settle();
-  const detail = query(h.mount, (n) => (n.className || '').startsWith('mx-diff-detail'));
-  assert.match(detail.textContent, /aux1 \(CLN - clean feed\) muted/);
-  assert.doesNotMatch(detail.textContent, /aux1(?!\s*\(CLN)/);
-  h.drawer.destroy();
-});
-
 test('a change the mixer never reports back is called NOT CONFIRMED', async () => {
   // set_comp_limit is silently inert when misused and reads back exactly as
   // sent; the drawer must never treat a resolved promise as proof.
@@ -649,7 +719,6 @@ test('a change the mixer never reports back is called NOT CONFIRMED', async () =
   await settle();
   h.drawer.setArmed(true);
   fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
   await settle();
 
   // Four seconds of snapshots that still show the old routing.
@@ -676,71 +745,55 @@ test('a failed send is reported as not sent, and the error is not swallowed', as
   await settle();
   h.drawer.setArmed(true);
   fire(crosspoint(h.mount, 'cam22-1', 'aux1'), 'click');
-  fire(buttonWithText(h.mount, 'Apply 1 change'), 'click');
   await settle();
 
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /NOT SENT/);
+  assert.match(noticeText(h.mount), /NOT SENT/);
+  assert.match(noteIn(h.mount, 'cam22-1', 'aux1').textContent, /NOT SENT/);
   assert.equal(h.calls.errors.length, 1);
   h.drawer.destroy();
 });
 
 /* ------------------------------------------------------------------ */
-/* Drift and golden                                                    */
+/* Drift and golden: withdrawn from the GUI, not from the codebase     */
 /* ------------------------------------------------------------------ */
 
-test('no golden reads as "no golden saved", never as "no differences"', async () => {
-  const h = harness();
-  h.drawer.open();
-  await settle();
-  const summary = query(h.mount, (n) => (n.className || '').startsWith('mx-drift-summary'));
-  assert.match(summary.textContent, /No golden saved/);
-  h.drawer.destroy();
-});
-
-test('drift from golden shows the clean-feed entry first and in the operator language', async () => {
+test('the drift panel is not in the GUI, and the drawer does not call the golden bindings', async () => {
+  // The operator asked for the drift panel to be taken out of the interface and
+  // was explicit that none of the machinery behind it may be deleted or
+  // weakened. So: nothing renders here, and nothing is fetched for it — while
+  // internal/mixer/golden.go, mixer.Compare and their tests, and
+  // compareSnapshots / sortDiffs / diffHeadline in ./model.js and THEIR tests,
+  // are all untouched. See model.test.js, which still exercises every one of
+  // them. Restoring the panel is a change to drawer.js alone.
   const h = harness({
-    getGolden: async () => snapshot([strip({ outputs: ['master'], displayName: 'CLAUDE-COMMS' })]),
-  });
-  h.drawer.open();
-  await settle();
-  const summary = query(h.mount, (n) => (n.className || '').startsWith('mx-drift-summary'));
-  assert.match(summary.textContent, /1 CRITICAL/);
-  const first = query(h.mount, (n) => (n.className || '').startsWith('mx-diff '));
-  assert.match(first.textContent, /CRITICAL/);
-  assert.match(first.textContent, /CLAUDE-COMMS IS NOW IN THE CLEAN FEED/);
-  h.drawer.destroy();
-});
-
-test('capture golden takes two presses, writes application state and not the mixer', async () => {
-  const h = harness();
-  h.drawer.open();
-  await settle();
-
-  fire(buttonWithText(h.mount, 'Capture golden'), 'click');
-  assert.deepEqual(h.calls.setGolden, [], 'one press only arms it');
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /press again to confirm|again to overwrite/i);
-
-  fire(buttonWithText(h.mount, 'Capture golden'), 'click');
-  await settle();
-  assert.equal(h.calls.setGolden.length, 1);
-  assert.deepEqual(h.calls.sendCommands, [], 'capturing golden must not touch the mixer');
-  h.drawer.destroy();
-});
-
-test('a diff source supplied by the host is used instead of the local comparison', async () => {
-  const h = harness({
+    getGolden: async () => {
+      h.calls.getGolden += 1;
+      return snapshot([strip({ outputs: ['master'] })]);
+    },
     getDiffs: async () => [
       { kind: 'strip', target: 'cam22-1', label: 'CLAUDE-COMMS', field: 'outputs', golden: 'master', current: 'master, aux1', severity: 'critical' },
     ],
-    getGolden: async () => snapshot(),
   });
   h.drawer.open();
   await settle();
-  const first = query(h.mount, (n) => (n.className || '').startsWith('mx-diff '));
-  assert.match(first.textContent, /IS NOW IN THE CLEAN FEED/);
+  h.drawer.update(snapshot());
+
+  assert.equal(query(h.mount, (n) => (n.className || '').startsWith('mx-drift')), null, 'no drift panel');
+  assert.equal(query(h.mount, (n) => (n.className || '').startsWith('mx-diff')), null, 'no diff list');
+  assert.equal(buttonWithText(h.mount, 'Capture golden'), null, 'no golden control');
+  assert.equal(h.calls.getGolden, 0, 'and nothing is fetched for a panel that is not there');
+  assert.deepEqual(h.calls.setGolden, [], 'and the golden state is never rewritten');
   h.drawer.destroy();
+});
+
+test('the drawer still requires the golden options it no longer calls', () => {
+  // They stay in the contract and stay wired by the host, so that putting the
+  // panel back does not also mean re-doing the wiring.
+  const { mount } = createTestDom();
+  assert.throws(
+    () => createMixerDrawer({ mount, getSnapshot: async () => {}, sendCommands: async () => {} }),
+    /needs opts.getGolden/,
+  );
 });
 
 /* ------------------------------------------------------------------ */
@@ -757,12 +810,14 @@ test('a failed getSnapshot is reported and the view says it may be out of date',
   await settle();
   assert.equal(h.calls.errors.length, 1);
   assert.match(h.calls.errors[0][1], /getSnapshot/);
-  const notice = query(h.mount, (n) => (n.className || '').startsWith('mx-notice'));
-  assert.match(notice.textContent, /out of date/);
+  assert.match(noticeText(h.mount), /out of date/);
   h.drawer.destroy();
 });
 
 test('with no state at all the drawer refuses to claim anything about the clean feed', async () => {
+  // An empty matrix reads as "nothing is in the clean feed". That is a claim
+  // this drawer cannot make, and losing the banner must not make it by
+  // omission.
   const h = harness({
     getSnapshot: async () => {
       throw new Error('backend unreachable');
@@ -770,8 +825,10 @@ test('with no state at all the drawer refuses to claim anything about the clean 
   });
   h.drawer.open();
   await settle();
-  const banner = query(h.mount, (n) => (n.className || '').startsWith('mx-banner'));
-  assert.match(banner.textContent, /cannot tell you what is in the clean feed/);
+  const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
+  assert.match(line.textContent, /CLN: unknown/);
+  assert.doesNotMatch(line.textContent, /nothing routed/);
+  assert.match(line.getAttribute('title'), /cannot tell you what is in the clean feed/);
   h.drawer.destroy();
 });
 
@@ -806,7 +863,7 @@ test('the drawer says STALE once updates stop arriving', async () => {
 /* The real captured frame                                             */
 /* ------------------------------------------------------------------ */
 
-test('the drawer renders the captured live frame and names CLAUDE-COMMS in the clean feed', async () => {
+test('the drawer renders the captured live frame and shows CLAUDE-COMMS in the clean feed', async () => {
   // demo-fixture.js is the real 31 July 2026 frame from the dev event. If the
   // shape the drawer expects ever stops matching a genuine snapshot, this is
   // the test that notices.
@@ -820,11 +877,10 @@ test('the drawer renders the captured live frame and names CLAUDE-COMMS in the c
   const comms = crosspoint(h.mount, 'cam22-1', 'aux1');
   assert.equal(comms.getAttribute('aria-checked'), 'true', 'the live routing puts commentary in the clean feed');
 
-  const banner = query(h.mount, (n) => (n.className || '').startsWith('mx-banner'));
-  assert.match(banner.textContent, /CLAUDE-COMMS/);
-  // cam22-1 was muted in the captured frame, so it is called out as routed but
-  // muted rather than as audible.
-  assert.match(banner.textContent, /muted: .*CLAUDE-COMMS/);
+  const line = query(h.mount, (n) => (n.className || '').startsWith('mx-cleanline'));
+  assert.match(line.getAttribute('title'), /CLAUDE-COMMS/);
+  // cam22-1 was muted in the captured frame, so it is not counted as audible.
+  assert.match(line.getAttribute('title'), /muted/);
   assert.deepEqual(h.calls.sendCommands, [], 'rendering a real frame writes nothing');
   h.drawer.destroy();
 });

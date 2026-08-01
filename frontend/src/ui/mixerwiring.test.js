@@ -10,13 +10,13 @@
  * These assert on the TEXT of the modules rather than by driving them, and that
  * is a deliberate choice with a reason on both sides.
  *
- * It cannot be done by driving them. settings.js imports ./mixer/index.js,
+ * It cannot be done by driving them. mixerhost.js imports ./mixer/index.js,
  * which imports ./mixer.css — `node --test` cannot parse a CSS import, which is
  * precisely why index.js exists and why drawer.js does not import the
  * stylesheet itself. And the DOM shim in mixer/testdom.js implements exactly
- * the surface drawer.js uses; settings.js needs <form>, <select>, classList and
- * more, and widening a shim until a test passes is how a shim stops being
- * evidence.
+ * the surface drawer.js uses; app.js and home.js need <video>, <select>,
+ * classList, navigator.mediaDevices and more, and widening a shim until a test
+ * passes is how a shim stops being evidence.
  *
  * And the failure they exist to catch is a TEXTUAL one. internal/mixer and
  * frontend/src/ui/mixer/ were complete, reviewed and committed, and none of it
@@ -41,19 +41,19 @@ const repoRoot = join(here, '..', '..', '..');
 const read = (...parts) => readFileSync(join(...parts), 'utf8');
 const ui = (name) => read(here, name);
 
-test('settings.js imports the drawer through its entry point', () => {
-  const src = ui('settings.js');
+test('mixerhost.js imports the drawer through its entry point', () => {
+  const src = ui('mixerhost.js');
   assert.match(
     src,
     /import \{ createMixerDrawer \} from '\.\/mixer\/index\.js'/,
-    'settings.js must import the drawer, or none of it reaches the bundle',
+    'mixerhost.js must import the drawer, or none of it reaches the bundle',
   );
   // index.js is the entry point BECAUSE it is where mixer.css is imported.
   // Importing drawer.js directly would build and would ship the drawer with no
   // stylesheet at all.
   assert.ok(
     !/from '\.\/mixer\/drawer\.js'/.test(src),
-    'settings.js must not reach past index.js to drawer.js — that is how the CSS gets left behind',
+    'mixerhost.js must not reach past index.js to drawer.js — that is how the CSS gets left behind',
   );
   // A dynamic import would also work, but only if it is ever evaluated. A
   // static one cannot be code-split away from the bundle by accident.
@@ -63,33 +63,75 @@ test('settings.js imports the drawer through its entry point', () => {
   );
 });
 
+test('app.js imports the mixer host, which is the only thing that keeps it in the bundle', () => {
+  // mixerhost.js is now the ONLY importer of ./mixer/index.js, so if nothing
+  // imports mixerhost.js the whole drawer and its stylesheet fall out of the
+  // build again — silently, with `npm run build` still succeeding. That is
+  // exactly what happened once already; this line is what notices.
+  const src = ui('app.js');
+  assert.match(
+    src,
+    /import \{ createMixerHost \} from '\.\/mixerhost\.js'/,
+    'app.js must import the mixer host statically',
+  );
+  assert.ok(!/import\(['"]\.\/mixerhost/.test(src), 'and statically, not behind a dynamic import');
+});
+
 test('mixer/index.js is what pulls the stylesheet into the bundle', () => {
   const src = read(here, 'mixer', 'index.js');
   assert.match(src, /import '\.\/mixer\.css'/, 'index.js must import mixer.css');
 });
 
-test('the drawer is behind Settings, not on the commentary screen', () => {
-  // Engineers set the desk up with it before a match; commentators never open
-  // it. A control that can change a live clean feed does not belong next to
-  // START.
+test('the mixer opens from the main screen, and home.js still knows nothing about it', () => {
+  // The drawer used to be a section inside Settings. The operator moved it to a
+  // button beside Settings on the main screen: reaching the clean-feed matrix
+  // should not mean going through a configuration form.
+  //
+  // Commentators now see that button, so what makes it safe — read-only until
+  // armed, locked again on close, two independent gates — matters MORE, not
+  // less. None of it lives in home.js, and this test is what keeps it that way:
+  // home.js may raise onMixer and nothing else.
   const src = ui('home.js');
-  assert.ok(!/mixer/i.test(src), 'home.js must not reference the mixer drawer');
+  assert.match(src, /handlers\.onMixer\(\)/, 'home.js must raise onMixer from its header button');
+  assert.ok(
+    !/createMixerDrawer|mixerhost|sendMixerCommands|setArmed/.test(src),
+    'home.js must not construct the drawer, reach the write path, or touch the arm gate',
+  );
+  assert.ok(!/from '\.\/backend\.js'/.test(src), 'home.js must not talk to the backend at all');
+
+  // And app.js is what turns that into an open. The drawer must NOT mount
+  // inside home.el: it paints position:fixed, but a hidden ancestor hides it.
+  const app = ui('app.js');
+  assert.match(app, /onMixer:/, 'app.js must wire the home button to the mixer host');
+  assert.match(app, /root\.append\([^)]*mixerMount\)/, 'the drawer mount must be a top-level sibling of the views');
 });
 
-test('settings.js supplies every option the drawer requires', () => {
+test('the settings screen no longer hosts the drawer', () => {
   const src = ui('settings.js');
+  assert.ok(!/createMixerDrawer/.test(src), 'settings.js must not construct a drawer');
+  assert.ok(!/backend\.sendMixerCommands/.test(src), 'and must not be a second way to the write path');
+});
+
+test('the mixer host supplies every option the drawer requires', () => {
+  const src = ui('mixerhost.js');
   for (const option of ['mount', 'getSnapshot', 'sendCommands', 'getGolden', 'setGolden']) {
     assert.match(src, new RegExp(`\\b${option}:`), `createMixerDrawer needs opts.${option}`);
   }
-  // Not required by createMixerDrawer, but required by this host: without
-  // onArmedChange the Go arm gate is never opened and Apply always fails, and
-  // without onError the drawer's failures go nowhere an operator can see.
+  // getGolden and setGolden stay wired even though this build of the drawer
+  // never calls them: the drift panel was withdrawn from the GUI, not deleted,
+  // and internal/mixer/golden.go and Compare are untouched. Restoring the panel
+  // must not also mean re-doing the wiring.
+  //
+  // onArmedChange and onError are not required by createMixerDrawer but are
+  // required by this host: without onArmedChange the Go arm gate is never
+  // opened and every write fails, and without onError the drawer's failures go
+  // nowhere an operator can see.
   assert.match(src, /\bonArmedChange:/, 'the host must mirror the drawer arm onto the Go gate');
   assert.match(src, /\bonError:/, 'the host must surface the drawer errors');
 });
 
 test('arming the drawer arms the Go gate, and disarming disarms it', () => {
-  const src = ui('settings.js');
+  const src = ui('mixerhost.js');
   assert.match(src, /backend\.armMixer\(\)/, 'the drawer arm must reach App.ArmMixer');
   assert.match(src, /backend\.disarmMixer\(\)/, 'the drawer disarm must reach App.DisarmMixer');
 });
@@ -97,14 +139,15 @@ test('arming the drawer arms the Go gate, and disarming disarms it', () => {
 test('the write path reaches the mixer only through the drawer', () => {
   // The drawer's own gate is the outer of two independent gates. A second call
   // site for sendMixerCommands anywhere in the host would be a way past it, and
-  // would look like a convenience.
-  const src = ui('settings.js');
-  const uses = src.match(/backend\.sendMixerCommands/g) || [];
-  assert.equal(uses.length, 1, 'sendMixerCommands must have exactly one call site: the drawer options');
+  // would look like a convenience. Checked across the WHOLE ui directory, not
+  // just one file, because the host is now more than one file.
+  const files = ['app.js', 'home.js', 'settings.js', 'mixerhost.js', 'backend.js'];
+  const sites = files.flatMap((f) => (ui(f).match(/backend\.sendMixerCommands/g) || []).map(() => f));
+  assert.deepEqual(sites, ['mixerhost.js'], 'sendMixerCommands must have exactly one call site: the drawer options');
 });
 
 test('the host feeds the drawer on a timer while it is open, and stops when it closes', () => {
-  const src = ui('settings.js');
+  const src = ui('mixerhost.js');
   assert.match(src, /setInterval\(/, 'the host must poll: the status socket carries no mixer subscription');
   assert.match(src, /clearInterval\(/, 'the polling must stop when the drawer closes');
   assert.match(src, /mixerDrawer\.update\(snapshot\)/, 'the poll must feed the drawer through update()');

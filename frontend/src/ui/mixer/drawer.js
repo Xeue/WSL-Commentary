@@ -8,18 +8,26 @@
  *
  * ======================= WHAT AN OPERATOR SEES ==============================
  *
- * The first thing on screen is not the matrix. It is the sentence naming every
- * strip currently in the CLEAN FEED, because that is the failure this drawer
- * exists to catch: every strip defaults to ["master","aux1","aux2"], aux1 is
- * the CLN output, and nothing in Sony's UI says so. An unmuted commentary input
- * is in the client's clean feed until somebody corrects its routing.
+ * Two columns: PGM and CLN. CLN is the clean feed the client receives — the bus
+ * M2L-X calls "AUX" on the mixer surface and "cln" on the output list, which
+ * nothing in Sony's UI says are the same bus. EVERY STRIP DEFAULTS TO
+ * ["master","aux1","aux2"], so an unmuted commentary input is in the client's
+ * clean feed until somebody corrects its routing. The five remaining buses are
+ * behind "Show all buses"; they cannot put commentary on air, so they do not get
+ * a column by default.
  *
  * ======================= WHAT IT WILL AND WILL NOT WRITE ====================
  *
- * The only write this drawer offers is set_routing on a crosspoint, and even
- * that is staged: clicking a crosspoint marks an intention, and a separate
- * Apply gesture sends it. Nothing is sent on open, close, update, arm, destroy
- * or on a diff appearing.
+ * The only write this drawer offers is set_routing on a crosspoint, and it is
+ * INSTANT: one click, one write, no staging and no Apply. Nothing is sent on
+ * open, close, update, arm or destroy.
+ *
+ * Instant does not mean unguarded. set_routing is an ABSOLUTE REPLACE of a
+ * strip's whole bus set, so every click re-reads the mixer and computes the
+ * outgoing set from THAT frame — never from what is on screen, which is up to a
+ * second old on a shared desk. If the view is stale or the re-read fails, the
+ * click is REFUSED and the refusal is printed in the cell that was clicked. See
+ * onCrosspoint.
  *
  * MUTE AND FADER ARE READ-ONLY HERE, DELIBERATELY. internal/mixer/mixer.go says
  * of SetInputMuted "THE ARGUMENT SHAPE IS NOT MEASURED", and of SetChFader that
@@ -29,6 +37,16 @@
  * displayed; neither can be written from here until WP-M1 has measured them.
  * Routing is also the correct fix: pulling a fader leaves the strip routed to
  * aux1, so the next state restore brings it back audible in the clean feed.
+ *
+ * ======================= WHAT IS WITHDRAWN, NOT DELETED =====================
+ *
+ * The golden/drift panel is GONE FROM THIS GUI at the operator's request. None
+ * of the machinery behind it has been removed or weakened: internal/mixer's
+ * golden.go and Compare are untouched, and so are compareSnapshots, sortDiffs
+ * and diffHeadline in ./model.js and every one of their tests. What changed is
+ * that this file no longer renders them and no longer calls opts.getGolden or
+ * opts.getDiffs. Those options are still REQUIRED by the contract and still
+ * wired by the host, so putting the panel back is a change to this file alone.
  */
 
 import { ALL_BUSES, CLEAN_FEED_BUS, busLabel } from './contract.js';
@@ -36,17 +54,13 @@ import {
   METER_FLOOR_DB,
   buildMatrixModel,
   busListText,
-  changeSeverity,
-  compareSnapshots,
   createWriteGate,
   describeCrosspointChange,
-  diffHeadline,
   formatDb,
   meterPercent,
   meterZone,
   routingAfterToggle,
   routingCommand,
-  sortDiffs,
   viewFreshness,
 } from './model.js';
 
@@ -64,7 +78,8 @@ const GLYPHS = Object.freeze({
   notRouted: '□', // WHITE SQUARE - crosspoint off
   routedClean: '◆', // BLACK DIAMOND - on, and on the clean feed
   notRoutedClean: '◇', // WHITE DIAMOND - off, clean feed column
-  pending: '✱', // HEAVY ASTERISK - staged, not sent
+  allowOn: '●', // BLACK CIRCLE - writes are live
+  allowOff: '○', // WHITE CIRCLE - read-only
 });
 
 /** CONFIRM_WINDOW_MS is how long a sent change may take to appear in a
@@ -73,10 +88,34 @@ const GLYPHS = Object.freeze({
  * APPLIED — the only proof is the state reading back. */
 const CONFIRM_WINDOW_MS = 4000;
 
-/** GOLDEN_CONFIRM_MS is how long the two-step "capture golden" control stays
- * armed. Re-baselining silently erases the very difference the drawer exists to
- * show, so it takes two deliberate clicks. */
-const GOLDEN_CONFIRM_MS = 5000;
+/**
+ * DEFAULT_BUSES are the columns an operator sees without asking.
+ *
+ * They are exactly the buses that LEAVE THE BUILDING: master is the PGM output
+ * and aux1 is the CLN output. Everything else is a monitor or, in aux2's case,
+ * a bus nothing accepts as a source. Five extra columns of things that cannot
+ * reach the client cost the two that can most of the width of the screen.
+ */
+const DEFAULT_BUSES = Object.freeze(['master', CLEAN_FEED_BUS]);
+
+/**
+ * COLUMN_LABELS are the column headings for the two default buses.
+ *
+ * Deliberately NOT busLabel(): with only two columns, "PGM" and "CLN" are the
+ * names an operator thinks in and the names printed on the router. The full
+ * labels ("aux1 (CLN - clean feed)") are still used everywhere a bus is named
+ * in prose — the confirmation lines especially, where a bare "aux1" would let
+ * "CONFIRMED: CLAUDE-COMMS -> master, aux1" read as success while confirming
+ * commentary in the client's clean feed. A COLUMN carries its meaning in the
+ * band, the ruling and the diamond glyph as well as in its heading; a SENTENCE
+ * carries it only in the words.
+ */
+const COLUMN_LABELS = Object.freeze({ master: 'PGM', [CLEAN_FEED_BUS]: 'CLN' });
+
+/** columnLabel is the heading for a bus column. */
+function columnLabel(bus) {
+  return Object.prototype.hasOwnProperty.call(COLUMN_LABELS, bus) ? COLUMN_LABELS[bus] : busLabel(bus);
+}
 
 /** FILTERS are the row filters. 54 strips is too many to scan under pressure;
  * "clean feed" answers the only question that matters in a hurry. */
@@ -92,17 +131,17 @@ const FILTERS = Object.freeze([
  * The returned drawer starts CLOSED and DISARMED and has not written anything.
  * See ./contract.js for the option and return shapes.
  *
- * Two options beyond the contract are honoured when the host supplies them, and
- * are optional in every sense — omit them and the drawer behaves exactly as the
+ * One option beyond the contract is honoured when the host supplies it, and is
+ * optional in every sense — omit it and the drawer behaves exactly as the
  * contract describes:
  *
- *   getDiffs()             a diff source backed by mixer.Compare. Without it
- *                          the drawer compares golden against current itself
- *                          (see compareSnapshots), because MixerDrawerOptions
- *                          has no diff member and getGolden returns a snapshot.
  *   onArmedChange(armed)   told whenever the armed state changes, INCLUDING the
  *                          forced disarm on close, so that the host's own idea
  *                          of armed cannot drift from the drawer's.
+ *
+ * opts.getGolden and opts.setGolden are still required by the contract and are
+ * still validated here, but this build never calls them: the drift panel has
+ * been withdrawn from the GUI. See the file header.
  *
  * @param {import('./contract.js').MixerDrawerOptions} opts
  * @returns {import('./contract.js').MixerDrawer}
@@ -134,27 +173,29 @@ export function createMixerDrawer(opts) {
     destroyed: false,
     snapshot: null,
     model: buildMatrixModel(null),
-    golden: null,
-    goldenLoaded: false,
-    diffs: [],
-    driftVisible: true,
     filter: 'all',
+    showAllBuses: false,
     lastUpdateAt: null,
     notice: '',
     noticeKind: 'info',
     /**
-     * Staged crosspoint changes: pendingKey() -> {strip, bus, routed}.
-     *
-     * The value carries its own strip and bus rather than being parsed back
-     * out of the key. STRIP NAMES CONTAIN SPACES - 'MIC 1-1' is a real strip in
-     * the captured live frame - so any parseable key format is one delimiter
-     * collision away from staging a change against the wrong strip, and a
-     * routing change against the wrong strip is a wrong strip on air.
+     * busy is true from the moment a crosspoint click starts its re-read until
+     * the write has been sent or refused. A second click in that window is
+     * refused rather than queued: two set_routing commands for one strip built
+     * from two different re-reads race, and set_routing REPLACES, so the loser
+     * silently reasserts the bus set the winner just changed.
      */
-    pending: new Map(),
+    busy: false,
+    /**
+     * cellNote is the refusal or result printed IN THE CELL THAT WAS CLICKED.
+     *
+     * With no Apply button there is no longer one place a refusal can live, and
+     * a notice at the top of a scrolled 54-row matrix is a refusal the operator
+     * does not see. One note at a time: {key, text, kind}, keyed by cellKey().
+     */
+    cellNote: null,
     /** sent changes awaiting confirmation from a following snapshot */
     awaiting: [],
-    goldenArmedUntil: 0,
     restoreFocus: null,
   };
 
@@ -177,7 +218,8 @@ export function createMixerDrawer(opts) {
   mount.appendChild(ui.root);
   ui.root.hidden = true;
 
-  /** element registry for in-place updates; rebuilt only when the strip set changes */
+  /** element registry for in-place updates; rebuilt only when the strip set or
+   * the visible bus set changes */
   let rowEls = new Map();
   let busEls = new Map();
   let builtStructureKey = null;
@@ -188,26 +230,12 @@ export function createMixerDrawer(opts) {
   ui.scrim.addEventListener('click', () => api.close());
 
   ui.armBtn.addEventListener('click', () => {
-    setArmed(!state.armed, 'operator pressed Arm');
+    setArmed(!state.armed, 'operator pressed Allow changes');
   });
 
-  ui.applyBtn.addEventListener('click', () => {
-    void applyPending();
-  });
-
-  ui.discardBtn.addEventListener('click', () => {
-    state.pending.clear();
-    notice('Staged changes discarded. Nothing was sent.', 'info');
+  ui.busToggle.addEventListener('click', () => {
+    state.showAllBuses = !state.showAllBuses;
     render();
-  });
-
-  ui.driftToggle.addEventListener('click', () => {
-    state.driftVisible = !state.driftVisible;
-    render();
-  });
-
-  ui.goldenBtn.addEventListener('click', () => {
-    void captureGolden();
   });
 
   for (const f of FILTERS) {
@@ -240,237 +268,190 @@ export function createMixerDrawer(opts) {
     const next = armed === true;
     if (next === state.armed) return;
     state.armed = next;
-    if (!next) state.pending.clear();
+    state.cellNote = null;
     if (typeof o.onArmedChange === 'function') o.onArmedChange(next);
     notice(
       next
-        ? 'WRITE PATH ARMED. Crosspoint changes are staged; nothing is sent until you press Apply.'
-        : `Write path DISARMED (${why}). Staged changes discarded; nothing was sent.`,
+        ? 'CHANGES ARE LIVE. A crosspoint click is now sent to the mixer immediately - there is no Apply step.'
+        : `Changes LOCKED (${why}). The matrix is read-only again; nothing was sent.`,
       next ? 'warn' : 'info',
     );
     render();
   }
 
   /**
-   * applyPending sends the staged crosspoint changes. The ONLY place in this
-   * module that reaches the write gate, and it runs solely from the Apply
-   * click handler.
+   * onCrosspoint is the operator gesture on a crosspoint, and the ONLY path in
+   * this module that reaches the write gate.
    *
-   * ===================== WHY THIS RE-READS BEFORE IT SENDS ==================
+   * ===================== ONE CLICK IS ONE WRITE, AND WHY IT RE-READS =========
    *
-   * set_routing REPLACES a strip's whole bus set. The staged crosspoint says
-   * what ONE bus should become; every other bus in the command comes from the
-   * routing this drawer happens to be holding. If that routing is old, the
-   * command is one intended change wrapped in a rollback of everything else on
-   * that strip — applied to a desk that is on air.
+   * set_routing REPLACES a strip's whole bus set. The click says what ONE bus
+   * should become; every other bus in the command is copied from the routing
+   * this drawer happens to be holding. If that routing is old, the command is
+   * one intended change wrapped in a rollback of everything else on that strip
+   * — applied to a desk that is on air. That is true whether the operator
+   * pressed Apply thirty seconds later or clicked once; removing the staging
+   * step removed a delay, not the hazard.
    *
-   * So the apply path has three separate defences, in this order:
+   * So a click has three defences, in this order:
    *
-   *   1. REFUSE A STALE VIEW. If updates have stopped, nothing is sent and the
-   *      operator is told why, with the age. Staged changes are KEPT, because
-   *      the intention was fine — it is the picture that was not.
-   *   2. RE-PLAN FROM A FRESH FRAME. Even a live view is up to a second old,
-   *      and the desk is shared. The staged crosspoints are re-applied to the
-   *      frame that arrives AFTER Apply was pressed, never to the one that was
-   *      on screen when it was. If the base moved, the operator is told after
-   *      the fact — their intent is still expressed exactly, on the routing
-   *      that is actually there.
+   *   1. REFUSE A STALE VIEW, before anything is read or planned. If updates
+   *      have stopped, nothing is sent and the operator is told why, IN THE
+   *      CELL THEY CLICKED, with the age.
+   *   2. PLAN FROM A FRESH FRAME. The desired set is computed from the snapshot
+   *      fetched by THIS click, never from the frame on screen when it was
+   *      made. If the base moved, the operator is told after the fact — their
+   *      intent is still expressed exactly, on the routing that is really there.
+   *      A re-read that FAILS refuses the click; it does not fall back.
    *   3. THE GATE. createWriteGate re-checks armed AND freshness at the moment
    *      of the write, so none of this depends on this function remembering to.
    *
-   * The refusal is a property of this path and of the gate, never of the Apply
-   * button's disabled state: a keyboard activation or a programmatic click
-   * arrives here just the same, and a disabled attribute stops neither.
+   * The refusal is a property of this path and of the gate, never of a disabled
+   * attribute: a keyboard activation or a programmatic click arrives here just
+   * the same, and aria-disabled stops neither.
    */
-  async function applyPending() {
-    if (state.pending.size === 0) {
-      notice('Nothing staged to send.', 'info');
-      render();
-      return;
-    }
+  async function onCrosspoint(stripName, bus) {
+    const key = cellKey(stripName, bus);
 
-    // 1. Freshness, before anything is planned or read.
-    const fresh = viewFreshness(state.lastUpdateAt, Date.now());
-    if (!fresh.fresh) {
+    if (!state.armed) {
+      cellNote(key, `LOCKED - press "Allow changes" first. Nothing was sent.`, 'info');
       notice(
-        `NOT SENT - ${fresh.text.toUpperCase()}. Nothing was written. ` +
-          'set_routing replaces a strip\'s WHOLE bus set, so applying from a view this old would send every other bus ' +
-          'back to what it was when the feed stopped - to a live desk. ' +
-          'Your staged changes have been KEPT. Wait for the view to go live again and press Apply.',
-        'warn',
-      );
-      render();
-      return;
-    }
-
-    // 2. Re-plan from the frame that arrives AFTER Apply.
-    const before = state.model;
-    try {
-      const snap = await o.getSnapshot();
-      if (!snap || typeof snap !== 'object') throw new Error('the mixer returned no state');
-      applySnapshot(snap);
-    } catch (err) {
-      onError(err, 'mixer: getSnapshot before Apply');
-      notice(
-        'NOT SENT: the mixer could not be re-read immediately before writing, so the routing this change would ' +
-          'replace is unknown. Nothing was written and your staged changes have been kept.',
-        'warn',
-      );
-      render();
-      return;
-    }
-    if (!state.model.hasData) {
-      notice(
-        'NOT SENT: the mixer reported no state when re-read, so there is no routing to build a replacement from. ' +
-          'Nothing was written and your staged changes have been kept.',
-        'warn',
-      );
-      render();
-      return;
-    }
-
-    const plan = planPending();
-    if (plan.commands.length === 0) {
-      // Everything staged is already true on the fresh frame — most likely
-      // somebody else just made the same correction. Not an error, and
-      // emphatically not a write.
-      state.pending.clear();
-      notice(
-        'Nothing sent: on the state just read back, every staged change is already in effect. ' +
-          'The staged list has been cleared.',
+        `Locked: changes are not allowed, so ${busLabel(bus)} on this strip cannot be changed. ` +
+          'Press "Allow changes" in the header first.',
         'info',
       );
       render();
       return;
     }
 
-    const moved = plan.intents.filter((i) => {
-      const was = before.rows.find((r) => r.name === i.strip);
-      return was && !sameSet(was.outputs, i.base);
-    });
-
-    // 3. The gate. It re-checks armed and freshness itself.
-    const result = await gate.submit(plan.commands, 'operator pressed Apply');
-    if (!result.sent) {
-      notice(`NOT SENT: ${result.reason}`, 'warn');
+    if (state.busy) {
+      cellNote(key, 'NOT SENT - another change is still being sent. Try again in a moment.', 'warn');
       render();
       return;
     }
-    state.pending.clear();
-    const deadline = Date.now() + CONFIRM_WINDOW_MS;
-    state.awaiting = plan.intents.map((i) => ({ ...i, deadline, state: 'pending' }));
-    const movedWord =
-      moved.length === 0
-        ? ''
-        : ` The desk had moved since the view you acted on: ${moved
-            .map((i) => i.label)
-            .join(', ')} - your change was re-planned onto the routing that is actually there, so no other bus was rolled back.`;
-    notice(
-      `Sent ${plan.commands.length} routing change(s). SENT IS NOT APPLIED - waiting for the mixer to report it back.${movedWord}`,
-      'warn',
-    );
+
+    const before = state.model.rows.find((r) => r.name === stripName);
+    if (!before) return;
+    // What the operator asked for, decided from the cell they could see. Only
+    // the DIRECTION comes from the screen; the bus set it is applied to does
+    // not.
+    const desiredRouted = !before.outputs.includes(bus);
+
+    // 1. Freshness, before anything is read or planned.
+    const fresh = viewFreshness(state.lastUpdateAt, Date.now());
+    if (!fresh.fresh) {
+      cellNote(key, `NOT SENT - ${fresh.text.toUpperCase()}. Nothing was written.`, 'warn');
+      notice(
+        `NOT SENT - ${fresh.text.toUpperCase()}. Nothing was written. ` +
+          "set_routing replaces a strip's WHOLE bus set, so acting on a view this old would send every other bus " +
+          'back to what it was when the feed stopped - to a live desk. ' +
+          'Wait for the view to go live again and click it again.',
+        'warn',
+      );
+      render();
+      return;
+    }
+
+    state.busy = true;
+    cellNote(key, 'Reading the mixer before writing...', 'info');
     render();
-  }
-
-  /**
-   * planPending folds the staged crosspoints into one set_routing per strip.
-   *
-   * One command per strip, never one per crosspoint: set_routing REPLACES the
-   * whole bus set, so two separate commands for the same strip would have the
-   * second undo the first.
-   *
-   * IT PLANS FROM state.model, WHICH IS WHATEVER FRAME WAS LAST APPLIED. That
-   * is the whole reason applyPending re-reads before calling this: the base
-   * every unstaged bus is copied from is only as current as the last snapshot,
-   * and set_routing sends that base back to the desk verbatim. Each intent
-   * carries the base it was planned from so the caller can say whether the
-   * desk moved underneath the operator.
-   */
-  function planPending() {
-    const byStrip = new Map();
-    for (const { strip: stripName, bus, routed } of state.pending.values()) {
-      const row = state.model.rows.find((r) => r.name === stripName);
-      if (!row) continue;
-      const entry = byStrip.get(stripName) || { row, outputs: row.outputs.slice() };
-      entry.outputs = routingAfterToggle(entry.outputs, bus, routed);
-      byStrip.set(stripName, entry);
-    }
-
-    const commands = [];
-    const intents = [];
-    for (const [stripName, entry] of byStrip) {
-      // Already in that state: sending would be a write with no effect, and
-      // every avoidable write to a live mixer is worth avoiding.
-      if (sameSet(entry.outputs, entry.row.outputs)) continue;
-      commands.push(routingCommand(stripName, entry.outputs));
-      intents.push({
-        strip: stripName,
-        label: entry.row.label,
-        desired: entry.outputs.slice(),
-        base: entry.row.outputs.slice(),
-      });
-    }
-    return { commands, intents };
-  }
-
-  /**
-   * captureGolden saves the current snapshot as golden. Two clicks: silently
-   * re-baselining would erase the difference the drawer exists to show. It
-   * writes application state only and NEVER touches the mixer, so it is
-   * available whether or not the drawer is armed.
-   */
-  async function captureGolden() {
-    if (!state.snapshot) {
-      notice('No state to capture yet.', 'warn');
-      render();
-      return;
-    }
-    const now = Date.now();
-    if (now > state.goldenArmedUntil) {
-      state.goldenArmedUntil = now + GOLDEN_CONFIRM_MS;
-      notice('Press "Capture golden" again to overwrite the saved golden state. This does not touch the mixer.', 'warn');
-      render();
-      later(() => {
-        if (!state.destroyed && Date.now() > state.goldenArmedUntil) render();
-      }, GOLDEN_CONFIRM_MS + 50);
-      return;
-    }
-    state.goldenArmedUntil = 0;
     try {
-      await o.setGolden(state.snapshot);
-      state.golden = state.snapshot;
-      state.goldenLoaded = true;
-      notice('Golden state captured from the current mixer state. The mixer was not changed.', 'info');
-    } catch (err) {
-      onError(err, 'mixer: setGolden');
-      notice('Could not save the golden state.', 'warn');
-    }
-    await refreshDiffs();
-    render();
-  }
-
-  async function refreshGolden() {
-    try {
-      state.golden = await o.getGolden();
-      state.goldenLoaded = true;
-    } catch (err) {
-      state.goldenLoaded = false;
-      onError(err, 'mixer: getGolden');
-    }
-  }
-
-  async function refreshDiffs() {
-    if (typeof o.getDiffs === 'function') {
+      // 2. Re-read, and plan from what came back.
+      let snap;
       try {
-        state.diffs = sortDiffs(await o.getDiffs());
-        return;
+        snap = await o.getSnapshot();
+        if (!snap || typeof snap !== 'object') throw new Error('the mixer returned no state');
       } catch (err) {
-        onError(err, 'mixer: getDiffs');
-        state.diffs = [];
+        onError(err, 'mixer: getSnapshot before a crosspoint write');
+        refuse(
+          key,
+          'NOT SENT - the mixer could not be re-read.',
+          'NOT SENT: the mixer could not be re-read immediately before writing, so the routing this change would ' +
+            'replace is unknown. Nothing was written.',
+        );
         return;
       }
+      applySnapshot(snap);
+      if (!state.model.hasData) {
+        refuse(
+          key,
+          'NOT SENT - the mixer reported no state.',
+          'NOT SENT: the mixer reported no state when re-read, so there is no routing to build a replacement from. ' +
+            'Nothing was written.',
+        );
+        return;
+      }
+
+      const row = state.model.rows.find((r) => r.name === stripName);
+      if (!row) {
+        refuse(
+          key,
+          'NOT SENT - this strip is not in the state just read back.',
+          `NOT SENT: ${before.label} is not present in the state just read back from the mixer, so there is no ` +
+            'routing to replace. Nothing was written.',
+        );
+        return;
+      }
+
+      const desired = routingAfterToggle(row.outputs, bus, desiredRouted);
+      if (sameSet(desired, row.outputs)) {
+        // Somebody else just made the same correction. Not an error, and
+        // emphatically not a write.
+        cellNote(key, 'Nothing sent - already in that state on the mixer.', 'info');
+        notice(
+          `Nothing sent: on the state just read back, ${describeCrosspointChange(row, bus, desiredRouted)} is ` +
+            'already in effect.',
+          'info',
+        );
+        return;
+      }
+
+      const moved = !sameSet(before.outputs, row.outputs);
+
+      // 3. The gate. It re-checks armed and freshness itself.
+      const result = await gate.submit(
+        [routingCommand(stripName, desired)],
+        'operator clicked a crosspoint',
+      );
+      if (!result.sent) {
+        refuse(key, `NOT SENT - ${result.reason}`, `NOT SENT: ${result.reason}`);
+        return;
+      }
+
+      state.awaiting = [
+        {
+          strip: stripName,
+          label: row.label,
+          desired: desired.slice(),
+          base: row.outputs.slice(),
+          deadline: Date.now() + CONFIRM_WINDOW_MS,
+          state: 'pending',
+        },
+      ];
+      cellNote(key, 'SENT - waiting for the mixer to report it back.', 'warn');
+      const movedWord = moved
+        ? ' The desk had moved since the view you clicked on: your change was planned onto the routing that is ' +
+          'actually there, so no other bus was rolled back.'
+        : '';
+      notice(
+        `Sent: ${describeCrosspointChange(row, bus, desiredRouted)}. ` +
+          `SENT IS NOT APPLIED - waiting for the mixer to report it back.${movedWord}`,
+        'warn',
+      );
+    } finally {
+      state.busy = false;
+      render();
     }
-    state.diffs = compareSnapshots(state.golden, state.snapshot);
+  }
+
+  /** refuse records one refusal in the clicked cell AND in the notice line. */
+  function refuse(key, short, long) {
+    cellNote(key, short, 'warn');
+    notice(long, 'warn');
+  }
+
+  function cellNote(key, text, kind) {
+    state.cellNote = { key, text, kind: kind || 'info' };
   }
 
   function notice(text, kind) {
@@ -479,14 +460,14 @@ export function createMixerDrawer(opts) {
   }
 
   function startStaleTimer() {
-    // Reads the clock and repaints one label. It never fetches and never
+    // Reads the clock and repaints two labels. It never fetches and never
     // writes; the contract's "must not poll" is about getSnapshot.
     if (typeof setInterval !== 'function') return null;
     const t = setInterval(() => {
       if (!state.open || state.destroyed) return;
       renderFreshness();
-      // renderArm too, so that when the feed stops the Apply control says
-      // BLOCKED without waiting for an update() that is not coming. This is
+      // renderArm too, so that when the feed stops the header says a click will
+      // be refused without waiting for an update() that is not coming. This is
       // the only case where the drawer changes without new state, and it is
       // exactly the case that matters.
       renderArm();
@@ -499,86 +480,88 @@ export function createMixerDrawer(opts) {
 
   function render() {
     if (!state.open || state.destroyed) return;
-    renderCleanFeedBanner();
+    renderCleanLine();
     renderArm();
     renderNotice();
-    renderDrift();
     renderMatrix();
     renderFreshness();
   }
 
-  function renderCleanFeedBanner() {
-    const b = ui.cleanBanner;
+  /**
+   * renderCleanLine is what is left of the clean-feed banner: one line in the
+   * header instead of a block at the top of the body.
+   *
+   * The block was removed as clutter. This line is not decoration — with no
+   * banner, a drawer that has NO STATE would otherwise show an empty matrix,
+   * and an empty matrix reads as "nothing is in the clean feed", which is a
+   * claim the drawer cannot make. So the unknown case is spelled out, and the
+   * known case gives the count with the names in the title.
+   */
+  function renderCleanLine() {
+    const l = ui.cleanLine;
     if (!state.model.hasData) {
-      b.className = 'mx-banner mx-banner--unknown';
-      b.textContent = 'No mixer state received. This drawer cannot tell you what is in the clean feed.';
+      l.className = 'mx-cleanline mx-cleanline--unknown';
+      l.textContent = 'CLN: unknown - no mixer state';
+      l.setAttribute('title', 'This drawer cannot tell you what is in the clean feed: no state has been received.');
       return;
     }
-    const audible = state.model.cleanFeed.filter((r) => !r.muted);
-    const muted = state.model.cleanFeed.filter((r) => r.muted);
-    if (state.model.cleanFeed.length === 0) {
-      b.className = 'mx-banner mx-banner--ok';
-      b.textContent = `Nothing is routed to ${busLabel(CLEAN_FEED_BUS)}.`;
+    const routed = state.model.cleanFeed;
+    const audible = routed.filter((r) => !r.muted);
+    if (routed.length === 0) {
+      l.className = 'mx-cleanline mx-cleanline--ok';
+      l.textContent = `${GLYPHS.notRoutedClean} CLN: nothing routed`;
+      l.setAttribute('title', `Nothing is routed to ${busLabel(CLEAN_FEED_BUS)}, the CLN output the client receives.`);
       return;
     }
-    b.className = audible.length > 0 ? 'mx-banner mx-banner--alert' : 'mx-banner mx-banner--warn';
+    const muted = routed.filter((r) => r.muted);
+    l.className = audible.length > 0 ? 'mx-cleanline mx-cleanline--alert' : 'mx-cleanline mx-cleanline--warn';
+    l.textContent =
+      `${audible.length > 0 ? GLYPHS.routedClean : GLYPHS.notRoutedClean} ` +
+      `CLN: ${routed.length} routed, ${audible.length} unmuted`;
+    // BOTH groups, always. A strip that is in the clean feed but muted is one
+    // un-mute away from being in it audibly, and the captured live frame is
+    // exactly that case: CLAUDE-COMMS is routed to aux1 and muted. Naming only
+    // the audible ones would have left it out of the only place it is named.
     const parts = [];
-    if (audible.length > 0) {
-      parts.push(`IN THE CLEAN FEED AND UNMUTED: ${audible.map((r) => r.label).join(', ')}.`);
-    }
-    if (muted.length > 0) {
-      parts.push(`Routed to the clean feed but muted: ${muted.map((r) => r.label).join(', ')}.`);
-    }
+    if (audible.length > 0) parts.push(`IN THE CLEAN FEED AND UNMUTED: ${audible.map((r) => r.label).join(', ')}.`);
+    if (muted.length > 0) parts.push(`Routed to the clean feed but muted: ${muted.map((r) => r.label).join(', ')}.`);
     parts.push(`${busLabel(CLEAN_FEED_BUS)} is the CLN output the client receives.`);
-    b.textContent = parts.join(' ');
+    l.setAttribute('title', parts.join(' '));
   }
 
   function renderArm() {
-    ui.armBtn.textContent = state.armed ? 'Disarm write path' : 'Arm write path';
+    // The label does not change with the state; the GLYPH, the aria-pressed and
+    // the state word beside it do. A toggle whose label becomes the opposite
+    // action is one an operator reads backwards under pressure.
+    ui.armBtn.textContent = `${state.armed ? GLYPHS.allowOn : GLYPHS.allowOff} Allow changes`;
     ui.armBtn.setAttribute('aria-pressed', String(state.armed));
-    ui.armBtn.className = state.armed ? 'mx-btn mx-btn--armed' : 'mx-btn';
-    ui.armState.textContent = state.armed
-      ? 'ARMED - crosspoints can be staged and applied to the live mixer'
-      : 'READ-ONLY - crosspoints are locked; nothing here can reach the mixer';
-    ui.armState.className = state.armed ? 'mx-armstate mx-armstate--armed' : 'mx-armstate';
+    ui.armBtn.className = state.armed ? 'mx-btn mx-allow mx-allow--on' : 'mx-btn mx-allow';
+    ui.armBtn.setAttribute(
+      'aria-label',
+      state.armed
+        ? 'Allow changes: ON. Crosspoint clicks are written to the live mixer immediately. Activate to lock.'
+        : 'Allow changes: OFF. The matrix is read-only. Activate to allow writes.',
+    );
 
-    const staged = state.pending.size;
-    // The freshness state is SHOWN on the Apply control as well as enforced in
-    // applyPending and in the write gate. Showing it is not the gate — an
-    // aria-disabled button still activates from a keyboard and still fires
-    // from a programmatic click — it is so the operator learns why before they
-    // press it rather than after.
     const fresh = viewFreshness(state.lastUpdateAt, Date.now());
-    ui.applyBtn.hidden = !state.armed;
-    ui.discardBtn.hidden = !state.armed || staged === 0;
-    ui.applyBtn.textContent = !fresh.fresh
-      ? `Apply BLOCKED - ${fresh.text}`
-      : staged === 0
-        ? 'Apply (nothing staged)'
-        : `Apply ${staged} change(s) to the live mixer`;
-    ui.applyBtn.setAttribute('aria-disabled', String(staged === 0 || !fresh.fresh));
-    ui.applyBtn.className = staged === 0 || !fresh.fresh ? 'mx-btn' : 'mx-btn mx-btn--danger';
-
-    renderStagedList();
-    renderAwaiting();
-
-    ui.goldenBtn.textContent =
-      Date.now() <= state.goldenArmedUntil ? 'Capture golden - press again to confirm' : 'Capture golden';
-  }
-
-  function renderStagedList() {
-    clear(ui.stagedList);
-    ui.stagedBox.hidden = state.pending.size === 0;
-    for (const { strip: stripName, bus, routed } of state.pending.values()) {
-      const row = state.model.rows.find((r) => r.name === stripName);
-      // Ranked by the same rule the drift list uses, so the words an operator
-      // reads BEFORE a write match the words they read after one.
-      const li = el(doc, 'li', {
-        className: `mx-staged mx-sev--${changeSeverity(bus)}`,
-        text: `${GLYPHS.pending} ${describeCrosspointChange(row || { label: stripName }, bus, routed)}`,
-      });
-      ui.stagedList.appendChild(li);
+    if (!state.armed) {
+      ui.armState.textContent = 'READ-ONLY';
+      ui.armState.className = 'mx-armstate';
+      ui.armState.setAttribute('title', 'Crosspoints are locked; nothing here can reach the mixer.');
+    } else if (!fresh.fresh) {
+      // Shown, not relied on. The refusal itself lives in onCrosspoint and in
+      // the write gate; this is so the operator learns before they click rather
+      // than after.
+      ui.armState.textContent = `WRITES LIVE - BLOCKED (${fresh.text})`;
+      ui.armState.className = 'mx-armstate mx-armstate--blocked';
+      ui.armState.setAttribute('title', 'A click will be refused until the view is live again.');
+    } else {
+      ui.armState.textContent = 'WRITES LIVE';
+      ui.armState.className = 'mx-armstate mx-armstate--armed';
+      ui.armState.setAttribute('title', 'A crosspoint click is sent to the live mixer immediately.');
     }
+
+    renderAwaiting();
   }
 
   /**
@@ -586,11 +569,11 @@ export function createMixerDrawer(opts) {
    *
    * It appears immediately after a write to a live desk and it is what the
    * operator checks to decide the change did what they meant. Every bus in it
-   * goes through busListText, never a bare join: "CONFIRMED: CLAUDE-COMMS ->
-   * master, aux1" reads as success while confirming that commentary is in the
-   * client's clean feed, which is the single failure this whole drawer exists
-   * to prevent. Rendered through the labels it reads "... -> master (PGM),
-   * aux1 (CLN - clean feed)" and cannot be misread as success.
+   * goes through busListText, never a bare join and never the column headings:
+   * "CONFIRMED: CLAUDE-COMMS -> master, aux1" reads as success while confirming
+   * that commentary is in the client's clean feed, which is the single failure
+   * this whole drawer exists to prevent. Rendered through the labels it reads
+   * "... -> master (PGM), aux1 (CLN - clean feed)" and cannot be misread.
    */
   function renderAwaiting() {
     clear(ui.awaitList);
@@ -618,59 +601,6 @@ export function createMixerDrawer(opts) {
     ui.notice.hidden = state.notice === '';
   }
 
-  function renderDrift() {
-    ui.driftToggle.textContent = state.driftVisible ? 'Hide drift' : 'Show drift';
-    ui.driftToggle.setAttribute('aria-expanded', String(state.driftVisible));
-    ui.driftBody.hidden = !state.driftVisible;
-
-    clear(ui.driftList);
-    if (!state.goldenLoaded) {
-      ui.driftSummary.textContent = 'Golden state not loaded.';
-      ui.driftSummary.className = 'mx-drift-summary';
-      return;
-    }
-    if (!state.golden) {
-      // Null golden is a normal state and must NOT read as "no differences":
-      // that is a claim the drawer cannot make.
-      ui.driftSummary.textContent = 'No golden saved. Capture one to be told when the mixer drifts from it.';
-      ui.driftSummary.className = 'mx-drift-summary mx-drift-summary--none';
-      return;
-    }
-    const diffs = state.diffs;
-    const crit = diffs.filter((d) => d.severity === 'critical').length;
-    const warn = diffs.filter((d) => d.severity === 'warn').length;
-    if (diffs.length === 0) {
-      ui.driftSummary.textContent = 'No differences from the golden state.';
-      ui.driftSummary.className = 'mx-drift-summary mx-drift-summary--ok';
-      return;
-    }
-    ui.driftSummary.textContent = `${diffs.length} difference(s) from golden - ${crit} CRITICAL, ${warn} warning(s).`;
-    ui.driftSummary.className = crit > 0 ? 'mx-drift-summary mx-drift-summary--alert' : 'mx-drift-summary mx-drift-summary--warn';
-
-    for (const d of diffs) {
-      const li = el(doc, 'li', { className: `mx-diff mx-sev--${d.severity}` });
-      li.appendChild(
-        el(doc, 'span', {
-          className: 'mx-diff-badge',
-          text: d.severity === 'critical' ? 'CRITICAL' : d.severity === 'warn' ? 'WARNING' : 'INFO',
-        }),
-      );
-      li.appendChild(el(doc, 'span', { className: 'mx-diff-head', text: diffHeadline(d) }));
-      li.appendChild(
-        el(doc, 'span', {
-          className: 'mx-diff-detail',
-          // d.label, never d.target: for a bus diff the target IS a raw bus
-          // name, so "aux1 muted: golden ..." would be the clean feed
-          // described as a string the operator cannot decode. MixerDiff says
-          // label is "already resolved, safe to show" — this is the read it
-          // was resolved for.
-          text: `${d.label} ${d.field}: golden "${d.golden}" -> now "${d.current}"`,
-        }),
-      );
-      ui.driftList.appendChild(li);
-    }
-  }
-
   function renderMatrix() {
     if (!state.model.hasData) {
       ui.matrixNote.hidden = false;
@@ -679,15 +609,25 @@ export function createMixerDrawer(opts) {
     }
     ui.matrixNote.hidden = true;
 
-    if (builtStructureKey !== state.model.structureKey) {
+    const key = `${state.model.structureKey}::${state.showAllBuses}`;
+    if (builtStructureKey !== key) {
       buildMatrixRows();
-      builtStructureKey = state.model.structureKey;
+      builtStructureKey = key;
     }
     for (const f of FILTERS) {
       ui.filterBtns.get(f.id).setAttribute('aria-pressed', String(state.filter === f.id));
       ui.filterBtns.get(f.id).className = state.filter === f.id ? 'mx-chip mx-chip--on' : 'mx-chip';
     }
+    ui.busToggle.textContent = state.showAllBuses ? 'Hide the other buses' : 'Show all buses';
+    ui.busToggle.setAttribute('aria-pressed', String(state.showAllBuses));
+    ui.busToggle.className = state.showAllBuses ? 'mx-chip mx-chip--on' : 'mx-chip';
     updateLive();
+  }
+
+  /** visibleBuses is the column set: the two that leave the building, or all
+   * seven once the operator asks for them. */
+  function visibleBuses() {
+    return state.showAllBuses ? ALL_BUSES : DEFAULT_BUSES;
   }
 
   function buildMatrixRows() {
@@ -696,17 +636,21 @@ export function createMixerDrawer(opts) {
     rowEls = new Map();
     busEls = new Map();
 
+    const buses = visibleBuses();
+
     const hr = el(doc, 'tr');
-    hr.appendChild(el(doc, 'th', { className: 'mx-th mx-th--strip', text: 'Strip', attrs: { scope: 'col' } }));
+    // "Input", not "Strip": "strip" is desk jargon and the rest of this
+    // application calls the thing an input.
+    hr.appendChild(el(doc, 'th', { className: 'mx-th mx-th--strip', text: 'Input', attrs: { scope: 'col' } }));
     hr.appendChild(el(doc, 'th', { className: 'mx-th mx-th--meter', text: 'Peak hold (dBFS)', attrs: { scope: 'col' } }));
     hr.appendChild(el(doc, 'th', { className: 'mx-th mx-th--state', text: 'Mute / fader', attrs: { scope: 'col' } }));
-    for (const bus of ALL_BUSES) {
+    for (const bus of buses) {
       const clean = bus === CLEAN_FEED_BUS;
       const th = el(doc, 'th', {
         className: `mx-th mx-th--bus${clean ? ' mx-col-clean' : ''}`,
-        attrs: { scope: 'col' },
+        attrs: { scope: 'col', 'data-bus': bus, title: busLabel(bus) },
       });
-      th.appendChild(el(doc, 'span', { className: 'mx-th-name', text: busLabel(bus) }));
+      th.appendChild(el(doc, 'span', { className: 'mx-th-name', text: columnLabel(bus) }));
       const sub = el(doc, 'span', { className: 'mx-th-sub' });
       th.appendChild(sub);
       const meter = el(doc, 'span', { className: 'mx-busmeter' });
@@ -751,7 +695,7 @@ export function createMixerDrawer(opts) {
       tr.appendChild(stateCell);
 
       const cells = new Map();
-      for (const bus of ALL_BUSES) {
+      for (const bus of buses) {
         const clean = bus === CLEAN_FEED_BUS;
         const td = el(doc, 'td', { className: `mx-cell mx-cell--x${clean ? ' mx-col-clean' : ''}` });
         const btn = el(doc, 'button', {
@@ -762,38 +706,23 @@ export function createMixerDrawer(opts) {
         const text = el(doc, 'span', { className: 'mx-x-text', attrs: { 'aria-hidden': 'true' } });
         btn.appendChild(glyph);
         btn.appendChild(text);
-        btn.addEventListener('click', () => onCrosspoint(row.name, bus));
+        btn.addEventListener('click', () => {
+          void onCrosspoint(row.name, bus);
+        });
+        // The note that carries a refusal, in the cell that was clicked. There
+        // is no Apply button to put it on any more, and a notice at the top of
+        // a scrolled matrix is a refusal nobody reads.
+        const note = el(doc, 'span', { className: 'mx-x-note', attrs: { role: 'alert' } });
+        note.hidden = true;
         td.appendChild(btn);
+        td.appendChild(note);
         tr.appendChild(td);
-        cells.set(bus, { btn, glyph, text });
+        cells.set(bus, { btn, glyph, text, note });
       }
 
       ui.tbody.appendChild(tr);
       rowEls.set(row.name, { tr, label, wire, fillL, fillR, meterText, muteEl, faderEl, cells });
     }
-  }
-
-  /**
-   * onCrosspoint is the operator gesture on a crosspoint. It NEVER sends: it
-   * stages an intention, which the Apply gesture may later send. While
-   * disarmed it explains itself rather than silently doing nothing.
-   */
-  function onCrosspoint(stripName, bus) {
-    if (!state.armed) {
-      notice(
-        `Locked: the write path is disarmed, so ${busLabel(bus)} on this strip cannot be changed. Press "Arm write path" first.`,
-        'info',
-      );
-      render();
-      return;
-    }
-    const row = state.model.rows.find((r) => r.name === stripName);
-    if (!row) return;
-    const key = pendingKey(stripName, bus);
-    const current = row.outputs.includes(bus);
-    if (state.pending.has(key)) state.pending.delete(key);
-    else state.pending.set(key, { strip: stripName, bus, routed: !current });
-    render();
   }
 
   /** updateLive repaints the values that change at 1 Hz, in place, so that a
@@ -854,9 +783,9 @@ export function createMixerDrawer(opts) {
   }
 
   function paintCrosspoint(refs, row, cell) {
-    const key = pendingKey(row.name, cell.bus);
-    const staged = state.pending.has(key);
-    const shown = staged ? state.pending.get(key).routed : cell.routed;
+    const shown = cell.routed;
+    const key = cellKey(row.name, cell.bus);
+    const note = state.cellNote && state.cellNote.key === key ? state.cellNote : null;
 
     const glyph = cell.cleanFeed
       ? shown
@@ -867,9 +796,9 @@ export function createMixerDrawer(opts) {
         : GLYPHS.notRouted;
 
     // The glyph is always the state, never the lock: an operator must be able
-    // to read the routing whether or not the drawer is armed. Locked cells are
+    // to read the routing whether or not changes are allowed. Locked cells are
     // marked instead by a dashed outline (a SHAPE, not a colour), by
-    // aria-disabled, and by the READ-ONLY line in the arm bar.
+    // aria-disabled, and by READ-ONLY in the header.
     refs.glyph.textContent = glyph;
     refs.text.textContent = cell.cleanFeed && shown ? 'CLN' : '';
 
@@ -877,17 +806,21 @@ export function createMixerDrawer(opts) {
     classes.push(shown ? 'mx-x--on' : 'mx-x--off');
     if (cell.cleanFeed) classes.push('mx-x--clean');
     if (cell.noEgress) classes.push('mx-x--noegress');
-    if (staged) classes.push('mx-x--staged');
     if (!state.armed) classes.push('mx-x--locked');
+    if (note && note.kind === 'warn') classes.push('mx-x--refused');
     refs.btn.className = classes.join(' ');
+
+    refs.note.textContent = note ? note.text : '';
+    refs.note.className = note ? `mx-x-note mx-x-note--${note.kind}` : 'mx-x-note';
+    refs.note.hidden = note === null;
 
     refs.btn.setAttribute('aria-checked', String(shown));
     refs.btn.setAttribute('aria-disabled', String(!state.armed));
-    const stagedWord = staged ? `. STAGED, not sent: will become ${shown ? 'routed' : 'not routed'}` : '';
-    const lockWord = state.armed ? '' : '. Locked: the write path is disarmed';
+    const lockWord = state.armed ? '' : '. Locked: changes are not allowed';
+    const noteWord = note ? `. ${note.text}` : '';
     refs.btn.setAttribute(
       'aria-label',
-      `${row.label} to ${cell.label}: ${cell.routed ? 'routed' : 'not routed'}${stagedWord}${lockWord}`,
+      `${row.label} to ${cell.label}: ${cell.routed ? 'routed' : 'not routed'}${lockWord}${noteWord}`,
     );
     refs.btn.setAttribute('title', `${row.label} (${row.name}) → ${cell.label}`);
   }
@@ -925,12 +858,16 @@ export function createMixerDrawer(opts) {
       }
     }
     if (changed && state.awaiting.every((a) => a.state === 'confirmed')) {
-      notice('All sent changes confirmed by the mixer.', 'info');
+      notice('The mixer has reported the change back: it is in effect.', 'info');
       const done = state.awaiting;
       later(() => {
         if (state.destroyed) return;
         if (state.awaiting === done) {
           state.awaiting = [];
+          // The "SENT - waiting" note in the cell goes with it. Left behind it
+          // would sit on a crosspoint that has long since been confirmed and
+          // read as if a write were still outstanding.
+          state.cellNote = null;
           render();
         }
       }, 4000);
@@ -941,8 +878,8 @@ export function createMixerDrawer(opts) {
 
   const api = {
     /**
-     * open shows the drawer and refreshes from getSnapshot and getGolden. It
-     * is READ-ONLY: opening never writes, and it never arms.
+     * open shows the drawer and refreshes from getSnapshot. It is READ-ONLY:
+     * opening never writes, and it never arms.
      */
     open() {
       if (state.destroyed || state.open) return;
@@ -960,26 +897,24 @@ export function createMixerDrawer(opts) {
           onError(err, 'mixer: getSnapshot on open');
           notice('Could not read the mixer. What is shown may be out of date.', 'warn');
         }
-        await refreshGolden();
-        await refreshDiffs();
         render();
       })();
     },
 
     /**
-     * close hides the drawer and DISARMS the write path.
+     * close hides the drawer and LOCKS changes again.
      *
      * The contract says close "must not disarm silently"; this task requires
-     * that it always disarm, because an armed drawer left open is a foot-gun.
+     * that it always disarm, because a drawer left able to write is a foot-gun.
      * Both are satisfied by disarming LOUDLY: the operator is told, the host is
      * told through onArmedChange when it supplied one, and the notice is still
      * on screen the next time the drawer is opened. What close must never do is
-     * leave the host believing the drawer is still armed.
+     * leave the host believing writes are still allowed.
      */
     close() {
       if (state.destroyed || !state.open) return;
       if (state.armed) setArmed(false, 'the drawer was closed');
-      state.pending.clear();
+      state.cellNote = null;
       state.open = false;
       ui.root.hidden = true;
       const target = state.restoreFocus;
@@ -1000,21 +935,16 @@ export function createMixerDrawer(opts) {
       if (state.destroyed) return;
       applySnapshot(snapshot);
       if (!state.open) return;
-      if (typeof o.getDiffs === 'function') {
-        void refreshDiffs().then(render);
-        return;
-      }
-      state.diffs = compareSnapshots(state.golden, state.snapshot);
       render();
     },
 
     /**
-     * setArmed enables or disables the write path. Arming by itself changes
-     * nothing on the mixer; it only permits a later operator gesture to.
+     * setArmed allows or forbids writes. Allowing by itself changes nothing on
+     * the mixer; it only permits a later operator gesture to.
      */
     setArmed(armed) {
       if (state.destroyed) return;
-      setArmed(armed, armed ? 'the host armed the drawer' : 'the host disarmed the drawer');
+      setArmed(armed, armed ? 'the host allowed changes' : 'the host locked changes');
     },
 
     /** destroy tears down. It removes listeners, restores the mount and
@@ -1025,7 +955,7 @@ export function createMixerDrawer(opts) {
       state.destroyed = true;
       state.open = false;
       state.armed = false;
-      state.pending.clear();
+      state.cellNote = null;
       doc.removeEventListener('keydown', onKeyDown, true);
       if (staleTimer !== null && typeof clearInterval === 'function') clearInterval(staleTimer);
       if (ui.root.parentNode === mount) mount.removeChild(ui.root);
@@ -1070,6 +1000,10 @@ export function createMixerDrawer(opts) {
  * buildShell creates the drawer chrome once. Everything below the matrix header
  * is filled in by render(); this only establishes the elements that never move,
  * so that a 1 Hz update does not rebuild the tree under the operator's cursor.
+ *
+ * The "Allow changes" control is in the HEADER, not in the body: it is the one
+ * control an operator hunts for, and every row of chrome above the matrix is a
+ * row of strips they cannot see.
  */
 function buildShell(doc) {
   const root = el(doc, 'div', { className: 'mx-root' });
@@ -1084,43 +1018,33 @@ function buildShell(doc) {
   titles.appendChild(el(doc, 'h2', { className: 'mx-title', text: 'Audio mixer' }));
   const freshness = el(doc, 'span', { className: 'mx-fresh', text: 'no state received yet' });
   titles.appendChild(freshness);
+  const cleanLine = el(doc, 'span', { className: 'mx-cleanline mx-cleanline--unknown', text: 'CLN: unknown - no mixer state' });
+  titles.appendChild(cleanLine);
   head.appendChild(titles);
+
+  const headControls = el(doc, 'div', { className: 'mx-headctl' });
+  const armState = el(doc, 'span', { className: 'mx-armstate', text: 'READ-ONLY' });
+  const armBtn = el(doc, 'button', {
+    className: 'mx-btn mx-allow',
+    text: `${GLYPHS.allowOff} Allow changes`,
+    attrs: { type: 'button', 'aria-pressed': 'false' },
+  });
   const closeBtn = el(doc, 'button', {
     className: 'mx-btn mx-btn--close',
     text: 'Close',
     attrs: { type: 'button', 'aria-label': 'Close the mixer drawer (Escape)' },
   });
-  head.appendChild(closeBtn);
+  headControls.appendChild(armState);
+  headControls.appendChild(armBtn);
+  headControls.appendChild(closeBtn);
+  head.appendChild(headControls);
   drawer.appendChild(head);
 
   const body = el(doc, 'div', { className: 'mx-body' });
 
-  const cleanBanner = el(doc, 'p', { className: 'mx-banner mx-banner--unknown', attrs: { role: 'status' } });
-  body.appendChild(cleanBanner);
-
-  const armBar = el(doc, 'div', { className: 'mx-armbar' });
-  const armBtn = el(doc, 'button', { className: 'mx-btn', text: 'Arm write path', attrs: { type: 'button', 'aria-pressed': 'false' } });
-  const armState = el(doc, 'span', { className: 'mx-armstate' });
-  const applyBtn = el(doc, 'button', { className: 'mx-btn', text: 'Apply', attrs: { type: 'button' } });
-  const discardBtn = el(doc, 'button', { className: 'mx-btn', text: 'Discard staged', attrs: { type: 'button' } });
-  applyBtn.hidden = true;
-  discardBtn.hidden = true;
-  armBar.appendChild(armBtn);
-  armBar.appendChild(applyBtn);
-  armBar.appendChild(discardBtn);
-  armBar.appendChild(armState);
-  body.appendChild(armBar);
-
   const notice = el(doc, 'p', { className: 'mx-notice', attrs: { role: 'status', 'aria-live': 'polite' } });
   notice.hidden = true;
   body.appendChild(notice);
-
-  const stagedBox = el(doc, 'section', { className: 'mx-stagedbox' });
-  stagedBox.appendChild(el(doc, 'h3', { className: 'mx-h3', text: 'Staged, not sent' }));
-  const stagedList = el(doc, 'ul', { className: 'mx-list' });
-  stagedBox.appendChild(stagedList);
-  stagedBox.hidden = true;
-  body.appendChild(stagedBox);
 
   const awaitBox = el(doc, 'section', { className: 'mx-awaitbox' });
   awaitBox.appendChild(el(doc, 'h3', { className: 'mx-h3', text: 'Sent - awaiting confirmation from the mixer' }));
@@ -1128,22 +1052,6 @@ function buildShell(doc) {
   awaitBox.appendChild(awaitList);
   awaitBox.hidden = true;
   body.appendChild(awaitBox);
-
-  const drift = el(doc, 'section', { className: 'mx-drift' });
-  const driftHead = el(doc, 'div', { className: 'mx-drift-head' });
-  driftHead.appendChild(el(doc, 'h3', { className: 'mx-h3', text: 'Drift from golden' }));
-  const driftToggle = el(doc, 'button', { className: 'mx-btn mx-btn--small', text: 'Hide drift', attrs: { type: 'button', 'aria-expanded': 'true' } });
-  const goldenBtn = el(doc, 'button', { className: 'mx-btn mx-btn--small', text: 'Capture golden', attrs: { type: 'button' } });
-  driftHead.appendChild(driftToggle);
-  driftHead.appendChild(goldenBtn);
-  drift.appendChild(driftHead);
-  const driftBody = el(doc, 'div', { className: 'mx-drift-body' });
-  const driftSummary = el(doc, 'p', { className: 'mx-drift-summary', text: 'Golden state not loaded.' });
-  const driftList = el(doc, 'ul', { className: 'mx-list' });
-  driftBody.appendChild(driftSummary);
-  driftBody.appendChild(driftList);
-  drift.appendChild(driftBody);
-  body.appendChild(drift);
 
   const tools = el(doc, 'div', { className: 'mx-tools' });
   tools.appendChild(el(doc, 'span', { className: 'mx-tools-label', text: 'Show:' }));
@@ -1153,13 +1061,20 @@ function buildShell(doc) {
     tools.appendChild(b);
     filterBtns.set(f.id, b);
   }
+  const busToggle = el(doc, 'button', {
+    className: 'mx-chip',
+    text: 'Show all buses',
+    attrs: { type: 'button', 'aria-pressed': 'false' },
+  });
+  tools.appendChild(busToggle);
   body.appendChild(tools);
 
   const legend = el(doc, 'p', { className: 'mx-legend' });
   legend.textContent =
     `${GLYPHS.routed} routed · ${GLYPHS.notRouted} not routed · ` +
     `${GLYPHS.routedClean} routed to the CLEAN FEED · ${GLYPHS.notRoutedClean} not on the clean feed · ` +
-    `${GLYPHS.pending} staged, not sent · dashed outline = locked, the write path is disarmed. ` +
+    'dashed outline = locked, changes are not allowed. ' +
+    'While changes are allowed a click is SENT IMMEDIATELY - there is no Apply step. ' +
     'Meters are peak hold, two channels, scaled -60 to 0 dBFS. Mute and fader are read-only here.';
   body.appendChild(legend);
 
@@ -1170,8 +1085,8 @@ function buildShell(doc) {
   const table = el(doc, 'table', { className: 'mx-matrix' });
   const caption = el(doc, 'caption', { className: 'mx-caption' });
   caption.textContent =
-    'Rows are channel strips, columns are the seven mixer buses. ' +
-    `${busLabel(CLEAN_FEED_BUS)} is the feed the client receives.`;
+    'Rows are inputs. PGM is the programme output; CLN is the clean feed the client receives ' +
+    `(${busLabel(CLEAN_FEED_BUS)}). "Show all buses" adds the five that do not leave the building.`;
   const thead = el(doc, 'thead');
   const tbody = el(doc, 'tbody');
   table.appendChild(caption);
@@ -1190,22 +1105,14 @@ function buildShell(doc) {
     drawer,
     closeBtn,
     freshness,
-    cleanBanner,
+    cleanLine,
     armBtn,
     armState,
-    applyBtn,
-    discardBtn,
     notice,
-    stagedBox,
-    stagedList,
     awaitBox,
     awaitList,
-    driftToggle,
-    goldenBtn,
-    driftBody,
-    driftSummary,
-    driftList,
     filterBtns,
+    busToggle,
     matrixNote,
     thead,
     tbody,
@@ -1234,19 +1141,18 @@ function el(doc, tag, spec = {}) {
 }
 
 /**
- * pendingKey identifies one crosspoint in the staged-changes map.
+ * cellKey identifies one crosspoint.
  *
  * JSON, not a joined string. Strip names contain spaces ('MIC 1-1') and
  * hyphens ('cam22-1'), so there is no printable delimiter that is safe by
  * inspection; JSON.stringify of the pair is unambiguous for any pair of
- * strings, and nothing ever parses it back — the map's VALUE carries the strip
- * and bus.
+ * strings, and nothing ever parses it back.
  *
  * @param {string} strip
  * @param {string} bus
  * @returns {string}
  */
-function pendingKey(strip, bus) {
+function cellKey(strip, bus) {
   return JSON.stringify([strip, bus]);
 }
 

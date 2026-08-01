@@ -73,19 +73,27 @@ import (
 // A parser that ignores path unmarshals that state into a node, finds no
 // stream_state in it, and concludes that cam1 — the only input on the switcher
 // that was actually working — is not a router input. Once a second, forever.
-// Hence wholeNodePath below: an entry that is not at "/" is a partial update
-// this package does not know how to merge, and it is SKIPPED rather than
-// misread. Merging arbitrary subtrees would mean mirroring the whole document
-// and patching it by JSON pointer, on a path vocabulary that has been observed
-// for four paths and guessed at for none.
+// Hence wholeNodePath below: an entry at "/" carries a whole node and nothing
+// else does. isWholeNode is the only test applied, here and in document.go.
 //
-// WHAT THIS COSTS, stated plainly because it is not fixed here: the lamps are
-// updated by whole-node states, so they are correct when the socket opens and
-// then only change when M2L-X sends another whole-node state. Whether a
-// stream_state change is pushed at "/" or at some subtree path is NOT KNOWN —
-// no input changed state during the 150 s window, and finding out means making
-// one change state, which this package must not do to a live switcher. See the
-// report accompanying this change.
+// THE DELTAS ARE NOW MERGED, not skipped. Skipping them was the first fix and
+// it closed the misreading above at the cost of a worse bug: the lamps were
+// then correct at connect and frozen for the rest of the session, an input
+// that was stopped when the socket opened reading STOPPED, NO VIDEO and BAD
+// FORMAT however loudly it was actually streaming. The document that makes a
+// delta meaningful — the opening snapshot, patched by JSON pointer at each
+// delta's path — is document.go, and every rule it applies to a path it has
+// never seen is written out at the top of that file.
+//
+// WHAT IS STILL NOT KNOWN, and it is the same thing as before: whether a
+// stream_state change is pushed AT ALL, at "/" or at any subtree path. No
+// input changed state during the 150 s window, and finding out means making
+// one change state, which this package must not do to a live switcher. If it
+// turns out a transition is never pushed, merging deltas cannot help and only
+// a reconnect can — which is what watcher.go's resyncInterval is, explicitly a
+// backstop against this one unproven assumption. Whoever observes a real
+// transition should record the (node, path) of the frames it produces here,
+// and then delete that backstop.
 
 // wholeNodePath is the "path" of an entry that carries a node's ENTIRE state.
 // Every entry of the opening snapshot has it; no delta observed ever did.

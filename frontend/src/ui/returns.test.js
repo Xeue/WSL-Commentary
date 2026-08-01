@@ -47,8 +47,15 @@ test('the seven tracks are the M2L-X bundle enum, in mid order', () => {
   RETURN_BUSES.forEach((bus, i) => {
     assert.equal(bus.mid, want[i].mid, `entry ${i} is mid ${want[i].mid}`);
     assert.equal(bus.name, want[i].name, `mid ${want[i].mid} is ${want[i].name}`);
-    assert.ok(bus.label.startsWith(`mid ${bus.mid} — `), `mid ${bus.mid} label leads with its mid`);
     assert.ok(bus.label.includes(bus.name), `mid ${bus.mid} label names ${bus.name}`);
+    // The label does NOT carry the mid number: the operator shortened these by
+    // hand and the number is not their vocabulary. This is asserted rather than
+    // merely allowed, because it is what the RETURN_HINT test below depends on
+    // — the hint must not point at a number that appears nowhere on screen.
+    assert.ok(
+      !/^mid\s/i.test(bus.label),
+      `mid ${bus.mid} label "${bus.label}" leads with its mid number; the labels are name-only`,
+    );
   });
 });
 
@@ -72,13 +79,28 @@ test('no label carries the mixer bus names that used to be here', () => {
   }
 });
 
-test('mids 4 to 6 say they are mix-minus feeds derived from the MIC inputs', () => {
+test('mids 4 to 6 say they are mix-minus feeds, and name their MIC input', () => {
+  // The label says "mix-minus"; RETURN_HINT carries "N-1" and the explanation
+  // of why one of these can be legitimately silent. The two share the work so
+  // that the dropdown itself stays short, which is what the operator asked for.
   for (const mid of [4, 5, 6]) {
     const label = returnLabel(mid);
     assert.match(label, /mix-minus/i, `mid ${mid} says it is a mix-minus feed`);
-    assert.match(label, /N-1/, `mid ${mid} spells out N-1, which is the term on the desk`);
-    assert.match(label, new RegExp(`MIC ${mid - 3}`), `mid ${mid} names the MIC input it is derived from`);
+    assert.match(label, new RegExp(`MIC${mid - 3}`), `mid ${mid} names the MIC input it is derived from`);
   }
+});
+
+test('the hint refers to tracks by the names on screen, never by mid number', () => {
+  // The labels do not carry mid numbers, so a hint that says "mids 4-6" points
+  // at something the operator cannot see anywhere in the interface. It must use
+  // the same names the dropdown does.
+  for (const name of ['MIC1', 'MIC2', 'MIC3']) {
+    assert.ok(RETURN_HINT.includes(name), `the hint names ${name}, as the dropdown does`);
+  }
+  assert.ok(
+    !/\bmids?\s*\d/i.test(RETURN_HINT),
+    `the hint refers to a track by mid number, which appears nowhere on screen: "${RETURN_HINT}"`,
+  );
 });
 
 test('the hint keeps the "you can hear yourself" note and adds the silent-feed one', () => {
@@ -87,9 +109,14 @@ test('the hint keeps the "you can hear yourself" note and adds the silent-feed o
   // what to do about it.
   assert.match(RETURN_HINT, /hear yourself/i);
   assert.match(RETURN_HINT, /Try another/i);
-  // And the new one: silence on 4, 5 or 6 is a correct reading of an event with
-  // no MIC inputs, and it looks exactly like a failure.
-  assert.match(RETURN_HINT, /4–6|4-6/);
+  // And the new one: silence on the mix-minus feeds is a correct reading of an
+  // event with no MIC inputs, and it looks exactly like a failure.
+  //
+  // It used to name them "mids 4-6". That is no longer allowed — the labels
+  // carry no mid numbers, so the hint must use the names the dropdown shows.
+  // The test for that is immediately above this one.
+  assert.match(RETURN_HINT, /mix-minus/i);
+  assert.match(RETURN_HINT, /N-1/);
   assert.match(RETURN_HINT, /silent/i);
 });
 

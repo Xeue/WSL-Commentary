@@ -54,7 +54,7 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   showError(message) / clearError()   the dismissible error banner
  *
  * handlers = {
- *   onSettings(), onStartStop(),
+ *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onLevelChange(fraction),
  * }
@@ -75,12 +75,32 @@ export function createHomeView(handlers) {
   devBadge.textContent = 'DEV — fake backend';
   devBadge.hidden = true;
   titleWrap.append(title, devBadge);
+  // The two header controls. Mixer sits beside Settings because that is where
+  // the operator asked for it: it used to be a section INSIDE Settings, which
+  // meant reaching the clean-feed matrix through a configuration form.
+  //
+  // A commentator sees this button, so the drawer's read-only-until-armed gate
+  // matters more, not less. This file does not weaken it and cannot: it neither
+  // builds the drawer nor knows what one is. It raises onMixer; app.js decides
+  // what that means, and the host module beside it owns everything else.
+  //
+  // mixerwiring.test.js asserts that by reading this file's TEXT, so do not
+  // name the forbidden symbols here even in a comment.
+  const headerBtns = document.createElement('div');
+  headerBtns.className = 'topbar-actions';
+  const mixerBtn = document.createElement('button');
+  mixerBtn.type = 'button';
+  mixerBtn.className = 'btn btn-ghost';
+  mixerBtn.textContent = 'Mixer';
+  mixerBtn.title = 'Show which inputs are in the CLEAN FEED the client receives. Opens read-only.';
+  mixerBtn.addEventListener('click', () => handlers.onMixer());
   const settingsBtn = document.createElement('button');
   settingsBtn.type = 'button';
   settingsBtn.className = 'btn btn-ghost';
   settingsBtn.textContent = 'Settings';
   settingsBtn.addEventListener('click', () => handlers.onSettings());
-  header.append(titleWrap, settingsBtn);
+  headerBtns.append(mixerBtn, settingsBtn);
+  header.append(titleWrap, headerBtns);
 
   function setDevBadge(visible) {
     devBadge.hidden = !visible;
@@ -251,7 +271,7 @@ export function createHomeView(handlers) {
   levelGroup.className = 'control-group control-group-level';
   const levelLabel = document.createElement('label');
   levelLabel.htmlFor = 'level-slider';
-  levelLabel.textContent = 'Level';
+  levelLabel.textContent = 'Return Level';
   const levelSlider = document.createElement('input');
   levelSlider.type = 'range';
   levelSlider.id = 'level-slider';

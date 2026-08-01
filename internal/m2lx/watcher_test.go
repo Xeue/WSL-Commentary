@@ -630,11 +630,19 @@ func TestWatcher_MalformedFrameDoesNotCrashOrResetStaleness(t *testing.T) {
 	conn.push([]byte(`{not valid json`))
 	expectNoStatus(t, out)
 
-	// The watcher must still be alive and processing subsequent good
-	// frames.
-	conn.push(statusPayload("cam7", "streaming", liveVideoFormat, liveAudioFormat))
+	// The watcher must still be alive and processing subsequent good frames.
+	//
+	// The recovery frame carries a DIFFERENT stream_state from the first one
+	// on purpose. A Status is now emitted only when something a lamp reads has
+	// actually moved (watcher.go, lampView), so re-pushing the identical frame
+	// would be correctly silent and would prove nothing about whether the
+	// watcher is still running. A changed one distinguishes "alive" from
+	// "wedged", which is the whole point of the test.
+	conn.push(statusPayload("cam7", "stopped", liveVideoFormat, liveAudioFormat))
 	s := recvStatus(t, out)
 	if s.StreamState != "streaming" {
+		// Still "streaming": the change is inside the 4 s debounce window.
+		// What matters here is that a Status arrived at all.
 		t.Fatalf("StreamState after a malformed frame = %q", s.StreamState)
 	}
 }
@@ -747,6 +755,526 @@ func TestWatcher_DeltaFramesAreNotEvidenceAboutTheStatusKey(t *testing.T) {
 	// And one about our own node, which is the nastier half of the trap.
 	conn.push(frame(deltaEntry("cam22", "/statistics", `{"bitrate":507.4,"packet_count":3374}`)))
 	expectNoStatus(t, out)
+
+	// The delta about our own node has now been MERGED rather than skipped,
+	// and the proof that it merged into the right place is that the node is
+	// still whole: a following stream_state delta finds a node with a
+	// display_name and formats still on it, not the wreckage of a /statistics
+	// state that overwrote them.
+	conn.push(frame(deltaEntry("cam22", "/stream_state", `"stopped"`)))
+	s := recvStatus(t, out)
+	if s.Video.Codec != "h264" || len(s.Audio) != 1 || s.Audio[0].Codec != "aac" {
+		t.Fatalf("Status after a merged /statistics delta = %+v; the node was damaged by it", s)
+	}
+	if s.KeyError != "" {
+		t.Fatalf("KeyError = %q; the merged node stopped being a router input", s.KeyError)
+	}
+}
+
+func TestWatcher_AStreamStateDeltaMovesTheLamp(t *testing.T) {
+	// THE BUG. The lamps read stream_state, streams.video.format and
+	// streams.audio, all three of which live in the document the socket
+	// snapshots once and then updates by subtree. Skipping deltas — which is
+	// what stopped a "/statistics" frame being misread as a whole node —
+	// froze all three at the state of the first frame: an input that was
+	// stopped at connect read STOPPED, NO VIDEO and BAD FORMAT for the rest
+	// of the session, however loudly it was actually streaming.
+	//
+	// NOTE what this frame is: a synthetic delta at "/stream_state". Nobody
+	// has ever observed a real transition on this socket, so this is the
+	// shape one WOULD take, not one that was captured. That is exactly why
+	// resyncInterval exists as well.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	// Connect: the input is stopped, so both formats are null. This is the
+	// state the operator's lamps were frozen in.
+	conn.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStopped, `null`, `null`))))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStopped {
+		t.Fatalf("opening snapshot = %+v, want stopped", s)
+	}
+
+	// It comes up. The transition arrives as a subtree delta, and so do the
+	// formats that appear with it.
+	conn.push(frame(deltaEntry("cam22", "/stream_state", `"`+StreamStateStreaming+`"`)))
+	s := recvStatus(t, out)
+	if s.StreamState != StreamStateStopped {
+		t.Fatalf("StreamState = %q immediately after the delta; the 4 s debounce must still be holding", s.StreamState)
+	}
+
+	conn.push(frame(deltaEntry("cam22", "/streams", `{"video":{"format":`+liveVideoFormat+`},`+
+		`"audio":[{"format":`+liveAudioFormat+`}]}`)))
+	s = recvStatus(t, out)
+	if s.Video.Codec != "h264" || s.Video.Width != 1920 || s.Video.FrameRate != 50 {
+		t.Fatalf("Video = %+v after a /streams delta, want the merged format", s.Video)
+	}
+	if len(s.Audio) != 1 || s.Audio[0].Codec != "aac" || s.Audio[0].SampleRate != 48000 {
+		t.Fatalf("Audio = %+v after a /streams delta", s.Audio)
+	}
+
+	// And the debounce commits the state change from the passage of time,
+	// with no further frame, exactly as it does for a whole-node update.
+	for i := 0; i < 3; i++ {
+		tw.tickPlain()
+		expectNoStatus(t, out)
+	}
+	wait := tw.tick()
+	s = recvStatus(t, out)
+	wait()
+	if s.StreamState != StreamStateStreaming {
+		t.Fatalf("StreamState after the debounce window = %q, want streaming — the lamp never moved", s.StreamState)
+	}
+	if s.Stale {
+		t.Fatal("Stale = true; the socket has been delivering throughout")
+	}
+}
+
+func TestWatcher_ABurstOfLevelsDeltasProducesNoStatus(t *testing.T) {
+	// "/levels" arrives about fifteen times a second and carries nothing any
+	// lamp reads. Merging it is right; announcing it is not. Emitting a Status
+	// per delta would put ~21 events a second on the Wails bus to say
+	// precisely nothing, and would make the event stream useless as a signal
+	// that something changed.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(liveFrame(t))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStreaming || s.KeyError != "" {
+		t.Fatalf("the live connect snapshot produced %+v", s)
+	}
+
+	// Verbatim off the wire, at the rate it actually arrives.
+	levels := readFixture(t, liveDeltaLevels)
+	stats := readFixture(t, liveDeltaStatistics)
+	for i := 0; i < 15; i++ {
+		conn.push(levels)
+	}
+	// And the one that IS about a router input, but about the one number this
+	// package deliberately refuses to read (statistics.bitrate freezes on a
+	// dead feed — see wireNode).
+	for i := 0; i < 5; i++ {
+		conn.push(stats)
+	}
+	expectNoStatus(t, out)
+
+	// The socket is emphatically not stale: those frames all counted as
+	// liveness even though none of them was worth announcing.
+	for i := 0; i < int(StaleAfter/tickInterval)-1; i++ {
+		tw.tickPlain()
+	}
+	expectNoStatus(t, out)
+
+	// A frame that DOES move a lamp still gets through, so the gate above is
+	// selective rather than simply shut.
+	conn.push(frame(deltaEntry("cam22", "/streams/video/format", `null`)))
+	if s := recvStatus(t, out); s.Video.Raw != "" {
+		t.Fatalf("Video = %+v after the format went null, want it cleared", s.Video)
+	}
+}
+
+func TestWatcher_ResyncsPeriodicallyAndRebaselinesFromTheFreshSnapshot(t *testing.T) {
+	// The backstop, and the reason it is needed is stated plainly in
+	// resyncInterval: it is NOT KNOWN whether a stream_state change is pushed
+	// on this socket at all. If it only ever appears in the frame that opens a
+	// connection, merging deltas cannot help and nothing but a reconnect will.
+	//
+	// So this drives a socket that is perfectly healthy — no error, no drop,
+	// no token rotation — and requires it to be reopened anyway.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn1 := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn1}
+	tw.waitStarted(t)
+
+	conn1.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStopped, `null`, `null`))))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStopped {
+		t.Fatalf("opening snapshot = %+v, want stopped", s)
+	}
+
+	// conn1 never says another word — the case the backstop exists for.
+	// Pre-load the replacement, buffered, so whichever tick performs the
+	// resync finds a connection waiting rather than blocking on the test.
+	conn2 := newFakeConn()
+	for i := 0; i < 5; i++ {
+		tw.nextConn <- wsConnOrErr{conn: conn2}
+	}
+
+	// Silence outlasts StaleAfter long before it reaches resyncInterval, so
+	// the loop emits Stale Statuses throughout. Drain them: that is correct
+	// behaviour, not the thing under test, and emit() blocks on an unread
+	// channel. See TestWatcher_ReconnectsAfterConnectionDrop for the same
+	// mechanics and why the drain must be stopped before the next recvStatus.
+	drainStop := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case <-out:
+			case <-drainStop:
+				return
+			}
+		}
+	}()
+
+	var resyncURL string
+	for i := 0; i < int(resyncInterval/tickInterval)+5 && resyncURL == ""; i++ {
+		tw.tick()()
+		select {
+		case resyncURL = <-tw.dials:
+		default:
+		}
+	}
+	close(drainStop)
+	<-drainDone
+	if resyncURL == "" {
+		t.Fatalf("the status socket was never reopened; a lamp frozen by a transition that is only ever in the snapshot would stay frozen for the whole session")
+	}
+	if resyncURL != statusURL(testStatusHost, "tok-1") {
+		t.Errorf("resync dialled %q", resyncURL)
+	}
+
+	// The fresh connection's snapshot says the input is up now, and carries
+	// formats where the old baseline had nulls. Re-baselining is what makes
+	// those reach the lamps.
+	conn2.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	s := recvStatus(t, out)
+	if s.Stale {
+		t.Fatal("Stale = true on the resync snapshot")
+	}
+	if s.Video.Codec != "h264" || len(s.Audio) != 1 || s.Audio[0].Codec != "aac" {
+		t.Fatalf("Status = %+v; the document was not re-baselined from the fresh snapshot", s)
+	}
+
+	// stream_state is debounced like any other change, resync or not.
+	for i := 0; i < 3; i++ {
+		tw.tickPlain()
+		expectNoStatus(t, out)
+	}
+	wait := tw.tick()
+	s = recvStatus(t, out)
+	wait()
+	if s.StreamState != StreamStateStreaming {
+		t.Fatalf("StreamState after the resync and the debounce window = %q", s.StreamState)
+	}
+}
+
+func TestStatusSocket_ResyncOnAHealthySocket(t *testing.T) {
+	// The ordinary case: close the working connection, open a new one at once
+	// (the socket was fine a moment ago and this loop is what broke it), and
+	// leave the backoff ladder at rung zero.
+	tw := newTestWatcher(&fakeClientToken{token: "tok-1"})
+	sock := newStatusSocket(tw.w)
+	conn1 := newFakeConn()
+	sock.conn, sock.gen, sock.backoffN = conn1, 1, 0
+
+	conn2 := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn2}
+	sock.resync(context.Background(), base)
+
+	if u := <-tw.dials; u != statusURL(testStatusHost, "tok-1") {
+		t.Errorf("resync dialled %q", u)
+	}
+	if sock.conn != wsConn(conn2) {
+		t.Error("resync did not adopt the new connection")
+	}
+	if sock.gen != 2 {
+		t.Errorf("gen = %d, want the generation bumped so the old connection's frames are discarded", sock.gen)
+	}
+	if _, _, err := conn1.ReadMessage(); err == nil {
+		t.Error("the old connection was left open")
+	}
+}
+
+func TestStatusSocket_ResyncDoesNothingWhenTheSocketIsAlreadyDown(t *testing.T) {
+	// A socket that is already down is going to be redialled by maintain, on
+	// the backoff ladder, and that redial produces exactly the same fresh
+	// snapshot. Dialling on top of it would only fight the ladder — and the
+	// ladder is the thing keeping this application from hammering a switcher
+	// that is refusing connections.
+	tw := newTestWatcher(&fakeClientToken{token: "tok-1"})
+	sock := newStatusSocket(tw.w)
+	sock.backoffN = 3
+	sock.nextAttempt = base.Add(5 * time.Second)
+
+	// A connection is left waiting in the dialer so that a resync which
+	// wrongly dials gets an answer and this test FAILS on the assertion
+	// below, rather than blocking forever on an unserviced dial. A hang and a
+	// failure look the same to a CI log and are not the same to anybody
+	// reading it.
+	tw.nextConn <- wsConnOrErr{conn: newFakeConn()}
+
+	sock.resync(context.Background(), base)
+
+	select {
+	case u := <-tw.dials:
+		t.Fatalf("resync dialled %q while the socket was down and a retry was already scheduled", u)
+	default:
+	}
+	if sock.conn != nil {
+		t.Error("resync opened a connection while the backoff ladder was mid-climb")
+	}
+	if sock.backoffN != 3 || !sock.nextAttempt.Equal(base.Add(5*time.Second)) {
+		t.Errorf("resync disturbed the backoff ladder: backoffN = %d, nextAttempt = %v", sock.backoffN, sock.nextAttempt)
+	}
+}
+
+func TestStatusSocket_ResyncWhoseRedialFailsArmsTheLadder(t *testing.T) {
+	// The resync must not be able to leave the loop in a state the ordinary
+	// reconnect path does not already handle: a failed redial is a plain
+	// disconnection, backoff and all, and staleness fires at StaleAfter if it
+	// keeps failing.
+	tw := newTestWatcher(&fakeClientToken{token: "tok-1"})
+	sock := newStatusSocket(tw.w)
+	sock.conn, sock.gen = newFakeConn(), 1
+
+	tw.nextConn <- wsConnOrErr{err: errors.New("connection refused")}
+	sock.resync(context.Background(), base)
+	<-tw.dials
+
+	if sock.conn != nil {
+		t.Fatal("resync kept a connection after the redial failed")
+	}
+	if sock.backoffN != 1 {
+		t.Errorf("backoffN = %d, want the ladder armed at rung one", sock.backoffN)
+	}
+	if want := base.Add(backoffDuration(1)); !sock.nextAttempt.Equal(want) {
+		t.Errorf("nextAttempt = %v, want %v", sock.nextAttempt, want)
+	}
+}
+
+func TestWatcher_AReconnectRebuildsTheDocumentFromScratch(t *testing.T) {
+	// A re-baseline is a REPLACEMENT, and it has to be, for the same reason
+	// the enumerated inputs are forgotten on reconnect: the switcher may have
+	// been reconfigured while we were away. If the old document survived, a
+	// node deleted from the switcher would still be sitting in it, and the
+	// first delta that happened to name it would light the lamps green
+	// against a node that no longer exists.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn1 := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn1}
+	tw.waitStarted(t)
+
+	conn1.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStreaming {
+		t.Fatalf("first Status = %+v", s)
+	}
+
+	// Force a reconnect the deterministic way: the token lives in the URL, so
+	// rotating it obliges the loop to reopen the socket on its next tick.
+	conn2 := newFakeConn()
+	client.set("tok-2")
+	wait := tw.tick()
+	if u := <-tw.dials; u != statusURL(testStatusHost, "tok-2") {
+		t.Fatalf("redial URL = %q", u)
+	}
+	tw.nextConn <- wsConnOrErr{conn: conn2}
+	wait()
+
+	// The new switcher does not have cam22 at all.
+	conn2.push(frame(entry("cam1", streamState("Input 1", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	if s := recvStatus(t, out); !s.Stale || s.KeyError == "" {
+		t.Fatalf("Status = %+v, want the report: the new snapshot does not carry cam22", s)
+	}
+
+	// A delta naming cam22 must now find nothing to merge into. If the old
+	// document had survived the reconnect it would merge into the state
+	// captured from conn1 and emit a healthy Status for a node that is not on
+	// this switcher.
+	conn2.push(frame(deltaEntry("cam22", "/stream_state", `"`+StreamStateStreaming+`"`)))
+	expectNoStatus(t, out)
+	conn2.push(frame(deltaEntry("cam22", "/statistics", `{"bitrate":507.4}`)))
+	expectNoStatus(t, out)
+}
+
+func TestWatcher_AChangeToStreamsAudioAloneIsEmitted(t *testing.T) {
+	// streams.audio is a lamp input in its own right, and its LENGTH is the
+	// load-bearing part: an empty audio array is the MP2/AC-3 silent-drop
+	// signature — M2L-X keeps the video online and discards the audio without
+	// saying so (Status.Audio). A change gate that compared only stream_state
+	// and the video format would swallow exactly that.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	if s := recvStatus(t, out); len(s.Audio) != 1 {
+		t.Fatalf("opening snapshot = %+v", s)
+	}
+
+	// The audio is dropped. Nothing else about the node changes: same
+	// stream_state, same video format.
+	conn.push(frame(deltaEntry("cam22", "/streams/audio", `[]`)))
+	s := recvStatus(t, out)
+	if s.Audio == nil {
+		t.Fatal("Audio is nil, want a non-nil empty slice")
+	}
+	if len(s.Audio) != 0 {
+		t.Fatalf("Audio = %+v, want empty: the silent-drop signature was swallowed", s.Audio)
+	}
+	if s.StreamState != StreamStateStreaming || s.Video.Codec != "h264" {
+		t.Errorf("Status = %+v; only the audio should have moved", s)
+	}
+
+	// A second audio stream appearing is a change too, and one that a
+	// length-blind comparison would also miss in the other direction.
+	conn.push(frame(deltaEntry("cam22", "/streams/audio",
+		`[{"format":`+liveAudioFormat+`},{"format":`+liveAudioFormat+`}]`)))
+	if s := recvStatus(t, out); len(s.Audio) != 2 {
+		t.Fatalf("Audio = %+v, want two streams", s.Audio)
+	}
+
+	// The same audio arriving again is NOT a change, and must be silent.
+	conn.push(frame(deltaEntry("cam22", "/streams/audio",
+		`[{"format":`+liveAudioFormat+`},{"format":`+liveAudioFormat+`}]`)))
+	expectNoStatus(t, out)
+}
+
+func TestWatcher_ResyncForgetsTheOldConnectionsMergedDeltas(t *testing.T) {
+	// A re-baseline has to be a REPLACEMENT. If the new connection's snapshot
+	// were merged into the old document, a subtree the switcher has since
+	// dropped would outlive it — and the whole point of the resync is that the
+	// fresh snapshot is the authority.
+	d := newDocument()
+	if _, err := d.apply(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.apply(frame(deltaEntry("cam22", "/stream_state", `"stopped"`))); err != nil {
+		t.Fatal(err)
+	}
+	if node, _ := d.streamNode("cam22"); node.StreamState != StreamStateStopped {
+		t.Fatalf("the delta did not merge: %+v", node)
+	}
+
+	// What run() does on a new connection generation.
+	d = newDocument()
+	if _, err := d.apply(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat)))); err != nil {
+		t.Fatal(err)
+	}
+	node, ok := d.streamNode("cam22")
+	if !ok || node.StreamState != StreamStateStreaming {
+		t.Fatalf("cam22 = %+v, ok = %v; the new snapshot must win outright", node, ok)
+	}
+}
+
+func TestWatcher_ADeltaBeforeAnySnapshotIsNotAStatus(t *testing.T) {
+	// A connection whose first frame is a delta has no baseline to merge into.
+	// Assembling a node from subtrees alone would produce one with no
+	// stream_state — which reads exactly like "your statusKey names something
+	// that is not a router input", i.e. it would report a misconfiguration
+	// that does not exist.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(deltaEntry("cam22", "/stream_state", `"streaming"`)))
+	expectNoStatus(t, out)
+	conn.push(frame(deltaEntry("cam22", "/streams/video/format", liveVideoFormat)))
+	expectNoStatus(t, out)
+	conn.push(readFixture(t, liveDeltaLevels))
+	expectNoStatus(t, out)
+
+	// The snapshot arrives late and is the first thing that says anything.
+	conn.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStopped, `null`, `null`))))
+	s := recvStatus(t, out)
+	if s.StreamState != StreamStateStopped {
+		t.Fatalf("Status = %+v, want the snapshot's value and nothing invented from the deltas before it", s)
+	}
+	if s.Video.Raw != "" || len(s.Audio) != 1 || s.Audio[0].Raw != "" {
+		t.Fatalf("Status = %+v; a delta from before the baseline leaked into it", s)
+	}
+}
+
+func TestWatcher_AnUnmergeableDeltaLeavesTheLampsAlone(t *testing.T) {
+	// The synthetic half of the parsing guard, at the Watch loop rather than
+	// the document. Four paths have ever been observed; a path this package
+	// cannot follow must leave the last good reading standing, and above all
+	// must never let the delta's own state stand in for the node.
+	client := &fakeClientToken{token: "tok-1"}
+	tw := newTestWatcher(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := tw.w.Watch(ctx, "cam22")
+	<-tw.dials
+	conn := newFakeConn()
+	tw.nextConn <- wsConnOrErr{conn: conn}
+	tw.waitStarted(t)
+
+	conn.push(frame(entry("cam22", streamState("CLAUDE-COMMS", StreamStateStreaming, liveVideoFormat, liveAudioFormat))))
+	if s := recvStatus(t, out); s.StreamState != StreamStateStreaming {
+		t.Fatalf("opening snapshot = %+v", s)
+	}
+
+	// A whole node's worth of state, arriving with a path that is not "/" and
+	// that this package cannot follow. Reading it as a node would report cam22
+	// as stopped with no formats; misreading it as a whole node would be
+	// yesterday's bug back again.
+	for _, path := range []string{"", "stream_state", "/a//b", "/display_name/x", "/streams/audio/0"} {
+		conn.push(frame(deltaEntry("cam22", path,
+			`{"display_name":"WRONG","stream_state":"stopped","streams":{"audio":[],"video":{"format":null}}}`)))
+		expectNoStatus(t, out)
+	}
+
+	// Still streaming, still h264, still one AAC stream: nothing above
+	// touched the document, and the debounce has nothing pending either.
+	for i := 0; i < int(DebounceWindow/tickInterval)+2; i++ {
+		tw.tickPlain()
+		expectNoStatus(t, out)
+	}
+
+	conn.push(frame(deltaEntry("cam22", "/stream_state", `"`+StreamStateStopped+`"`)))
+	s := recvStatus(t, out)
+	if s.StreamState != StreamStateStreaming {
+		t.Fatalf("StreamState = %q; the confirmed value should still be streaming, with stopped only now pending", s.StreamState)
+	}
+	if s.Video.Codec != "h264" || len(s.Audio) != 1 || s.Audio[0].Codec != "aac" {
+		t.Fatalf("Status = %+v; an unmergeable delta damaged the node after all", s)
+	}
+	if s.KeyError != "" {
+		t.Fatalf("KeyError = %q; an unmergeable delta was taken as evidence about the statusKey", s.KeyError)
+	}
 }
 
 func TestWatcher_AKeyErrorIsOnlyDecidedFromASnapshot(t *testing.T) {
