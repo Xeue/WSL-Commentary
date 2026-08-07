@@ -854,3 +854,69 @@ func TestReturnChannelValid(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Element naming for dynamically added pads
+// ---------------------------------------------------------------------------
+
+// TestFakeSinkNamesCannotCollideAcrossAttempts guards a monitor that sits in
+// backoff for a whole match against an M2L-X answering perfectly.
+//
+// One pipeline is reused for every address resolveSinkHost returned, and tsdemux
+// names its src pads after the PID — audio_0100, video_0101 — so address 2
+// demuxes the same transport and produces the same pad names as address 1.
+// gst_bin_add REFUSES an element whose name is already taken in the bin, and it
+// refuses quietly. A fakesink name derived from the pad alone therefore cannot
+// be added on the second attempt, the undecoded pad is left with no sink, and an
+// unlinked demuxer src pad returns GST_FLOW_NOT_LINKED until mpegtsbase pauses
+// the task and posts an error. That is exactly the wedge the fakesink exists to
+// prevent, arriving through the mechanism meant to prevent it.
+//
+// The scenario is not hypothetical: it needs only a host that has gained a
+// second A record and a first address that got far enough to parse a PMT.
+func TestFakeSinkNamesCannotCollideAcrossAttempts(t *testing.T) {
+	const pad = "video_0101"
+
+	seen := make(map[string]uint64)
+	for seq := uint64(1); seq <= 8; seq++ {
+		name := fakeSinkName("retfake", seq, pad)
+		if first, dup := seen[name]; dup {
+			t.Fatalf("attempt %d produced the element name %q, already used by attempt %d: "+
+				"gst_bin_add refuses it and the pad is left unlinked", seq, name, first)
+		}
+		seen[name] = seq
+
+		if !strings.Contains(name, pad) {
+			t.Errorf("name %q drops the pad name; a bus message from this element "+
+				"cannot be traced back to a stream in a field log", name)
+		}
+		if !strings.HasPrefix(name, "retfake") {
+			t.Errorf("name %q does not carry the prefix it was given", name)
+		}
+	}
+}
+
+// TestFakeSinkNamesDifferPerPadWithinOneAttempt guards the other direction: a
+// transport carrying video and a second audio stream produces two undecoded pads
+// on the SAME attempt, and both need a sink.
+func TestFakeSinkNamesDifferPerPadWithinOneAttempt(t *testing.T) {
+	a := fakeSinkName("retfake", 1, "video_0101")
+	b := fakeSinkName("retfake", 2, "audio_0102")
+	if a == b {
+		t.Fatalf("two pads on one attempt got the same element name %q", a)
+	}
+}
+
+// TestFakeSinkNameSurvivesAnUnnamedPad guards the degenerate case. A pad with no
+// name would otherwise yield a name ending in "-", and two of them would collide
+// with each other — the sequence number already prevents that, but a name that
+// ends in a dangling separator reads as a truncated log line.
+func TestFakeSinkNameSurvivesAnUnnamedPad(t *testing.T) {
+	name := fakeSinkName("retfake", 3, "")
+	if strings.HasSuffix(name, "-") {
+		t.Errorf("name %q ends in a separator with nothing after it", name)
+	}
+	if name == fakeSinkName("retfake", 4, "") {
+		t.Error("two unnamed pads produced the same element name")
+	}
+}

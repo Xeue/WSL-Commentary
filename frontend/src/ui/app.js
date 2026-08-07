@@ -13,6 +13,11 @@ import {
   normaliseReturnSource,
   deriveReturnSourceEffects,
 } from './returnsource.js';
+// The return path state machine. Every stop, start, mute and un-mute of either
+// return path goes through it — this file no longer calls startReturn,
+// stopReturn or setAudioEnabled itself, and must not start again. See the header
+// of returnpath.js for why the ordering is a module rather than a convention.
+import { createReturnPath, returnOptsFingerprint } from './returnpath.js';
 import { DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../monitor/channels.js';
 
 // The frontend seam (fixed by CONTRACT.md, not negotiable by either side):
@@ -51,10 +56,30 @@ export function mountApp(root) {
   // hearing nothing and every lamp green.
   let currentHeadphoneDevices = [];
   let currentOutputDevices = [];
-  /** 'webrtc' | 'srt'. The path currently feeding the commentator's ears. */
+  /**
+   * 'webrtc' | 'srt'. The path currently feeding the commentator's ears.
+   *
+   * It is a MIRROR of returnPath.source, kept in step by the onSource callback
+   * below. It is assigned in exactly one other place — init, before the monitor
+   * is constructed, because createMonitor has to be told whether to build its
+   * audio silent and returnPath.adoptSaved cannot run until it exists. Every
+   * other read is read-only. Assigning to it from a handler would put the
+   * decision back in two places, which is the shape of the bug returnpath.js
+   * exists to remove.
+   */
   let currentReturnSource = DEFAULT_RETURN_SOURCE;
-  /** Guards against two overlapping source switches leaving both paths on. */
-  let sourceSwitchInFlight = false;
+
+  /**
+   * The gst.ReturnOpts fingerprint the RUNNING SRT return was started with.
+   *
+   * gst.ReturnOpts is read once, in Play. Nothing about a running pipeline
+   * changes when the configuration does, so a Settings save that alters the
+   * channel or the WASAPI endpoint leaves every control on screen agreeing with
+   * a pipeline that disagrees with all of them — deterministically, not as a
+   * race. Comparing this against the saved config is how a save that matters is
+   * told from one that does not.
+   */
+  let runningReturnOpts = '';
 
   const settings = createSettingsView({
     onBack: showHome,
@@ -98,6 +123,57 @@ export function mountApp(root) {
       else console.info(`wslcomms: mixer: ${message}`);
     },
   });
+
+  // --- the return path ------------------------------------------------------
+
+  /**
+   * returnPath owns every transition between the two return paths.
+   *
+   * It is given the effects and nothing else — no DOM, no configuration — which
+   * is what lets "exactly one path is audible, in every reachable state
+   * including every failure path" be tested as a property rather than as three
+   * examples. See returnpath.test.js.
+   *
+   * setWebRTCAudible goes through safeMonitorCall, so it cannot throw. That
+   * matters: the machine treats it as infallible, and a monitor that is missing
+   * or broken is a MONITOR lamp problem, not a reason to abandon a transition
+   * half-done.
+   */
+  const returnPath = createReturnPath({
+    startReturn: () => backend.startReturn(),
+    stopReturn: () => backend.stopReturn(),
+    setWebRTCAudible: (on) => safeMonitorCall((m) => m.setAudioEnabled(on)),
+    saveSource: (source) => persistConfigAndWait({ returnSource: source }),
+    isAlreadyRunning: backend.isReturnAlreadyRunningError,
+    isNotRunning: backend.isReturnNotRunningError,
+    showError: (message) => home.showError(message),
+    log: (message) => console.info(message),
+    onSource: (source) => {
+      currentReturnSource = source;
+      home.setReturnSource(source);
+      renderHeadphoneList();
+    },
+  });
+
+  /**
+   * afterReturnOperation records what the running return was built from, and
+   * reports a refusal.
+   *
+   * A refusal is the in-flight guard doing its job — two of these sequences
+   * running at once is how a stop from one lands between the other's stop and
+   * start — so it is said out loud and the control is put back to what the
+   * configuration actually holds, rather than left showing a choice that was
+   * never applied.
+   */
+  function afterReturnOperation(result, revert) {
+    runningReturnOpts =
+      returnPath.source === RETURN_SOURCE_SRT ? returnOptsFingerprint(currentConfig) : '';
+    if (result && result.applied === false && result.reason) {
+      home.showError(`That change was not applied: ${result.reason}.`);
+      if (revert) revert();
+    }
+    return result;
+  }
 
   function showSettings() {
     // Settings must not be opened behind a live mixer drawer: the drawer is
@@ -322,19 +398,20 @@ export function mountApp(root) {
 
     if (effects.srtRunning) {
       // wasapi2sink's device is fixed when the pipeline is built, so retargeting
-      // means restarting the monitor — and StartReturn reads the endpoint out of
-      // the SAVED config, so the save has to land first or the return comes back
-      // up on the old endpoint and says it succeeded.
-      //
-      // Stop before start: two monitors dialled into the same M2L-X output would
-      // hold two of its four fan-out slots.
-      (async () => {
-        await persistConfigAndWait({ [effects.deviceKey]: deviceId });
-        await backend.stopReturn().catch((err) => {
-          console.info('wslcomms: nothing to stop before moving the SRT return:', err.message);
-        });
-        await backend.startReturn();
-      })().catch((err) => home.showError(`Could not move the SRT return: ${err.message}`));
+      // means restarting the monitor. returnPath.applyOption owns that sequence:
+      // it saves first (StartReturn reads the endpoint out of the SAVED config,
+      // so a start racing its own save comes back up on the old endpoint and
+      // reports success), it stops before it starts (two monitors dialled into
+      // the same M2L-X output would hold two of its four fan-out slots), it
+      // holds the same in-flight guard the source switch does, and — the part
+      // that used to be missing — it puts the commentator on WebRTC rather than
+      // leaving them in silence if the restart fails.
+      returnPath
+        .applyOption({
+          what: 'SRT headphone device',
+          save: () => persistConfigAndWait({ [effects.deviceKey]: deviceId }),
+        })
+        .then((result) => afterReturnOperation(result, renderHeadphoneList));
       return;
     }
 
@@ -380,13 +457,16 @@ export function mountApp(root) {
     // setter for it. Changing it means saving and rebuilding the pipeline —
     // which is a second or two of silence, and the honest alternative is a
     // control that appears to do nothing until the next restart.
-    (async () => {
-      await persistConfigAndWait({ returnChannel: channel });
-      await backend.stopReturn().catch((err) => {
-        console.info('wslcomms: nothing to stop before rebuilding the SRT return:', err.message);
-      });
-      await backend.startReturn();
-    })().catch((err) => home.showError(`Could not change the SRT return channel: ${err.message}`));
+    returnPath
+      .applyOption({
+        what: 'return channel',
+        save: () => persistConfigAndWait({ returnChannel: channel }),
+      })
+      .then((result) =>
+        afterReturnOperation(result, () =>
+          home.setReturnChannel(normaliseChannelMode(currentConfig?.returnChannel)),
+        ),
+      );
   }
 
   /**
@@ -407,75 +487,44 @@ export function mountApp(root) {
    */
   async function onReturnSourceChange(source) {
     const next = normaliseReturnSource(source);
-    if (next === currentReturnSource || sourceSwitchInFlight) {
-      home.setReturnSource(currentReturnSource);
-      return;
-    }
-    sourceSwitchInFlight = true;
-    const previous = currentReturnSource;
     home.clearError();
 
-    try {
-      const effects = deriveReturnSourceEffects(next);
+    const result = await returnPath.select(next);
+    afterReturnOperation(result, () => home.setReturnSource(returnPath.source));
 
-      // 1. Silence whatever is audible now.
-      if (!effects.webrtcAudible) safeMonitorCall((m) => m.setAudioEnabled(false));
-      if (!effects.srtRunning) {
-        await backend.stopReturn().catch((err) => {
-          // StopReturn rejects when nothing was running, which is the normal
-          // case here and not a failure. A stop that fails for a real reason is
-          // logged but must not abort the switch either: the alternative is
-          // refusing to leave SRT, which strands the commentator on a path that
-          // is already not working.
-          console.info('wslcomms: stopping the SRT return:', err.message);
-        });
-      }
-
-      // 2. Adopt the new path and SAVE IT. StartReturn reads returnSource out
-      //    of the saved config and refuses unless it is already "srt", so this
-      //    save is not bookkeeping — it is a precondition of step 3.
-      currentReturnSource = next;
-      await persistConfigAndWait({ returnSource: next });
-      home.setReturnSource(next);
-      renderHeadphoneList();
-
-      // 3. Start the incoming path.
-      if (effects.srtRunning) {
-        await backend.startReturn();
-        home.setSRTReturnState(await backend.getReturnState());
-      } else {
-        // Asked, not assumed. App.IsSRTReturnSelected is the single place that
-        // decides which path owns the headphones; comparing returnSource to a
-        // string literal here would put the same decision in two languages, and
-        // the failure of the two disagreeing is both paths playing at once.
-        const srtOwnsHeadphones = await backend.isSRTReturnSelected();
-        safeMonitorCall((m) => m.setAudioEnabled(!srtOwnsHeadphones));
-        safeMonitorCall((m) => m.setSinkId(selectedHeadphoneId(next)));
-      }
-    } catch (err) {
-      // The new path did not start. Go back to the old one rather than leaving
-      // the commentator with nothing: the previous path is known to have been
-      // working a moment ago.
-      home.showError(
-        `Could not switch the return to ${next.toUpperCase()}: ${err.message}. ` +
-          `Staying on ${previous.toUpperCase()}.`,
-      );
-      currentReturnSource = previous;
-      home.setReturnSource(previous);
-      renderHeadphoneList();
+    // The control follows the machine, not the click. On every path — applied,
+    // refused, or recovered onto WebRTC after a failed start — onSource has
+    // already put the segmented control and the Headphones list where the audio
+    // actually is, and this only fills in the two things the machine cannot
+    // know about.
+    if (returnPath.source === RETURN_SOURCE_SRT) {
+      // The status line for a return that is now running. It is a separate call
+      // because it can fail on its own — a build without GetReturnState — and a
+      // failure to READ the state must not be mistaken for a failure to start.
       try {
-        await persistConfigAndWait({ returnSource: previous });
-        if (previous === RETURN_SOURCE_SRT) await backend.startReturn();
-        else safeMonitorCall((m) => m.setAudioEnabled(true));
-      } catch (e) {
-        console.error('wslcomms: could not restore the previous return path', e);
-        // Last resort. If even the restore failed, the WebRTC path is the one
-        // that needs no backend at all, so it is the one to leave audible
-        // rather than leaving the commentator in silence.
-        safeMonitorCall((m) => m.setAudioEnabled(true));
+        home.setSRTReturnState(await backend.getReturnState());
+      } catch (err) {
+        console.info('wslcomms: the SRT return state could not be read:', err.message);
       }
-    } finally {
-      sourceSwitchInFlight = false;
+    } else {
+      // Asked, not assumed. App.IsSRTReturnSelected is the single place that
+      // decides which path owns the headphones; comparing returnSource to a
+      // string literal here would put the same decision in two languages.
+      //
+      // It is a CHECK, not the mechanism: returnPath has already stopped the SRT
+      // return and un-muted WebRTC in that order. If Go disagrees with what just
+      // happened, that is worth a line in the console and is not a reason to
+      // re-mute a commentator who is listening.
+      try {
+        if (await backend.isSRTReturnSelected()) {
+          console.warn(
+            'wslcomms: the Go side still reports the SRT return as selected after a switch to WebRTC',
+          );
+        }
+      } catch (err) {
+        console.info('wslcomms: could not confirm which path owns the headphones:', err.message);
+      }
+      safeMonitorCall((m) => m.setSinkId(selectedHeadphoneId(returnPath.source)));
     }
   }
 
@@ -504,6 +553,44 @@ export function mountApp(root) {
       if (sink && currentReturnSource !== RETURN_SOURCE_SRT) m.setSinkId(sink);
     });
     showHome();
+
+    // AND APPLY IT TO A RUNNING SRT RETURN, which the lines above do not.
+    //
+    // Everything they touch is live: the Web Audio graph, the crop, the
+    // dropdowns. gst.ReturnOpts is not. It is read once, in Play, so a channel
+    // or endpoint saved here reaches a pipeline that will never look at it
+    // again — the operator sets "Left only", saves, every control on screen
+    // agrees, and comms is still in their right ear. Deterministic, not a race,
+    // and silent.
+    //
+    // Only when something the pipeline was actually BUILT from has changed:
+    // rebuilding on every Save would take the return away for a second or two
+    // because somebody corrected a typo in the event id.
+    applyReturnOptionsFromConfig();
+  }
+
+  /**
+   * applyReturnOptionsFromConfig rebuilds a running SRT return when the saved
+   * configuration no longer matches what it was started with.
+   *
+   * The comparison is over returnOptsFingerprint — every field app_return.go's
+   * returnOpts reads, and nothing else. returnpath.test.js asserts that list is
+   * still the same list by reading returnOpts itself, because a field added
+   * there and forgotten here is exactly this bug again.
+   */
+  function applyReturnOptionsFromConfig() {
+    if (returnPath.source !== RETURN_SOURCE_SRT) {
+      runningReturnOpts = '';
+      return;
+    }
+    if (returnOptsFingerprint(currentConfig) === runningReturnOpts) return;
+
+    returnPath
+      // The save has already happened — Settings wrote the whole config — so
+      // this only needs the rebuild. applyOption still owns the ordering, the
+      // in-flight guard and the fallback to WebRTC if the restart fails.
+      .applyOption({ what: 'saved return settings', save: async () => {} })
+      .then((result) => afterReturnOperation(result));
   }
 
   // --- monitor -------------------------------------------------------------
@@ -584,12 +671,19 @@ export function mountApp(root) {
     safeMonitorCall((m) => m.stop());
     // An SRT caller left dialled in holds one of M2L-X's four fan-out slots
     // after this window is gone. Best-effort — beforeunload cannot await — and
-    // only when there is something to stop, because StopReturn rejects
-    // otherwise. app.go's teardown stops it as well; this is the earlier of the
-    // two, not the only one.
-    if (currentReturnSource === RETURN_SOURCE_SRT) {
-      backend.stopReturn().catch(() => {});
-    }
+    // app.go's teardown stops it as well; this is the earlier of the two, not
+    // the only one.
+    //
+    // UNCONDITIONAL, not "only if the selected path is SRT". StopReturn rejects
+    // when nothing was running and that rejection is free, whereas the case this
+    // covers is not hypothetical: it is precisely a page whose belief about
+    // what is running has come apart from the Go side that leaves a monitor
+    // behind, and that is the page least able to tell.
+    //
+    // It does not go through returnPath, and does not need to: stopping can only
+    // ever take audio away. The machine owns the two directions that can make
+    // something audible.
+    backend.stopReturn().catch(() => {});
   });
 
   // --- startup ---------------------------------------------------------
@@ -635,6 +729,13 @@ export function mountApp(root) {
     );
 
     // The saved path, honoured — but never a path this build cannot run.
+    //
+    // This is the one assignment to currentReturnSource outside onSource, and it
+    // has to be here: createMonitor below is told at CONSTRUCTION whether to
+    // build its audio silent, and returnPath.adoptSaved — which is what sets the
+    // mirror everywhere else — cannot run before the monitor it drives exists.
+    // adoptSaved re-establishes it a few lines later through the same callback
+    // every other transition uses.
     const savedSource = normaliseReturnSource(currentConfig.returnSource);
     currentReturnSource =
       savedSource === RETURN_SOURCE_SRT && !srtAvailable ? DEFAULT_RETURN_SOURCE : savedSource;
@@ -647,25 +748,31 @@ export function mountApp(root) {
     // if SRT is the saved path, so there is no window in which both are live.
     setUpMonitor(currentConfig);
 
-    if (currentReturnSource === RETURN_SOURCE_SRT) {
+    // Bring the saved path into force.
+    //
+    // This runs even when the saved path is WEBRTC, and it is not a no-op then:
+    // adoptSaved asks the Go side to stop before it un-mutes, because "the saved
+    // path is WebRTC" does not prove nothing is running. A page that reloaded
+    // after a failed switch — or one whose beforeunload stopReturn() did not
+    // complete before the context died — can find an orphaned monitor playing
+    // into the same headphones, and nothing else in the application would ever
+    // stop it. The cost of asking is one StopReturn that usually rejects with
+    // errReturnNotRunning; the cost of assuming is a commentator hearing the
+    // match twice from the moment the page loads.
+    //
+    // No save is needed for the SRT case: currentReturnSource came from the
+    // saved config, so what StartReturn is about to read is already on disk.
+    const adopted = await returnPath.adoptSaved(currentReturnSource);
+    afterReturnOperation(adopted);
+
+    if (returnPath.source === RETURN_SOURCE_SRT) {
       try {
-        // No save needed: currentReturnSource came from the saved config, so
-        // what StartReturn is about to read is already what is on disk.
-        await backend.startReturn();
         home.setSRTReturnState(await backend.getReturnState());
       } catch (err) {
-        // Falling back to WebRTC rather than leaving the commentator in silence
-        // on a path that did not start.
-        home.showError(
-          `The SRT return did not start: ${err.message}. Falling back to the WebRTC return.`,
-        );
-        currentReturnSource = DEFAULT_RETURN_SOURCE;
-        // Saved, so the Go side's own view of which path owns the headphones
-        // agrees with what is actually playing.
-        persistConfig({ returnSource: DEFAULT_RETURN_SOURCE });
-        home.setReturnSource(currentReturnSource);
-        renderHeadphoneList();
-        safeMonitorCall((m) => m.setAudioEnabled(true));
+        // A build with StartReturn but no GetReturnState. The return IS running;
+        // only its status line is missing, and this is the throw that used to
+        // land in the recovery above and un-mute WebRTC over the top of it.
+        console.info('wslcomms: the SRT return state could not be read:', err.message);
       }
     }
   })();

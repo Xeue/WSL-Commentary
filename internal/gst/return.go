@@ -479,6 +479,46 @@ func MixMatrixString(m [][]float32) string {
 }
 
 // ---------------------------------------------------------------------------
+// Element naming for dynamically added pads
+// ---------------------------------------------------------------------------
+
+// fakeSinkName builds the element name for a sink attached to one of the
+// demuxer's dynamically created pads.
+//
+// # Why a sequence number and not just the pad name
+//
+// gst_bin_add REFUSES an element whose name is already taken in that bin, and it
+// refuses by returning FALSE with a warning on the GStreamer log — not by
+// raising anything a caller is likely to be watching. So a name that can repeat
+// is a link that can silently fail to be made, and on this path an undecoded pad
+// that never got a sink wedges the demuxer a few seconds later: gst_pad_push
+// returns GST_FLOW_NOT_LINKED, mpegtsbase aggregates it, and the whole transport
+// stops. That is the exact failure the sinks exist to prevent, arriving through
+// the mechanism meant to prevent it.
+//
+// Pad names DO repeat. tsdemux names its pads after the PID — audio_0100,
+// video_0101 — so the same transport re-demuxed produces the same names every
+// time. One pipeline is reused across every address resolveSinkHost returned, so
+// an M2L-X host with two A records demuxes the same PIDs twice; a PMT update
+// mid-stream can do it a third time without any address changing. The sequence
+// number is monotonic per pipeline, so no two calls can collide however many
+// times the same PID comes back.
+//
+// The pad name is kept as well, after the number, because these names are what
+// appears as the source of a bus message and "retfake-2-video_0101" locates a
+// fault in a field log where "retfake-2" does not.
+//
+// It lives here, in the build-tag-free half, so that the property can be tested
+// in both builds — see TestFakeSinkNamesCannotCollideAcrossAttempts. The cgo
+// half is the only caller.
+func fakeSinkName(prefix string, seq uint64, padName string) string {
+	if padName == "" {
+		padName = "unnamed"
+	}
+	return fmt.Sprintf("%s-%d-%s", prefix, seq, padName)
+}
+
+// ---------------------------------------------------------------------------
 // The contract
 // ---------------------------------------------------------------------------
 

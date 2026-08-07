@@ -279,6 +279,12 @@ type returnPipeline struct {
 	sink      gogst.Element
 	fakeSinks []gogst.Element
 
+	// fakeSeq numbers the fakesinks so that no two can ever be given the same
+	// element name. It is an atomic rather than a padMu-guarded counter because
+	// it is incremented on the demuxer's streaming thread and read nowhere else;
+	// see fakeSinkName in return.go for what a repeated name costs.
+	fakeSeq atomic.Uint64
+
 	// padMu guards audioLinked, audioReady and fakeSinks, all touched from the
 	// demuxer's streaming thread inside onPadAdded.
 	padMu       sync.Mutex
@@ -531,11 +537,45 @@ func (r *returnPipeline) signalAudioReady() {
 // toNullForRetry takes the pipeline back to NULL between address attempts, so
 // that a failed srtsrc's socket is released rather than left half-open while
 // another connect is attempted from the same pipeline.
+//
+// It also takes the previous attempt's fakesinks back out of the bin. THE
+// PIPELINE IS REUSED ACROSS ADDRESSES, and everything the last attempt's
+// demuxer built is still in it: sinks linked to pads that no longer exist,
+// which the next attempt has no use for and which gst_bin_add would have to
+// find distinct names around. fakeSinkName already guarantees the names are
+// distinct, so this is not what keeps address 2 working — it is what stops the
+// bin growing a sink per undecoded pad per address for the life of an M2L-X
+// instance with several A records.
+//
+// The order is fixed: the pipeline reaches NULL first, which stops the streaming
+// threads and brings every child to NULL with it, and only then are the elements
+// removed. gst_bin_remove unlinks the pads it finds linked, but removing an
+// element from a bin that is still rolling is a race with the thread pushing
+// into it.
 func (r *returnPipeline) toNullForRetry() {
 	if r.pipeline == nil {
 		return
 	}
 	r.pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(elementShutdownTimeout))
+
+	r.padMu.Lock()
+	stale := r.fakeSinks
+	r.fakeSinks = nil
+	r.padMu.Unlock()
+
+	for _, fake := range stale {
+		if fake == nil {
+			continue
+		}
+		if !r.pipeline.Remove(fake) {
+			// Logged, not delivered. The next attempt is not harmed by a sink
+			// left behind — its own names are unique — so this is a hygiene
+			// failure, and putting it on Errors would abort a reconnect that can
+			// still succeed.
+			log.Printf("gst: return monitor: could not remove %s from the pipeline between attempts",
+				fake.GetName())
+		}
+	}
 }
 
 // drainErrors discards everything currently queued, without blocking.
@@ -837,7 +877,13 @@ func padMediaKind(pad gogst.Pad) string {
 // because its consequence is the demuxer wedging a few seconds later and the
 // operator being told nothing.
 func (r *returnPipeline) fakeSinkFor(pipeline gogst.Pipeline, pad gogst.Pad) {
-	name := nameReturnFakeSink + "-" + pad.GetName()
+	// The name carries a per-pipeline sequence number, NOT just the pad name.
+	// tsdemux names pads after the PID, one pipeline is retried against every
+	// address resolveSinkHost returned, and gst_bin_add refuses a duplicate name
+	// — so a name derived from the pad alone makes every address after the first
+	// fail to sink its undecoded pads, and an unsinked pad wedges the demuxer.
+	// See fakeSinkName in return.go.
+	name := fakeSinkName(nameReturnFakeSink, r.fakeSeq.Add(1), pad.GetName())
 	fake := gogst.ElementFactoryMake("fakesink", name)
 	if fake == nil {
 		r.deliver(errors.New("gst: return monitor: could not create fakesink for " + pad.GetName()))
@@ -855,14 +901,19 @@ func (r *returnPipeline) fakeSinkFor(pipeline gogst.Pipeline, pad gogst.Pad) {
 		fake.SetObjectProperty("async", false)
 	}
 
-	r.padMu.Lock()
-	r.fakeSinks = append(r.fakeSinks, fake)
-	r.padMu.Unlock()
-
 	if !pipeline.Add(fake) {
 		r.deliver(errors.New("gst: return monitor: could not add " + name + " to the pipeline"))
 		return
 	}
+	// Recorded only once it is IN the bin, because the list means "elements this
+	// pipeline put in the bin and must take back out" — see toNullForRetry.
+	// Recording an element that was never added would make the retry path call
+	// gst_bin_remove on a stranger. `fake` stays reachable across the Add either
+	// way, which is the other thing the list has to guarantee.
+	r.padMu.Lock()
+	r.fakeSinks = append(r.fakeSinks, fake)
+	r.padMu.Unlock()
+
 	if !fake.SyncStateWithParent() {
 		r.deliver(errors.New("gst: return monitor: " + name + " would not sync state with the pipeline"))
 		return

@@ -611,3 +611,100 @@ func TestReturnPassphraseIsForgivingWhereStartIsStrict(t *testing.T) {
 	}
 	_ = a.StopReturn()
 }
+
+// ---------------------------------------------------------------------------
+// The premises the frontend's recovery rests on
+// ---------------------------------------------------------------------------
+
+// TestStopReturnDropsItsSessionBeforeItCanFail guards a premise the frontend's
+// recovery is built on, in the file where the premise lives.
+//
+// frontend/src/ui/returnpath.js stops the SRT return before it ever makes the
+// WebRTC return audible, and it treats EVERY outcome of that stop — including a
+// reported failure — as "the Go side is no longer running a monitor". That is
+// only true because StopReturn clears a.ret BEFORE it calls mon.Stop(), so a
+// monitor whose Stop failed is still gone from this App's point of view and a
+// later StartReturn will build a fresh one rather than refusing.
+//
+// Move the a.ret = nil after the Stop and the frontend's reasoning silently
+// becomes wrong: a failed stop would leave a session behind, the next
+// StartReturn would answer errReturnAlreadyRunning forever, and the recovery
+// would un-mute WebRTC over the top of a monitor it could never stop.
+func TestStopReturnDropsItsSessionBeforeItCanFail(t *testing.T) {
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+
+	mon.stopErr = errors.New("gst: return monitor: pipeline would not go to NULL")
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() = %v", err)
+	}
+	if err := a.StopReturn(); err == nil {
+		t.Fatal("the test's premise is wrong: StopReturn reported success on a failing monitor")
+	}
+
+	// The session must be gone even though the stop failed, so that the frontend
+	// can start again rather than being told one is already running forever.
+	a.retMu.Lock()
+	sess := a.ret
+	a.retMu.Unlock()
+	if sess != nil {
+		t.Fatal("StopReturn kept its session after a failed Stop. The frontend stops the " +
+			"return before it un-mutes WebRTC and treats any outcome as 'no monitor is being " +
+			"managed'; keeping the session here makes that false and the next StartReturn " +
+			"would refuse with errReturnAlreadyRunning for the rest of the match.")
+	}
+
+	// And a second StartReturn must be accepted, which is the observable form of
+	// the same property.
+	withFakeReturn(a)
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() after a failed StopReturn = %v, want nil", err)
+	}
+	_ = a.StopReturn()
+}
+
+// TestReturnSentinelsAreSpelledAsTheFrontendMatchesThem guards the string
+// contract across the Wails boundary.
+//
+// Wails flattens a Go error to its message, so neither sentinel survives as
+// anything a JavaScript caller can compare identities on.
+// frontend/src/ui/backend.js therefore matches on the text, and if the two drift
+// apart the frontend stops recognising "already running" — treats it as a failed
+// start, falls back to WebRTC and un-mutes it while an orphaned pipeline is
+// still writing CLN to the same headphones. returnpath.test.js asserts the same
+// pair from the other side; this is the half that fails when the Go text is the
+// thing that moved.
+func TestReturnSentinelsAreSpelledAsTheFrontendMatchesThem(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errReturnAlreadyRunning, "the return monitor is already running"},
+		{errReturnNotRunning, "the return monitor is not running"},
+	} {
+		if !strings.Contains(strings.ToLower(tc.err.Error()), tc.want) {
+			t.Errorf("%q no longer contains %q, which frontend/src/ui/backend.js matches on",
+				tc.err.Error(), tc.want)
+		}
+	}
+
+	// StartReturn must return the sentinel UNWRAPPED, so the message the
+	// frontend sees is the sentinel's own text and not a prefix around it.
+	a, _ := newTestApp(t)
+	withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() = %v", err)
+	}
+	err := a.StartReturn()
+	if !errors.Is(err, errReturnAlreadyRunning) {
+		t.Fatalf("a second StartReturn = %v, want errReturnAlreadyRunning", err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "the return monitor is already running") {
+		t.Errorf("the message that crosses the Wails boundary is %q, which the frontend "+
+			"cannot recognise as the already-running refusal", err.Error())
+	}
+	_ = a.StopReturn()
+}

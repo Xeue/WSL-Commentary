@@ -250,15 +250,46 @@ const (
 	// reading entirely — which is exactly the case the discarding is for.
 	eventQueueDepth = 64
 
-	// shutdownTimeout bounds the whole ordered teardown.
+	// shutdownTimeout bounds the whole ordered teardown: a.Stop() and
+	// a.StopReturn(), in that order, sharing one budget.
 	//
-	// The one wait teardown cannot shorten is a gst.Pipeline.ReplaceSink already
-	// in flight: it is synchronous by contract and internal/gst bounds it at
-	// sinkStateChangeTimeout, ten seconds. Add internal/gst's
-	// elementShutdownTimeout of five seconds for taking the pipeline to NULL and
-	// fifteen seconds is the sum, not a guess. Past it the process exits anyway
-	// and lets the OS reclaim the audio endpoint.
-	shutdownTimeout = 15 * time.Second
+	// # What it covers
+	//
+	// a.Stop's worst case is a gst.Pipeline.ReplaceSink already in flight. That
+	// is synchronous by contract and internal/gst bounds it at
+	// sinkStateChangeTimeout, ten seconds; add elementShutdownTimeout, five
+	// seconds, for taking the pipeline to NULL. Fifteen seconds is that sum. The
+	// contribution feed is the path that must be given every chance to finish, so
+	// it gets the whole budget if it needs it.
+	//
+	// a.StopReturn is normally prompt — the monitor sits in RECEIVING, its
+	// backoff wait is cancelled rather than served, and Close is bounded at
+	// elementShutdownTimeout. Twenty seconds gives that ordinary case five
+	// seconds of headroom after a sender stop that used its whole budget, which
+	// is the only reason this is twenty and not fifteen.
+	//
+	// # WHAT IT DOES NOT COVER, AND IS NOT MEANT TO
+	//
+	// A StopReturn that lands while gst returnPipeline.Play is in flight WILL BE
+	// CUT OFF. Play holds the pipeline lock across a DNS resolve
+	// (hostResolveTimeout, three seconds) and then, per resolved address, a state
+	// change to PLAYING (returnStateChangeTimeout, ten), a wait for the demuxer's
+	// audio pad (returnAudioPadTimeout, ten) and a return to NULL
+	// (elementShutdownTimeout, five) — thirty-three seconds for a single address
+	// and more for a name with several. No value written here would contain that
+	// without making a closed window hang for the best part of a minute.
+	//
+	// That is an accepted loss, not an oversight. The window has already gone; a
+	// wslcomms.exe left in Task Manager after a match is a support call. What is
+	// abandoned is a headphone endpoint and an SRT socket, and process exit
+	// releases both — including the M2L-X fan-out slot, which goes when the
+	// socket closes whether or not GStreamer was asked politely.
+	//
+	// Neither figure bounds the SYNCHRONOUS half of a GStreamer state change:
+	// gst_element_set_state takes no timeout and runs on the calling goroutine,
+	// so a wedged WASAPI endpoint hangs past any of this. That is what the
+	// timeout is a backstop for.
+	shutdownTimeout = 20 * time.Second
 
 	// statusKeyDiscoveryWindow is how long a statusKey discovery watches
 	// switcher_status after START before giving up.

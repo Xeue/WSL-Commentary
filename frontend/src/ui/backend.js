@@ -489,6 +489,14 @@ const RETURN_METHODS = Object.freeze({
 });
 
 /**
+ * RETURN_METHOD_NAMES is every Go method the SRT return path needs, derived from
+ * the table above rather than listed again — a sixth binding added there is
+ * covered here without a second edit, and srtReturnAvailable is what decides
+ * whether the option is offered at all.
+ */
+const RETURN_METHOD_NAMES = Object.freeze(Object.values(RETURN_METHODS));
+
+/**
  * BindingMissingError means the Wails runtime is real but does not export the
  * method — an older build, or a sibling still mid-edit. Distinct from an
  * ordinary failure because the remedy is different: nothing the operator can do
@@ -520,9 +528,80 @@ async function callGoBound(method, ...args) {
  * all. False against a Wails build without the bindings; the UI uses it to
  * disable the SRT option with a reason rather than offering a button that always
  * fails.
+ *
+ * IT CHECKS ALL FIVE, not just start and stop. Every one of them is called on a
+ * path that has already assumed availability: getReturnState() straight after
+ * startReturn(), isSRTReturnSelected() when switching back to WebRTC, and
+ * listOutputDevices() to fill the Headphones dropdown. A build with StartReturn
+ * and StopReturn but not GetReturnState offers the option, starts the return,
+ * and then throws a BindingMissingError out of the line after the start — which
+ * lands in the caller's recovery path WITH A MONITOR ALREADY RUNNING. Deciding
+ * availability on a subset is how a missing binding turns into a wrong recovery.
  */
 export function srtReturnAvailable() {
-  return hasBinding(RETURN_METHODS.start) && hasBinding(RETURN_METHODS.stop);
+  return RETURN_METHOD_NAMES.every(hasBinding);
+}
+
+/**
+ * RETURN_ALREADY_RUNNING is the text of app_return.go's errReturnAlreadyRunning.
+ *
+ * It is a STRING CONTRACT and it is mirrored here on purpose: Wails flattens a
+ * Go error to its message, so the sentinel does not survive the boundary as
+ * anything else. returnsource.test.js asserts that app_return.go still spells it
+ * this way, because the cost of the two drifting apart is silent — the caller
+ * stops recognising "already running", treats it as a failed start, and takes
+ * the recovery path while a monitor is running.
+ */
+export const RETURN_ALREADY_RUNNING = 'the return monitor is already running';
+
+/**
+ * isReturnAlreadyRunningError reports whether err is StartReturn's refusal to
+ * open a SECOND monitor.
+ *
+ * This is not a failure to start; it means one is already up. It happens for one
+ * ordinary reason: the WebView reloaded. beforeunload fires stopReturn() and
+ * cannot await it, the page dies before the IPC completes, and the Go-side
+ * monitor outlives the context that asked for it. The new page then reads
+ * returnSource: "srt" and gets this back from its own StartReturn.
+ *
+ * Treated as a failure it produces the worst outcome this application has: the
+ * caller falls back to WebRTC, un-mutes it, and the orphaned GStreamer pipeline
+ * is still playing CLN into the same headphones a few hundred milliseconds
+ * apart. The right response is stop-then-start, which is what
+ * ui/returnpath.js does with this.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isReturnAlreadyRunningError(err) {
+  if (!err) return false;
+  const message = typeof err === 'string' ? err : String(err.message ?? err);
+  return message.toLowerCase().includes(RETURN_ALREADY_RUNNING);
+}
+
+/**
+ * RETURN_NOT_RUNNING is the text of app_return.go's errReturnNotRunning, under
+ * the same string contract as RETURN_ALREADY_RUNNING above.
+ */
+export const RETURN_NOT_RUNNING = 'the return monitor is not running';
+
+/**
+ * isReturnNotRunningError reports whether err is StopReturn's "there was nothing
+ * to stop".
+ *
+ * That is the NORMAL answer on most stop paths — the return is stopped
+ * unconditionally before WebRTC is made audible, precisely so that nothing has
+ * to be assumed about whether one was running — so it must be distinguishable
+ * from a stop that genuinely failed. A red banner on every ordinary path switch
+ * trains people to ignore the banner.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isReturnNotRunningError(err) {
+  if (!err) return false;
+  const message = typeof err === 'string' ? err : String(err.message ?? err);
+  return message.toLowerCase().includes(RETURN_NOT_RUNNING);
 }
 
 // FAKE_OUTPUT_DEVICES are WASAPI RENDER endpoints. Their ids deliberately do
@@ -603,6 +682,15 @@ export async function startReturn() {
     throw new Error(
       `wslcomms: cannot start the SRT return: returnSource is "${fakeConfig.returnSource || 'webrtc'}"`,
     );
+  }
+  // And it refuses a SECOND monitor, exactly as app_return.go's
+  // errReturnAlreadyRunning does. A fake that quietly restarted instead would
+  // hide the whole stop-then-start recovery: the case is reached by nothing more
+  // exotic than reloading the WebView while the SRT return is up, and it is the
+  // case in which getting the recovery wrong puts both paths in the
+  // commentator's ears.
+  if (fakeReturnState !== RETURN_STATE.STOPPED) {
+    throw new Error(`wslcomms: ${RETURN_ALREADY_RUNNING}`);
   }
   if (fakeReturnTimer) clearTimeout(fakeReturnTimer);
   setFakeReturnState(RETURN_STATE.CONNECTING);

@@ -234,50 +234,115 @@ test('the UI says the picture is unchanged by this control', () => {
 // The wiring: silence first, then start
 // --------------------------------------------------------------------------
 
-/** switchBody is the body of app.js's one source-switching function. */
-function switchBody() {
-  const src = ui('app.js');
-  const start = src.indexOf('async function onReturnSourceChange(');
-  assert.ok(start > 0, 'app.js must have exactly one source-switching function');
-  const end = src.indexOf('sourceSwitchInFlight = false;', start);
-  assert.ok(end > start, 'the function must clear its in-flight guard');
-  return src.slice(start, end);
+// The ordering used to be asserted here, as three lines of app.js read as text,
+// because driving app.js would need a DOM shim and a Wails runtime. It is not
+// asserted that way any more, and the reason is not that the shim got easier:
+// the ordering MOVED. It lives in returnpath.js, which takes its effects as
+// arguments and can therefore be driven for real — see returnpath.test.js, where
+// "exactly one path is audible" is checked over every entry point crossed with
+// every combination of which call fails and how.
+//
+// What is left here is the property that makes that worth anything: THE ORDERING
+// EXISTS IN EXACTLY ONE PLACE. A second stop/start/mute sequence written into a
+// handler would be a second ordering to get right, and the one that gets it
+// wrong will be the one written in a hurry twenty minutes before kick-off.
+
+/**
+ * codeOnly strips comments, so that a note DISCUSSING a call cannot satisfy — or
+ * break — a guard that counts call sites. Same reasoning as
+ * internal/gst/gst_stub_test.go's parseSource, which parses without comments.
+ */
+function codeOnly(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
-test('the switch silences WebRTC BEFORE it starts the SRT return', () => {
-  const body = switchBody();
-  const mute = body.indexOf('setAudioEnabled(false)');
-  const startSRT = body.indexOf('startReturn(');
-  assert.ok(mute > -1, 'the switch must be able to silence the WebRTC path');
-  assert.ok(startSRT > -1, 'and to start the SRT one');
+test('nothing outside the machine can make a return path AUDIBLE', () => {
+  // Stopping and muting are safe from anywhere: they can only ever take audio
+  // away. STARTING and UN-MUTING are the dangerous direction, because getting
+  // either one out of order with the other is both paths in the commentator's
+  // ears — so both live behind the one seam, and this is what says so.
+  const src = codeOnly(ui('app.js'));
+  const seamStart = src.indexOf('const returnPath = createReturnPath({');
+  const seamEnd = src.indexOf('\n  });', seamStart);
+  assert.ok(seamStart > 0 && seamEnd > seamStart, 'app.js must build the return path machine');
+
+  for (const [call, why] of [
+    ['backend.startReturn(', 'starting the SRT return'],
+    ['setAudioEnabled(', 'silencing or un-silencing the WebRTC return'],
+  ]) {
+    let at = src.indexOf(call);
+    assert.ok(at > -1, `app.js must reach ${call} somewhere`);
+    while (at > -1) {
+      assert.ok(
+        at > seamStart && at < seamEnd,
+        `app.js calls ${call} outside the returnpath.js seam: ${why} is the machine's job, ` +
+          'and a second call site is a second ordering to get right',
+      );
+      at = src.indexOf(call, at + 1);
+    }
+  }
+});
+
+test('every transition in app.js goes through the one machine', () => {
+  const src = codeOnly(ui('app.js'));
+  for (const entry of ['select', 'applyOption', 'adoptSaved']) {
+    assert.match(
+      src,
+      new RegExp(`returnPath\\s*\\.\\s*${entry}\\(`),
+      `app.js must reach the machine through returnPath.${entry}()`,
+    );
+  }
   assert.ok(
-    mute < startSRT,
-    'WebRTC must be silenced before SRT is started — the other order is both paths at once',
+    !src.includes('sourceSwitchInFlight'),
+    'the in-flight guard belongs to the machine, which is the only thing that can hold it ' +
+      'across a source switch AND a channel change AND a headphone change',
   );
 });
 
-test('the switch stops the SRT return BEFORE it un-mutes WebRTC', () => {
-  const body = switchBody();
-  const stopSRT = body.indexOf('stopReturn(');
-  const unmute = body.indexOf('setAudioEnabled(true)');
-  assert.ok(stopSRT > -1 && unmute > -1);
-  assert.ok(stopSRT < unmute, 'SRT must be stopped before WebRTC is made audible again');
+test('the machine silences the outgoing path before starting the incoming one', () => {
+  // Asserted against returnpath.js's source as well as its behaviour, because
+  // the structural statement is the one that survives a refactor: the ONLY route
+  // to setWebRTCAudible(true) is goWebRTC, and goWebRTC awaits stopReturn first.
+  const src = ui('returnpath.js');
+
+  const unmutes = [...codeOnly(src).matchAll(/io\.setWebRTCAudible\(true\)/g)];
+  assert.equal(
+    unmutes.length,
+    1,
+    'there must be exactly ONE place WebRTC is made audible; each extra one is an ' +
+      'ordering that has to be got right again',
+  );
+
+  const fn = src.slice(src.indexOf('async function goWebRTC()'));
+  const body = fn.slice(0, fn.indexOf('\n  }'));
+  assert.ok(
+    body.includes('io.setWebRTCAudible(true)'),
+    'the single un-mute must be inside goWebRTC',
+  );
+  assert.ok(
+    body.indexOf('await stopSRT()') < body.indexOf('io.setWebRTCAudible(true)'),
+    'goWebRTC must stop the SRT return BEFORE it un-mutes WebRTC',
+  );
+
+  const startFn = src.slice(src.indexOf('async function startSRT()'));
+  const startBody = startFn.slice(0, startFn.indexOf('\n  }'));
+  assert.ok(
+    startBody.indexOf('muteWebRTC()') < startBody.indexOf('io.startReturn()'),
+    'startSRT must silence WebRTC BEFORE it starts the SRT return',
+  );
 });
 
-test('the switch is the only place either path is made audible', () => {
-  // A second call site is a second ordering to get right, and the one that gets
-  // it wrong will be the one written in a hurry.
-  const src = ui('app.js');
-  const enables = src.match(/setAudioEnabled\(/g) || [];
-  const starts = src.match(/backend\.startReturn\(/g) || [];
-  assert.ok(enables.length > 0 && starts.length > 0);
-  // Both appear in the switch, in the switch's error recovery, and in startup.
-  // What must NOT exist is a call in a handler that does not also deal with the
-  // other path — so every startReturn call site must sit in a file that also
-  // silences WebRTC.
+test('errReturnAlreadyRunning is stop-then-start, not a failed start', () => {
+  // It says a monitor IS running. Treated as a failure the caller falls back to
+  // WebRTC and un-mutes it over the top of an orphaned GStreamer pipeline that
+  // is still writing CLN to the same headphones.
+  const src = ui('returnpath.js');
+  const startFn = src.slice(src.indexOf('async function startSRT()'));
+  const body = startFn.slice(0, startFn.indexOf('\n  }'));
+  assert.match(body, /isAlreadyRunning\(err\)/, 'startSRT must recognise the refusal');
   assert.ok(
-    src.includes('setAudioEnabled(false)'),
-    'anything that can start the SRT return must also be able to silence WebRTC',
+    body.indexOf('await stopSRT()') > body.indexOf('isAlreadyRunning(err)'),
+    'and answer it by stopping what is running before starting again',
   );
 });
 
@@ -425,12 +490,25 @@ test('StartReturn takes no arguments, so the config is saved before it is called
     'it really does take no arguments',
   );
 
-  const body = switchBody();
-  const save = body.indexOf('persistConfigAndWait({ returnSource: next })');
-  const start = body.indexOf('backend.startReturn(');
+  // The ordering is in returnpath.js's select(), on the branch that adopts SRT.
+  const src = ui('returnpath.js');
+  const fn = src.slice(src.indexOf('async function select(next)'));
+  const body = fn.slice(0, fn.indexOf('\n  async function restore'));
+  const save = body.indexOf('await io.saveSource(wanted)');
+  const start = body.indexOf('await startSRT()');
   assert.ok(save > -1, 'the switch must await the save');
-  assert.ok(start > -1);
-  assert.ok(save < start, 'and it must land before StartReturn reads it');
+  assert.ok(start > -1, 'and start the return');
+  assert.ok(save < start, 'and the save must land before StartReturn reads it');
+
+  // The same ordering on the rebuild path, where it is the difference between a
+  // channel change taking effect and the pipeline coming back up on the old one
+  // while reporting success.
+  const rebuild = src.slice(src.indexOf('async function rebuildSRT('));
+  const rebuildBody = rebuild.slice(0, rebuild.indexOf('\n  }'));
+  assert.ok(
+    rebuildBody.indexOf('await save()') < rebuildBody.indexOf('await startSRT()'),
+    'a rebuild must save before it starts, or the return comes back on the previous settings',
+  );
 });
 
 test('which path owns the headphones is asked of Go, not decided twice', () => {
@@ -447,6 +525,84 @@ test('a build without the bindings says so instead of failing opaquely', () => {
   assert.match(js, /export function srtReturnAvailable\(\)/, 'and the UI can ask before offering the option');
   assert.match(ui('app.js'), /srtReturnAvailable\(\)/, 'and app.js does ask');
   assert.match(ui('home.js'), /setSRTAvailable/, 'and the option can be disabled with a reason');
+});
+
+test('srtReturnAvailable checks EVERY binding the SRT path calls, not just two', () => {
+  // Availability decides whether the option is offered at all, and every one of
+  // the five is called on a path that has already assumed it:
+  //
+  //   GetReturnState       straight after startReturn(), where a throw used to
+  //                        land in the recovery WITH A MONITOR RUNNING
+  //   IsSRTReturnSelected  when switching back to WebRTC
+  //   ListOutputDevices    to fill the Headphones dropdown for the SRT path
+  //
+  // A build with StartReturn and StopReturn but not GetReturnState would offer
+  // the option, start the return, and then fail on the next line — which is how
+  // a missing binding turns into a wrong recovery. It is also what makes it safe
+  // for returnpath.js to treat a BindingMissingError from StopReturn as proof
+  // that nothing is running: no StopReturn means no StartReturn means nothing
+  // was ever started.
+  const js = ui('backend.js');
+
+  const tableStart = js.indexOf('const RETURN_METHODS');
+  const table = js.slice(tableStart, js.indexOf('});', tableStart));
+  const named = [...table.matchAll(/'([A-Z][A-Za-z]+)'/g)].map((m) => m[1]);
+  assert.equal(named.length, 5, `RETURN_METHODS should name five Go methods, found ${named}`);
+
+  const fn = js.slice(js.indexOf('export function srtReturnAvailable()'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+
+  // It must consult the whole table rather than a hand-picked subset. Either it
+  // iterates every value, or it names all five — anything else is a subset that
+  // will be wrong the next time a binding is added.
+  const iterates = /RETURN_METHOD_NAMES\.every\(|Object\.values\(RETURN_METHODS\)\.every\(/.test(
+    body,
+  );
+  if (!iterates) {
+    for (const method of named) {
+      assert.ok(
+        body.includes(method),
+        `srtReturnAvailable does not check ${method}. It is called on a path that assumes ` +
+          'the option was offered, so a build missing it fails after the return has started.',
+      );
+    }
+  }
+
+  // And the list it iterates has to be the whole table, not a copy.
+  if (iterates) {
+    assert.match(
+      js,
+      /RETURN_METHOD_NAMES = Object\.freeze\(Object\.values\(RETURN_METHODS\)\)/,
+      'RETURN_METHOD_NAMES must be derived from RETURN_METHODS, not listed again',
+    );
+  }
+});
+
+test('a Settings save reaches a RUNNING SRT return, not just the controls', () => {
+  // gst.ReturnOpts is read once, in Play. Nothing about a running pipeline
+  // changes when the configuration does — so without this the operator sets
+  // "Left only", presses Save, every control on screen agrees, and comms is
+  // still in their right ear. Deterministic, not a race, and silent.
+  const src = ui('app.js');
+
+  const start = src.indexOf('function onConfigSaved(config)');
+  assert.ok(start > 0, 'app.js must handle a Settings save');
+  const body = src.slice(start, src.indexOf('\n  function applyReturnOptionsFromConfig', start));
+  assert.match(
+    body,
+    /applyReturnOptionsFromConfig\(\)/,
+    'a Settings save must apply the saved return options to a running SRT return',
+  );
+
+  const applyStart = src.indexOf('function applyReturnOptionsFromConfig()');
+  const apply = src.slice(applyStart, src.indexOf('\n  }', applyStart));
+  assert.match(
+    apply,
+    /returnOptsFingerprint\(currentConfig\)/,
+    'and it must decide on what the pipeline was BUILT from, not on every save: ' +
+      'rebuilding because somebody corrected a typo takes the return away for a second',
+  );
+  assert.match(apply, /returnPath\s*[\s\S]*\.applyOption\(/, 'through the one machine');
 });
 
 test('the fake refuses to start the SRT return while returnSource is webrtc', () => {

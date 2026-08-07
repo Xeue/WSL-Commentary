@@ -2274,3 +2274,80 @@ func TestGetStatusKeyCandidatesReturnsACopyAndNeverNil(t *testing.T) {
 		t.Fatalf("a caller mutated the stored candidates: %q", second[0].Key)
 	}
 }
+
+// TestShutdownTimeoutJustificationNamesEveryStopItBounds guards against a
+// justification that has stopped being true.
+//
+// shutdownTimeout is not a number on its own. It is a number plus an argument
+// about which waits it contains, and that argument is what the next person
+// reading it will trust instead of re-deriving. The failure this catches is
+// silent and has already happened once: teardownOrdered grew a StopReturn call
+// while the comment still explained fifteen seconds as "the sum" of two timeouts
+// that belong entirely to the SENDER's path — so the sum was arithmetically
+// right about a set of waits that was no longer the set being performed.
+//
+// The rule is not "the budget must cover everything". Some of it genuinely
+// cannot be covered — a return Stop landing on a Play in flight runs to
+// thirty-three seconds for one address, and containing that would make a closed
+// window hang for the best part of a minute. The rule is that every stop the
+// teardown performs must be ACCOUNTED FOR in the justification: covered, or
+// named as expected to be cut off. Either is honest; silence is not.
+func TestShutdownTimeoutJustificationNamesEveryStopItBounds(t *testing.T) {
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Fatalf("reading app.go: %v", err)
+	}
+	text := string(src)
+
+	// The doc comment on the constant: from "// shutdownTimeout bounds" to the
+	// declaration itself.
+	start := strings.Index(text, "// shutdownTimeout bounds")
+	if start < 0 {
+		t.Fatal("app.go no longer documents shutdownTimeout")
+	}
+	end := strings.Index(text[start:], "shutdownTimeout =")
+	if end < 0 {
+		t.Fatal("app.go no longer declares shutdownTimeout after its comment")
+	}
+	justification := text[start : start+end]
+
+	// Every a.Something() call teardownOrdered makes that can block on a
+	// pipeline. Read from the source rather than listed here, so that a step
+	// added later is caught rather than assumed away.
+	bodyStart := strings.Index(text, "func (a *App) teardownOrdered() {")
+	if bodyStart < 0 {
+		t.Fatal("app.go no longer has teardownOrdered")
+	}
+	body := text[bodyStart : bodyStart+strings.Index(text[bodyStart:], "\n}\n")]
+
+	for _, call := range []string{"a.Stop()", "a.StopReturn()"} {
+		if !strings.Contains(body, call) {
+			continue // no longer part of the teardown; nothing to justify
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(call, "a."), "()")
+		if !strings.Contains(justification, name) {
+			t.Errorf("teardownOrdered calls %s but shutdownTimeout's justification never "+
+				"mentions %s. Say what its worst case is and whether this budget covers it — "+
+				"a stop that is expected to be cut off is a fine answer, an unstated one is not.",
+				call, name)
+		}
+	}
+
+	// The specific false claim that was there before: fifteen seconds presented
+	// as "the sum" of the sender's two timeouts, with a second stop in the same
+	// budget. If the justification ever claims to be a complete sum again, it has
+	// to also say what is outside it.
+	if strings.Contains(justification, "the sum, not a guess") &&
+		strings.Contains(body, "a.StopReturn()") {
+		t.Error("shutdownTimeout is justified as a complete sum while teardownOrdered runs a " +
+			"second stop inside the same budget; the sum is of the sender's waits only")
+	}
+
+	// And it must be at least the sender's own worst case, which is the one wait
+	// the teardown genuinely cannot shorten.
+	const senderWorstCase = 15 * time.Second
+	if shutdownTimeout < senderWorstCase {
+		t.Errorf("shutdownTimeout = %s, below the sender's own bounded worst case of %s",
+			shutdownTimeout, senderWorstCase)
+	}
+}

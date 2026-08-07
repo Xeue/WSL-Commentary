@@ -420,7 +420,8 @@ func funcBody(t *testing.T, fset *token.FileSet, file *ast.File, receiver, name 
 		}
 		return buf.String()
 	}
-	t.Fatalf("%s has no function %s (receiver %q)", cgoSourceFile, name, receiver)
+	t.Fatalf("%s has no function %s (receiver %q)",
+		fset.Position(file.Pos()).Filename, name, receiver)
 	return ""
 }
 
