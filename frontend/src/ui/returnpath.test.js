@@ -602,9 +602,9 @@ test('returnOptsFingerprint changes for every field gst.ReturnOpts is built from
   const base = {
     srtHost: 'm2lx.example',
     m2lxHost: 'm2lx.example',
-    srtReturnPort: 40503,
+    srtReturnPort: 40501,
     srtLatencyMs: 120,
-    pbkeylen: 0,
+    srtReturnPBKeyLen: 0,
     returnChannel: 'stereo',
     headphoneEndpointId: '{0.0.0.00000000}.{aaaa}',
     // Fields that must NOT force a rebuild: nothing in gst.ReturnOpts reads them.
@@ -612,6 +612,10 @@ test('returnOptsFingerprint changes for every field gst.ReturnOpts is built from
     returnMid: 2,
     audioDeviceId: '{0.0.1.00000000}.{bbbb}',
     headphoneDeviceId: 'browser-id',
+    // The SEND path's key length. app_return.go stopped reading it when the two
+    // paths were given separate encryption settings, so changing it must no
+    // longer tear down a working monitor.
+    pbkeylen: 0,
   };
   const baseline = returnOptsFingerprint(base);
 
@@ -624,7 +628,7 @@ test('returnOptsFingerprint changes for every field gst.ReturnOpts is built from
     );
   }
 
-  for (const key of ['returnGainDb', 'returnMid', 'audioDeviceId', 'headphoneDeviceId']) {
+  for (const key of ['returnGainDb', 'returnMid', 'audioDeviceId', 'headphoneDeviceId', 'pbkeylen']) {
     const changed = { ...base, [key]: `${base[key]}-changed` };
     assert.equal(
       returnOptsFingerprint(changed),
@@ -649,7 +653,11 @@ test('RETURN_OPTS_CONFIG_KEYS covers every config field app_return.go reads', ()
     EffectiveSRTHost: ['srtHost', 'm2lxHost'],
     EffectiveSRTReturnPort: ['srtReturnPort'],
     SRTLatencyMs: ['srtLatencyMs'],
-    PBKeyLen: ['pbkeylen'],
+    // The RETURN path's key length, not the send path's PBKeyLen. If
+    // app_return.go ever reads cfg.PBKeyLen again this table has no entry for
+    // it and the assertion below fails, which is the point: the two paths dial
+    // endpoints M2L-X encrypts independently.
+    SRTReturnPBKeyLen: ['srtReturnPBKeyLen'],
     EffectiveReturnChannel: ['returnChannel'],
     HeadphoneEndpointID: ['headphoneEndpointId'],
   };

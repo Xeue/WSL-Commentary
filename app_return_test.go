@@ -11,7 +11,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -565,7 +568,7 @@ func TestReturnOptsCarryThePassphraseAndNothingLogsIt(t *testing.T) {
 	setConfig(a, srtReturnConfig())
 
 	const secret = "correct-horse-battery-staple"
-	if err := store.Set(secrets.KeySRT, secret); err != nil {
+	if err := store.Set(secrets.KeySRTReturn, secret); err != nil {
 		t.Fatalf("store.Set() error = %v", err)
 	}
 
@@ -585,31 +588,457 @@ func TestReturnOptsCarryThePassphraseAndNothingLogsIt(t *testing.T) {
 	_ = a.StopReturn()
 }
 
-func TestReturnPassphraseIsForgivingWhereStartIsStrict(t *testing.T) {
-	// App.srtPassphrase refuses to start the FEED when pbkeylen is non-zero and
-	// no passphrase is stored, because an encrypted session with no key fails
-	// inside libsrt with an error nobody can read twenty minutes before
-	// kick-off, and Start is the moment to be strict.
-	//
-	// The return is a monitor. The same combination there costs an amber lamp
-	// and a line in the log, and the reconnect loop keeps trying — which is a
-	// better outcome than a button that will not work and an error box about a
-	// field the operator has not been asked about yet.
-	a, _ := newTestApp(t)
-	withFakeReturn(a)
+// TestTheReturnUsesItsOwnPassphraseAndKeyLength is the property the whole
+// change exists for.
+//
+// M2L-X sets encryption PER OUTPUT — Output 1 (pgm, 40501) measured
+// encrypted=false while Outputs 2 and 3 measured encrypted=true — so the
+// commentary INPUT the feed goes to and the OUTPUT the monitor comes from
+// routinely need different answers. When the return read secrets.KeySRT and
+// cfg.PBKeyLen there was no way to express that: setting the key that makes the
+// monitor work changed the key the feed goes out with, and the two faults are
+// indistinguishable from the outside.
+func TestTheReturnUsesItsOwnPassphraseAndKeyLength(t *testing.T) {
+	a, store := newTestApp(t)
+	mon := withFakeReturn(a)
+
+	const sendSecret = "the-contribution-input-key"
+	const returnSecret = "the-programme-output-key"
+	if err := store.Set(secrets.KeySRT, sendSecret); err != nil {
+		t.Fatalf("store.Set(KeySRT) error = %v", err)
+	}
+	if err := store.Set(secrets.KeySRTReturn, returnSecret); err != nil {
+		t.Fatalf("store.Set(KeySRTReturn) error = %v", err)
+	}
 
 	cfg := srtReturnConfig()
-	cfg.PBKeyLen = 16 // asks for encryption; no passphrase is stored
+	cfg.PBKeyLen = 16          // the send path negotiates AES-128
+	cfg.SRTReturnPBKeyLen = 32 // the return negotiates AES-256
+	setConfig(a, cfg)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	opts, _ := mon.startedWith()
+
+	if opts.Passphrase == sendSecret {
+		t.Fatal("the return was given the SEND path's passphrase. Those are the keys to two " +
+			"different M2L-X endpoints; sharing them means fixing the monitor breaks the feed.")
+	}
+	if opts.Passphrase != returnSecret {
+		t.Fatalf("Passphrase = %q, want the one stored under %q", opts.Passphrase, secrets.TargetSRTReturn)
+	}
+	if opts.PBKeyLen != 32 {
+		t.Errorf("PBKeyLen = %d, want srtReturnPBKeyLen's 32, not pbkeylen's %d",
+			opts.PBKeyLen, cfg.PBKeyLen)
+	}
+
+	_ = a.StopReturn()
+}
+
+func TestStartReturnRefusesAnEncryptedSessionWithNoKey(t *testing.T) {
+	// The exact fault that cost an afternoon, caught before anything is dialled.
+	//
+	// srtReturnPBKeyLen non-zero with no stored passphrase asks libsrt for an
+	// encrypted session with no key. It cannot succeed against anything, and
+	// left to run it produces a lamp stuck in BACKOFF and an ERROR:UNSECURE
+	// buried in a log file. The Settings screen now has both controls, so a
+	// non-zero key length is a statement the operator made rather than a
+	// default they inherited, and refusing here with the Credential Manager
+	// target named is worth more than an amber lamp.
+	for _, keylen := range []int{16, 32} {
+		t.Run(strconv.Itoa(keylen), func(t *testing.T) {
+			a, _ := newTestApp(t)
+			mon := withFakeReturn(a)
+
+			cfg := srtReturnConfig()
+			cfg.SRTReturnPBKeyLen = keylen
+			setConfig(a, cfg)
+
+			err := a.StartReturn()
+			if err == nil {
+				t.Fatal("StartReturn() = nil; an encrypted session with no key cannot connect")
+			}
+			// It must say where to put the passphrase, which Credential Manager
+			// entry that is, and that it is not the feed's one.
+			msg := err.Error()
+			for _, want := range []string{secrets.TargetSRTReturn, "srtReturnPBKeyLen", "Settings"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error %q does not mention %q", msg, want)
+				}
+			}
+			if _, started := mon.startedWith(); started {
+				t.Error("a monitor was started for a configuration that cannot handshake")
+			}
+		})
+	}
+}
+
+func TestTheSendPathsKeyLengthDoesNotGateTheReturn(t *testing.T) {
+	// The mirror of the test above, and the reason the two key lengths are two
+	// fields. App.srtPassphrase refuses to start the FEED when pbkeylen is
+	// non-zero and no SEND passphrase is stored. That must have no bearing on
+	// the monitor: an encrypted commentary input and an unencrypted programme
+	// output is a perfectly ordinary arrangement, and it is the one measured on
+	// the live instance.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+
+	cfg := srtReturnConfig()
+	cfg.PBKeyLen = 16         // the send path asks for encryption; no send passphrase is stored
+	cfg.SRTReturnPBKeyLen = 0 // the output being monitored is not encrypted
 	setConfig(a, cfg)
 
 	if _, err := a.srtPassphrase(cfg); err == nil {
 		t.Fatal("the test's premise is wrong: srtPassphrase accepted pbkeylen with no passphrase")
 	}
 	if err := a.StartReturn(); err != nil {
-		t.Fatalf("StartReturn() = %v; the monitor must not refuse over a credential "+
-			"combination the SRT handshake will report on its own", err)
+		t.Fatalf("StartReturn() = %v; the SEND path's credentials must not gate the monitor", err)
+	}
+	opts, started := mon.startedWith()
+	if !started {
+		t.Fatal("the monitor was not started")
+	}
+	if opts.PBKeyLen != 0 {
+		t.Errorf("PBKeyLen = %d, want 0; the return took the send path's key length", opts.PBKeyLen)
+	}
+	if opts.Passphrase != "" {
+		t.Error("the return was given a passphrase it has none stored for")
 	}
 	_ = a.StopReturn()
+}
+
+func TestAStoredReturnPassphraseWithNoKeyLengthIsStillOffered(t *testing.T) {
+	// Where the return stays forgiving. gst.ReturnOpts.normalise defaults an
+	// unset key length to 16 when a passphrase is present, so this is a working
+	// AES-128 session rather than a contradiction — and an operator who typed a
+	// passphrase and left the dropdown alone meant to use it.
+	a, store := newTestApp(t)
+	mon := withFakeReturn(a)
+
+	const secret = "typed-the-passphrase-only"
+	if err := store.Set(secrets.KeySRTReturn, secret); err != nil {
+		t.Fatalf("store.Set() error = %v", err)
+	}
+	cfg := srtReturnConfig()
+	cfg.SRTReturnPBKeyLen = 0
+	setConfig(a, cfg)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() = %v", err)
+	}
+	opts, _ := mon.startedWith()
+	if opts.Passphrase != secret {
+		t.Fatalf("Passphrase = %q, want the stored secret", opts.Passphrase)
+	}
+	_ = a.StopReturn()
+}
+
+func TestReturnPassphraseReportsAnUnreadableCredentialStore(t *testing.T) {
+	// A Credential Manager that cannot be READ is a fault rather than a state,
+	// and it is not the same thing as "nothing has been entered yet". It must
+	// not be swallowed into an unencrypted session that then fails at the far
+	// end for a reason that has nothing to do with the far end.
+	a, store := newTestApp(t)
+	store.getErr = errors.New("credential manager is not available")
+
+	cfg := srtReturnConfig()
+	_, err := a.returnPassphrase(cfg)
+	if err == nil {
+		t.Fatal("returnPassphrase() = nil error on an unreadable store")
+	}
+	if !strings.Contains(err.Error(), secrets.TargetSRTReturn) {
+		t.Errorf("error %q does not name the Credential Manager target it could not read", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Saying why the return will not connect
+// ---------------------------------------------------------------------------
+
+func TestTheReturnSaysWhyItIsNotConnecting(t *testing.T) {
+	// Before this, a return that could not handshake said NOTHING: the lamp
+	// showed BACKOFF, which is also what it shows for a peer that has gone away
+	// for ten seconds, and the reason lived in a log file nobody had open. That
+	// is what cost the operator an afternoon against an encrypted output with no
+	// passphrase set.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.emit(gst.ReturnStateBackoff)
+	}
+	_ = a.StopReturn() // joins the forwarder, so every event has been queued
+
+	msgs := errorEventsFrom(drainPump(a))
+	if len(msgs) != 1 {
+		t.Fatalf("got %d %q events, want exactly 1: %q", len(msgs), EventError, msgs)
+	}
+	// It must name the endpoint that is actually being dialled and the
+	// encryption that is actually being offered, and point at the fix.
+	for _, want := range []string{"40503", "NO encryption", "Settings"} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("the diagnostic %q does not mention %q", msgs[0], want)
+		}
+	}
+}
+
+func TestTheReturnSaysNothingAboutABlip(t *testing.T) {
+	// Fewer than returnDiagnoseAfter failures is indistinguishable from an
+	// M2L-X output the operator has not switched on yet, and a toast for that
+	// is the noise the "error" event must not carry during a match.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter-1; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.emit(gst.ReturnStateBackoff)
+	}
+	_ = a.StopReturn()
+
+	if msgs := errorEventsFrom(drainPump(a)); len(msgs) != 0 {
+		t.Fatalf("got %d %q events after %d failures, want none: %q",
+			len(msgs), EventError, returnDiagnoseAfter-1, msgs)
+	}
+}
+
+func TestTheReturnSaysItOnceAndThenStaysQuiet(t *testing.T) {
+	// The reconnect ladder caps at thirty seconds and never gives up, so a
+	// permanent fault would otherwise report twice a minute for the rest of the
+	// match and bury the toasts that mean the FEED is off air. One message per
+	// StartReturn, and a successful connect re-arms it — an outage that clears
+	// and returns is new information.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter*4; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.emit(gst.ReturnStateBackoff)
+	}
+	_ = a.StopReturn()
+
+	if msgs := errorEventsFrom(drainPump(a)); len(msgs) != 1 {
+		t.Fatalf("got %d %q events over %d failures, want exactly 1",
+			len(msgs), EventError, returnDiagnoseAfter*4)
+	}
+}
+
+func TestAConnectedReturnResetsTheFailureCount(t *testing.T) {
+	// RECEIVING means the handshake succeeded and audio is flowing, so whatever
+	// was wrong is not wrong now. A count that survived it would announce an
+	// encryption problem because of two blips an hour apart.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter*2; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.emit(gst.ReturnStateBackoff)
+		mon.emit(gst.ReturnStateReceiving)
+	}
+	_ = a.StopReturn()
+
+	if msgs := errorEventsFrom(drainPump(a)); len(msgs) != 0 {
+		t.Fatalf("got %d %q events for failures that each recovered, want none: %q",
+			len(msgs), EventError, msgs)
+	}
+}
+
+func TestTheDiagnosticNamesTheEncryptionItOffered(t *testing.T) {
+	// Two ways to get encryption wrong, two different messages. Reporting "not
+	// connected" for both is what made the fault undiagnosable in the first
+	// place.
+	tests := []struct {
+		name       string
+		opts       gst.ReturnOpts
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name: "nothing offered",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503},
+			want: []string{"srt://m2lx.example.com:40503", "NO encryption", "has a passphrase set"},
+		},
+		{
+			name: "aes-128 offered",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k", PBKeyLen: 16},
+			want: []string{"AES-128", "wrong", "not encrypted at all"},
+			// The two must not be confusable: an operator who reads "NO
+			// encryption" here would go and set a passphrase that is already set.
+			wantAbsent: []string{"NO encryption"},
+		},
+		{
+			name: "aes-256 offered",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40501, Passphrase: "k", PBKeyLen: 32},
+			want: []string{"AES-256", "srt://m2lx.example.com:40501"},
+		},
+		{
+			// A passphrase with no key length. gst.ReturnOpts.normalise turns
+			// that into AES-128 — but on the monitor's own copy of the options,
+			// because Start takes them by value, so the defaulting never comes
+			// back here. Reporting "AES-0" would send the operator looking for
+			// a setting that is not wrong.
+			name:       "a passphrase with no key length is the AES-128 gst will negotiate",
+			opts:       gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k"},
+			want:       []string{"AES-128"},
+			wantAbsent: []string{"AES-0", "NO encryption"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := returnDiagnostic(tt.opts)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("returnDiagnostic() = %q, does not contain %q", got, want)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("returnDiagnostic() = %q, must not contain %q", got, absent)
+				}
+			}
+		})
+	}
+}
+
+func TestTheDiagnosticNeverCarriesThePassphrase(t *testing.T) {
+	// It is built from gst.ReturnOpts, which HOLDS the passphrase, and it goes
+	// to the "error" event, which crosses the Wails boundary and is written to
+	// the log. Asserted rather than assumed.
+	const secret = "correct-horse-battery-staple"
+	for _, keylen := range []int{0, 16, 32} {
+		got := returnDiagnostic(gst.ReturnOpts{
+			Host:       "m2lx.example.com",
+			Port:       40503,
+			Passphrase: secret,
+			PBKeyLen:   keylen,
+		})
+		if strings.Contains(got, secret) {
+			t.Fatalf("the diagnostic leaks the passphrase: %q", got)
+		}
+	}
+
+	// And end to end, through the event the frontend actually receives.
+	a, store := newTestApp(t)
+	mon := withFakeReturn(a)
+	if err := store.Set(secrets.KeySRTReturn, secret); err != nil {
+		t.Fatalf("store.Set() error = %v", err)
+	}
+	cfg := srtReturnConfig()
+	cfg.SRTReturnPBKeyLen = 32
+	setConfig(a, cfg)
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.emit(gst.ReturnStateBackoff)
+	}
+	_ = a.StopReturn()
+
+	for _, e := range drainPump(a) {
+		if s, ok := e.data.(string); ok && strings.Contains(s, secret) {
+			t.Fatalf("the %q event leaks the return passphrase: %q", e.name, s)
+		}
+	}
+}
+
+func TestNoBoundMethodHandsBackTheReturnPassphrase(t *testing.T) {
+	// SetSecret is write-only by design and there is no getter anywhere on the
+	// bound surface. The new credential must not have quietly become the
+	// exception — GetConfig is the method a Settings screen calls on every open,
+	// and a passphrase in the config struct would cross the boundary on every
+	// one of them.
+	a, store := newTestApp(t)
+	const secret = "correct-horse-battery-staple"
+	if err := store.Set(secrets.KeySRTReturn, secret); err != nil {
+		t.Fatalf("store.Set() error = %v", err)
+	}
+
+	cfg, err := a.GetConfig()
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("GetConfig() carries the return passphrase across the Wails boundary: %s", encoded)
+	}
+
+	// The key length is not a secret and MUST be there, or the Settings screen
+	// cannot show what is configured.
+	if !strings.Contains(string(encoded), "srtReturnPBKeyLen") {
+		t.Fatalf("GetConfig() does not carry srtReturnPBKeyLen: %s", encoded)
+	}
+
+	// Reflection over the whole bound surface: no exported method may return
+	// the passphrase. Every one that takes no arguments is called and its
+	// results searched.
+	v := reflect.ValueOf(a)
+	for i := 0; i < v.NumMethod(); i++ {
+		m := v.Type().Method(i)
+		if m.Type.NumIn() != 1 { // the receiver only
+			continue
+		}
+		switch m.Name {
+		case "Start", "Stop", "StartReturn", "StopReturn", "ArmMixer", "DisarmMixer":
+			// State-changing. Not getters, and not worth starting a pipeline
+			// inside an assertion about strings.
+			continue
+		}
+		for _, out := range v.Method(i).Call(nil) {
+			if !out.IsValid() || !out.CanInterface() {
+				continue
+			}
+			blob, err := json.Marshal(out.Interface())
+			if err != nil {
+				continue // not JSON-encodable, so not what Wails sends either
+			}
+			if strings.Contains(string(blob), secret) {
+				t.Fatalf("%s() returns the SRT return passphrase across the Wails boundary", m.Name)
+			}
+		}
+	}
+}
+
+// errorEventsFrom picks the "error" event payloads out of a drained pump.
+func errorEventsFrom(events []pumpEvent) []string {
+	var out []string
+	for _, e := range events {
+		if e.name != EventError {
+			continue
+		}
+		s, ok := e.data.(string)
+		if !ok {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

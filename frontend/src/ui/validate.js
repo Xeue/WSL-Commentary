@@ -89,6 +89,16 @@ export function validateConfig(config) {
     errors.pbkeylen = 'Key length must be 0 (no passphrase), 16 or 32.';
   }
 
+  // The RETURN path's key length. Same three values, a different endpoint, and
+  // deliberately not the same field as pbkeylen above: M2L-X sets encryption
+  // per output — Output 1 (pgm, 40501) measured encrypted=false while Outputs 2
+  // and 3 measured encrypted=true — so the feed and the monitor routinely need
+  // different answers. Sharing one control means whichever way it is set, one
+  // of the two paths is wrong, and the failure is a silent handshake refusal.
+  if (!isInt(config.srtReturnPBKeyLen) || !PBKEYLEN_VALUES.includes(config.srtReturnPBKeyLen)) {
+    errors.srtReturnPBKeyLen = 'Return key length must be 0 (no passphrase), 16 or 32.';
+  }
+
   // statusKey is OPTIONAL. It names the switcher_status node the three
   // WebSocket-derived lamps read; with it empty they say NO STATUS, which is
   // honest, and the feed is unaffected. Requiring it made the app unusable

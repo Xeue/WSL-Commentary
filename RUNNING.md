@@ -515,16 +515,42 @@ The ports above match the mock invocation in §5.1. The SRT half of this cannot 
 exercised until Gate B — `srtsink` dials the mock's listener directly, and there
 is no `srtsink` without GStreamer.
 
-The **M2L-X password** and the **SRT passphrase** never go in that file. They go
-in Windows Credential Manager under `WSLComms/m2lx` and `WSLComms/srt`. Normally
-the Settings screen writes them through `SetSecret`. There is deliberately no
-getter — a secret goes in and does not come back out across the Wails boundary,
-so the Settings screen can only ever show "set this session", never the value.
+The **M2L-X password** and the **two SRT passphrases** never go in that file.
+They go in Windows Credential Manager:
+
+| Target | What it is |
+|---|---|
+| `WSLComms/m2lx` | the M2L-X sign-in password |
+| `WSLComms/srt` | the SRT passphrase for the **send** path — the commentary input this app dials |
+| `WSLComms/srtreturn` | the SRT passphrase for the **return** path — the M2L-X output the monitor dials |
+
+The two SRT passphrases are separate credentials because **M2L-X sets encryption
+per output**, measured on the live instance:
+
+```
+Output 1  src=pgm  port 40501  encrypted=false
+Output 2  src=pvw  port 40502  encrypted=true
+Output 3  src=cln  port 40503  encrypted=true
+```
+
+so the endpoint the feed goes to and the endpoint the monitor comes from
+routinely need different keys. Sharing one meant that entering the key which
+made the return work changed the key the feed went out with. The key *lengths*
+are separate too, and they are not secrets, so they live in `config.json` as
+`pbkeylen` (send) and `srtReturnPBKeyLen` (return); both are `0`, `16` or `32`,
+with `0` meaning no encryption is negotiated.
+
+Normally the Settings screen writes all three through `SetSecret`. There is
+deliberately no getter — a secret goes in and does not come back out across the
+Wails boundary, so the Settings screen can only ever show "set this session",
+never the value.
 
 To seed them by hand before the GUI exists:
 
 ```powershell
-cmdkey /generic:WSLComms/m2lx /user:wslcomms /pass:changeme
+cmdkey /generic:WSLComms/m2lx      /user:wslcomms /pass:changeme
+cmdkey /generic:WSLComms/srt       /user:wslcomms /pass:send-path-key
+cmdkey /generic:WSLComms/srtreturn /user:wslcomms /pass:return-path-key
 ```
 
 `internal/secrets` stores the value as a UTF-16LE `CredentialBlob`, which is what
@@ -568,9 +594,20 @@ measured, and the comment beside it says which measurement.
   an instance that is now powered off. `internal/kvs` codes defensively and every
   error it returns names the exact field that was missing or the wrong shape.
   Expect to be surprised at Gate C.
-- **SP-4 / SP-5** — the production `statusKey`, and whether the commentary input
+- **SP-4 / SP-5** — the production `statusKey`, and whether the commentary INPUT
   has an SRT passphrase set and at what `pbkeylen`, are both unmeasured. They are
-  config, not code.
+  config, not code. The three programme OUTPUTS have since been measured (§7):
+  40501 is unencrypted, 40502 and 40503 are not. That is why the return has its
+  own passphrase and its own `srtReturnPBKeyLen` rather than borrowing the send
+  path's — the input's answer says nothing about the outputs'.
+- **A wrong or missing RETURN passphrase cannot be named precisely yet.** libsrt
+  distinguishes `ERROR:BADSECRET` from `ERROR:UNSECURE` and `internal/gst` logs
+  whichever it got, but `gst.ReturnOpts` has no `OnConnectError` callback the way
+  `sender.Opts` does, so that reason reaches the log and stops there. After three
+  consecutive failed attempts `app_return.go` emits one message naming the
+  endpoint and the encryption it offered, and points at the log for the exact
+  reason. Giving `gst.ReturnOpts` an `OnConnectError func(error)` would let the
+  operator be told which of the two it was; it is reported, not worked around.
 - **No race detector until Gate B.** The concurrency in `internal/sender` and in
   `app.go` has been read by hand and stressed with `go test -tags dev . -count=20`
   and `go test ./... -count=20`, which is not the same thing. `app.go` has four

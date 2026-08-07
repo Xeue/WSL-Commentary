@@ -1,9 +1,27 @@
 // Package secrets is the application's only route to Windows Credential
-// Manager. It holds exactly two values: the M2L-X sign-in password and the SRT
-// passphrase. Neither ever appears in config.json, in a log line, or in a
-// GStreamer URI.
+// Manager. It holds exactly three values: the M2L-X sign-in password, the SRT
+// passphrase for the SEND path, and the SRT passphrase for the RETURN path.
+// None of them ever appears in config.json, in a log line, or in a GStreamer
+// URI.
 //
 // Owner: WP-1. No other work package writes files in this directory.
+//
+// # Why the two SRT passphrases are two credentials
+//
+// They are the keys to two different SRT endpoints on M2L-X, and encryption is
+// a per-endpoint setting there rather than an instance-wide one. Measured on
+// the live instance:
+//
+//	Output 1  src=pgm  port 40501  encrypted=false
+//	Output 2  src=pvw  port 40502  encrypted=true
+//	Output 3  src=cln  port 40503  encrypted=true
+//
+// The send path dials the commentary INPUT; the return path dials one of those
+// OUTPUTS. Storing one passphrase for both would mean that the moment the two
+// endpoints disagree — which is the normal case above, not an exotic one —
+// setting the key that makes the feed work breaks the monitor, or the reverse,
+// with nothing on screen saying which of the two a failure came from. Two
+// credentials, two Settings fields, two independent failures.
 package secrets
 
 import (
@@ -21,9 +39,15 @@ const (
 	// POST /api/local_auth/signin.
 	KeyM2LX = "m2lx"
 
-	// KeySRT is the SRT passphrase, set on srtsink with g_object_set so that it
-	// never has to be percent-encoded into a URI.
+	// KeySRT is the SRT passphrase for the SEND path, set on srtsink with
+	// g_object_set so that it never has to be percent-encoded into a URI.
 	KeySRT = "srt"
+
+	// KeySRTReturn is the SRT passphrase for the RETURN path, set on srtsrc the
+	// same way. It is a SEPARATE credential from KeySRT and not a duplicate of
+	// it: see the package doc comment for the measurement that makes them
+	// different keys to different endpoints.
+	KeySRTReturn = "srtreturn"
 )
 
 // Credential Manager generic-credential target names. The mapping from logical
@@ -35,8 +59,13 @@ const (
 	// TargetM2LX is the Credential Manager target holding the M2L-X password.
 	TargetM2LX = TargetPrefix + KeyM2LX
 
-	// TargetSRT is the Credential Manager target holding the SRT passphrase.
+	// TargetSRT is the Credential Manager target holding the send path's SRT
+	// passphrase.
 	TargetSRT = TargetPrefix + KeySRT
+
+	// TargetSRTReturn is the Credential Manager target holding the return
+	// path's SRT passphrase.
+	TargetSRTReturn = TargetPrefix + KeySRTReturn
 )
 
 // ErrNotFound is returned by Get when no credential exists for the key. It is
@@ -44,16 +73,18 @@ const (
 // callers must distinguish "not set" from "Credential Manager is broken".
 var ErrNotFound = errors.New("secrets: credential not found")
 
-// ErrUnknownKey is returned when a key other than KeyM2LX or KeySRT is used.
+// ErrUnknownKey is returned when a key other than KeyM2LX, KeySRT or
+// KeySRTReturn is used.
 var ErrUnknownKey = errors.New("secrets: unknown key")
 
-// Store reads and writes the two application secrets.
+// Store reads and writes the three application secrets.
 //
 // Implementations must treat the returned string as sensitive: it must not be
 // logged, embedded in a URI, or emitted across the Wails boundary.
 type Store interface {
-	// Get returns the secret stored under key, which must be KeyM2LX or
-	// KeySRT. It returns ErrNotFound if the credential has never been written.
+	// Get returns the secret stored under key, which must be KeyM2LX, KeySRT
+	// or KeySRTReturn. It returns ErrNotFound if the credential has never been
+	// written.
 	Get(key string) (string, error)
 
 	// Set writes value under key, creating or replacing the generic credential.
@@ -84,6 +115,8 @@ func targetFor(key string) (string, error) {
 		return TargetM2LX, nil
 	case KeySRT:
 		return TargetSRT, nil
+	case KeySRTReturn:
+		return TargetSRTReturn, nil
 	default:
 		return "", ErrUnknownKey
 	}
@@ -150,7 +183,7 @@ func (credManagerStore) Set(key, value string) error {
 // anything else — e.g. the raw UTF-8 bytes of s — round-trips fine through
 // this package alone, but produces a value Windows' own tooling renders as
 // garbage and silently mis-decodes multi-byte characters if another
-// application ever reads WSLComms/m2lx or WSLComms/srt.
+// application ever reads WSLComms/m2lx, WSLComms/srt or WSLComms/srtreturn.
 func utf16LEBytes(s string) []byte {
 	units := utf16.Encode([]rune(s))
 	b := make([]byte, len(units)*2)

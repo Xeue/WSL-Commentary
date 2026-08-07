@@ -16,9 +16,15 @@ import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
 // write path, one call site, and mixerwiring.test.js proves it by reading this
 // file's TEXT — so the forbidden symbols are not named here, even in prose.
 
-// The Settings screen: every field of specification section 9, plus the two
+// The Settings screen: every field of specification section 9, plus the three
 // Credential Manager secrets. Same window, swapped view — there is no
 // second window and no menu (spec section 10).
+//
+// The three secrets are the M2L-X password, the SRT passphrase for the SEND
+// path and the SRT passphrase for the RETURN path. The last two are separate
+// fields on this form and separate Credential Manager entries, because M2L-X
+// sets encryption per endpoint and the two routinely differ — see the note
+// beside the "SRT return encryption" group.
 //
 // Owner: WP-5b.
 //
@@ -47,7 +53,8 @@ function blankConfig() {
     returnMid: 2,
     returnChannel: 'stereo',
     returnSource: 'webrtc',
-    srtReturnPort: 40503,
+    srtReturnPort: 40501,
+    srtReturnPBKeyLen: 0,
     monitorTile: { x: 0, y: 360, w: 640, h: 360 },
     returnGainDb: 18,
     slatePath: 'slate.png',
@@ -147,10 +154,16 @@ export function createSettingsView(handlers) {
   // default because somebody pressed Save on an unrelated screen is a way to
   // change what is in their ears without touching a control that says so.
   let carriedReturnSource = normaliseReturnSource(undefined);
-  // The port of the M2L-X output the SRT return dials. 40503 is Output 3,
-  // src=cln — the only output that carries the CLN bus. Carried rather than
-  // exposed: it is measured, it is the same on every instance seen so far, and
-  // a wrong value here is a monitor that never connects with nothing to say why.
+  // The port of the M2L-X output the SRT return dials. 40501 is Output 1,
+  // src=pgm — the DIRTY programme feed, which is the picture a commentator
+  // watches. Carried rather than exposed: it is measured, it is the same on
+  // every instance seen so far, and a wrong value here is a monitor that never
+  // connects with nothing to say why.
+  //
+  // It defaulted to 40503 (src=cln) for one revision and that was the fault
+  // this screen's new encryption controls exist because of: 40503 measured
+  // encrypted=true, the return dialled it with no passphrase, and every
+  // handshake was refused in silence.
   let carriedSRTReturnPort = 0;
   function addField(key, labelText, input, hint) {
     const { wrap, errorEl } = row(labelText, input.id, input, hint);
@@ -422,6 +435,60 @@ export function createSettingsView(handlers) {
   // lives on the main screen only; this form carries the saved value through
   // untouched — see collectConfig.
 
+  // --- SRT return encryption ---------------------------------------------
+  //
+  // Grouped with the return settings above rather than with the SRT OUTPUT
+  // fields, because that is what they belong to: they are the key to the M2L-X
+  // output this app DIALS, not to the input it SENDS to.
+  //
+  // They are separate controls from "Passphrase key length" and "SRT
+  // passphrase" in the SRT output section for a measured reason. M2L-X sets
+  // encryption per output:
+  //
+  //     Output 1  src=pgm  port 40501  encrypted=false
+  //     Output 2  src=pvw  port 40502  encrypted=true
+  //     Output 3  src=cln  port 40503  encrypted=true
+  //
+  // so the send path and the return path routinely need different answers, and
+  // one pair of controls for both cannot express that. Setting the key that
+  // makes the monitor work would change the key the feed goes out with.
+  const returnEncryptionHeading = document.createElement('h3');
+  returnEncryptionHeading.textContent = 'SRT return encryption';
+  form.appendChild(returnEncryptionHeading);
+
+  addField(
+    'srtReturnPBKeyLen',
+    'Return key length',
+    selectInput('f-srtReturnPBKeyLen', [
+      { value: 0, label: 'No passphrase (0)' },
+      { value: 16, label: '16' },
+      { value: 32, label: '32' },
+    ]),
+    'Leave at 0 unless the M2L-X output being monitored has a passphrase set. Setting this ' +
+      'without entering a passphrase below stops the return from starting, with a message ' +
+      'saying so — an encrypted session with no key cannot connect to anything.',
+  );
+
+  const srtReturnPassphraseInput = textInput('f-srtReturnPassphrase', 'password');
+  srtReturnPassphraseInput.autocomplete = 'new-password';
+  srtReturnPassphraseInput.placeholder = 'Leave blank to keep the stored passphrase';
+  const srtReturnPassphraseRow = row(
+    'SRT return passphrase',
+    'f-srtReturnPassphrase',
+    srtReturnPassphraseInput,
+    'A DIFFERENT passphrase from the SRT one above: that one is the key to the commentary ' +
+      'input this app sends to, this one is the key to the M2L-X output it listens back on. ' +
+      'Stored in Windows Credential Manager, never in config.json.',
+  );
+  const srtReturnPassphraseBadge = document.createElement('span');
+  srtReturnPassphraseBadge.className = 'secret-badge';
+  srtReturnPassphraseRow.wrap.insertBefore(srtReturnPassphraseBadge, srtReturnPassphraseRow.errorEl);
+  fields.srtReturnPassphrase = {
+    input: srtReturnPassphraseInput,
+    errorEl: srtReturnPassphraseRow.errorEl,
+  };
+  form.appendChild(srtReturnPassphraseRow.wrap);
+
   addField(
     'returnGainDb',
     'Return gain (dB)',
@@ -554,6 +621,7 @@ export function createSettingsView(handlers) {
       isValidReturnMid(config.returnMid) ? config.returnMid : DEFAULT_RETURN_MID,
     );
     fields.returnChannel.input.value = normaliseChannelMode(config.returnChannel);
+    fields.srtReturnPBKeyLen.input.value = String(config.srtReturnPBKeyLen ?? 0);
     // Held, not shown. See the note beside the returnChannel field.
     carriedReturnSource = normaliseReturnSource(config.returnSource);
     carriedSRTReturnPort = Number(config.srtReturnPort) || 0;
@@ -566,6 +634,7 @@ export function createSettingsView(handlers) {
     fields.slatePath.input.value = config.slatePath || 'slate.png';
     fields.m2lxPassword.input.value = '';
     fields.srtPassphrase.input.value = '';
+    fields.srtReturnPassphrase.input.value = '';
     liveURLInput.value = formatLiveOperationURL(config.m2lxHost, config.eventId);
     hideLiveURLMessages();
     refreshSRTPlaceholder();
@@ -577,10 +646,16 @@ export function createSettingsView(handlers) {
   function refreshSecretBadges() {
     const m2lxSet = backend.isSecretSetThisSession(backend.SECRET_KEY_M2LX);
     const srtSet = backend.isSecretSetThisSession(backend.SECRET_KEY_SRT);
+    const srtReturnSet = backend.isSecretSetThisSession(backend.SECRET_KEY_SRT_RETURN);
     m2lxPasswordBadge.textContent = m2lxSet ? 'set' : 'not set';
     m2lxPasswordBadge.classList.toggle('secret-badge-set', m2lxSet);
     srtPassphraseBadge.textContent = srtSet ? 'set' : 'not set';
     srtPassphraseBadge.classList.toggle('secret-badge-set', srtSet);
+    // Read through the same write-only signal as the other two: "set" means
+    // this field was saved during THIS run of the app, never that Credential
+    // Manager was consulted. There is no getter for a secret anywhere.
+    srtReturnPassphraseBadge.textContent = srtReturnSet ? 'set' : 'not set';
+    srtReturnPassphraseBadge.classList.toggle('secret-badge-set', srtReturnSet);
   }
 
   function collectConfig() {
@@ -598,6 +673,7 @@ export function createSettingsView(handlers) {
       [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
       returnMid: Number(fields.returnMid.input.value),
       returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
+      srtReturnPBKeyLen: Number(fields.srtReturnPBKeyLen.input.value),
       // Carried through from the loaded config, not collected from a control.
       // See the declarations of these two for why.
       returnSource: carriedReturnSource,
@@ -655,6 +731,7 @@ export function createSettingsView(handlers) {
       await backend.saveConfig(config);
       const m2lxPassword = fields.m2lxPassword.input.value;
       const srtPassphrase = fields.srtPassphrase.input.value;
+      const srtReturnPassphrase = fields.srtReturnPassphrase.input.value;
       if (m2lxPassword.length > 0) {
         await backend.setSecret(backend.SECRET_KEY_M2LX, m2lxPassword);
         fields.m2lxPassword.input.value = '';
@@ -662,6 +739,13 @@ export function createSettingsView(handlers) {
       if (srtPassphrase.length > 0) {
         await backend.setSecret(backend.SECRET_KEY_SRT, srtPassphrase);
         fields.srtPassphrase.input.value = '';
+      }
+      // Its own key, its own Credential Manager entry. Writing this must not
+      // touch SECRET_KEY_SRT: a working feed is not something to break while
+      // fixing a pair of headphones.
+      if (srtReturnPassphrase.length > 0) {
+        await backend.setSecret(backend.SECRET_KEY_SRT_RETURN, srtReturnPassphrase);
+        fields.srtReturnPassphrase.input.value = '';
       }
       refreshSecretBadges();
       setSaveMessage('Settings saved.', false);

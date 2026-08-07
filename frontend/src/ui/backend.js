@@ -61,10 +61,18 @@ export const EVENT_STATUS_KEYS = 'statusKeyCandidates';
 // EventReturn constant exactly. The payload is a gst.ReturnState string.
 export const EVENT_RETURN = 'return';
 
-// Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT constants
-// exactly. Passed to setSecret().
+// Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT / KeySRTReturn
+// constants exactly. Passed to setSecret().
+//
+// SECRET_KEY_SRT and SECRET_KEY_SRT_RETURN are two DIFFERENT passphrases, not
+// one value stored twice. Encryption on M2L-X is a per-endpoint setting — the
+// commentary input this app sends to and the programme output the return dials
+// disagree about it on the measured instance — so one field for both means the
+// operator cannot describe what is in front of them, and setting the key that
+// makes the monitor work changes the key the feed goes out with.
 export const SECRET_KEY_M2LX = 'm2lx';
 export const SECRET_KEY_SRT = 'srt';
+export const SECRET_KEY_SRT_RETURN = 'srtreturn';
 
 // sender.State string values, mirrored here because the fake backend needs
 // to emit them and callers need something to compare against without a
@@ -183,7 +191,8 @@ function defaultFakeConfig() {
     headphoneEndpointId: '', // a WASAPI endpoint GUID — the SRT return path
     returnSource: 'webrtc', // config.DefaultReturnSource
     returnChannel: 'stereo', // config.DefaultReturnChannel
-    srtReturnPort: 40503, // config.DefaultSRTReturnPort — Output 3, src=cln
+    srtReturnPort: 40501, // config.DefaultSRTReturnPort — Output 1, src=pgm (DIRTY programme)
+    srtReturnPBKeyLen: 0, // config.DefaultSRTReturnPBKeyLen — Output 1 measured encrypted=false
     returnMid: 2, // config.DefaultReturnMid (aux1/CLN)
     monitorTile: { x: 0, y: 360, w: 640, h: 360 }, // config.DefaultMonitorTile
     returnGainDb: 18, // config.DefaultReturnGainDB
@@ -197,7 +206,11 @@ let fakeConfig = defaultFakeConfig();
 // the only "set"/"not set" signal the Settings screen can show, because
 // SetSecret is write-only by design (internal/secrets never grows a getter)
 // — see setSecret()'s doc comment below.
-const secretSetThisSession = { [SECRET_KEY_M2LX]: false, [SECRET_KEY_SRT]: false };
+const secretSetThisSession = {
+  [SECRET_KEY_M2LX]: false,
+  [SECRET_KEY_SRT]: false,
+  [SECRET_KEY_SRT_RETURN]: false,
+};
 let fakeDevices = FAKE_DEVICES.slice();
 let fakeDeviceError = null;
 
@@ -330,14 +343,19 @@ export async function saveConfig(config) {
 }
 
 /**
- * Writes one of the two Credential Manager secrets. key is
- * SECRET_KEY_M2LX or SECRET_KEY_SRT. There is deliberately no getter: a
+ * Writes one of the three Credential Manager secrets. key is SECRET_KEY_M2LX,
+ * SECRET_KEY_SRT or SECRET_KEY_SRT_RETURN. There is deliberately no getter: a
  * secret goes in and never comes back out across this boundary, on the real
  * backend or the fake. isSecretSetThisSession is the only trace of it left in
  * this process.
+ *
+ * The key is checked here as well as in Go. internal/secrets rejects an unknown
+ * key, but the fake backend never reaches it, and a typo that silently recorded
+ * a badge as "set" against a key nothing reads is exactly the reassurance an
+ * operator must not be given about a passphrase.
  */
 export async function setSecret(key, value) {
-  if (key !== SECRET_KEY_M2LX && key !== SECRET_KEY_SRT) {
+  if (!Object.prototype.hasOwnProperty.call(secretSetThisSession, key)) {
     throw new Error(`secrets: unknown key "${key}"`);
   }
   if (hasWails()) {

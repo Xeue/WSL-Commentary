@@ -461,18 +461,27 @@ export function createReturnPath(io) {
  * disagreeing with every control on screen, and the disagreement is silent —
  * "Left only" saved, acknowledged, shown, and comms still in the right ear.
  *
- * The SRT PASSPHRASE is deliberately absent. It is not in the config; it comes
- * from Credential Manager through App.SetSecret, and this module cannot see it
- * change. Changing the passphrase mid-match therefore still needs a manual
- * source switch, which is a real gap and is stated here rather than papered
- * over.
+ * The SRT RETURN PASSPHRASE is deliberately absent. It is not in the config; it
+ * comes from Credential Manager through App.SetSecret, and this module cannot
+ * see it change. Changing the passphrase mid-match therefore still needs a
+ * manual source switch, which is a real gap and is stated here rather than
+ * papered over. The key LENGTH beside it is not a secret, is in the config, and
+ * IS here — so an operator who switches the return between an encrypted and an
+ * unencrypted M2L-X output gets the rebuild that change needs.
+ *
+ * `pbkeylen` — the SEND path's key length — is deliberately NOT here any more.
+ * app_return.go used to read it and now reads `srtReturnPBKeyLen` instead,
+ * because encryption on M2L-X is a per-endpoint setting and the feed's input
+ * and the monitor's output disagree about it on the measured instance. Leaving
+ * it in this list would stop and rebuild a perfectly good monitor every time
+ * somebody adjusted the contribution feed's encryption.
  */
 export const RETURN_OPTS_CONFIG_KEYS = Object.freeze([
   'srtHost',
   'm2lxHost', // EffectiveSRTHost falls back to it
   'srtReturnPort',
   'srtLatencyMs',
-  'pbkeylen',
+  'srtReturnPBKeyLen',
   'returnChannel',
   'headphoneEndpointId',
 ]);

@@ -773,14 +773,24 @@ func (a *App) SaveConfig(c *config.Config) error {
 	return nil
 }
 
-// SetSecret writes one of the two Credential Manager secrets from the Settings
-// screen. key is secrets.KeyM2LX or secrets.KeySRT. There is deliberately no
-// getter: a secret goes into Credential Manager and never comes back out across
-// this boundary.
+// SetSecret writes one of the three Credential Manager secrets from the
+// Settings screen. key is secrets.KeyM2LX, secrets.KeySRT (the SEND path's SRT
+// passphrase) or secrets.KeySRTReturn (the RETURN path's). There is deliberately
+// no getter: a secret goes into Credential Manager and never comes back out
+// across this boundary.
+//
+// The two SRT passphrases are separate keys because encryption on M2L-X is set
+// per endpoint — the commentary input and the programme outputs disagree about
+// it on the measured instance — so conflating them means fixing the monitor
+// breaks the feed, or the reverse. secrets.targetFor rejects anything else, so
+// a mistyped key from the frontend fails here rather than writing a fourth
+// credential nobody reads.
 //
 // Writing the M2L-X password restarts the control plane, for the same first-run
 // reason as SaveConfig: the sign-in loop stops as soon as it finds no stored
-// password, and this is what tells it to try again.
+// password, and this is what tells it to try again. Neither SRT passphrase
+// does: they are read afresh by Start and StartReturn, and restarting sign-in
+// over one would drop a working control plane for nothing.
 func (a *App) SetSecret(key, value string) error {
 	if err := a.store.Set(key, value); err != nil {
 		return err

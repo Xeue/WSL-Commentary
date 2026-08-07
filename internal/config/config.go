@@ -3,9 +3,12 @@
 //
 // Owner: WP-1. No other work package writes files in this directory.
 //
-// The two secrets referenced by this configuration — the M2L-X password and the
-// SRT passphrase — are deliberately NOT stored here. They live in Windows
-// Credential Manager and are reached through the internal/secrets package.
+// The three secrets referenced by this configuration — the M2L-X password, the
+// SEND path's SRT passphrase and the RETURN path's SRT passphrase — are
+// deliberately NOT stored here. They live in Windows Credential Manager and are
+// reached through the internal/secrets package. What this file holds is the
+// non-secret half of each: which key LENGTH to negotiate (PBKeyLen for the
+// send path, SRTReturnPBKeyLen for the return), never the key itself.
 //
 // WP-1 addition beyond the WP-0 contract: (*Config).Validate reports which
 // fields required for Start to succeed are missing or out of range. It is not
@@ -158,21 +161,64 @@ type Config struct {
 	ReturnChannel string `json:"returnChannel"`
 
 	// SRTReturnPort is the port of the M2L-X output the SRT return dials.
-	// Default 40503, which is Output 3, src=cln.
+	// Default 40501, which is Output 1, src=pgm — THE DIRTY PROGRAMME FEED.
 	//
 	// The HOST is deliberately absent. It follows the M2L-X host through
 	// EffectiveSRTHost, exactly as the send path does, because on every instance
 	// seen so far the SRT listener answers on the same name as the REST API and
 	// a third host field is a third thing to get wrong under pressure.
 	//
-	// 40503 is measured, not assumed. On the live instance the outputs are:
-	// Output 1 src=pgm on 40501, Output 2 src=pvw (whose AUDIO is the master bus,
-	// the same as pgm, so it is not a fourth bus), Output 3 src=cln on 40503, and
-	// Outputs 4-7 byte-transparent relays of router inputs. M2L-X's output source
-	// field accepts only pgm | pvw | cln | <router input id> — aux1, aux2, master
-	// and mon1 all return HTTP 400 — so Output 3 is the only way to hear CLN, and
-	// CLN is the bus with the hard-panned pair on it.
+	// # Why PGM and not CLN
+	//
+	// This defaulted to 40503 (src=cln) for one revision and that was wrong. The
+	// operator's requirement is the DIRTY picture — programme, with everything on
+	// it — because that is what a commentator watches. Clean audio comes from the
+	// WebRTC monitor's mid 2, which is the same bus by a different route, so
+	// there is nothing the CLN output was needed for.
+	//
+	// Measured on the live instance: Output 1 src=pgm on 40501, Output 2 src=pvw
+	// (whose AUDIO is the master bus, the same as pgm, so it is not a fourth
+	// bus), Output 3 src=cln on 40503, and Outputs 4-7 byte-transparent relays of
+	// router inputs. M2L-X's output source field accepts only
+	// pgm | pvw | cln | <router input id> — aux1, aux2, master and mon1 all
+	// return HTTP 400 — so this is the whole menu.
+	//
+	// Verified by dialling it: 40501 negotiates video/x-h265 hvc1 1920x1080 50/1
+	// and audio/mpeg mpegversion=4 base-profile=lc.
 	SRTReturnPort int `json:"srtReturnPort"`
+
+	// SRTReturnPBKeyLen is the SRT encryption key length for the RETURN path,
+	// 16 or 32. Zero — the default — means encryption is not negotiated at all.
+	//
+	// It has exactly the semantics of PBKeyLen above, applied to a different
+	// endpoint, and it is a SEPARATE field rather than a reuse of that one
+	// because M2L-X sets encryption PER OUTPUT. Measured on the live instance:
+	//
+	//	Output 1  src=pgm  port 40501  encrypted=false
+	//	Output 2  src=pvw  port 40502  encrypted=true
+	//	Output 3  src=cln  port 40503  encrypted=true
+	//
+	// So the send path and the return path routinely need different answers,
+	// and sharing one field means the operator cannot express the arrangement
+	// that is actually in front of them.
+	//
+	// # THE PASSPHRASE IS NOT HERE
+	//
+	// It is in Windows Credential Manager under secrets.TargetSRTReturn
+	// ("WSLComms/srtreturn"), reached through internal/secrets, exactly as the
+	// M2L-X password and the send path's passphrase are. config.json is written
+	// to %APPDATA% in plain text, is hand-editable by design, and is the first
+	// thing that gets pasted into a support ticket; a passphrase in it is a
+	// passphrase in every copy of that file that has ever been mailed. Save
+	// must never write one — TestSave_NeverWritesSecretFields enforces it — so
+	// what lives here is the key LENGTH, which is not a secret and which
+	// internal/gst needs alongside the passphrase to set up srtsrc.
+	//
+	// This field being non-zero with no stored passphrase is the one
+	// combination App.StartReturn refuses outright: it asks for an encrypted
+	// session with no key, which cannot succeed and which otherwise fails
+	// inside libsrt as ERROR:UNSECURE with nothing on screen to say so.
+	SRTReturnPBKeyLen int `json:"srtReturnPBKeyLen"`
 
 	// ReturnMid is the WebRTC transceiver mid whose audio is routed to the
 	// headphones. Default 2, which is aux1/CLN — effects without commentary.
@@ -238,9 +284,20 @@ const (
 	// DefaultReturnChannel passes the return through unchanged.
 	DefaultReturnChannel = ReturnChannelStereo
 
-	// DefaultSRTReturnPort is Output 3 on the measured instance: src=cln, the
-	// bus carrying FX hard-left and comms hard-right. See the field comment.
-	DefaultSRTReturnPort = 40503
+	// DefaultSRTReturnPort is Output 1 on the measured instance: src=pgm, the
+	// DIRTY programme feed, which is the picture a commentator watches. See the
+	// field comment for why this is not the clean feed.
+	DefaultSRTReturnPort = 40501
+
+	// DefaultSRTReturnPBKeyLen is 0: no encryption negotiated on the return.
+	//
+	// That is the right default for DefaultSRTReturnPort, and the two belong
+	// together. Output 1 measured encrypted=false, so a default pair of
+	// (40501, 0) connects on a stock instance with nothing typed in. Defaulting
+	// this to 16 or 32 would make a first run fail against an unencrypted
+	// output, which is the mirror image of the fault this whole change exists
+	// to stop happening.
+	DefaultSRTReturnPBKeyLen = 0
 
 	// DefaultReturnGainDB is the measured offset between the SRT-ingested peak
 	// level and the level the KVS monitor arrives at.
@@ -279,6 +336,11 @@ func Defaults() *Config {
 		ReturnSource:  DefaultReturnSource,
 		ReturnChannel: DefaultReturnChannel,
 		SRTReturnPort: DefaultSRTReturnPort,
+		// Explicit even though it is the zero value. Defaults() is a table that
+		// says what every documented default IS, and a field that is silently
+		// absent from it reads as "nobody decided", which for an encryption
+		// setting is not the same as "decided: none".
+		SRTReturnPBKeyLen: DefaultSRTReturnPBKeyLen,
 	}
 }
 
@@ -486,6 +548,16 @@ func (c *Config) ValidateReturn() error {
 
 	if p := c.EffectiveSRTReturnPort(); p < 1 || p > 65535 {
 		errs = append(errs, fmt.Errorf("srtReturnPort must be between 1 and 65535, got %d", p))
+	}
+
+	// The same three values Validate allows for the send path's pbkeylen, and
+	// for the same reason: 16 and 32 are the only key lengths SRT's AES-CTR
+	// supports, and 0 means no encryption is negotiated. Checked HERE rather
+	// than in Validate because it is a return field, and no return field may be
+	// a reason the contribution feed does not go on air — see this method's
+	// header for the whole argument.
+	if k := c.SRTReturnPBKeyLen; k != 0 && k != 16 && k != 32 {
+		errs = append(errs, fmt.Errorf("srtReturnPBKeyLen must be 0, 16 or 32, got %d", k))
 	}
 
 	if c.EffectiveSRTHost() == "" {

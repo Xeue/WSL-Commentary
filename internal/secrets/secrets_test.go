@@ -81,9 +81,11 @@ func TestTargetFor(t *testing.T) {
 	}{
 		{"m2lx key", KeyM2LX, TargetM2LX, false},
 		{"srt key", KeySRT, TargetSRT, false},
+		{"srt return key", KeySRTReturn, TargetSRTReturn, false},
 		{"unknown key", "bogus", "", true},
 		{"empty key", "", "", true},
 		{"case-sensitive: M2LX is not m2lx", "M2LX", "", true},
+		{"case-sensitive: srtReturn is not srtreturn", "srtReturn", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,6 +116,40 @@ func TestTargetNames(t *testing.T) {
 	if TargetSRT != "WSLComms/srt" {
 		t.Errorf("TargetSRT = %q, want %q", TargetSRT, "WSLComms/srt")
 	}
+	if TargetSRTReturn != "WSLComms/srtreturn" {
+		t.Errorf("TargetSRTReturn = %q, want %q", TargetSRTReturn, "WSLComms/srtreturn")
+	}
+}
+
+// TestTheTwoSRTPassphrasesAreSeparateCredentials is the property the whole
+// third target exists for.
+//
+// M2L-X sets encryption per OUTPUT: on the measured instance Output 1 (pgm,
+// 40501) is unencrypted while Outputs 2 and 3 are encrypted. The send path
+// dials the commentary input and the return path dials one of those outputs, so
+// one shared credential means that entering the key that makes the monitor work
+// silently changes the key the FEED goes out with. If these two ever resolve to
+// the same Credential Manager entry, that is exactly what happens, and the
+// symptom is a working feed that stops working when somebody fixes the
+// headphones.
+func TestTheTwoSRTPassphrasesAreSeparateCredentials(t *testing.T) {
+	if KeySRT == KeySRTReturn {
+		t.Fatalf("KeySRT and KeySRTReturn are both %q; the send and return "+
+			"passphrases must be different credentials", KeySRT)
+	}
+
+	send, err := targetFor(KeySRT)
+	if err != nil {
+		t.Fatalf("targetFor(KeySRT) error = %v", err)
+	}
+	ret, err := targetFor(KeySRTReturn)
+	if err != nil {
+		t.Fatalf("targetFor(KeySRTReturn) error = %v", err)
+	}
+	if send == ret {
+		t.Fatalf("both SRT passphrases resolve to the Credential Manager target %q; "+
+			"setting one would overwrite the other", send)
+	}
 }
 
 // --- Store.{Get,Set} argument validation: no Credential Manager access. ---
@@ -132,8 +168,9 @@ func TestCredManagerStore_UnknownKey(t *testing.T) {
 // --- Live Windows Credential Manager integration test. ---
 //
 // This talks to the real Credential Manager vault of whatever account runs
-// `go test`, using the exact targets ("WSLComms/m2lx", "WSLComms/srt") the
-// production application uses. To avoid destroying a real stored secret if
+// `go test`, using the exact targets ("WSLComms/m2lx", "WSLComms/srt",
+// "WSLComms/srtreturn") the production application uses. To avoid destroying a
+// real stored secret if
 // this ever runs on a machine where the app has already been configured,
 // each subtest backs up whatever is currently stored under its target
 // before touching it and restores that exact state in t.Cleanup, whether
@@ -194,7 +231,7 @@ func TestCredManagerStore_RoundTrip(t *testing.T) {
 	const value = "pàsswörd 日本語 𝄞 tëst"
 	const overwrite = "replacement-value-42"
 
-	for _, key := range []string{KeyM2LX, KeySRT} {
+	for _, key := range []string{KeyM2LX, KeySRT, KeySRTReturn} {
 		t.Run(key, func(t *testing.T) {
 			target, err := targetFor(key)
 			if err != nil {
@@ -245,5 +282,68 @@ func TestCredManagerStore_RoundTrip(t *testing.T) {
 				t.Errorf("Set(%q, \"\") on already-absent credential: error = %v, want nil", key, err)
 			}
 		})
+	}
+}
+
+// TestSRTAndSRTReturnDoNotShareAVaultEntry is the live half of
+// TestTheTwoSRTPassphrasesAreSeparateCredentials: the constants differing is
+// necessary but not sufficient, because a mistake in targetFor or in
+// Credential Manager's own name matching would still land both on one entry.
+// This writes two different values through the real vault and reads both back.
+func TestSRTAndSRTReturnDoNotShareAVaultEntry(t *testing.T) {
+	store := New()
+
+	const sendValue = "send-path-key-ößü-𝄞"
+	const returnValue = "return-path-key-完全に-別"
+
+	for _, key := range []string{KeySRT, KeySRTReturn} {
+		target, err := targetFor(key)
+		if err != nil {
+			t.Fatalf("targetFor(%q) error = %v", key, err)
+		}
+		backup, existed := backupCredential(t, target)
+		t.Cleanup(func() { restoreCredential(t, target, backup, existed) })
+		deleteCredential(t, target)
+	}
+
+	if err := store.Set(KeySRT, sendValue); err != nil {
+		t.Fatalf("Set(KeySRT, ...) error = %v", err)
+	}
+	if err := store.Set(KeySRTReturn, returnValue); err != nil {
+		t.Fatalf("Set(KeySRTReturn, ...) error = %v", err)
+	}
+
+	gotSend, err := store.Get(KeySRT)
+	if err != nil {
+		t.Fatalf("Get(KeySRT) error = %v", err)
+	}
+	gotReturn, err := store.Get(KeySRTReturn)
+	if err != nil {
+		t.Fatalf("Get(KeySRTReturn) error = %v", err)
+	}
+	if gotSend != sendValue {
+		t.Errorf("Get(KeySRT) = %q, want %q — the return passphrase overwrote the send one",
+			gotSend, sendValue)
+	}
+	if gotReturn != returnValue {
+		t.Errorf("Get(KeySRTReturn) = %q, want %q", gotReturn, returnValue)
+	}
+
+	// And clearing one must leave the other alone. Clearing the RETURN
+	// passphrase because an output turned out to be unencrypted must not take
+	// the contribution feed's key with it.
+	if err := store.Set(KeySRTReturn, ""); err != nil {
+		t.Fatalf("Set(KeySRTReturn, \"\") error = %v", err)
+	}
+	if _, err := store.Get(KeySRTReturn); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(KeySRTReturn) after clearing = %v, want ErrNotFound", err)
+	}
+	stillSend, err := store.Get(KeySRT)
+	if err != nil {
+		t.Fatalf("Get(KeySRT) after clearing the return passphrase error = %v", err)
+	}
+	if stillSend != sendValue {
+		t.Errorf("Get(KeySRT) after clearing the return passphrase = %q, want %q",
+			stillSend, sendValue)
 	}
 }
