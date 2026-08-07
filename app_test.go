@@ -553,6 +553,14 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	// A page that reloads mid-match must not show the SENDING lamp grey while
 	// the feed is up. The sender only emits on transitions, so the current state
 	// is replayed here instead.
+	//
+	// domReady replays TWO lamps, not one: the return monitor emits only on
+	// transitions for the same reason, and a reloaded page would otherwise show
+	// the RETURN lamp grey with audio in the commentator's ears. The count is
+	// asserted exactly so that a third replay has to be a decision — every event
+	// queued here is delivered to a page that has just loaded, and the ones the
+	// status lamps would need are deliberately NOT replayed because a cached
+	// Status risks showing stale green (specification section 8).
 	a, _ := newTestApp(t)
 	silencePump(a)
 
@@ -563,11 +571,14 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 1 {
-		t.Fatalf("domReady queued %d events, want exactly the sender replay: %+v", len(queued), queued)
+	if len(queued) != 2 {
+		t.Fatalf("domReady queued %d events, want the sender and return replays: %+v", len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[0], EventSender, sender.StateConnected)
+	}
+	if queued[1].name != EventReturn || queued[1].data != gst.ReturnStateStopped {
+		t.Fatalf("domReady queued %+v, want %s = %s", queued[1], EventReturn, gst.ReturnStateStopped)
 	}
 }
 
@@ -578,8 +589,15 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 1 || queued[0].data != sender.StateStopped {
+	if len(queued) != 2 {
+		t.Fatalf("domReady queued %+v, want a sender and a return replay", queued)
+	}
+	if queued[0].data != sender.StateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any session has run", queued, sender.StateStopped)
+	}
+	if queued[1].data != gst.ReturnStateStopped {
+		t.Fatalf("domReady queued %+v, want %s before any return monitor has run",
+			queued, gst.ReturnStateStopped)
 	}
 }
 
@@ -773,6 +791,14 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // listed second here so the original eight stay legible as one group. Their
 // shapes and their safety properties are asserted in app_mixer_test.go; this
 // list exists only to make an addition a decision rather than an accident.
+//
+// The five return methods are the fifteenth to nineteenth, added with the SRT
+// return monitor and documented in the same header. Four are read-only or
+// purely local; StartReturn and StopReturn open and close a second SRT session
+// that only ever RECEIVES, on a separate lock, a separate pipeline and a
+// separate validation path from the contribution feed. They are listed third for
+// the same reason the mixer six are listed second: so that each group stays
+// legible as one decision.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -792,6 +818,12 @@ func assertBoundSurface(t *testing.T) {
 		"SendMixerCommands": true,
 		"GetMixerGolden":    true,
 		"SetMixerGolden":    true,
+
+		"ListOutputDevices":   true,
+		"StartReturn":         true,
+		"StopReturn":          true,
+		"GetReturnState":      true,
+		"IsSRTReturnSelected": true,
 	}
 
 	got := exportedMethodsOfApp()

@@ -2,6 +2,10 @@ import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
 import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
+// The channel table, from the module that enforces it in the Web Audio graph.
+// See the note beside the same import in home.js.
+import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
 
 // THE MIXER DRAWER IS NOT HERE ANY MORE. It moved to a button beside Settings
 // on the main screen, at the operator's request — reaching the clean-feed
@@ -39,7 +43,11 @@ function blankConfig() {
     statusKey: '',
     audioDeviceId: '',
     headphoneDeviceId: '',
+    headphoneEndpointId: '',
     returnMid: 2,
+    returnChannel: 'stereo',
+    returnSource: 'webrtc',
+    srtReturnPort: 40503,
     monitorTile: { x: 0, y: 360, w: 640, h: 360 },
     returnGainDb: 18,
     slatePath: 'slate.png',
@@ -129,6 +137,21 @@ export function createSettingsView(handlers) {
   });
 
   const fields = {}; // key -> { input, errorEl }
+
+  // Fields with no control on this screen that must survive a Save unchanged.
+  // Held between populate() and collectConfig().
+  //
+  // saveConfig REPLACES the stored object: a field this form does not restate
+  // is a field this form DELETES. That is not hypothetical — returnSource
+  // decides which path the commentator hears, and silently resetting it to the
+  // default because somebody pressed Save on an unrelated screen is a way to
+  // change what is in their ears without touching a control that says so.
+  let carriedReturnSource = normaliseReturnSource(undefined);
+  // The port of the M2L-X output the SRT return dials. 40503 is Output 3,
+  // src=cln — the only output that carries the CLN bus. Carried rather than
+  // exposed: it is measured, it is the same on every instance seen so far, and
+  // a wrong value here is a monitor that never connects with nothing to say why.
+  let carriedSRTReturnPort = 0;
   function addField(key, labelText, input, hint) {
     const { wrap, errorEl } = row(labelText, input.id, input, hint);
     fields[key] = { input, errorEl };
@@ -343,9 +366,22 @@ export function createSettingsView(handlers) {
   );
   addField(
     'headphoneDeviceId',
-    'Headphone device ID',
+    'Headphone device ID — WebRTC return',
     textInput('f-headphoneDeviceId'),
-    'Normally set from the Headphones dropdown on the main screen.',
+    'A browser mediaDeviceId, used when the return source is WebRTC. Normally set from the ' +
+      'Headphones dropdown on the main screen.',
+  );
+  // A SECOND device field, not a duplicate. The two return paths address the
+  // same headphones through different identifier spaces — a browser
+  // mediaDeviceId and a WASAPI endpoint id — and one put in the other's field
+  // does not fail: it plays on the default device. Two labelled fields is the
+  // cheapest way to make that visible to whoever is pasting a GUID.
+  addField(
+    DEVICE_KEY_SRT,
+    'Headphone device ID — SRT return',
+    textInput('f-headphoneEndpointId'),
+    'A Windows WASAPI endpoint id, used when the return source is SRT. Not interchangeable with ' +
+      'the field above even though both name the same headphones.',
   );
 
   // --- monitor / return ---------------------------------------------------
@@ -364,6 +400,28 @@ export function createSettingsView(handlers) {
       RETURN_BUSES.map((b) => ({ value: b.mid, label: b.label })),
     )
   );
+  // Which SOURCE channel of that bus reaches the ears. It is here as well as on
+  // the main screen because it is part of the saved configuration and because
+  // CLN on this event carries effects hard left and comms hard right — a
+  // commentator who wants effects alone needs one channel, not one bus.
+  //
+  // "Left only" means the LEFT SOURCE CHANNEL IN BOTH EARS.
+  addField(
+    'returnChannel',
+    'Return channel',
+    selectInput(
+      'f-returnChannel',
+      CHANNEL_MODES.map((m) => ({ value: m.value, label: m.label })),
+    ),
+    CHANNEL_MODES.map((m) => `${m.label}: ${m.hint}`).join(' '),
+  );
+  // The return SOURCE — WebRTC or the native SRT path — has NO control here on
+  // purpose. It decides what the commentator can hear right now, and a
+  // configuration screen that changes it as a side effect of pressing Save is a
+  // way to silence somebody mid-match from a screen they are not looking at. It
+  // lives on the main screen only; this form carries the saved value through
+  // untouched — see collectConfig.
+
   addField(
     'returnGainDb',
     'Return gain (dB)',
@@ -491,9 +549,14 @@ export function createSettingsView(handlers) {
     fields.statusKey.input.value = config.statusKey || '';
     fields.audioDeviceId.input.value = config.audioDeviceId || '';
     fields.headphoneDeviceId.input.value = config.headphoneDeviceId || '';
+    fields[DEVICE_KEY_SRT].input.value = config[DEVICE_KEY_SRT] || '';
     fields.returnMid.input.value = String(
       isValidReturnMid(config.returnMid) ? config.returnMid : DEFAULT_RETURN_MID,
     );
+    fields.returnChannel.input.value = normaliseChannelMode(config.returnChannel);
+    // Held, not shown. See the note beside the returnChannel field.
+    carriedReturnSource = normaliseReturnSource(config.returnSource);
+    carriedSRTReturnPort = Number(config.srtReturnPort) || 0;
     fields.returnGainDb.input.value = String(config.returnGainDb ?? 18);
     const tile = config.monitorTile || { x: 0, y: 360, w: 640, h: 360 };
     fields['monitorTile.x'].input.value = String(tile.x ?? 0);
@@ -532,7 +595,13 @@ export function createSettingsView(handlers) {
       statusKey: fields.statusKey.input.value.trim(),
       audioDeviceId: fields.audioDeviceId.input.value.trim(),
       headphoneDeviceId: fields.headphoneDeviceId.input.value.trim(),
+      [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
       returnMid: Number(fields.returnMid.input.value),
+      returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
+      // Carried through from the loaded config, not collected from a control.
+      // See the declarations of these two for why.
+      returnSource: carriedReturnSource,
+      srtReturnPort: carriedSRTReturnPort,
       monitorTile: {
         x: Number(fields['monitorTile.x'].input.value),
         y: Number(fields['monitorTile.y'].input.value),

@@ -213,12 +213,37 @@ function New-BundleEntry {
 function Get-PluginEntries {
     <#
     .SYNOPSIS
-        The thirteen plugins of specification section 3, and nothing else.
+        The thirteen plugins of specification section 3, plus mpegtsdemux for
+        the return path, and nothing else.
     .DESCRIPTION
         This list is closed. Adding to it is a specification change, not a build
         change: every plugin here was chosen because the pipeline in section 5
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
+
+        There has been exactly one addition since section 3 was written:
+        mpegtsdemux, for the SRT return monitor. It is stated here rather than
+        slipped into the list because that is the rule this function exists to
+        enforce on everyone else.
+
+        Two plugins were CONSIDERED for the return and deliberately not added:
+
+          libav       gst-libav is FFmpeg. Its licence depends on how it was
+                      built and is not ours to assume, which is the same
+                      commercial-shipping concern that keeps x264 out and the
+                      reason *libav* and *avcodec* are in $ForbiddenPatterns.
+                      avdec_aac ranks primary on the dev machine and must not be
+                      selected; the AAC decoder is mfaacdec, from the
+                      mediafoundation plugin already in this list.
+          d3d11       d3d11h265dec would decode the return's H.265 picture. The
+                      return is AUDIO ONLY - the picture is a separate, larger
+                      decision the operator has not taken - so the video pad is
+                      sent to a fakesink and this plugin is not bundled.
+                      (libgstd3d11-1.0-0.dll appears in Get-RuntimeEntries as an
+                      optional RUNTIME library because the Media Foundation
+                      plugin links it. That is a different thing from bundling
+                      the d3d11 PLUGIN, and adding the plugin would be a new
+                      decision.)
 
         The gstreamer plugin file naming convention (libgst<name>.dll) is the
         same in the MSVC and MinGW builds, so these names are the ones this
@@ -249,8 +274,10 @@ function Get-PluginEntries {
             -Why 'mfh264enc and mfaacenc: LGPL wrappers over codecs already in Windows. This plugin is what makes x264 unnecessary.'
         New-BundleEntry -Kind Plugin -Names 'libgstmpegtsmux.dll' `
             -Why 'mpegtsmux alignment=7, giving 1316-byte buffers - exactly one SRT payload.'
+        New-BundleEntry -Kind Plugin -Names 'libgstmpegtsdemux.dll' `
+            -Why 'tsdemux: the RETURN path''s demuxer. The commentator''s off-air monitor dials an M2L-X output as an SRT caller and gets MPEG-TS back, and this is the only element in the tree that can take the AAC out of it. Audio only - the H.265 video pad is fakesinked, not decoded.'
         New-BundleEntry -Kind Plugin -Names 'libgstsrt.dll' `
-            -Why 'srtsink, mode=caller, auto-reconnect=false. The contribution path.'
+            -Why 'srtsink, mode=caller, auto-reconnect=false. The contribution path. Also srtsrc, mode=caller, for the return monitor.'
     )
 }
 
@@ -406,11 +433,14 @@ function Assert-ManifestSane {
         }
     }
 
-    # The plugin allowlist is closed and must equal specification section 3.
+    # The plugin allowlist is closed and must equal specification section 3,
+    # plus mpegtsdemux, which is the one deliberate addition since: the return
+    # monitor's demuxer. Adding a plugin remains a specification change and this
+    # list is where it has to be made, not somewhere it can be drifted into.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
-        'wasapi2', 'mediafoundation', 'mpegtsmux', 'srt'
+        'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {
@@ -613,7 +643,7 @@ $entries += Get-RuntimeEntries
 Write-Host "Validating the file list ($($entries.Count) entries)..."
 Assert-ManifestSane -Entries $entries
 Write-Host "  file list OK: no wildcards, no forbidden names, no duplicate destinations,"
-Write-Host "  plugin set equals specification section 3 exactly."
+Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, exactly."
 Write-Host ''
 
 $srcBin = Join-Path $GstRoot 'bin'

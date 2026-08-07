@@ -6,11 +6,30 @@
  *
  * The graph is deliberately the shortest one that does the job:
  *
- *   remote track ─► MediaStreamAudioSourceNode ─► GainNode ─► MediaStreamAudioDestinationNode
- *                                                                      │
- *                                                       <audio>.srcObject
- *                                                                      │
- *                                                       setSinkId(headphoneDeviceId)
+ *   remote track ─► MediaStreamAudioSourceNode
+ *                        │
+ *                        ▼
+ *                  ChannelSplitter(2) ══► ChannelMerger(2) ─► GainNode ─► MediaStreamAudioDestinationNode
+ *                                                                                      │
+ *                                                                       <audio>.srcObject
+ *                                                                                      │
+ *                                                                       setSinkId(headphoneDeviceId)
+ *
+ * THE SPLITTER AND MERGER are the channel selector: Stereo / Left only / Right
+ * only. Which splitter output is wired to which merger input is the whole of it,
+ * and that table lives in channels.js — read the note there about why "Left
+ * only" puts the LEFT SOURCE channel in BOTH ears rather than silencing an ear.
+ * They are built once, in ensureGraph, and only the wiring between them changes,
+ * so switching channel is as cheap as switching bus and neither touches the peer
+ * connection.
+ *
+ * THE gain ─► dest EDGE is the mute. When the commentator switches the return
+ * source to SRT, the browser must go genuinely silent, and it is severed here
+ * rather than turned down to zero: a gain of zero is still a running graph
+ * pulling packets into a device the native path is also writing to, and one
+ * accidental ramp back up is a second copy of the programme at a different
+ * offset in somebody's ears mid-match. There is no volume control in this
+ * application that can undo a disconnected edge.
  *
  * Three things in here are not obvious and each of them fails *silently* — the
  * commentator hears nothing, every lamp is green, and there is nothing in the
@@ -43,6 +62,7 @@
 
 import { computeGain, clampGainDb, clampLevel, GAIN_RAMP_SECONDS } from './gain.js';
 import { MonitorError, MonitorErrorCode, toMonitorError } from './errors.js';
+import { channelRouting, normaliseChannelMode, describeChannelMode } from './channels.js';
 
 /** Events that count as a user gesture for the purposes of unblocking audio. */
 const GESTURE_EVENTS = Object.freeze(['pointerdown', 'keydown', 'touchend']);
@@ -59,10 +79,22 @@ const GESTURE_EVENTS = Object.freeze(['pointerdown', 'keydown', 'touchend']);
  * @param {number} args.gainDb make-up gain in dB (default 18, measured)
  * @param {number} [args.level] 0..1 user level; defaults to 1
  * @param {string} [args.sinkId] headphone device id to route to
+ * @param {string} [args.channelMode] 'stereo' | 'left' | 'right'; see channels.js
+ * @param {boolean} [args.muted] start with the graph severed from the output —
+ *        used when the commentator's return source is SRT and this path must
+ *        not be audible at all
  * @param {(err: Error) => void} args.onError
  * @returns {ReturnAudio}
  */
-export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onError }) {
+export function createReturnAudio({
+  audioEl,
+  gainDb,
+  level = 1,
+  sinkId = '',
+  channelMode,
+  muted = false,
+  onError,
+}) {
   if (!audioEl || typeof audioEl.play !== 'function') {
     throw new MonitorError(
       MonitorErrorCode.BAD_OPTIONS,
@@ -73,13 +105,22 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
   let currentGainDb = clampGainDb(gainDb);
   let currentLevel = clampLevel(level);
   let requestedSinkId = typeof sinkId === 'string' ? sinkId : '';
+  let currentChannelMode = normaliseChannelMode(channelMode);
+  /** True while this path is deliberately severed from the output. */
+  let currentMuted = !!muted;
   /** The sink actually applied to the element; '' means the system default. */
   let appliedSinkId = null;
 
   /** @type {AudioContext|null} */
   let ctx = null;
+  /** @type {ChannelSplitterNode|null} */
+  let splitter = null;
+  /** @type {ChannelMergerNode|null} */
+  let merger = null;
   /** @type {GainNode|null} */
   let gainNode = null;
+  /** Whether gainNode is currently connected to dest. See applyMute. */
+  let outputConnected = false;
   /** @type {MediaStreamAudioDestinationNode|null} */
   let dest = null;
   /** @type {MediaStreamAudioSourceNode|null} */
@@ -111,15 +152,93 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
     // bound (docs/test-results.md §2.2). Every millisecond the browser can be
     // persuaded not to add is worth having.
     ctx = new Ctor({ latencyHint: 'interactive' });
+
+    // The channel selector. Two outputs and two inputs is the whole of it; the
+    // interesting part is which is wired to which, and that is channels.js.
+    //
+    // Both nodes are built ONCE and outlive every attach(), so switching bus
+    // does not disturb the channel choice and switching channel does not
+    // disturb the routed track.
+    splitter = ctx.createChannelSplitter(2);
+    merger = ctx.createChannelMerger(2);
+
     gainNode = ctx.createGain();
     gainNode.gain.value = computeGain(currentGainDb, currentLevel);
+    merger.connect(gainNode);
+    applyChannelRouting();
+
     dest = ctx.createMediaStreamDestination();
-    gainNode.connect(dest);
+    outputConnected = false;
+    applyMute();
 
     audioEl.srcObject = dest.stream;
     audioEl.autoplay = true;
+    // NOTE: audioEl.muted is deliberately NOT the mute. The element's own mute
+    // leaves the graph running and is one property assignment away from being
+    // undone by anything that touches the element; applyMute severs the edge.
     audioEl.muted = false;
     audioEl.volume = 1;
+  }
+
+  /**
+   * applyChannelRouting rewires the splitter to the merger for the current mode.
+   *
+   * splitter.disconnect() with no arguments is safe here and only here: the
+   * splitter's ONLY destination is the merger, so there is nothing else to lose.
+   * If that ever stops being true this must become the three-argument form.
+   */
+  function applyChannelRouting() {
+    if (!splitter || !merger) return;
+    try {
+      splitter.disconnect();
+    } catch {
+      /* nothing connected yet */
+    }
+    for (const { from, to } of channelRouting(currentChannelMode)) {
+      splitter.connect(merger, from, to);
+    }
+  }
+
+  /**
+   * applyMute connects or severs the gain -> destination edge.
+   *
+   * Severed is genuinely silent: no packets reach the element, and the element
+   * is paused as well so the WebView is not holding an output device open that
+   * the native SRT path wants. Reconnecting restarts playback, because a paused
+   * element does not resume on its own when its stream comes back.
+   */
+  function applyMute() {
+    if (!gainNode || !dest) return;
+
+    if (currentMuted) {
+      if (outputConnected) {
+        try {
+          gainNode.disconnect(dest);
+        } catch {
+          /* already disconnected */
+        }
+        outputConnected = false;
+      }
+      try {
+        audioEl.pause();
+      } catch {
+        /* not playing */
+      }
+      return;
+    }
+
+    if (!outputConnected) {
+      try {
+        gainNode.connect(dest);
+        outputConnected = true;
+      } catch (err) {
+        report(toMonitorError(MonitorErrorCode.AUDIO_FAILED, 'un-muting the return', err));
+        return;
+      }
+    }
+    startPlayback().catch(() => {
+      /* startPlayback reports its own failures */
+    });
   }
 
   /** disconnectSource tears down just the per-track part of the graph. */
@@ -283,7 +402,9 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
    */
   async function resume() {
     if (closed || !ctx) return;
-    await startPlayback();
+    // A muted path has nothing to resume. Retrying playback on it would be the
+    // one place a "silenced" WebRTC return could start making noise again.
+    if (!currentMuted) await startPlayback();
     await applySinkId(true);
     applyGain();
   }
@@ -341,14 +462,19 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
 
       try {
         source = ctx.createMediaStreamSource(sourceStream);
-        source.connect(gainNode);
+        // Into the SPLITTER, not the gain: the channel selector sits between
+        // the track and everything else.
+        source.connect(splitter);
       } catch (err) {
         report(toMonitorError(MonitorErrorCode.AUDIO_FAILED, 'createMediaStreamSource', err));
         return;
       }
 
       applyGain();
-      await startPlayback();
+      // A muted path stays paused. Starting playback here would attach the
+      // WebView to the output device the native SRT return is using, for a
+      // stream that is severed from the graph and therefore silent anyway.
+      if (!currentMuted) await startPlayback();
       await applySinkId(true);
     },
 
@@ -379,6 +505,42 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
     },
 
     /**
+     * setChannelMode picks which SOURCE channel reaches which ear.
+     *
+     * Live: it rewires the splitter to the merger and touches nothing else — not
+     * the AudioContext, not the source node, not the element, not the peer
+     * connection. Switching channel is exactly as cheap as switching bus, which
+     * is the point: on this event CLN carries effects hard left and comms hard
+     * right, so choosing a channel is part of choosing what to listen to.
+     *
+     * @param {string} mode 'stereo' | 'left' | 'right'
+     * @returns {string} the mode actually in force
+     */
+    setChannelMode(mode) {
+      currentChannelMode = normaliseChannelMode(mode, currentChannelMode);
+      applyChannelRouting();
+      return currentChannelMode;
+    },
+
+    /**
+     * setMuted severs or restores the gain -> destination edge.
+     *
+     * This is what the return SOURCE control uses to make sure only one path is
+     * audible. Selecting SRT mutes this one; selecting WebRTC un-mutes it. It is
+     * not a user volume control and there is no UI for it on its own.
+     *
+     * @param {boolean} m
+     * @returns {boolean} the mute state in force
+     */
+    setMuted(m) {
+      const next = !!m;
+      if (next === currentMuted) return currentMuted;
+      currentMuted = next;
+      applyMute();
+      return currentMuted;
+    },
+
+    /**
      * setSinkId asks for an output device. Remembered and re-applied whenever
      * the element gets a stream — see note 2 in the module comment.
      * @param {string} deviceId '' for the system default
@@ -402,6 +564,13 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
         requestedSinkId,
         appliedSinkId,
         routed: !!source,
+        channelMode: currentChannelMode,
+        channelRouting: describeChannelMode(currentChannelMode),
+        muted: currentMuted,
+        // The honest one: whether anything can actually reach the element. A
+        // support log that says muted:false but outputConnected:false is a bug
+        // in applyMute, and the two are printed separately so it is visible.
+        outputConnected,
         sampleRate: ctx ? ctx.sampleRate : 0,
       };
     },
@@ -433,14 +602,18 @@ export function createReturnAudio({ audioEl, gainDb, level = 1, sinkId = '', onE
         /* not playing */
       }
       audioEl.srcObject = null;
-      if (gainNode) {
+      for (const node of [splitter, merger, gainNode]) {
+        if (!node) continue;
         try {
-          gainNode.disconnect();
+          node.disconnect();
         } catch {
           /* already disconnected */
         }
-        gainNode = null;
       }
+      splitter = null;
+      merger = null;
+      gainNode = null;
+      outputConnected = false;
       if (dest) {
         try {
           dest.disconnect();

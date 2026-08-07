@@ -37,6 +37,13 @@
 //	GetMixerGolden()            *mixer.Snapshot            caller: WP-M4
 //	SetMixerGolden(snapshot)    error                      caller: WP-M4
 //
+// and the five added for the SRT return monitor, which live in app_return.go:
+//
+//	ListOutputDevices()         []gst.Device               caller: WP-5b
+//	StartReturn() / StopReturn() error                     caller: WP-5b
+//	GetReturnState()            gst.ReturnState            caller: WP-5b
+//	IsSRTReturnSelected()       bool                       caller: WP-5b
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
@@ -62,16 +69,36 @@
 // second path, and app_mixer.go says why adding one would be a bug rather than
 // a feature. SetMixerGolden writes a local file and never touches the mixer.
 //
+// The five return methods are the FIFTEENTH to NINETEENTH. Four of the five are
+// read-only or purely local; StartReturn and StopReturn open and close a second
+// SRT session that only ever RECEIVES. Nothing in app_return.go can write to
+// M2L-X, and nothing in it can reach the contribution session — the two hold
+// different locks, drive different pipelines and share no state, which is the
+// property that stops a headphone monitor taking a live feed off air.
+//
+// IsSRTReturnSelected is the one that looks redundant next to GetConfig and is
+// not: it is the single place that decides which return path owns the
+// headphones, and the frontend has to agree with Go about that or the
+// commentator hears the same programme twice a few hundred milliseconds apart.
+// Deriving it from a config string on both sides of the boundary is how the two
+// come to disagree.
+//
 // The event list below is deliberately NOT extended for the mixer. Mixer
 // snapshots are pulled by GetMixerSnapshot rather than pushed, because the
 // status socket only carries a complete document once per connection and a
 // pushed "latest known" frame would be exactly the cached stale frame the
 // drawer's freshness gate is built to reject. See app_mixer.go.
 //
+// It IS extended for the return, and for the opposite reason: the return
+// monitor's state changes on its own, from a reconnect loop nobody polls, and a
+// RETURN lamp that only updated when the frontend happened to ask would show
+// green through an outage the commentator can hear.
+//
 // # Events emitted Go to JS
 //
 //	"status"              an m2lx.Status
 //	"sender"              a sender.State
+//	"return"              a gst.ReturnState
 //	"error"               a string
 //	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
 //
@@ -79,29 +106,38 @@
 // sign-in failures, and — rate-limited, because the sender retries forever — the
 // reason each connection attempt failed. See connectErrorReporter.
 //
-// Headphone enumeration and selection are JavaScript-side only, through
-// enumerateDevices and setSinkId. No Go package owns output devices.
+// Headphone enumeration and selection for the WEBRTC return are JavaScript-side
+// only, through enumerateDevices and setSinkId. The SRT return needs a WASAPI
+// IMMDevice endpoint ID instead, which no browser API can produce, so
+// ListOutputDevices enumerates those on the Go side and config keeps both
+// identifiers under two names. They are not interchangeable; see
+// config.Config.HeadphoneEndpointID.
 //
 // # Lifecycle: one context tree, one shutdown order
 //
-// Five things run concurrently in this process: the Wails event loop, the status
+// Six things run concurrently in this process: the Wails event loop, the status
 // WebSocket watcher, the m2lx client's token-refresh timer, the sender's two
-// goroutines, and the event pump below. Every one of them is rooted in a single
-// context created by NewApp, and shut down in exactly one order by teardown:
+// goroutines, the return monitor's two, and the event pump below. Every one of
+// them is rooted in a single context created by NewApp, and shut down in exactly
+// one order by teardown:
 //
 //  0. the closing flag is raised, so that a bound method already in flight on a
 //     Wails message-handler goroutine cannot build a new session or a new
 //     control plane behind the teardown that has just walked past them;
 //  1. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
 //     endpoint and the SRT socket are released before anything else moves;
-//  2. the mixer write path — it is closed BEFORE the control plane, because a
+//  2. the return monitor — same reason, and deliberately AFTER the sender: both
+//     release a WASAPI endpoint and an SRT socket, and if the whole sequence
+//     overruns shutdownTimeout the process exits regardless, so the one that
+//     must already have finished is the contribution path;
+//  3. the mixer write path — it is closed BEFORE the control plane, because a
 //     Send in flight is a write to a live desk and must not be left racing a
 //     teardown; Close also disarms, so the gate is shut whatever happens next;
-//  3. the status watcher — its context is cancelled and its goroutines joined;
-//  4. the token refresh — the m2lx client's own background goroutine, which is
-//     bounded by a context of the client's own and so survives step 3; only
+//  4. the status watcher — its context is cancelled and its goroutines joined;
+//  5. the token refresh — the m2lx client's own background goroutine, which is
+//     bounded by a context of the client's own and so survives step 4; only
 //     m2lx.Client.Close stops it (see stopControlPlaneLocked);
-//  5. the root context, then a WaitGroup join of everything left.
+//  6. the root context, then a WaitGroup join of everything left.
 //
 // Step 0 is what makes the order deterministic rather than merely usual. Both
 // races it closes are decided the same way whichever goroutine wins the lock:
@@ -118,6 +154,22 @@
 //	ctlMu               (never held with either of the others)
 //	senderMu            (leaf; never held while any other lock is taken)
 //	mixMu               (leaf; never held while any other lock is taken)
+//	retMu -> cfgMu      (StartReturn reads the config while holding it)
+//	retStateMu          (leaf; never held while any other lock is taken)
+//
+// retMu is a SIXTH and it is deliberately disjoint from sessMu rather than
+// nested under it. The two guard two independent media sessions that share no
+// device, no socket and no pipeline, and the whole reason app_return.go exists
+// as a separate path is that a monitor must not be able to block the feed. A
+// single lock over both would have made StartReturn wait on a wedged
+// gst.Pipeline.Stop, which is precisely the coupling that was designed out.
+//
+// retStateMu is a SEVENTH, and it is split off retMu for a concrete reason
+// rather than for symmetry: StopReturn holds retMu across the join of the
+// state-forwarding goroutine, and that goroutine writes lastReturn. One lock
+// over both deadlocks the first Stop that lands while a transition is in
+// flight. senderMu is split off sessMu for exactly this reason and it is worth
+// two locks in both places.
 //
 // No goroutine started here takes any of the five, so the WaitGroup joins
 // performed under ctlMu and sessMu cannot deadlock against their own workers.
@@ -166,6 +218,12 @@ const (
 
 	// EventSender carries a sender.State behind the SENDING lamp.
 	EventSender = "sender"
+
+	// EventReturn carries a gst.ReturnState behind the RETURN lamp: the state
+	// of the SRT return monitor. It is emitted only when returnSource is "srt";
+	// on the WebRTC path nothing produces it and the lamp is the browser's
+	// business.
+	EventReturn = "return"
 
 	// EventError carries a human-readable error string for display.
 	EventError = "error"
@@ -381,6 +439,40 @@ type App struct {
 	// down by DisarmMixer — never on application start.
 	mixCtl mixer.Controller
 
+	// retMu guards ret: the SRT return monitor.
+	//
+	// It is held for the whole of StartReturn and StopReturn, so that a
+	// StartReturn racing a StopReturn cannot open a second pipeline on the same
+	// headphone endpoint — the same hazard sessMu covers for the capture
+	// endpoint, and the reason the two are separate locks is in the file header.
+	retMu sync.Mutex
+
+	// ret is the running return session, or nil when the monitor is stopped. It
+	// is nil for the whole of a session on the WebRTC return path.
+	ret *returnSession
+
+	// retStateMu guards lastReturn, and is a DIFFERENT lock from retMu on
+	// purpose. StopReturn holds retMu across the join of the state-forwarding
+	// goroutine, and that goroutine writes lastReturn on every transition; one
+	// lock over both would deadlock the first Stop that arrived while a
+	// transition was in flight. It is the same split senderMu makes against
+	// sessMu, for the same reason.
+	//
+	// It is a leaf: nothing is taken while it is held.
+	retStateMu sync.Mutex
+
+	// lastReturn is the most recent gst.ReturnState forwarded to the frontend,
+	// replayed by domReady for the same reason lastSender is: the monitor emits
+	// only on transitions, so a page that reloaded mid-match would otherwise
+	// show the RETURN lamp grey while audio was in the commentator's ears.
+	lastReturn gst.ReturnState
+
+	// returnDial builds the return monitor. It is gst.NewReturnMonitor in the
+	// application and a fake in the tests, which is how the wire-up is exercised
+	// without a GStreamer pipeline. Nil means the real one; see
+	// App.newReturnMonitor.
+	returnDial func() gst.ReturnMonitor
+
 	// mixerDial builds the mixer write controller. It is mixer.NewController in
 	// the application and a fake in the tests, which is the only way to
 	// exercise the arm gate without a live switcher_controller socket. Nil
@@ -422,6 +514,7 @@ func NewApp(appDir string, gstInitErr error) *App {
 		events:     newEventPump(),
 		store:      secrets.New(),
 		lastSender: sender.StateStopped,
+		lastReturn: gst.ReturnStateStopped,
 	}
 }
 
@@ -484,6 +577,11 @@ func (a *App) domReady(ctx context.Context) {
 	last := a.lastSender
 	a.senderMu.Unlock()
 	a.events.send(EventSender, last)
+
+	a.retStateMu.Lock()
+	lastRet := a.lastReturn
+	a.retStateMu.Unlock()
+	a.events.send(EventReturn, lastRet)
 }
 
 // secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
@@ -560,7 +658,7 @@ func (a *App) teardown() {
 }
 
 // teardownOrdered is teardown's body: raise the closing flag, then sender,
-// mixer write path, watcher, token refresh, join.
+// return monitor, mixer write path, watcher, token refresh, join.
 //
 // The flag is raised before anything is stopped, which is what makes the order
 // hold against a bound method that is already running. See step 0 of the
@@ -570,6 +668,14 @@ func (a *App) teardownOrdered() {
 
 	if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
 		log.Printf("wslcomms: stopping the sender during shutdown: %v", err)
+	}
+
+	// The return monitor after the sender, never before it. Both release a
+	// WASAPI endpoint and an SRT socket, and if the whole sequence overruns
+	// shutdownTimeout the process exits regardless — so the one that must
+	// already have finished is the contribution path.
+	if err := a.StopReturn(); err != nil && !errors.Is(err, errReturnNotRunning) {
+		log.Printf("wslcomms: stopping the return monitor during shutdown: %v", err)
 	}
 
 	a.closeMixerController()

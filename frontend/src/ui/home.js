@@ -1,6 +1,24 @@
 import { createLampRow } from './lamps.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+import {
+  RETURN_SOURCES,
+  RETURN_SOURCE_SRT,
+  DEFAULT_RETURN_SOURCE,
+  normaliseReturnSource,
+  describeReturnSource,
+  deriveReturnSourceEffects,
+  LATENCY_NOTE,
+  PICTURE_NOTE,
+  CHANNEL_REBUILD_NOTE,
+} from './returnsource.js';
+// The channel table comes from the monitor module because that is where it is
+// ENFORCED — it is the wiring of a ChannelSplitter to a ChannelMerger, and the
+// words here have to be the words for that wiring. It is pure data with no
+// browser API in it. Writing a second copy of "Stereo / Left only / Right only"
+// on this side is precisely the bug ./returns.js exists to record: two tables
+// that agree with each other and are both wrong.
+import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../monitor/channels.js';
 
 // The main screen: the PGM tile, the three device/return controls, the
 // START/STOP button and the five lamps. Specification section 10 layout, less
@@ -35,6 +53,21 @@ import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js
 
 const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
 
+// The four gst.ReturnState values, each with the sentence that says whether the
+// commentator should be worried. The state name alone is not enough: "BACKOFF"
+// tells a broadcast engineer that a connection attempt failed and another is
+// coming, and tells a commentator nothing at all.
+//
+// The strings are app.go's, forwarded on the "return" event. Any state not in
+// this table still prints, with no gloss — an unknown state is shown as itself
+// rather than swallowed.
+const RETURN_STATE_WORDS = Object.freeze({
+  STOPPED: ' — not running',
+  CONNECTING: ' — dialling M2L-X',
+  RECEIVING: ' — audio is arriving',
+  BACKOFF: ' — the last attempt failed; retrying',
+});
+
 // The Return dropdown offers all seven audio tracks. It used to offer two, CLN
 // and PGM. That was fine as long as the documented routing held. It did not:
 // the commentator on mid 2 could hear themselves delayed, which means
@@ -59,6 +92,10 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   setInputDevices(devices, selected)  populates the commentary input dropdown
  *   setHeadphoneDevices(devices, sel)   populates the headphones dropdown
  *   setReturnMid(mid)                   selects one of the seven buses, 1..7
+ *   setReturnChannel(mode)              stereo / left / right
+ *   setReturnSource(source)             webrtc / srt; also relabels Headphones
+ *   setSRTAvailable(available, reason)  disables the SRT option with a reason
+ *   setSRTReturnState(state)            the native return's own status line
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
  *   setBusy(busy)                       disables the button while a call is in flight
@@ -68,7 +105,8 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  * handlers = {
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
- *   onReturnChange(mid), onLevelChange(fraction),
+ *   onReturnChange(mid), onReturnChannelChange(mode), onReturnSourceChange(src),
+ *   onLevelChange(fraction),
  * }
  */
 export function createHomeView(handlers) {
@@ -246,6 +284,78 @@ export function createHomeView(handlers) {
     return row;
   }
 
+  /**
+   * makeSegmented builds a radio group drawn as a row of buttons.
+   *
+   * Radios rather than a <select> because both of these controls have two or
+   * three options that are chosen mid-match, sometimes in the ten seconds before
+   * kick-off, and every option being visible without opening anything is worth
+   * the width. Radios rather than <button>s because a radio group is what a
+   * screen reader and a keyboard already understand, and because exactly-one-
+   * selected is then enforced by the platform rather than by this file.
+   *
+   * Returns { el, set(value), setOptionEnabled(value, enabled, reason) }.
+   */
+  function makeSegmented(name, options, onChange) {
+    const group = document.createElement('div');
+    group.className = 'segmented';
+    group.setAttribute('role', 'radiogroup');
+    const inputs = new Map();
+
+    for (const opt of options) {
+      const id = `${name}-${opt.value}`;
+      const label = document.createElement('label');
+      label.className = 'segment';
+      label.htmlFor = id;
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = name;
+      input.id = id;
+      input.value = opt.value;
+      if (opt.hint) label.title = opt.hint;
+      input.addEventListener('change', () => {
+        paint();
+        if (input.checked) onChange(input.value);
+      });
+      const text = document.createElement('span');
+      text.textContent = opt.label;
+      label.append(input, text);
+      group.appendChild(label);
+      inputs.set(opt.value, { input, label });
+    }
+
+    // The selected segment is marked with a CLASS as well as being styled from
+    // :has(:checked). :has() is a recent selector and this is the difference
+    // between a control that shows which option is live and one that looks
+    // like nothing is selected — which, on a control that decides what the
+    // commentator hears, is worth not depending on a browser version for.
+    function paint() {
+      for (const { input, label } of inputs.values()) {
+        label.classList.toggle('segment-checked', input.checked);
+      }
+    }
+
+    return {
+      el: group,
+      set(value) {
+        const entry = inputs.get(value);
+        if (entry) entry.input.checked = true;
+        paint();
+      },
+      setOptionEnabled(value, enabled, reason) {
+        const entry = inputs.get(value);
+        if (!entry) return;
+        entry.input.disabled = !enabled;
+        entry.label.classList.toggle('segment-disabled', !enabled);
+        // The reason goes on the control itself. A disabled option with no
+        // explanation is read as "this is broken", and the most likely reason —
+        // the binding is not in this build — is not something anyone can fix by
+        // clicking harder.
+        if (!enabled && reason) entry.label.title = reason;
+      },
+    };
+  }
+
   const inputSelect = document.createElement('select');
   inputSelect.id = 'input-select';
   inputSelect.addEventListener('change', () => handlers.onInputChange(inputSelect.value));
@@ -276,6 +386,60 @@ export function createHomeView(handlers) {
   returnLabel.textContent = 'Return Audio';
   returnGroup.append(returnLabel, returnSelect);
 
+  // --- return CHANNEL, beside the bus -------------------------------------
+  //
+  // Choosing a bus is no longer enough. FX and comms are mixed on PGM but hard-
+  // panned left and right on CLN — M2L-X pans per input strip, not per bus, so
+  // the operator got there with double router inputs — and a commentator who
+  // wants the effects on their own needs one CHANNEL of that bus.
+  //
+  // "Left only" is the LEFT SOURCE CHANNEL IN BOTH EARS. It is not "audio in
+  // the left ear": half the commentators are wearing one-ear cans and this
+  // application does not know which ear. That is enforced in the Web Audio
+  // graph, not here — see frontend/src/monitor/channels.js.
+  const channelSegmented = makeSegmented(
+    'return-channel',
+    CHANNEL_MODES.map((m) => ({ value: m.value, label: m.label, hint: m.hint })),
+    (mode) => handlers.onReturnChannelChange(mode),
+  );
+  channelSegmented.set(DEFAULT_CHANNEL_MODE);
+
+  const channelGroup = document.createElement('div');
+  channelGroup.className = 'control-group control-group-channel';
+  const channelLabel = document.createElement('span');
+  channelLabel.className = 'control-label';
+  channelLabel.textContent = 'Return Channel';
+  channelGroup.append(channelLabel, channelSegmented.el);
+
+  // --- return SOURCE: which path feeds the headphones ----------------------
+  const sourceSegmented = makeSegmented(
+    'return-source',
+    RETURN_SOURCES.map((s) => ({ value: s.value, label: s.label, hint: s.summary })),
+    (source) => handlers.onReturnSourceChange(source),
+  );
+  sourceSegmented.set(DEFAULT_RETURN_SOURCE);
+
+  const sourceGroup = document.createElement('div');
+  sourceGroup.className = 'control-group control-group-source';
+  const sourceLabel = document.createElement('span');
+  sourceLabel.className = 'control-label';
+  sourceLabel.textContent = 'Return Source';
+  sourceGroup.append(sourceLabel, sourceSegmented.el);
+
+  // The note under the control. It carries three things the commentator cannot
+  // work out by listening: what the selected path IS and what it costs, the one
+  // latency figure anybody has measured (and the plain statement that the other
+  // has not been), and the fact that the picture is unchanged either way.
+  const sourceNote = document.createElement('p');
+  sourceNote.className = 'return-source-note';
+
+  // The native return's own status. Separate from the note because it is the
+  // only line on this screen that reports something happening rather than
+  // something configured, and it must not be mistaken for the WebRTC lamps.
+  const srtStatusLine = document.createElement('p');
+  srtStatusLine.className = 'return-source-status';
+  srtStatusLine.hidden = true;
+
   const levelGroup = document.createElement('div');
   levelGroup.className = 'control-group control-group-level';
   const levelLabel = document.createElement('label');
@@ -291,12 +455,31 @@ export function createHomeView(handlers) {
   levelSlider.addEventListener('input', () => handlers.onLevelChange(Number(levelSlider.value) / 100));
   levelGroup.append(levelLabel, levelSlider);
 
+  // The Headphones row is built by hand rather than through makeRow because its
+  // LABEL changes: the two return paths address the same hardware through
+  // different identifier spaces — a browser mediaDeviceId and a WASAPI endpoint
+  // id — and the list in this dropdown is whichever set belongs to the selected
+  // path. An unlabelled dropdown that silently swaps its contents is how the
+  // wrong id ends up in the wrong config field.
+  const headphoneRow = document.createElement('div');
+  headphoneRow.className = 'control-group';
+  const headphoneLabel = document.createElement('label');
+  headphoneLabel.htmlFor = 'headphone-select';
+  headphoneLabel.textContent = 'Headphones';
+  headphoneRow.append(headphoneLabel, headphoneSelect);
+
   controls.append(
     makeRow('Commentary input', 'input-select', inputSelect),
-    makeRow('Headphones', 'headphone-select', headphoneSelect),
+    headphoneRow,
     returnGroup,
+    channelGroup,
+    sourceGroup,
     levelGroup,
   );
+
+  const returnNotes = document.createElement('div');
+  returnNotes.className = 'return-notes';
+  returnNotes.append(sourceNote, srtStatusLine);
 
   // --- start/stop + lamps -------------------------------------------------
   const actionRow = document.createElement('div');
@@ -318,7 +501,16 @@ export function createHomeView(handlers) {
     'STATUS UNAVAILABLE — the switcher status feed has been silent for over 15 seconds.';
   statusUnavailableBanner.hidden = true;
 
-  el.append(header, errorBanner, pgmStage, audioEl, controls, actionRow, statusUnavailableBanner);
+  el.append(
+    header,
+    errorBanner,
+    pgmStage,
+    audioEl,
+    controls,
+    returnNotes,
+    actionRow,
+    statusUnavailableBanner,
+  );
 
   // --- setters --------------------------------------------------------
 
@@ -360,6 +552,73 @@ export function createHomeView(handlers) {
     returnSelect.value = isValidReturnMid(mid) ? String(mid) : String(DEFAULT_RETURN_MID);
   }
 
+  function setReturnChannel(mode) {
+    channelSegmented.set(normaliseChannelMode(mode));
+  }
+
+  let currentReturnSource = DEFAULT_RETURN_SOURCE;
+
+  /**
+   * setReturnSource selects a path AND relabels the Headphones dropdown to say
+   * whose device list is in it. The two always move together: the label is the
+   * only thing on screen that distinguishes a mediaDeviceId list from a WASAPI
+   * endpoint list, and they name the same headphones.
+   *
+   * It does not fetch or swap the list itself — app.js does that, because only
+   * app.js can reach either device source.
+   */
+  function setReturnSource(source) {
+    currentReturnSource = normaliseReturnSource(source);
+    sourceSegmented.set(currentReturnSource);
+    const effects = deriveReturnSourceEffects(currentReturnSource);
+    headphoneLabel.textContent = `Headphones — ${effects.deviceSource}`;
+    const parts = [describeReturnSource(currentReturnSource), LATENCY_NOTE, PICTURE_NOTE];
+    // Only on the SRT path, where it is true: there the channel selector is a
+    // mix matrix inside the GStreamer pipeline and changing it rebuilds the
+    // receiver. On WebRTC it is two Web Audio nodes and the change is instant.
+    if (effects.srtRunning) parts.push(CHANNEL_REBUILD_NOTE);
+    sourceNote.textContent = parts.join(' ');
+    if (!effects.srtRunning) setSRTReturnState(null);
+  }
+
+  /**
+   * setSRTAvailable disables the SRT option, with the reason on the control.
+   * Used when the build has no SRT-return bindings — a genuine possibility while
+   * the native side lands — so the option is visibly unavailable rather than
+   * silently failing when it is pressed.
+   */
+  function setSRTAvailable(available, reason) {
+    sourceSegmented.setOptionEnabled(RETURN_SOURCE_SRT, available !== false, reason);
+  }
+
+  /**
+   * setSRTReturnState renders the native return's own status. `state` is a
+   * gst.ReturnState string. Pass null or undefined to hide the line entirely,
+   * which is what "the SRT path is not selected" looks like — an empty status
+   * line beside a running WebRTC return reads as a fault.
+   *
+   * The state is printed, not reduced to a colour. BACKOFF with no audio is a
+   * normal state that resolves itself; STOPPED with no audio is not; and a
+   * commentator who can hear the difference has to be able to see it too.
+   */
+  function setSRTReturnState(state) {
+    if (!state) {
+      srtStatusLine.hidden = true;
+      srtStatusLine.textContent = '';
+      return;
+    }
+    const name = String(state).toUpperCase();
+    srtStatusLine.textContent = `SRT return: ${name}${RETURN_STATE_WORDS[name] || ''}`;
+    // Only BACKOFF is called out. It is the one state that means something is
+    // wrong and is retrying — the others are all normal parts of coming up.
+    srtStatusLine.classList.toggle('return-source-status-bad', name === 'BACKOFF');
+    srtStatusLine.hidden = false;
+  }
+
+  // Draw the note once at construction so the panel is never blank before any
+  // config has loaded.
+  setReturnSource(DEFAULT_RETURN_SOURCE);
+
   function setLevel(fraction) {
     levelSlider.value = String(Math.round(Math.max(0, Math.min(1, fraction)) * 100));
   }
@@ -389,6 +648,10 @@ export function createHomeView(handlers) {
     setInputDevices,
     setHeadphoneDevices,
     setReturnMid,
+    setReturnChannel,
+    setReturnSource,
+    setSRTAvailable,
+    setSRTReturnState,
     setLevel,
     setRunning,
     setBusy,

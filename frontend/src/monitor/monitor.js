@@ -27,6 +27,25 @@
  *   monitor.on(event, cb);        // 'state' -> connectionState string
  *                                 // 'error' -> Error
  *
+ * Two additions to the seam, both driven by the home screen's return controls:
+ *
+ *   monitor.setChannelMode(mode)  // 'stereo' | 'left' | 'right' — WHICH SOURCE
+ *                                 // CHANNEL reaches the ears. Live, like
+ *                                 // setReturnMid: no peer connection is
+ *                                 // dropped. See ./channels.js.
+ *   monitor.setAudioEnabled(on)   // whether this path is audible AT ALL.
+ *                                 // The PICTURE is unaffected either way.
+ *
+ * setAudioEnabled(false) is what the return SOURCE control uses when the
+ * commentator switches to the native SRT return: only one path may be audible
+ * or they hear the same programme twice at different offsets. The monitor knows
+ * nothing about SRT and must not — it is told to be silent, not why.
+ *
+ * ./channels.js is the one other module in here that WP-5b may import, and only
+ * for CHANNEL_MODES and its labels. It is pure data and pure arithmetic, and the
+ * alternative is a second hand-written copy of the same three words on the UI
+ * side, which is the exact bug frontend/src/ui/returns.js exists to record.
+ *
  * Additive to that list, because spec §7 requires the page to be able to scale
  * the tile to the window and the seam as written has no way to say so:
  *
@@ -80,6 +99,7 @@ import { resolveViewerEndpoints, fetchIceServers, createSignalingClient, newView
 import { createViewerPeerConnection, createViewerOffer, applyAnswer, closePeerConnection } from './peer.js';
 import { VIDEO_MID, normaliseReturnMid, busForMid } from './buses.js';
 import { normaliseTile } from './geometry.js';
+import { normaliseChannelMode } from './channels.js';
 import { clampGainDb, clampLevel, DEFAULT_GAIN_DB } from './gain.js';
 import { restartDelayMs } from './backoff.js';
 import { MonitorError, MonitorErrorCode, toMonitorError } from './errors.js';
@@ -103,6 +123,10 @@ const EVENTS = ['state', 'error'];
  * @param {number} [opts.gainDb]
  * @param {number} [opts.level] 0..1; defaults to 1
  * @param {string} [opts.sinkId] initial headphone device id
+ * @param {string} [opts.channelMode] 'stereo' | 'left' | 'right'; default stereo
+ * @param {boolean} [opts.audioEnabled] default true. False builds the return
+ *        graph silent — the picture is unaffected — for a page that starts with
+ *        the native SRT return selected.
  * @param {boolean} [opts.manageVideoLayout] default true. Set false if the page
  *        crops the mosaic itself; the monitor then touches no layout and
  *        setScale/fitTo become no-ops that still return a clamped number. See
@@ -140,6 +164,8 @@ export function createMonitor(opts) {
   let gainDb = clampGainDb(o.gainDb === undefined ? DEFAULT_GAIN_DB : o.gainDb);
   let level = o.level === undefined ? 1 : clampLevel(o.level);
   let sinkId = typeof o.sinkId === 'string' ? o.sinkId : '';
+  let channelMode = normaliseChannelMode(o.channelMode);
+  let audioEnabled = o.audioEnabled !== false;
 
   /** Reported connectionState. Starts at 'closed': nothing is open yet. */
   let state = 'closed';
@@ -203,6 +229,8 @@ export function createMonitor(opts) {
         gainDb,
         level,
         sinkId,
+        channelMode,
+        muted: !audioEnabled,
         onError: emitError,
       });
     } catch (err) {
@@ -571,6 +599,43 @@ export function createMonitor(opts) {
     },
 
     /**
+     * setChannelMode picks which SOURCE channel of the selected bus reaches the
+     * ears: 'stereo', 'left' or 'right'.
+     *
+     * Live, and for the same reason setReturnMid is: nothing about the peer
+     * connection changes. It rewires two Web Audio nodes that were built on the
+     * first routed track and outlive every bus switch.
+     *
+     * "left" means the LEFT SOURCE CHANNEL IN BOTH EARS, not "sound in the left
+     * ear". See channels.js.
+     *
+     * @param {string} mode
+     * @returns {string} the mode in force
+     */
+    setChannelMode(mode) {
+      channelMode = normaliseChannelMode(mode, channelMode);
+      if (audio) audio.setChannelMode(channelMode);
+      return channelMode;
+    },
+
+    /**
+     * setAudioEnabled decides whether this path is audible at all.
+     *
+     * false severs the Web Audio graph from the output element and pauses it.
+     * The PROGRAMME PICTURE IS UNAFFECTED: it rides on the same peer connection
+     * and keeps coming. Nothing here knows what the alternative audio path is;
+     * the page does.
+     *
+     * @param {boolean} enabled
+     * @returns {boolean} the state in force
+     */
+    setAudioEnabled(enabled) {
+      audioEnabled = enabled !== false;
+      if (audio) audio.setMuted(!audioEnabled);
+      return audioEnabled;
+    },
+
+    /**
      * setGainDb sets the absolute make-up gain in dB. Default 18 — see gain.js
      * and docs/test-results.md line 121.
      * @param {number} db
@@ -656,6 +721,8 @@ export function createMonitor(opts) {
         restartScheduled: restartTimer !== null,
         returnMid,
         returnBus: busForMid(returnMid),
+        channelMode,
+        audioEnabled,
         gainDb,
         level,
         sinkId,

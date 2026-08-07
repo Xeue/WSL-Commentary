@@ -443,6 +443,130 @@ input[type='range'] {
 /* .control-hint is gone with the sentence under the Return dropdown, which the
    operator removed. Settings' own hints use .field-hint and are unaffected. */
 
+/* A .control-label is a <span>, not a <label>: the segmented controls are radio
+   groups and each radio has its own <label>. It is styled identically to a
+   real one so the row reads as one row. */
+.control-label {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Segmented controls: return channel, return source                    */
+/* ------------------------------------------------------------------ */
+
+/* Every option visible without opening anything. These are pressed in the ten
+   seconds before kick-off by someone looking at the match, and a <select> that
+   has to be opened to see what is in it costs a second and a glance. */
+.segmented {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--panel);
+  min-height: 44px;
+}
+
+.segment {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0.7rem;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  text-align: center;
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.segment:last-child {
+  border-right: 0;
+}
+
+/* The radio itself is not drawn, but it is NOT display:none — a removed
+   control is unreachable by keyboard and invisible to a screen reader, and the
+   selection semantics of the group are the whole reason these are radios. */
+.segment input[type='radio'] {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.segment:hover {
+  background: var(--panel-alt);
+}
+
+/* Two selectors for one state: the class is set by home.js on every change, the
+   :has() rule is the same thing for a browser that supports it. Either alone
+   would do; both means a control whose selected option is always visible. */
+.segment-checked,
+.segment:has(input[type='radio']:checked) {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Focus has to be visible on the LABEL, because that is what is drawn. */
+.segment:has(input[type='radio']:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.segment-disabled,
+.segment:has(input[type='radio']:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.segment:has(input[type='radio']:disabled:checked) {
+  background: var(--grey);
+}
+
+/* The channel control is three short words; the source control is two. Neither
+   needs the width the dropdowns do. */
+.control-group-channel {
+  flex: 1 1 260px;
+}
+
+.control-group-source {
+  flex: 1 1 200px;
+}
+
+/* ------------------------------------------------------------------ */
+/* What the selected return source actually is                          */
+/* ------------------------------------------------------------------ */
+
+/* Two lines, not a tooltip. The difference between the paths — monitor-grade
+   audio already arriving, against a real 15 Mbit/s stream and one of M2L-X's
+   four fan-out slots — is the whole basis on which the choice is made, and a
+   commentator cannot hear a bitrate. The measured 489 ms WebRTC figure is
+   printed; the SRT figure is NOT, because nobody has measured it. */
+.return-notes {
+  flex: 0 0 auto;
+  margin: 0 0 0.6rem;
+}
+
+.return-source-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.return-source-status {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+.return-source-status-bad {
+  color: var(--red);
+}
+
 /* ------------------------------------------------------------------ */
 /* Start/stop + lamps                                                   */
 /* ------------------------------------------------------------------ */
@@ -734,6 +858,8 @@ input[type='range'] {
 @media (max-width: 560px) {
   .control-group,
   .control-group-return,
+  .control-group-channel,
+  .control-group-source,
   .control-group-level {
     flex: 1 1 100%;
   }

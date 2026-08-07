@@ -57,6 +57,10 @@ export const EVENT_ERROR = 'error';
 // nothing is saved until the operator confirms one on the Settings screen.
 export const EVENT_STATUS_KEYS = 'statusKeyCandidates';
 
+// EventReturn: the native SRT return monitor's state, mirroring app.go's
+// EventReturn constant exactly. The payload is a gst.ReturnState string.
+export const EVENT_RETURN = 'return';
+
 // Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT constants
 // exactly. Passed to setSecret().
 export const SECRET_KEY_M2LX = 'm2lx';
@@ -71,6 +75,27 @@ export const SENDER_STATE = Object.freeze({
   DRAINING: 'DRAINING',
   BACKOFF: 'BACKOFF',
   STOPPED: 'STOPPED',
+});
+
+// RETURN_STATE: gst.ReturnState's four values, mirrored here so the UI has
+// something to compare against without a dependency on internal/gst. The Go
+// side is authoritative; these strings are the contract and must match it.
+//
+// These four are not interchangeable to a commentator, which is why the status
+// line prints the state rather than a green/red verdict:
+//
+//   STOPPED     nothing is coming and nothing is trying
+//   CONNECTING  a pipeline is being built and the SRT caller is dialling
+//   RECEIVING   the handshake succeeded and audio is arriving
+//   BACKOFF     an attempt failed; it is waiting to try again
+//
+// BACKOFF with no audio is a normal state that resolves itself. STOPPED with no
+// audio is not.
+export const RETURN_STATE = Object.freeze({
+  STOPPED: 'STOPPED',
+  CONNECTING: 'CONNECTING',
+  RECEIVING: 'RECEIVING',
+  BACKOFF: 'BACKOFF',
 });
 
 // m2lx.StreamState* string values, mirrored for the same reason.
@@ -154,7 +179,11 @@ function defaultFakeConfig() {
     pbkeylen: 0,
     statusKey: '',
     audioDeviceId: '',
-    headphoneDeviceId: '',
+    headphoneDeviceId: '', // a browser mediaDeviceId — the WebRTC return path
+    headphoneEndpointId: '', // a WASAPI endpoint GUID — the SRT return path
+    returnSource: 'webrtc', // config.DefaultReturnSource
+    returnChannel: 'stereo', // config.DefaultReturnChannel
+    srtReturnPort: 40503, // config.DefaultSRTReturnPort — Output 3, src=cln
     returnMid: 2, // config.DefaultReturnMid (aux1/CLN)
     monitorTile: { x: 0, y: 360, w: 640, h: 360 }, // config.DefaultMonitorTile
     returnGainDb: 18, // config.DefaultReturnGainDB
@@ -406,6 +435,220 @@ export async function getStatusKeyCandidates() {
  */
 export function isSecretSetThisSession(key) {
   return !!secretSetThisSession[key];
+}
+
+// ---------------------------------------------------------------------------
+// The native SRT return
+// ---------------------------------------------------------------------------
+//
+// Five bindings and one event, for the return path the browser is not in:
+// srtsrc ! tsdemux ! aacparse ! mfaacdec ! audioconvert ! wasapi2sink, entirely
+// inside Go. Mirrors app_return.go.
+//
+// # StartReturn TAKES NO ARGUMENTS, AND THAT MATTERS
+//
+// Everything it needs — host, port, latency, passphrase, channel selection and
+// the WASAPI endpoint — it reads from the saved configuration. So a caller that
+// changes any of those must SAVE FIRST and start second. Calling startReturn()
+// with an unsaved change starts the previous configuration, silently and
+// successfully, which is the worst kind of success.
+//
+// It also refuses outright while returnSource is "webrtc". That refusal is on
+// the Go side on purpose: it is the guarantee that both paths cannot be up at
+// once, and the frontend is exactly where a race between a settings save and a
+// page reload would put both of them up.
+//
+// # isSRTReturnSelected, and why the UI does not just compare a string
+//
+// app_return.go's IsSRTReturnSelected exists so that ONE place decides which
+// path owns the headphones. The frontend could read returnSource out of
+// getConfig() and compare it to "srt" itself — and then the same decision would
+// be written in two languages, and the failure of the two disagreeing is both
+// paths playing at once, which is the one outcome the setting exists to
+// prevent. So the WebRTC return is attached on the answer to this question, not
+// on a local string comparison.
+//
+// # A build without the bindings
+//
+// They are recent. Every call below distinguishes three situations that
+// otherwise all arrive as the same opaque rejected promise inside WebView2:
+//
+//   no Wails runtime at all   -> the fake below answers, honestly labelled
+//   Wails, but no such method -> BindingMissingError, which the UI renders as
+//                                "this build has no SRT return" rather than as
+//                                a failure of the return itself
+//   Wails, method present     -> the real thing
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const RETURN_METHODS = Object.freeze({
+  list: 'ListOutputDevices',
+  start: 'StartReturn',
+  stop: 'StopReturn',
+  state: 'GetReturnState',
+  selected: 'IsSRTReturnSelected',
+});
+
+/**
+ * BindingMissingError means the Wails runtime is real but does not export the
+ * method — an older build, or a sibling still mid-edit. Distinct from an
+ * ordinary failure because the remedy is different: nothing the operator can do
+ * at the desk will fix it.
+ */
+export class BindingMissingError extends Error {
+  constructor(method) {
+    super(
+      `wslcomms: this build has no App.${method}. The native SRT return is not available in it; ` +
+        'the WebRTC return is unaffected.',
+    );
+    this.name = 'BindingMissingError';
+    this.method = method;
+  }
+}
+
+function hasBinding(method) {
+  return hasWails() && typeof window.go.main.App[method] === 'function';
+}
+
+/** callGoBound is callGo with the missing-method case named. */
+async function callGoBound(method, ...args) {
+  if (!hasBinding(method)) throw new BindingMissingError(method);
+  return callGo(method, ...args);
+}
+
+/**
+ * srtReturnAvailable reports whether this build can do the native SRT return at
+ * all. False against a Wails build without the bindings; the UI uses it to
+ * disable the SRT option with a reason rather than offering a button that always
+ * fails.
+ */
+export function srtReturnAvailable() {
+  return hasBinding(RETURN_METHODS.start) && hasBinding(RETURN_METHODS.stop);
+}
+
+// FAKE_OUTPUT_DEVICES are WASAPI RENDER endpoints. Their ids deliberately do
+// NOT match FAKE_DEVICES: those are capture endpoints, and the whole hazard the
+// return-source control has to avoid is treating a WASAPI endpoint id and a
+// browser mediaDeviceId as the same string. A dev session in which the two
+// lists share ids would hide exactly that mistake.
+const FAKE_OUTPUT_DEVICES = [
+  {
+    id: '{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}',
+    name: 'Headphones (Focusrite Scarlett 2i2 USB)',
+  },
+  {
+    id: '{0.0.0.00000000}.{2e91b4c7-88a0-41d6-bf3c-6a0e5c7d4b02}',
+    name: 'DVS Transmit  1-2 (Dante Virtual Soundcard)',
+  },
+  {
+    id: '{0.0.0.00000000}.{c5d0e133-19af-4f2b-a7e4-91b0c2f6d38a}',
+    name: 'Speakers (Realtek(R) Audio)',
+  },
+];
+
+let fakeReturnState = RETURN_STATE.STOPPED;
+let fakeReturnTimer = null;
+
+function setFakeReturnState(next) {
+  fakeReturnState = next;
+  fakeEmit(EVENT_RETURN, fakeReturnState);
+}
+
+/**
+ * Lists the Windows audio RENDER endpoints the native return can play through.
+ *
+ * Device.id is a WASAPI IMMDevice endpoint GUID and is what belongs in
+ * config.headphoneEndpointId. It is NOT a browser mediaDeviceId and the two
+ * cannot be substituted in either direction — see
+ * config.Config.HeadphoneEndpointID for what goes wrong when they are, which is
+ * nothing visible: audio in the wrong ears and no diagnostic anywhere.
+ *
+ * @returns {Promise<Array<{id: string, name: string}>>}
+ */
+export async function listOutputDevices() {
+  if (hasWails()) return callGoBound(RETURN_METHODS.list);
+  if (fakeDeviceError) throw new Error(fakeDeviceError);
+  return FAKE_OUTPUT_DEVICES.slice();
+}
+
+/**
+ * Reports whether the SRT return is the configured path, according to the Go
+ * side. The WebRTC return audio is attached only when this is false.
+ *
+ * @returns {Promise<boolean>}
+ */
+export async function isSRTReturnSelected() {
+  if (hasWails()) return callGoBound(RETURN_METHODS.selected);
+  return fakeConfig.returnSource === 'srt';
+}
+
+/**
+ * Starts the native SRT return.
+ *
+ * NO ARGUMENTS: it reads the saved configuration. Save returnSource,
+ * headphoneEndpointId and returnChannel BEFORE calling this, or it starts the
+ * previous ones and reports success.
+ *
+ * Resolving means the reconnect loop is running, not that audio is arriving —
+ * a connection failure is deliberately not an error here, because the
+ * commentator may well press the button before the operator has enabled the
+ * output. Watch the "return" event for what is actually happening.
+ */
+export async function startReturn() {
+  if (hasWails()) return callGoBound(RETURN_METHODS.start);
+
+  // The fake refuses in the same case the real one does, because that refusal
+  // is the guarantee that both paths cannot be audible at once and a fake that
+  // waved it through would let the bug be written and then not reproduce.
+  if (fakeConfig.returnSource !== 'srt') {
+    throw new Error(
+      `wslcomms: cannot start the SRT return: returnSource is "${fakeConfig.returnSource || 'webrtc'}"`,
+    );
+  }
+  if (fakeReturnTimer) clearTimeout(fakeReturnTimer);
+  setFakeReturnState(RETURN_STATE.CONNECTING);
+  fakeReturnTimer = setTimeout(() => {
+    fakeReturnTimer = null;
+    setFakeReturnState(RETURN_STATE.RECEIVING);
+  }, 900);
+}
+
+/**
+ * Stops the native SRT return and releases the M2L-X fan-out slot.
+ *
+ * REJECTS WHEN NOTHING WAS RUNNING — app_return.go returns errReturnNotRunning
+ * so that teardown can call it unconditionally and still tell "there was
+ * nothing to stop" from a real failure. Every caller here catches it. The fake
+ * refuses in the same case for the same reason the fake start does.
+ */
+export async function stopReturn() {
+  if (hasWails()) return callGoBound(RETURN_METHODS.stop);
+  if (fakeReturnState === RETURN_STATE.STOPPED) {
+    throw new Error('wslcomms: the return monitor is not running (fake)');
+  }
+  if (fakeReturnTimer) {
+    clearTimeout(fakeReturnTimer);
+    fakeReturnTimer = null;
+  }
+  setFakeReturnState(RETURN_STATE.STOPPED);
+}
+
+/**
+ * Reads the SRT return's state now, for a page that has just loaded and has not
+ * yet seen a "return" event. One of RETURN_STATE.
+ *
+ * @returns {Promise<string>}
+ */
+export async function getReturnState() {
+  if (hasWails()) return callGoBound(RETURN_METHODS.state);
+  return fakeReturnState;
+}
+
+/**
+ * Subscribes to the "return" event, a gst.ReturnState string. Returns an
+ * unsubscribe function.
+ */
+export function onReturn(cb) {
+  return subscribe(EVENT_RETURN, cb);
 }
 
 // ---------------------------------------------------------------------------

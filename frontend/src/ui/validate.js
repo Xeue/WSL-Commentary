@@ -17,6 +17,8 @@
 // still empty when pressed; that is internal/gst.PipelineOpts's job to
 // reject, not Settings'.
 
+import { CHANNEL_MODES } from '../monitor/channels.js';
+
 const PBKEYLEN_VALUES = [0, 16, 32];
 
 // All seven audio transceiver mids, matching internal/config.Validate's 1..7
@@ -25,6 +27,11 @@ const PBKEYLEN_VALUES = [0, 16, 32];
 // was already subscribed to — no help at all to a commentator who can hear
 // themselves on the default one.
 const RETURN_MID_VALUES = [1, 2, 3, 4, 5, 6, 7];
+
+// The three channel modes, from the one table that defines them (imported at
+// the top of the file). Not restated: a validator with its own copy of the enum
+// is how a value becomes valid here and unroutable in the audio graph.
+const RETURN_CHANNEL_VALUES = CHANNEL_MODES.map((m) => m.value);
 
 function isBlank(v) {
   return typeof v !== 'string' || v.trim().length === 0;
@@ -90,6 +97,19 @@ export function validateConfig(config) {
 
   if (!isInt(config.returnMid) || !RETURN_MID_VALUES.includes(config.returnMid)) {
     errors.returnMid = 'Return must be one of the seven audio transceivers, mid 1 to 7.';
+  }
+
+  // returnChannel picks which SOURCE channel of the selected bus reaches the
+  // ears — see frontend/src/monitor/channels.js. Validated because a value with
+  // no routing entry leaves the ChannelSplitter wired to nothing, and the
+  // symptom of that is silence, which is the symptom of everything else too.
+  //
+  // returnSource is deliberately NOT validated here: the Settings form has no
+  // control for it, so an error keyed to it would light no field and leave
+  // "fix the highlighted fields" pointing at nothing highlighted. Settings
+  // normalises it on the way through instead.
+  if (!RETURN_CHANNEL_VALUES.includes(config.returnChannel)) {
+    errors.returnChannel = 'Return channel must be Stereo, Left only or Right only.';
   }
 
   if (typeof config.returnGainDb !== 'number' || !Number.isFinite(config.returnGainDb)) {

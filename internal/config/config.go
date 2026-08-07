@@ -99,8 +99,80 @@ type Config struct {
 
 	// HeadphoneDeviceID is the browser mediaDeviceId of the commentator's
 	// headphone output, written by the output dropdown and consumed only by the
-	// frontend's setSinkId call. No Go package enumerates output devices.
+	// frontend's setSinkId call on the WEBRTC return path.
+	//
+	// It is not interchangeable with HeadphoneEndpointID below. See that field.
 	HeadphoneDeviceID string `json:"headphoneDeviceId"`
+
+	// HeadphoneEndpointID is the WASAPI IMMDevice endpoint ID GUID of the same
+	// headphones, used by the SRT return path and passed to wasapi2sink's device
+	// property. Empty means the Windows default playback device.
+	//
+	// # Why there are two of these and why they must not be merged
+	//
+	// They identify the same physical output and are different KINDS of
+	// identifier. HeadphoneDeviceID is a browser mediaDeviceId: a per-origin,
+	// per-session salted hash minted by the WebView, meaningful only to
+	// enumerateDevices and setSinkId, and regenerated when the browsing
+	// context's storage is cleared. HeadphoneEndpointID is an IMMDevice endpoint
+	// ID GUID, which is what WASAPI takes and what survives a device rename.
+	//
+	// Neither can be converted into the other, and the failure of using one
+	// where the other belongs is silent in both directions: setSinkId rejects an
+	// endpoint GUID and keeps playing to the default device, and wasapi2sink
+	// does not recognise a mediaDeviceId and falls back to the default endpoint.
+	// In both cases the commentator gets audio, in the wrong ears, with nothing
+	// anywhere saying why. Two fields, two dropdowns, two enumerations —
+	// gst.ListOutputDevices fills this one.
+	HeadphoneEndpointID string `json:"headphoneEndpointId"`
+
+	// ReturnSource selects which return path feeds the headphones: "webrtc"
+	// (the default) or "srt".
+	//
+	// # Why this is a choice rather than both
+	//
+	// The two paths reach the same headphones by different routes, and running
+	// both plays the same programme twice with a few hundred milliseconds
+	// between the copies — which is not "a bit of echo", it is unusable to
+	// commentate over. So this is exclusive by construction: App.StartReturn
+	// refuses unless this is "srt", and the frontend only attaches the WebRTC
+	// return when it is "webrtc".
+	//
+	// The default stays "webrtc" because that is the path that has been used on
+	// air. The SRT path exists for the case the WebRTC one cannot serve: the CLN
+	// bus now carries FX hard-left and comms hard-right, and monitoring just the
+	// effects means picking one CHANNEL, which needs ReturnChannel below and
+	// which the browser side has no reliable way to do.
+	ReturnSource string `json:"returnSource"`
+
+	// ReturnChannel is which channel of the SRT return reaches the headphones:
+	// "stereo" (the default), "left" or "right".
+	//
+	// On the operator's current routing left is the effects feed and right is
+	// the comms feed. "left" and "right" put that source channel into BOTH ears
+	// rather than silencing one — a commentator with one dead side spends the
+	// match assuming the headphones are broken.
+	//
+	// It has no effect on the WebRTC return path, which selects a whole bus by
+	// ReturnMid and cannot select within it.
+	ReturnChannel string `json:"returnChannel"`
+
+	// SRTReturnPort is the port of the M2L-X output the SRT return dials.
+	// Default 40503, which is Output 3, src=cln.
+	//
+	// The HOST is deliberately absent. It follows the M2L-X host through
+	// EffectiveSRTHost, exactly as the send path does, because on every instance
+	// seen so far the SRT listener answers on the same name as the REST API and
+	// a third host field is a third thing to get wrong under pressure.
+	//
+	// 40503 is measured, not assumed. On the live instance the outputs are:
+	// Output 1 src=pgm on 40501, Output 2 src=pvw (whose AUDIO is the master bus,
+	// the same as pgm, so it is not a fourth bus), Output 3 src=cln on 40503, and
+	// Outputs 4-7 byte-transparent relays of router inputs. M2L-X's output source
+	// field accepts only pgm | pvw | cln | <router input id> — aux1, aux2, master
+	// and mon1 all return HTTP 400 — so Output 3 is the only way to hear CLN, and
+	// CLN is the bus with the hard-panned pair on it.
+	SRTReturnPort int `json:"srtReturnPort"`
 
 	// ReturnMid is the WebRTC transceiver mid whose audio is routed to the
 	// headphones. Default 2, which is aux1/CLN — effects without commentary.
@@ -141,6 +213,35 @@ const (
 	// DefaultReturnMid is the transceiver mid routed to the headphones: aux1/CLN.
 	DefaultReturnMid = 2
 
+	// ReturnSourceWebRTC is the KVS/WebRTC return, and the default. It is the
+	// path that has been used on air.
+	ReturnSourceWebRTC = "webrtc"
+
+	// ReturnSourceSRT is the SRT return: a second SRT session, dialled as a
+	// caller into an M2L-X output, decoded and played to the headphones by
+	// internal/gst. It is what makes single-channel monitoring possible.
+	ReturnSourceSRT = "srt"
+
+	// DefaultReturnSource is ReturnSourceWebRTC. Changing the default would
+	// change which return path a machine uses on its next launch without anyone
+	// asking for it, which is not a thing to do to a commentary position.
+	DefaultReturnSource = ReturnSourceWebRTC
+
+	// The three channel selections. They mirror gst.ReturnChannel's values,
+	// which are the same strings; config does not import internal/gst, because
+	// a configuration package that depends on the cgo package cannot be tested
+	// without it.
+	ReturnChannelStereo = "stereo"
+	ReturnChannelLeft   = "left"
+	ReturnChannelRight  = "right"
+
+	// DefaultReturnChannel passes the return through unchanged.
+	DefaultReturnChannel = ReturnChannelStereo
+
+	// DefaultSRTReturnPort is Output 3 on the measured instance: src=cln, the
+	// bus carrying FX hard-left and comms hard-right. See the field comment.
+	DefaultSRTReturnPort = 40503
+
 	// DefaultReturnGainDB is the measured offset between the SRT-ingested peak
 	// level and the level the KVS monitor arrives at.
 	DefaultReturnGainDB = 18.0
@@ -170,11 +271,14 @@ var DefaultMonitorTile = Tile{X: 0, Y: 360, W: 640, H: 360}
 // disagreeing about what "default" means.
 func Defaults() *Config {
 	return &Config{
-		SRTLatencyMs: DefaultSRTLatencyMs,
-		ReturnMid:    DefaultReturnMid,
-		MonitorTile:  DefaultMonitorTile,
-		ReturnGainDB: DefaultReturnGainDB,
-		SlatePath:    DefaultSlateFilename,
+		SRTLatencyMs:  DefaultSRTLatencyMs,
+		ReturnMid:     DefaultReturnMid,
+		MonitorTile:   DefaultMonitorTile,
+		ReturnGainDB:  DefaultReturnGainDB,
+		SlatePath:     DefaultSlateFilename,
+		ReturnSource:  DefaultReturnSource,
+		ReturnChannel: DefaultReturnChannel,
+		SRTReturnPort: DefaultSRTReturnPort,
 	}
 }
 
@@ -299,6 +403,97 @@ func (c *Config) EffectiveSRTHost() string {
 		return h
 	}
 	return hostOnly(c.M2LXHost)
+}
+
+// EffectiveReturnSource returns the configured return path, substituting
+// DefaultReturnSource for an empty value.
+//
+// Load already substitutes defaults for keys ABSENT from config.json, but an
+// explicitly empty string survives — a hand-edited file, or a Settings screen
+// that saved a half-filled form. "webrtc" is the answer in both cases: it is
+// what the position was doing before anyone touched the file.
+func (c *Config) EffectiveReturnSource() string {
+	if s := strings.TrimSpace(c.ReturnSource); s != "" {
+		return s
+	}
+	return DefaultReturnSource
+}
+
+// EffectiveReturnChannel returns the configured channel selection,
+// substituting DefaultReturnChannel for an empty value.
+func (c *Config) EffectiveReturnChannel() string {
+	if s := strings.TrimSpace(c.ReturnChannel); s != "" {
+		return s
+	}
+	return DefaultReturnChannel
+}
+
+// EffectiveSRTReturnPort returns the port the SRT return dials, substituting
+// DefaultSRTReturnPort for a zero value.
+//
+// Zero and "unset" are the same thing here — zero is not a valid UDP port — so
+// unlike EffectiveReturnSource this substitution cannot mask a deliberate
+// setting.
+func (c *Config) EffectiveSRTReturnPort() int {
+	if c.SRTReturnPort != 0 {
+		return c.SRTReturnPort
+	}
+	return DefaultSRTReturnPort
+}
+
+// UsesSRTReturn reports whether the SRT return path is the configured one.
+func (c *Config) UsesSRTReturn() bool {
+	return c.EffectiveReturnSource() == ReturnSourceSRT
+}
+
+// ValidateReturn reports every reason the SRT RETURN cannot start, joined one
+// message per problem field, or nil when it is ready.
+//
+// # Why this is separate from Validate and not folded into it
+//
+// Validate is the gate on Start — on putting the contribution feed on air — and
+// nothing in it may be a reason a match does not go out. The return is a
+// commentator's monitor: valuable, but a mistyped returnChannel must not be the
+// reason the feed stays off. This is the same judgement the statusKey field
+// records, and it was made the same way: requiring a field for Start that Start
+// does not need made the application unstartable for a reason that had nothing
+// to do with sending.
+//
+// So the two live apart. App.Start calls Validate; App.StartReturn calls this.
+// A configuration can be perfectly able to send and unable to monitor, which is
+// exactly what happens on the first run after the operator switches
+// returnSource to "srt" and has not yet picked a headphone endpoint.
+//
+// headphoneEndpointId is deliberately NOT required. Empty means wasapi2sink
+// opens the Windows default playback device, which on a commentary position is
+// very often the right one and is always better than refusing to monitor at all.
+func (c *Config) ValidateReturn() error {
+	var errs []error
+
+	switch c.EffectiveReturnSource() {
+	case ReturnSourceWebRTC, ReturnSourceSRT:
+	default:
+		errs = append(errs, fmt.Errorf("returnSource must be %q or %q, got %q",
+			ReturnSourceWebRTC, ReturnSourceSRT, c.ReturnSource))
+	}
+
+	switch c.EffectiveReturnChannel() {
+	case ReturnChannelStereo, ReturnChannelLeft, ReturnChannelRight:
+	default:
+		errs = append(errs, fmt.Errorf("returnChannel must be %q, %q or %q, got %q",
+			ReturnChannelStereo, ReturnChannelLeft, ReturnChannelRight, c.ReturnChannel))
+	}
+
+	if p := c.EffectiveSRTReturnPort(); p < 1 || p > 65535 {
+		errs = append(errs, fmt.Errorf("srtReturnPort must be between 1 and 65535, got %d", p))
+	}
+
+	if c.EffectiveSRTHost() == "" {
+		errs = append(errs, errors.New(
+			"the SRT return has no host to dial: set m2lxHost, or srtHost to override it"))
+	}
+
+	return errors.Join(errs...)
 }
 
 // hostOnly reduces a host that may carry a scheme, a port and a path to the
