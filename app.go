@@ -124,29 +124,86 @@
 //  0. the closing flag is raised, so that a bound method already in flight on a
 //     Wails message-handler goroutine cannot build a new session or a new
 //     control plane behind the teardown that has just walked past them;
-//  1. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
+//  1. the ROOT CONTEXT is cancelled, which is the one step that cannot block
+//     and so is the one step that must never be behind a step that can. It ends
+//     every context-bound piece of work in the process at once: the mixer
+//     drawer's in-flight GetMixerSnapshot dials, a KVS credential fetch, the
+//     control plane generation whose context derives from it, the event pump;
+//  2. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
 //     endpoint and the SRT socket are released before anything else moves;
-//  2. the return monitor — same reason, and deliberately AFTER the sender: both
+//  3. the return monitor — same reason, and deliberately AFTER the sender: both
 //     release a WASAPI endpoint and an SRT socket, and if the whole sequence
 //     overruns shutdownTimeout the process exits regardless, so the one that
 //     must already have finished is the contribution path;
-//  3. the mixer write path — it is closed BEFORE the control plane, because a
+//  4. the mixer write path — it is closed BEFORE the control plane, because a
 //     Send in flight is a write to a live desk and must not be left racing a
 //     teardown; Close also disarms, so the gate is shut whatever happens next;
-//  4. the status watcher — its context is cancelled and its goroutines joined;
-//  5. the token refresh — the m2lx client's own background goroutine, which is
-//     bounded by a context of the client's own and so survives step 4; only
+//  5. the status watcher — its context is cancelled and its goroutines joined;
+//  6. the token refresh — the m2lx client's own background goroutine, which is
+//     bounded by a context of the client's own and so survives step 5; only
 //     m2lx.Client.Close stops it (see stopControlPlaneLocked);
-//  6. the root context, then a WaitGroup join of everything left.
+//  7. a WaitGroup join of everything left.
 //
 // Step 0 is what makes the order deterministic rather than merely usual. Both
 // races it closes are decided the same way whichever goroutine wins the lock:
-// a Start that got sessMu first completes and is then stopped by step 1, and a
-// Start that arrives after step 1 is refused. There is no interleaving in which
+// a Start that got sessMu first completes and is then stopped by step 2, and a
+// Start that arrives after step 2 is refused. There is no interleaving in which
 // a pipeline outlives teardown.
 //
-// The whole sequence is bounded by shutdownTimeout. A process that will not exit
-// is a support call, so a wedged pipeline loses the race rather than the window.
+// # EVERY STEP HAS ITS OWN BOUND, AND THAT IS THE POINT
+//
+// The order above used to be a plain sequence inside one overall timeout. That
+// is not the same thing, and the difference is what put a wslcomms.exe in Task
+// Manager after a match: the timeout bounded the WAIT, not the WORK, so the
+// first step that would not return took the whole budget and EVERY STEP BEHIND
+// IT WAS SIMPLY NEVER RUN. Measured, with a return monitor that could not be
+// stopped: after the twenty seconds were up the mixer's write socket was still
+// open and still armed, the status watcher and the token-refresh timer were
+// still running, and the root context had never been cancelled — so every
+// GetMixerSnapshot dial the drawer had in flight was still live too. Nothing
+// had been released by a shutdown that had already given up.
+//
+// So each step is bounded on its own and a step that overruns is ABANDONED, in
+// so many words, and the next one runs anyway. The steps take disjoint locks —
+// see the lock order below — so a sender still wedged in cgo cannot stop the
+// return monitor, the mixer socket or the watcher from being closed behind it.
+//
+// # WHAT IS ABANDONED, AND WHY THAT IS SAFE
+//
+// Only ever a GStreamer state change that will not complete. gst_element_set_state
+// takes no timeout and runs on the calling goroutine inside cgo, so when it
+// wedges — a WASAPI endpoint that will not release, an SRT socket mid-handshake
+// — there is no Go-side context, deadline or cancellation that can reach it.
+// internal/gst says so at length; see the timeout constants there.
+//
+// Abandoning it costs nothing that process exit does not already recover. The
+// audio endpoint, both SRT sockets and the M2L-X fan-out slot are all released
+// by the OS when the process goes, whether or not GStreamer was asked politely
+// first. Nothing is buffered waiting to be written: config.json and the mixer
+// golden file are both written synchronously through a temp file and a rename,
+// long before any of this.
+//
+// It is safe HERE and would not be safe anywhere else, which is why the bound
+// lives in teardown rather than inside internal/gst. Everywhere else, "the
+// pipeline has reached NULL" is what stops the next Start opening a second
+// pipeline on the same endpoint. At teardown there is no next Start: the
+// closing flag is raised at step 0 and both Start paths refuse.
+//
+// # AND THEN THE PROCESS EXITS, WHATEVER IT TAKES
+//
+// A teardown that abandoned something has deliberately stopped being able to
+// account for a thread. Returning normally hands that thread to the Go runtime's
+// exit path, which on Windows means ExitProcess: it kills the other threads
+// first and then runs the detach handler of every loaded DLL under the loader
+// lock, and GStreamer, WASAPI and COM are all in that set. Whether that hangs
+// cannot be determined from here — it needs a wedged endpoint on the machine
+// that has one — but there is no way to make it safe either, and its failure
+// mode is precisely the one being fixed: a window that has gone and a process
+// that has not. So when something has been abandoned the teardown does not
+// return and hope; it terminates the process itself. See hardExit.
+//
+// A process that will not exit is a support call, so a wedged pipeline loses the
+// race rather than the window.
 //
 // # Five locks, in this order
 //
@@ -190,6 +247,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -250,25 +308,35 @@ const (
 	// reading entirely — which is exactly the case the discarding is for.
 	eventQueueDepth = 64
 
-	// shutdownTimeout bounds the whole ordered teardown: a.Stop() and
-	// a.StopReturn(), in that order, sharing one budget.
+	// shutdownTimeout bounds the whole ordered teardown, and the four constants
+	// under it divide that budget between the steps. a.Stop() and a.StopReturn()
+	// are the two steps in it that can block on a pipeline; both are named below
+	// and neither is silently assumed to be covered.
 	//
-	// # What it covers
+	// IT IS THE SUM OF THE PER-STEP BUDGETS, NOT A SECOND OPINION ABOUT THEM.
+	// It used to be the only bound there was, and one step that would not return
+	// therefore consumed all of it and left every later step unrun — the mixer
+	// socket still open and armed, the watcher still running, the root context
+	// never cancelled. Each step now carries its own bound, and this is the
+	// backstop for the arithmetic being wrong rather than for the work being
+	// slow.
+	//
+	// # What the per-step budgets cover
 	//
 	// a.Stop's worst case is a gst.Pipeline.ReplaceSink already in flight. That
 	// is synchronous by contract and internal/gst bounds it at
 	// sinkStateChangeTimeout, ten seconds; add elementShutdownTimeout, five
-	// seconds, for taking the pipeline to NULL. Fifteen seconds is that sum. The
-	// contribution feed is the path that must be given every chance to finish, so
-	// it gets the whole budget if it needs it.
+	// seconds, for taking the pipeline to NULL. Fifteen seconds is that sum, and
+	// senderStopBudget is fifteen seconds: the contribution feed is the path that
+	// must be given every chance to finish, so it keeps the largest share and it
+	// still goes first.
 	//
 	// a.StopReturn is normally prompt — the monitor sits in RECEIVING, its
 	// backoff wait is cancelled rather than served, and Close is bounded at
-	// elementShutdownTimeout. Twenty seconds gives that ordinary case five
-	// seconds of headroom after a sender stop that used its whole budget, which
-	// is the only reason this is twenty and not fifteen.
+	// elementShutdownTimeout — so returnStopBudget is two seconds, which is that
+	// ordinary case with room to spare.
 	//
-	// # WHAT IT DOES NOT COVER, AND IS NOT MEANT TO
+	// # WHAT THEY DO NOT COVER, AND ARE NOT MEANT TO
 	//
 	// A StopReturn that lands while gst returnPipeline.Play is in flight WILL BE
 	// CUT OFF. Play holds the pipeline lock across a DNS resolve
@@ -285,11 +353,42 @@ const (
 	// releases both — including the M2L-X fan-out slot, which goes when the
 	// socket closes whether or not GStreamer was asked politely.
 	//
-	// Neither figure bounds the SYNCHRONOUS half of a GStreamer state change:
-	// gst_element_set_state takes no timeout and runs on the calling goroutine,
-	// so a wedged WASAPI endpoint hangs past any of this. That is what the
-	// timeout is a backstop for.
+	// None of these figures bounds the SYNCHRONOUS half of a GStreamer state
+	// change: gst_element_set_state takes no timeout and runs on the calling
+	// goroutine, so a wedged WASAPI endpoint hangs past any of this. That is what
+	// the abandonment is for, and why a teardown that abandons anything ends the
+	// process itself rather than returning into an exit path that would have to
+	// step over the wedged thread. See teardown.
 	shutdownTimeout = 20 * time.Second
+
+	// senderStopBudget bounds step 2, a.Stop. Fifteen seconds is the sender's own
+	// bounded worst case; see above.
+	senderStopBudget = 15 * time.Second
+
+	// returnStopBudget bounds step 3, a.StopReturn. Two seconds is the ordinary
+	// case with room to spare; a Play in flight is expected to be cut off and is
+	// accounted for above.
+	returnStopBudget = 2 * time.Second
+
+	// mixerCloseBudget bounds step 4, closeMixerController. Closing a
+	// switcher_controller socket is a Close and a goroutine join, both prompt.
+	// The one thing that can stretch it is a reconnect dial already in flight,
+	// which internal/mixer bounds at its own ten second dialTimeout — half the
+	// whole shutdown budget for a socket the process is about to drop anyway, so
+	// it is abandoned instead. Disarm happens before Close, so the write gate is
+	// shut either way.
+	mixerCloseBudget = 1 * time.Second
+
+	// controlPlaneStopBudget bounds steps 5 and 6, stopControlPlaneLocked. Its
+	// context is already cancelled by step 1, m2lx.Client.Close is bounded by
+	// that same cancellation, and the join is of goroutines that all select on
+	// it. One second is generous for work that should be instant.
+	controlPlaneStopBudget = 1 * time.Second
+
+	// rootJoinBudget bounds step 7, the join of everything rooted in rootCtx —
+	// in practice the event pump, which exits on the cancellation step 1 already
+	// performed. One second is generous for the same reason.
+	rootJoinBudget = 1 * time.Second
 
 	// statusKeyDiscoveryWindow is how long a statusKey discovery watches
 	// switcher_status after START before giving up.
@@ -520,6 +619,41 @@ type App struct {
 	// OnShutdown and from main's error path, and exactly one of them must do the
 	// work.
 	shutdownOnce sync.Once
+
+	// exitProcess ends the process when a teardown has had to abandon a step.
+	// NewApp installs forceExit; it is a field so that a test can watch the
+	// decision being made without the test binary being the thing that dies.
+	//
+	// Nothing but teardown may call it. It is not an error path and it is not a
+	// panic — it is the last line of "the window has gone, so the process goes".
+	exitProcess func()
+}
+
+// forceExit ends this process immediately, and is the one thing in the
+// application that is allowed to.
+//
+// The default is os.Exit, which is what any Go program does when main returns.
+// exit_windows.go replaces it with TerminateProcess on the platform this
+// application actually ships on, and the difference is the whole reason this is
+// a variable: os.Exit is ExitProcess, which terminates the other threads and
+// then runs the detach handler of every loaded DLL under the loader lock. This
+// is only ever reached with a GStreamer thread abandoned mid-state-change, and
+// GStreamer, WASAPI and COM are all in that set of DLLs. TerminateProcess runs
+// none of it and cannot be blocked by any of it.
+//
+// The status is zero because the operator asked the application to close and it
+// closed. What could not be stopped on the way out is a log line, not a failed
+// run — and a GUI process's exit status is not read by anything here anyway.
+var forceExit = func() { os.Exit(0) }
+
+// hardExit ends the process. See forceExit and teardown.
+func (a *App) hardExit() {
+	if a.exitProcess == nil {
+		// Only reachable from an App built by something other than NewApp.
+		forceExit()
+		return
+	}
+	a.exitProcess()
 }
 
 // session is one running contribution session: the pipeline, the sender driving
@@ -538,14 +672,15 @@ type session struct {
 func NewApp(appDir string, gstInitErr error) *App {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &App{
-		appDir:     appDir,
-		gstInitErr: gstInitErr,
-		rootCtx:    ctx,
-		rootCancel: cancel,
-		events:     newEventPump(),
-		store:      secrets.New(),
-		lastSender: sender.StateStopped,
-		lastReturn: gst.ReturnStateStopped,
+		appDir:      appDir,
+		gstInitErr:  gstInitErr,
+		rootCtx:     ctx,
+		rootCancel:  cancel,
+		events:      newEventPump(),
+		store:       secrets.New(),
+		lastSender:  sender.StateStopped,
+		lastReturn:  gst.ReturnStateStopped,
+		exitProcess: forceExit,
 	}
 }
 
@@ -662,61 +797,141 @@ func (a *App) shutdown(_ context.Context) {
 	a.teardown()
 }
 
-// teardown performs the ordered shutdown described in the file comment, bounded
-// by shutdownTimeout. It is idempotent.
+// teardown performs the ordered shutdown described in the file comment. It is
+// idempotent.
 //
-// The bound is the point. The ordered sequence is the correct one and normally
-// completes in well under a second, but it contains one call — sender.Stop —
-// that can be waiting on a synchronous SRT handshake inside internal/gst. If
-// that ever wedges, the process must still exit: the window has already gone,
-// and a wslcomms.exe left in Task Manager after a match is a support call.
+// The bounds are the point. The ordered sequence is the correct one and normally
+// completes in well under a second, but it contains two calls — sender.Stop and
+// the return monitor's Stop — that can be waiting on a GStreamer state change
+// inside cgo, where nothing on the Go side can reach them. Each step therefore
+// carries its own budget and an overrun abandons that step rather than the rest
+// of the shutdown; shutdownTimeout is the backstop over the lot.
+//
+// If anything WAS abandoned, this does not return. The window has already gone,
+// a thread is unaccounted for, and a wslcomms.exe left in Task Manager after a
+// match is a support call — so the process is ended here rather than handed to
+// an exit path that would have to step over that thread. See the file comment
+// and hardExit.
 func (a *App) teardown() {
 	a.shutdownOnce.Do(func() {
-		done := make(chan struct{})
+		abandoned := make(chan int, 1)
 		go func() {
-			defer close(done)
-			a.teardownOrdered()
+			abandoned <- a.teardownOrdered()
 		}()
 
 		timer := time.NewTimer(shutdownTimeout)
 		defer timer.Stop()
 		select {
-		case <-done:
+		case n := <-abandoned:
+			if n == 0 {
+				return
+			}
+			log.Printf("wslcomms: shutdown abandoned %d step(s) that would not return; "+
+				"ending the process rather than exiting through them", n)
 		case <-timer.C:
+			// The per-step budgets sum to shutdownTimeout, so reaching this is
+			// arithmetic gone wrong rather than work gone slow. Same answer.
 			log.Printf("wslcomms: shutdown did not complete within %s; exiting anyway", shutdownTimeout)
 		}
+		a.hardExit()
 	})
 }
 
-// teardownOrdered is teardown's body: raise the closing flag, then sender,
-// return monitor, mixer write path, watcher, token refresh, join.
+// teardownOrdered is teardown's body: raise the closing flag, cancel the root
+// context, then sender, return monitor, mixer write path, watcher, token
+// refresh, join. It returns how many steps had to be abandoned.
 //
 // The flag is raised before anything is stopped, which is what makes the order
 // hold against a bound method that is already running. See step 0 of the
 // shutdown order in the file comment for why both interleavings are safe.
-func (a *App) teardownOrdered() {
+//
+// Nothing here returns early. Every step runs even when the one in front of it
+// had to be abandoned, because the steps take disjoint locks and because the
+// alternative is what this function used to do: leave the mixer's write socket
+// open and armed, the status watcher running and the root context uncancelled,
+// because the sender would not reach NULL.
+func (a *App) teardownOrdered() int {
 	a.closing.Store(true)
 
-	if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
-		log.Printf("wslcomms: stopping the sender during shutdown: %v", err)
+	// FIRST, not last. It cannot block, and it is what ends every context-bound
+	// piece of work in the process — the drawer's in-flight GetMixerSnapshot
+	// dials, a KVS fetch, the control plane generation, the event pump. Behind a
+	// step that can wedge it is a cancellation that never happens.
+	a.rootCancel()
+
+	abandoned := 0
+	step := func(what string, budget time.Duration, stop func() error) {
+		if !teardownStep(what, budget, stop) {
+			abandoned++
+		}
 	}
+
+	step("the sender", senderStopBudget, func() error {
+		if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
+			return err
+		}
+		return nil
+	})
 
 	// The return monitor after the sender, never before it. Both release a
-	// WASAPI endpoint and an SRT socket, and if the whole sequence overruns
-	// shutdownTimeout the process exits regardless — so the one that must
-	// already have finished is the contribution path.
-	if err := a.StopReturn(); err != nil && !errors.Is(err, errReturnNotRunning) {
-		log.Printf("wslcomms: stopping the return monitor during shutdown: %v", err)
+	// WASAPI endpoint and an SRT socket, and if the whole sequence overruns the
+	// process exits regardless — so the one that must already have finished is
+	// the contribution path.
+	step("the return monitor", returnStopBudget, func() error {
+		if err := a.StopReturn(); err != nil && !errors.Is(err, errReturnNotRunning) {
+			return err
+		}
+		return nil
+	})
+
+	step("the mixer write path", mixerCloseBudget, a.closeMixerController)
+
+	step("the status watcher and the token refresh", controlPlaneStopBudget, func() error {
+		a.ctlMu.Lock()
+		defer a.ctlMu.Unlock()
+		a.stopControlPlaneLocked()
+		return nil
+	})
+
+	step("the background goroutines", rootJoinBudget, func() error {
+		a.rootWG.Wait()
+		return nil
+	})
+
+	return abandoned
+}
+
+// teardownStep runs one step of the ordered shutdown under its own bound and
+// reports whether it finished. A step that overruns is left running on its own
+// goroutine and the caller carries on without it.
+//
+// Abandoning is stated in the log rather than implied by silence, and it names
+// what is being left behind, because the next person to read that log line is
+// diagnosing a window that took a moment to go and needs to know which
+// subsystem did not answer.
+//
+// The abandoned goroutine is not leaked in any sense that matters: it is a
+// GStreamer state change inside cgo that the process is about to exit out from
+// under. See the file comment for what that costs, which is nothing the OS does
+// not reclaim.
+func teardownStep(what string, budget time.Duration, stop func() error) (finished bool) {
+	done := make(chan error, 1)
+	go func() { done <- stop() }()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("wslcomms: stopping %s during shutdown: %v", what, err)
+		}
+		return true
+	case <-timer.C:
+		log.Printf("wslcomms: %s did not stop within %s. ABANDONING it and continuing the "+
+			"shutdown; the process is going, which releases the device and the socket anyway", what, budget)
+		return false
 	}
-
-	a.closeMixerController()
-
-	a.ctlMu.Lock()
-	a.stopControlPlaneLocked()
-	a.ctlMu.Unlock()
-
-	a.rootCancel()
-	a.rootWG.Wait()
 }
 
 // ---------------------------------------------------------------------------

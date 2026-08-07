@@ -154,17 +154,15 @@ export function createSettingsView(handlers) {
   // default because somebody pressed Save on an unrelated screen is a way to
   // change what is in their ears without touching a control that says so.
   let carriedReturnSource = normaliseReturnSource(undefined);
-  // The port of the M2L-X output the SRT return dials. 40501 is Output 1,
-  // src=pgm — the DIRTY programme feed, which is the picture a commentator
-  // watches. Carried rather than exposed: it is measured, it is the same on
-  // every instance seen so far, and a wrong value here is a monitor that never
-  // connects with nothing to say why.
-  //
-  // It defaulted to 40503 (src=cln) for one revision and that was the fault
-  // this screen's new encryption controls exist because of: 40503 measured
-  // encrypted=true, the return dialled it with no passphrase, and every
-  // handshake was refused in silence.
-  let carriedSRTReturnPort = 0;
+
+  // srtReturnPort USED TO BE CARRIED HERE AND MUST NOT BE AGAIN. It has a real
+  // control in the Monitor group below, because carrying it is exactly how it
+  // became uneditable: it defaulted to 40503 (src=cln, measured encrypted=true)
+  // for one revision, the return dialled it with no passphrase, every handshake
+  // was refused in silence — and an operator whose config.json still held 40503
+  // had no way to correct it from the application at all. A field with no
+  // control is a field nobody can fix.
+
   function addField(key, labelText, input, hint) {
     const { wrap, errorEl } = row(labelText, input.id, input, hint);
     fields[key] = { input, errorEl };
@@ -435,6 +433,28 @@ export function createSettingsView(handlers) {
   // lives on the main screen only; this form carries the saved value through
   // untouched — see collectConfig.
 
+  // WHICH M2L-X OUTPUT THE SRT RETURN DIALS. A real control, not a carried
+  // value, and that is the whole point of it: it was carried through this form
+  // untouched for one revision, so a config.json written while the default was
+  // 40503 could not be corrected from the application at all. The operator had
+  // an encrypted clean feed in a field nothing on screen would show them.
+  //
+  // It sits with the return settings and immediately above the return
+  // encryption controls because the two are one decision: the port chooses the
+  // output, and encryption is set PER OUTPUT on M2L-X, so changing this may
+  // well mean changing the two controls below it as well.
+  addField(
+    'srtReturnPort',
+    'SRT return port — which M2L-X output to listen to',
+    numberInput('f-srtReturnPort'),
+    'Measured on the live instance. 40501 — Output 1, src=pgm: the DIRTY programme feed, the ' +
+      'default, and what a commentator watches (encrypted=false). 40502 — Output 2, src=pvw: its ' +
+      'AUDIO is the master bus, the same as pgm (encrypted=true). 40503 — Output 3, src=cln: the ' +
+      'clean feed (encrypted=true). 40504 and up — Outputs 4 to 7, byte-transparent relays of ' +
+      'router inputs. An encrypted output needs the passphrase and key length below, or every ' +
+      'handshake is refused in silence.',
+  );
+
   // --- SRT return encryption ---------------------------------------------
   //
   // Grouped with the return settings above rather than with the SRT OUTPUT
@@ -622,9 +642,13 @@ export function createSettingsView(handlers) {
     );
     fields.returnChannel.input.value = normaliseChannelMode(config.returnChannel);
     fields.srtReturnPBKeyLen.input.value = String(config.srtReturnPBKeyLen ?? 0);
+    // `||`, not `??`: a stored 0 must show as the default, because 0 is what
+    // internal/config.EffectiveSRTReturnPort substitutes the default FOR. A
+    // form that showed 0 would be showing a port the return never dials, and
+    // the validator below would then refuse to save the screen it just drew.
+    fields.srtReturnPort.input.value = String(config.srtReturnPort || blankConfig().srtReturnPort);
     // Held, not shown. See the note beside the returnChannel field.
     carriedReturnSource = normaliseReturnSource(config.returnSource);
-    carriedSRTReturnPort = Number(config.srtReturnPort) || 0;
     fields.returnGainDb.input.value = String(config.returnGainDb ?? 18);
     const tile = config.monitorTile || { x: 0, y: 360, w: 640, h: 360 };
     fields['monitorTile.x'].input.value = String(tile.x ?? 0);
@@ -673,11 +697,12 @@ export function createSettingsView(handlers) {
       [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
       returnMid: Number(fields.returnMid.input.value),
       returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
+      srtReturnPort: Number(fields.srtReturnPort.input.value),
       srtReturnPBKeyLen: Number(fields.srtReturnPBKeyLen.input.value),
       // Carried through from the loaded config, not collected from a control.
-      // See the declarations of these two for why.
+      // See the declaration above for why. It is the LAST such field; every
+      // other one on this screen now has a control.
       returnSource: carriedReturnSource,
-      srtReturnPort: carriedSRTReturnPort,
       monitorTile: {
         x: Number(fields['monitorTile.x'].input.value),
         y: Number(fields['monitorTile.y'].input.value),

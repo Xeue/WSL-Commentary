@@ -168,6 +168,11 @@ func main() {
 	// repeated here because wails.Run can also return by a path that never fires
 	// OnShutdown — a WebView2 environment that fails to create, for instance —
 	// and because the os.Exit below would skip a deferred call entirely.
+	//
+	// IT MAY NOT RETURN. A teardown that had to abandon a step ends the process
+	// itself rather than handing an unaccountable thread to the ordinary exit
+	// path; see App.teardown. That is deliberate and it is why nothing below
+	// this line may be load-bearing for anything but the error report.
 	app.teardown()
 
 	if err != nil {

@@ -681,7 +681,21 @@ test('Settings carries the return source through a save instead of dropping it',
   // for an unrelated reason.
   const src = ui('settings.js');
   assert.match(src, /returnSource: carriedReturnSource/, 'the saved value is carried, not collected');
-  assert.match(src, /srtReturnPort: carriedSRTReturnPort/, 'and so is the port the return dials');
+  // The port the return dials is NOT carried any more, and must not become
+  // carried again. Carrying it is what made it uneditable: an operator whose
+  // config.json held 40503 — the encrypted clean feed — had no control to
+  // correct it with, so the monitor could never connect and the screen said
+  // nothing. It is collected from its own numeric field now.
+  assert.match(
+    src,
+    /srtReturnPort: Number\(fields\.srtReturnPort\.input\.value\)/,
+    'the return port must be collected from its control, not carried',
+  );
+  assert.equal(
+    /carriedSRTReturnPort/.test(src),
+    false,
+    'the return port is carried again; a carried field is a field an operator cannot fix',
+  );
   assert.match(src, /returnChannel: normaliseChannelMode\(/, 'and the channel is collected from its control');
   assert.match(src, /\[DEVICE_KEY_SRT\]:/, 'and the WASAPI endpoint id is not dropped either');
 });

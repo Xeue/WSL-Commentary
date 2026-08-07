@@ -37,6 +37,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,6 +114,12 @@ func newTestApp(t *testing.T) (*App, *fakeStore) {
 	a := NewApp(t.TempDir(), nil)
 	store := newFakeStore()
 	a.store = store
+
+	// The real exitProcess ends the process, which under `go test` is the test
+	// binary and every other test in it. Every App a test builds gets a no-op
+	// instead; a test that cares whether teardown decided to end the process
+	// installs its own recorder over this one.
+	a.exitProcess = func() {}
 
 	a.cfgMu.Lock()
 	a.cfg = validConfig()
@@ -1192,6 +1199,228 @@ func TestTeardownCompletesPromptly(t *testing.T) {
 
 	if elapsed >= shutdownTimeout {
 		t.Fatalf("teardown took %v, reaching the %v bound; the ordered shutdown is wedged", elapsed, shutdownTimeout)
+	}
+}
+
+// wedgedReturnMonitor is a gst.ReturnMonitor whose Stop never returns.
+//
+// That is not a contrived fake. internal/gst's returnMonitor.Stop waits on the
+// run goroutine, which can be inside returnPipeline.Play, which holds the
+// pipeline lock across gst_element_set_state — a cgo call that takes no timeout
+// and cannot be interrupted from Go. internal/gst says so beside its own
+// timeout constants. A monitor that will not stop is the measured worst case,
+// not a hypothesis.
+type wedgedReturnMonitor struct {
+	states chan gst.ReturnState
+	block  chan struct{}
+}
+
+func newWedgedReturnMonitor() *wedgedReturnMonitor {
+	return &wedgedReturnMonitor{
+		states: make(chan gst.ReturnState, 8),
+		block:  make(chan struct{}),
+	}
+}
+
+func (m *wedgedReturnMonitor) Start(gst.ReturnOpts) error     { return nil }
+func (m *wedgedReturnMonitor) States() <-chan gst.ReturnState { return m.states }
+func (m *wedgedReturnMonitor) Stop() error                    { <-m.block; return nil }
+
+// release lets the abandoned Stop finish, so the test does not leave a
+// goroutine parked for the rest of the run.
+func (m *wedgedReturnMonitor) release() { close(m.block); close(m.states) }
+
+var _ gst.ReturnMonitor = (*wedgedReturnMonitor)(nil)
+
+// TestTeardownAbandonsAWedgedStepAndStillRunsTheRest is the operator's bug:
+// "when I close the app, it doesn't close properly, the window closes, but in
+// task manager I have to kill it."
+//
+// The teardown used to be a plain sequence inside one overall timeout, so the
+// FIRST step that would not return consumed the whole budget and every step
+// behind it was never run at all. Measured before the fix, with this same
+// wedged monitor: teardown took the full twenty seconds and, when it gave up,
+// the mixer's write socket was still open and still armed, the status watcher
+// and the token-refresh timer were still running, and the root context had
+// never been cancelled — so every GetMixerSnapshot dial the drawer had in
+// flight was still live too. A shutdown that had already given up had released
+// nothing.
+//
+// This test fails on every one of those counts without the per-step bounds: on
+// the deadline first, and then on each thing that was never stopped.
+func TestTeardownAbandonsAWedgedStepAndStillRunsTheRest(t *testing.T) {
+	a, _ := newTestApp(t)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	_, ctl := withFakeMixer(t, a)
+	if _, err := a.ArmMixer(); err != nil {
+		t.Fatalf("ArmMixer() error = %v", err)
+	}
+
+	mon := newWedgedReturnMonitor()
+	a.returnDial = func() gst.ReturnMonitor { return mon }
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	t.Cleanup(mon.release)
+
+	// The deadline is the return step's own budget plus the four prompt steps
+	// behind it, with room to spare — and far below shutdownTimeout, which is
+	// what the unfixed code took.
+	const deadline = returnStopBudget + 5*time.Second
+
+	exited := make(chan struct{}, 1)
+	a.exitProcess = func() {
+		select {
+		case exited <- struct{}{}:
+		default:
+		}
+	}
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		a.teardown()
+		done <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-done:
+		t.Logf("teardown returned after %v", elapsed)
+	case <-time.After(deadline):
+		t.Fatalf("teardown did not return within %v with one step wedged; the window has gone and "+
+			"the process is still here, which is the fault being fixed", deadline)
+	}
+
+	// Everything BEHIND the wedged step must still have happened. These are the
+	// four things the unfixed teardown left running.
+	if ctl.closeCount() == 0 {
+		t.Error("the mixer write path was never closed: a switcher_controller socket that can " +
+			"change a live clean feed outlived the window because the return monitor would not stop")
+	}
+	if a.rootCtx.Err() == nil {
+		t.Error("the root context was never cancelled: every in-flight GetMixerSnapshot dial, the " +
+			"KVS fetch and the event pump were all still running after the shutdown gave up")
+	}
+	a.ctlMu.Lock()
+	stillUp := a.ctlCancel != nil
+	a.ctlMu.Unlock()
+	if stillUp {
+		t.Error("the control plane was never stopped: the status socket and the m2lx token-refresh " +
+			"goroutine outlived the window")
+	}
+
+	select {
+	case <-exited:
+	default:
+		t.Error("teardown abandoned a step and then returned normally. A step was abandoned because " +
+			"it is inside a cgo call nothing here can reach; handing that thread to the ordinary " +
+			"exit path is what leaves a process in Task Manager. It must end the process itself")
+	}
+}
+
+// TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned keeps the hard exit
+// rare. It is the last resort for a thread that cannot be accounted for, and a
+// shutdown that stopped everything it was asked to must leave by the ordinary
+// door: Wails still has an error to return to main, and main still has an exit
+// status to set from it.
+func TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned(t *testing.T) {
+	a, _ := newTestApp(t)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	_, ctl := withFakeMixer(t, a)
+	if _, err := a.ArmMixer(); err != nil {
+		t.Fatalf("ArmMixer() error = %v", err)
+	}
+	withFakeReturn(a)
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	var exits atomic.Int64
+	a.exitProcess = func() { exits.Add(1) }
+
+	a.teardown()
+
+	if got := exits.Load(); got != 0 {
+		t.Errorf("teardown ended the process %d time(s) on a clean shutdown; the hard exit is for a "+
+			"step that could not be stopped, not for every close", got)
+	}
+	if ctl.closeCount() == 0 {
+		t.Error("the mixer write path was not closed by a clean teardown")
+	}
+}
+
+// TestTeardownStepBudgetsFitInsideTheOverallBound checks the arithmetic the
+// shutdownTimeout comment now claims.
+//
+// shutdownTimeout stopped being the thing that bounds the work and became the
+// backstop for these five adding up. If they ever exceed it the backstop fires
+// first, teardown is cut off mid-sequence again, and the steps behind the cut
+// stop running — which is exactly the defect the per-step budgets removed.
+func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
+	total := senderStopBudget + returnStopBudget + mixerCloseBudget + controlPlaneStopBudget + rootJoinBudget
+	if total > shutdownTimeout {
+		t.Fatalf("the per-step budgets total %v, over shutdownTimeout's %v: the overall bound would "+
+			"cut the ordered teardown short and the last steps would stop running again", total, shutdownTimeout)
+	}
+
+	// And the sender keeps the largest share. It is the contribution feed; it
+	// goes first and it is the one path given every chance to finish.
+	for name, budget := range map[string]time.Duration{
+		"returnStopBudget":       returnStopBudget,
+		"mixerCloseBudget":       mixerCloseBudget,
+		"controlPlaneStopBudget": controlPlaneStopBudget,
+		"rootJoinBudget":         rootJoinBudget,
+	} {
+		if budget > senderStopBudget {
+			t.Errorf("%s (%v) is larger than senderStopBudget (%v); the contribution feed is the "+
+				"path that must be given every chance to finish", name, budget, senderStopBudget)
+		}
+	}
+}
+
+// TestTeardownCancelsTheRootContextBeforeAnythingThatCanBlock pins the ordering
+// that makes the abandonment safe.
+//
+// rootCancel cannot block, and it is the only step that releases every
+// context-bound piece of work at once. Behind a step that CAN block it is a
+// cancellation that never happens, which is how the drawer's in-flight status
+// dials survived a shutdown. Being first costs nothing: neither the sender nor
+// the return monitor is driven by that context.
+func TestTeardownCancelsTheRootContextBeforeAnythingThatCanBlock(t *testing.T) {
+	a, _ := newTestApp(t)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	cancelledFirst := make(chan bool, 1)
+	mon := newWedgedReturnMonitor()
+	a.returnDial = func() gst.ReturnMonitor { return mon }
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	t.Cleanup(mon.release)
+
+	// Watched from the wedged step itself: by the time anything that can block
+	// is running, the root context must already be done.
+	go func() {
+		<-a.rootCtx.Done()
+		cancelledFirst <- true
+	}()
+
+	a.exitProcess = func() {}
+	a.teardown()
+
+	select {
+	case <-cancelledFirst:
+	case <-time.After(time.Second):
+		t.Fatal("the root context was not cancelled by a teardown whose media step was wedged; " +
+			"rootCancel is behind a step that can block again")
 	}
 }
 
@@ -2314,7 +2543,10 @@ func TestShutdownTimeoutJustificationNamesEveryStopItBounds(t *testing.T) {
 	// Every a.Something() call teardownOrdered makes that can block on a
 	// pipeline. Read from the source rather than listed here, so that a step
 	// added later is caught rather than assumed away.
-	bodyStart := strings.Index(text, "func (a *App) teardownOrdered() {")
+	// Matched without the return type and the brace: teardownOrdered grew a
+	// count of the steps it had to abandon, and this test is about what the
+	// justification says, not about the signature.
+	bodyStart := strings.Index(text, "func (a *App) teardownOrdered()")
 	if bodyStart < 0 {
 		t.Fatal("app.go no longer has teardownOrdered")
 	}

@@ -89,6 +89,22 @@ export function validateConfig(config) {
     errors.pbkeylen = 'Key length must be 0 (no passphrase), 16 or 32.';
   }
 
+  // The port of the M2L-X OUTPUT the return dials, as opposed to srtPort above,
+  // which is the INPUT the feed is sent to. Same range check, a different
+  // endpoint, and the one field on this screen an operator is most likely to
+  // have inherited a wrong value for: it had no control at all for a revision,
+  // so a config.json written while the default was 40503 — src=cln, measured
+  // encrypted=true — could not be corrected from the application.
+  //
+  // Zero is rejected rather than accepted as "use the default". Go's
+  // EffectiveSRTReturnPort does substitute the default for 0, but the form
+  // shows the substituted value, so a 0 arriving here means the operator
+  // cleared the box — and silently saving a different number from the one on
+  // screen is how a field stops meaning what it says.
+  if (!isInt(config.srtReturnPort) || config.srtReturnPort < 1 || config.srtReturnPort > 65535) {
+    errors.srtReturnPort = 'SRT return port must be a whole number from 1 to 65535 — 40501 is the programme output.';
+  }
+
   // The RETURN path's key length. Same three values, a different endpoint, and
   // deliberately not the same field as pbkeylen above: M2L-X sets encryption
   // per output — Output 1 (pgm, 40501) measured encrypted=false while Outputs 2

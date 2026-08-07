@@ -125,6 +125,44 @@ test('the return key length rejects everything else, including the plausible mis
   }
 });
 
+// ---------------------------------------------------------------------------
+// validateConfig: the return PORT
+// ---------------------------------------------------------------------------
+
+test('the return port accepts the four measured M2L-X outputs', () => {
+  // 40501 pgm, 40502 pvw, 40503 cln, 40504+ the byte-transparent relays.
+  for (const value of [40501, 40502, 40503, 40504, 40507, 1, 65535]) {
+    const errors = validateConfig({ ...validForm(), srtReturnPort: value });
+    assert.equal(errors.srtReturnPort, undefined, `port ${value} is in range`);
+  }
+});
+
+test('the return port is validated like a port, 1 to 65535', () => {
+  for (const value of [0, -1, 65536, 1.5, '40501', null, undefined, NaN]) {
+    const errors = validateConfig({ ...validForm(), srtReturnPort: value });
+    assert.ok(errors.srtReturnPort, `srtReturnPort ${String(value)} must be rejected`);
+  }
+});
+
+test('the two SRT ports are validated independently', () => {
+  // srtPort is the M2L-X INPUT the feed is sent to; srtReturnPort is the
+  // OUTPUT the monitor listens to. Blaming one for the other sends the
+  // operator to the wrong control.
+  const sendBad = validateConfig({ ...validForm(), srtPort: 0, srtReturnPort: 40501 });
+  assert.ok(sendBad.srtPort, 'srtPort 0 must be reported');
+  assert.equal(sendBad.srtReturnPort, undefined, 'the return port is fine and must not light up');
+
+  const returnBad = validateConfig({ ...validForm(), srtPort: 40001, srtReturnPort: 0 });
+  assert.ok(returnBad.srtReturnPort, 'srtReturnPort 0 must be reported');
+  assert.equal(returnBad.srtPort, undefined, 'the send port is fine and must not light up');
+});
+
+test('the return port error names a port the operator can actually type', () => {
+  const { srtReturnPort } = validateConfig({ ...validForm(), srtReturnPort: 0 });
+  assert.match(srtReturnPort, /return/i);
+  assert.match(srtReturnPort, /40501/);
+});
+
 test('the two key lengths are validated independently', () => {
   // The measured arrangement: an unencrypted commentary input and an encrypted
   // programme output. One shared control could not express it, and a validator
@@ -260,6 +298,90 @@ test('Settings collects and populates the return key length', () => {
   );
   // The control offers exactly the three key lengths, in one place.
   assert.match(js, /selectInput\('f-srtReturnPBKeyLen',/);
+});
+
+test('the return port has a real control, populated and collected', () => {
+  // THE DEFECT THIS PINS. srtReturnPort was carried through the form: read in
+  // populate, written back in collectConfig, never rendered. An operator whose
+  // config.json held 40503 — src=cln, measured encrypted=true — had no way to
+  // correct it from the application, so their return could not connect and
+  // nothing on screen would say why.
+  const js = ui('settings.js');
+  assert.match(js, /numberInput\('f-srtReturnPort'\)/, 'the return port must have a numeric input');
+  assert.match(
+    js,
+    /addField\(\s*'srtReturnPort',/,
+    'the return port must be a real field, not a carried value',
+  );
+  assert.match(
+    js,
+    /srtReturnPort: Number\(fields\.srtReturnPort\.input\.value\)/,
+    'collectConfig must send the port as a number, not a string',
+  );
+  assert.match(
+    js,
+    /fields\.srtReturnPort\.input\.value = String\(config\.srtReturnPort/,
+    'populate must show what is saved, or the operator corrects a value they cannot see',
+  );
+  assert.equal(
+    /carriedSRTReturnPort/.test(js),
+    false,
+    'the return port is carried again; that is precisely how it became uneditable',
+  );
+});
+
+test('the return port field names the outputs, because nothing else does', () => {
+  // There is no endpoint that lists the M2L-X outputs. The port menu was
+  // measured by dialling each one, and a bare "SRT return port" box is a
+  // five-digit number with no way to find out what to type.
+  const js = ui('settings.js');
+  const field = js.slice(js.indexOf("addField(\n    'srtReturnPort',"), js.indexOf("SRT return encryption'"));
+  assert.ok(field.length > 0, 'the return port field must be in the SRT return group');
+  for (const port of ['40501', '40502', '40503', '40504']) {
+    assert.ok(field.includes(port), `the hint must name port ${port}`);
+  }
+  assert.match(field, /pgm/, 'and say which source each output carries');
+  assert.match(field, /cln/);
+});
+
+test('the return port sits with the return settings, above the encryption controls', () => {
+  // Between the Monitor group and "SRT return encryption": the port chooses the
+  // output, and M2L-X sets encryption PER OUTPUT, so changing one is a reason
+  // to look at the other. Under "SRT output" it would read as the send port.
+  const js = ui('settings.js');
+  const monitor = js.indexOf("monitorHeading.textContent = 'Monitor'");
+  const port = js.indexOf("addField(\n    'srtReturnPort',");
+  const encryption = js.indexOf("returnEncryptionHeading.textContent = 'SRT return encryption'");
+  assert.ok(monitor > 0 && port > 0 && encryption > 0);
+  assert.ok(port > monitor, 'the return port belongs in the Monitor group, not the SRT output group');
+  assert.ok(port < encryption, 'and above the encryption controls it decides the answer for');
+});
+
+test('srtReturnPort is spelled the same way in the form and in config.go', () => {
+  // Same silent failure as srtReturnPBKeyLen: a key mismatch is not an error,
+  // Go keeps 0, EffectiveSRTReturnPort substitutes 40501, and the screen shows
+  // whatever the operator typed while the monitor dials something else.
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(
+    go,
+    /SRTReturnPort int `json:"srtReturnPort"`/,
+    'internal/config no longer tags the return port "srtReturnPort"',
+  );
+  for (const file of ['settings.js', 'validate.js', 'backend.js', 'returnpath.js']) {
+    assert.ok(ui(file).includes('srtReturnPort'), `${file} must use the same key as config.go`);
+  }
+});
+
+test('the return port range matches internal/config.ValidateReturn', () => {
+  // Go refuses the same range. Two validators that disagree mean either a Save
+  // the form accepts and StartReturn then refuses, or the reverse — and the
+  // reverse is the one that reaches an operator as "it just does not connect".
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(
+    go,
+    /srtReturnPort must be between 1 and 65535/,
+    'internal/config no longer bounds the return port at 1..65535',
+  );
 });
 
 test('the return passphrase field is a password field and is cleared on open', () => {
