@@ -708,5 +708,12 @@ func (a *App) stopPictureForTeardown() error {
 			problems = append(problems, err)
 		}
 	}
+	// errors.Join and NOT a formatted summary, because what teardownStep does
+	// with this error depends on being able to see through it: an overlay Close
+	// that gave up wraps gst.ErrAbandonedThread, the joined error's Unwrap
+	// []error keeps errors.Is working through it, and that is what turns this
+	// step from "finished with a complaint" into "abandoned" and ends the
+	// process by TerminateProcess. A fmt.Errorf with %v here would flatten the
+	// sentinel to text and put the shutdown hang back. See teardownStep.
 	return errors.Join(problems...)
 }

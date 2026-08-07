@@ -52,6 +52,31 @@ function codeOnly(src) {
 }
 
 /**
+ * mosaicPage models the ONE line of home.js this file's fallback property is
+ * about: setPictureOverlaid toggles `pgm-tile-overlaid` on the PGM tile, and
+ * main.css hides the mosaic <video> for as long as that class is set.
+ *
+ * Nothing else about home.js is modelled and nothing else is claimed. home.js
+ * needs a DOM this runner does not have — see mixerwiring.test.js on why
+ * widening a shim until a test passes stops the shim being evidence — so the
+ * fact that home.js is driven by THIS and by nothing else is asserted from its
+ * text, in "the wiring" section below.
+ */
+function mosaicPage() {
+  const classes = new Set();
+  return {
+    setPictureOverlaid(on) {
+      if (on === true) classes.add('pgm-tile-overlaid');
+      else classes.delete('pgm-tile-overlaid');
+    },
+    /** What the commentator can see underneath the native window. */
+    get mosaicShowing() {
+      return !classes.has('pgm-tile-overlaid');
+    },
+  };
+}
+
+/**
  * harness builds an overlay over a fake window, and records every call that
  * would have crossed into Go.
  */
@@ -66,6 +91,7 @@ function harness(initial = {}) {
     visibles: [],
     logs: [],
   };
+  const page = mosaicPage();
   const overlay = createOverlay({
     measure: () => state.css,
     dpr: () => state.dpr,
@@ -74,9 +100,10 @@ function harness(initial = {}) {
       state.rects.push({ ...physical });
     },
     setVisible: (v) => state.visibles.push(v),
+    onVisible: (v) => page.setPictureOverlaid(v),
     log: (m) => state.logs.push(m),
   });
-  return { state, overlay };
+  return { state, overlay, page };
 }
 
 // --------------------------------------------------------------------------
@@ -413,8 +440,198 @@ test('losing the SRT picture hides the overlay without touching the blockers', (
 });
 
 // --------------------------------------------------------------------------
+// THE FALLBACK: whenever the overlay is not visible, the mosaic IS
+// --------------------------------------------------------------------------
+//
+// This is the property the whole picture design rests on, and it is stated as a
+// property rather than as three examples because the failure it replaces was an
+// unconsidered CASE and not a wrong answer to a considered one.
+//
+// The mosaic used to be suppressed on `effects.showingSRT` — "SRT is the chosen
+// source". But the overlay is a native child window, and it is HIDDEN whenever
+// anything must appear above it: the mixer drawer, Settings, a modal. None of
+// those change the source. So opening the drawer hid the native video and left
+// the mosaic suppressed underneath it, and the commentator got BLACK — during a
+// match, from an operator action that is meant to be safe.
+
+/** The operations that can change what is on screen, each a named step. */
+const VISIBILITY_OPS = [
+  ['sync', (h) => h.overlay.sync()],
+  ['want', (h) => h.overlay.setWanted(true)],
+  ['unwant', (h) => h.overlay.setWanted(false)],
+  ['open settings', (h) => h.overlay.block(BLOCK_SETTINGS)],
+  ['close settings', (h) => h.overlay.unblock(BLOCK_SETTINGS)],
+  ['open the mixer drawer', (h) => h.overlay.block(BLOCK_MIXER)],
+  ['close the mixer drawer', (h) => h.overlay.unblock(BLOCK_MIXER)],
+  ['leave the home view', (h) => h.overlay.block(BLOCK_HIDDEN)],
+  ['return to the home view', (h) => h.overlay.unblock(BLOCK_HIDDEN)],
+  ['lose the measurement', (h) => (h.state.css = null)],
+  ['regain the measurement', (h) => (h.state.css = { x: 0, y: 0, width: 800, height: 450 })],
+];
+
+test('THE COMMENTATOR IS NEVER LOOKING AT BLACK: mosaic showing === overlay hidden, in every reachable state', () => {
+  // Exhaustive over every sequence of the operations above up to length 3 —
+  // every ordering and every repeat, 1,463 sequences — asserting the
+  // biconditional after EVERY step and not only at the end, so a sequence that
+  // reaches a bad state and leaves it again still fails.
+  //
+  // Each sequence is REPLAYED FROM A FRESH OVERLAY rather than walked depth-first
+  // over one shared instance. That costs a few thousand redundant operations and
+  // buys the thing a property test lives or dies by: the path in the failure
+  // message is the path that actually produced it.
+  const depth = 3;
+  const sequences = [[]];
+  for (let d = 0; d < depth; d++) {
+    for (const seq of sequences.filter((s) => s.length === d)) {
+      for (let i = 0; i < VISIBILITY_OPS.length; i++) sequences.push([...seq, i]);
+    }
+  }
+
+  let checks = 0;
+  for (const seq of sequences) {
+    const h = harness();
+    assert.equal(h.page.mosaicShowing, true, 'at birth the overlay is hidden, so the mosaic is the picture');
+
+    const trail = [];
+    for (const i of seq) {
+      const [name, op] = VISIBILITY_OPS[i];
+      op(h);
+      trail.push(name);
+      checks++;
+      assert.equal(
+        h.page.mosaicShowing,
+        !h.overlay.visible,
+        `after [${trail.join(' -> ')}] the overlay is ${h.overlay.visible ? 'VISIBLE' : 'hidden'} and the ` +
+          `mosaic is ${h.page.mosaicShowing ? 'showing' : 'SUPPRESSED'}. Exactly one picture must be on ` +
+          `screen: an overlay that is not up over a mosaic that is suppressed is a commentator looking at black`,
+      );
+    }
+  }
+  assert.equal(sequences.length, 1 + 11 + 121 + 1331, 'the whole space up to length 3');
+  assert.ok(checks > 4000, `the walk must actually explore it; it made ${checks} checks`);
+});
+
+test('opening the mixer drawer over a live SRT picture puts the mosaic back', () => {
+  // The property above covers this, but this is the operator's actual action and
+  // it is worth being able to read the failure without decoding a trail.
+  const { overlay, page } = harness();
+  overlay.unblock(BLOCK_HIDDEN);
+  overlay.setWanted(true);
+  overlay.sync();
+  assert.equal(overlay.visible, true);
+  assert.equal(page.mosaicShowing, false, 'the native window is over the tile');
+
+  overlay.block(BLOCK_MIXER);
+  assert.equal(overlay.visible, false, 'the drawer must never be under the picture');
+  assert.equal(
+    page.mosaicShowing,
+    true,
+    'the native picture has gone and the mosaic is still suppressed: the commentator is watching black ' +
+      'for as long as the mixer drawer is open',
+  );
+
+  overlay.unblock(BLOCK_MIXER);
+  assert.equal(overlay.visible, true);
+  assert.equal(page.mosaicShowing, false, 'and the mosaic goes back under the native picture');
+});
+
+test('Settings, and Settings opened from behind the drawer, both leave a picture on screen', () => {
+  const { overlay, page } = harness();
+  overlay.unblock(BLOCK_HIDDEN);
+  overlay.setWanted(true);
+  overlay.sync();
+
+  overlay.block(BLOCK_MIXER);
+  overlay.block(BLOCK_SETTINGS);
+  assert.equal(page.mosaicShowing, true);
+  overlay.unblock(BLOCK_MIXER); // Settings is still up
+  assert.equal(overlay.visible, false);
+  assert.equal(page.mosaicShowing, true, 'still covered, so still the mosaic');
+  overlay.unblock(BLOCK_SETTINGS);
+  assert.equal(page.mosaicShowing, false, 'and only now does the native picture come back');
+});
+
+test('the page is told the visibility even when it did not change', () => {
+  // setVisible is IPC and repeating it is a swapchain resize, so it is sent only
+  // on a change. The page report is a class name and is unconditional, so the
+  // page cannot be left holding a stale answer by any route — including a first
+  // apply that changes nothing.
+  const { state, overlay, page } = harness();
+  overlay.sync();
+  overlay.sync();
+  assert.deepEqual(state.visibles, [], 'nothing crossed into Go');
+  assert.equal(page.mosaicShowing, true, 'and the page still knows the overlay is not up');
+});
+
+test('a page report that throws is logged, not propagated', () => {
+  // The same rule as every other injected call here. A DOM failure must not
+  // abandon a visibility transition half-done, with the native window told one
+  // thing and the page another.
+  const logs = [];
+  const overlay = createOverlay({
+    measure: () => ({ x: 0, y: 0, width: 10, height: 10 }),
+    dpr: () => 1,
+    setRect: () => {},
+    setVisible: () => {},
+    onVisible: () => {
+      throw new Error('no such element');
+    },
+    log: (m) => logs.push(m),
+  });
+  assert.doesNotThrow(() => {
+    overlay.unblock(BLOCK_HIDDEN);
+    overlay.setWanted(true);
+    overlay.sync();
+  });
+  assert.equal(overlay.visible, true, 'the overlay still made its decision');
+  assert.ok(
+    logs.some((l) => l.includes('no such element')),
+    'the failure must be said somewhere',
+  );
+});
+
+// --------------------------------------------------------------------------
 // The wiring
 // --------------------------------------------------------------------------
+
+test('the mosaic follows the OVERLAY, and home.js has no other way to suppress it', () => {
+  // The two halves of the fix that the property test above cannot see, because
+  // home.js and app.js need a DOM this runner does not have.
+  const home = codeOnly(ui('home.js'));
+
+  // home.js may only set the class from the flag it is given.
+  const setter = home.slice(home.indexOf('function setPictureOverlaid('));
+  assert.ok(setter.length > 0, 'home.js must expose setPictureOverlaid');
+  assert.match(
+    setter.slice(0, setter.indexOf('\n  }')),
+    /classList\.toggle\('pgm-tile-overlaid', overlaid/,
+    'setPictureOverlaid must toggle the class from its argument',
+  );
+
+  // And nowhere else may touch it. This is the actual regression: the class was
+  // toggled inside renderPicture from `effects.showingSRT`, which is the source
+  // selection and not the window.
+  const sites = home.match(/pgm-tile-overlaid/g) || [];
+  assert.equal(sites.length, 1, 'pgm-tile-overlaid must have exactly one call site in home.js');
+  assert.ok(
+    !/pgm-tile-overlaid'?,\s*effects\./.test(home),
+    'the mosaic must never be suppressed on the picture SOURCE: the overlay is also hidden for the ' +
+      'mixer drawer, Settings and modals, and suppressing it then leaves the commentator with black',
+  );
+  assert.ok(
+    !/showingSRT/.test(setter.slice(0, setter.indexOf('\n  }'))),
+    'and setPictureOverlaid must not consult the selection either',
+  );
+
+  // app.js is what connects the two, from the overlay's own visibility.
+  const app = codeOnly(ui('app.js'));
+  assert.match(
+    app,
+    /onVisible:\s*\(on\)\s*=>\s*home\.setPictureOverlaid\(on\)/,
+    'app.js must drive home.setPictureOverlaid from the overlay controller, which is where visibility ' +
+      'is decided — any other source is a second opinion about what is on screen',
+  );
+});
 
 test('app.js blocks the overlay for Settings, on both reasons', () => {
   const src = codeOnly(ui('app.js'));

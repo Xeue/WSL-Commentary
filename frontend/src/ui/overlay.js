@@ -204,6 +204,11 @@ export function describeRect(rect, dpr) {
  *   must send the first two: gst.ScaleRect does the multiplication, because the
  *   ratio Go could read for itself is a different number.
  * @property {(visible: boolean) => void} setVisible
+ * @property {(visible: boolean) => void} [onVisible]
+ *   Called with the SAME answer setVisible is given, but on every apply rather
+ *   than only on a change, and never conditionally. It is how the page learns
+ *   whether the native window is on screen, which is what decides whether the
+ *   fallback mosaic underneath is suppressed. See shouldShow.
  * @property {(message: string) => void} [log]
  */
 
@@ -249,6 +254,38 @@ export function createOverlay(io) {
   }
 
   /**
+   * callOnVisible tells the page what the native window is doing.
+   *
+   * ================= WHY THE PAGE HAS TO BE TOLD THIS AT ALL ==================
+   *
+   * Because the mosaic underneath is suppressed while the overlay covers it, and
+   * the page cannot work out for itself whether it is covered. It used to guess,
+   * from "SRT is the chosen source" — which is a different fact. The overlay is
+   * hidden whenever something must appear above it (the mixer drawer, Settings,
+   * a modal), and none of those touch the source, so opening the drawer hid the
+   * native video and left the mosaic suppressed: the commentator got BLACK.
+   *
+   * So this is the overlay's own visibility, the same expression that decides
+   * the native SetVisible, and the invariant it carries is: WHENEVER THE OVERLAY
+   * IS NOT VISIBLE, THE MOSAIC IS.
+   *
+   * It is called on every apply, not only on a change, and that asymmetry with
+   * setVisible is deliberate. setVisible is IPC and repeating it is a swapchain
+   * resize; this is a class name on an element the page already owns, and making
+   * it unconditional means the page's state is a pure function of the overlay's
+   * with no memory to get out of step — which is worth more than the toggle it
+   * saves.
+   */
+  function callOnVisible(next) {
+    if (typeof io.onVisible !== 'function') return;
+    try {
+      io.onVisible(next);
+    } catch (err) {
+      log(`wslcomms: could not report the picture overlay visibility to the page: ${err?.message || err}`);
+    }
+  }
+
+  /**
    * shouldShow is the whole visibility rule, in one expression.
    *
    * Every term is necessary and the order they are written in is the order they
@@ -262,9 +299,14 @@ export function createOverlay(io) {
 
   function apply() {
     const next = shouldShow();
-    if (next === visible) return;
-    visible = next;
-    callSetVisible(visible);
+    if (next !== visible) {
+      visible = next;
+      callSetVisible(visible);
+    }
+    // Unconditional, and AFTER the window has been told, so the page never
+    // uncovers the mosaic a moment before the native window has gone. See
+    // callOnVisible for why the page is told at all.
+    callOnVisible(visible);
   }
 
   return {

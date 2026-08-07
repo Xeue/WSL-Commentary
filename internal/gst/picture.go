@@ -205,6 +205,32 @@ var ErrPictureAlreadyStarted = errors.New("gst: picture monitor already started"
 // ErrPictureNotStarted is returned by Stop on a monitor that was never started.
 var ErrPictureNotStarted = errors.New("gst: picture monitor not started")
 
+// ErrAbandonedThread marks an error whose Close GAVE UP on an OS thread rather
+// than joining it. It is wrapped, never returned bare: the wrapping error says
+// which thread and what it was doing.
+//
+// # Why a sentinel and not just a sentence in the message
+//
+// Because a caller has to be able to ACT on it, and only a sentinel can be
+// acted on. App.teardown runs each shutdown step under its own budget and ends
+// the process with TerminateProcess if any step had to be abandoned, precisely
+// so that the ordinary exit — ExitProcess, which runs DLL_PROCESS_DETACH for
+// GStreamer, WASAPI, D3D11 and COM under the loader lock after killing every
+// other thread — never runs over a thread that was killed mid-call. See
+// exit_windows.go.
+//
+// A step that RETURNS is scored as finished. overlay.Close is the first Close
+// in this application that returns on a hang instead of hanging, so it is the
+// first that can hand teardown a completed step with an abandoned thread behind
+// it — the exact shape the hard exit exists to catch, arriving through the one
+// door that did not look for it. errors.Is on this value is that door.
+//
+// It is declared here, in the file with no build tag, rather than beside
+// ErrNoHostWindow in each of overlay_windows.go and overlay_other.go: package
+// main tests for it on every platform, and two build-tagged errors.New calls
+// are two different values.
+var ErrAbandonedThread = errors.New("gst: an OS thread was abandoned rather than joined")
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------

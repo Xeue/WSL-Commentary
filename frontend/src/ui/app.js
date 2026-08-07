@@ -199,6 +199,20 @@ export function mountApp(root) {
         .then(() => backend.setPictureVisible(on))
         .catch(pictureFault);
     },
+    // THE MOSAIC FOLLOWS THE WINDOW, NOT THE SOURCE SELECTION.
+    //
+    // home.js suppresses the mosaic <video> while the native overlay covers it,
+    // and this is the only thing that tells it to. It used to be driven from
+    // `effects.showingSRT` inside home.renderPicture, which is a different fact:
+    // the overlay is hidden whenever something must appear above it — the mixer
+    // drawer, Settings, a modal — and none of those change the source. Opening
+    // the drawer therefore took the native picture away and left the mosaic
+    // suppressed underneath it, and the commentator got BLACK.
+    //
+    // Wired here because overlay.js is where visibility is DECIDED — the same
+    // expression that drives setVisible above — so the page cannot hold a
+    // different opinion about what is on screen.
+    onVisible: (on) => home.setPictureOverlaid(on),
     log: (message) => console.info(message),
   });
 

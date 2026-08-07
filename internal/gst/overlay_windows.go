@@ -201,6 +201,37 @@ const (
 	// picture_cgo.go.
 	wsDisabled = 0x08000000
 
+	// wsExNoParentNotify (WS_EX_NOPARENTNOTIFY) IS LOAD-BEARING AND IT IS NOT A
+	// TIDINESS FLAG. DO NOT REMOVE IT.
+	//
+	// Without it, Windows SENDS the parent a WM_PARENTNOTIFY when this child is
+	// created and again when it is destroyed. The parent is the Wails top-level
+	// window and it belongs to a DIFFERENT THREAD — see the threading section of
+	// the file header, which is about the same hazard from the other direction —
+	// and a cross-thread SendMessage blocks, with no timeout, until the owning
+	// thread pumps its queue.
+	//
+	// On the destroy that is fatal to the shutdown. DestroyWindow runs on this
+	// file's pump thread during App.teardown, and at that moment the Wails main
+	// thread is inside OnShutdown → teardown, parked in a select. IT IS NOT
+	// PUMPING. So the notify never gets picked up, destroy() blocks for the whole
+	// of teardown, the picture step overruns its budget and is abandoned — on an
+	// ORDINARY QUIT, deterministically, with no GPU hang and nothing wrong
+	// anywhere. This one bit is the difference between the abandonment path being
+	// a rare last resort and being what happens every time the operator closes
+	// the application.
+	//
+	// On the create it is milder but real: the same send makes CreateWindowExW
+	// wait on the Wails thread, so NewPictureOverlay's `<-o.created` blocks the
+	// Wails handler that called it — while that handler holds picViewMu, which is
+	// the lock stopPictureForTeardown needs.
+	//
+	// Nothing is given up by setting it. WM_PARENTNOTIFY exists so a parent can
+	// react to its children being created, destroyed or clicked; the parent here
+	// is a WebView2 host that knows nothing about this window, and the child is
+	// wsDisabled so it produces no mouse notifications either.
+	wsExNoParentNotify = 0x00000004
+
 	swpNoActivate  = 0x0010
 	swpShowWindow  = 0x0040
 	swpNoZOrder    = 0x0004
@@ -232,6 +263,19 @@ const (
 // with a class registered by Wails, go-webview2, Chromium or gstd3d11 — all four
 // of which register classes in this process.
 const overlayClassName = "WslCommsPictureOverlay"
+
+// overlayExStyle and overlayStyle are the two style words CreateWindowExW is
+// given, named rather than written inline so that overlay_windows_test.go can
+// assert what is in them without creating a window — which a `go test` binary
+// cannot do, having no visible top-level window to be a child of.
+//
+// Every bit in both has a paragraph above it. wsExNoParentNotify in particular
+// is the one that reads like a default and is not: dropping it wedges the whole
+// teardown on a main thread that has stopped pumping.
+const (
+	overlayExStyle = wsExNoParentNotify
+	overlayStyle   = wsChild | wsClipSiblings | wsClipChildren | wsDisabled
+)
 
 type wndClassExW struct {
 	cbSize        uint32
@@ -532,11 +576,17 @@ func (o *overlay) pump(parent syscall.Handle) {
 	// Created hidden (no WS_VISIBLE), disabled, clipping siblings, at 0x0.
 	// Nothing is shown until SetVisible(true), and nothing is positioned until
 	// SetRect; both are the frontend's explicit decisions.
+	//
+	// The extended style is NOT zero. It is WS_EX_NOPARENTNOTIFY, which is what
+	// stops this call and the matching DestroyWindow from SENDING a message to a
+	// parent window owned by a thread that is not pumping. See wsExNoParentNotify
+	// — it is the difference between a clean quit and a teardown that abandons
+	// the picture step every single time.
 	hwnd, _, callErr := procCreateWindowExW.Call(
-		0, // no extended style: not layered, not transparent, not topmost
+		overlayExStyle,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
-		wsChild|wsClipSiblings|wsClipChildren|wsDisabled,
+		overlayStyle,
 		0, 0, 0, 0,
 		uintptr(parent),
 		0, hinst, 0,
@@ -715,9 +765,16 @@ func (o *overlay) Close() error {
 		select {
 		case <-o.done:
 		case <-timer.C:
+			// WRAPPED, not merely described. The sentence is for the log; the
+			// wrapped ErrAbandonedThread is what App.teardownStep tests for, and
+			// it is the only reason that teardown scores this step as unfinished
+			// and ends the process with TerminateProcess instead of returning
+			// into ExitProcess with this thread still inside DestroyWindow or
+			// gstd3d11's subclass procedure. See gst.ErrAbandonedThread.
 			o.closeErr = fmt.Errorf(
 				"gst: overlay: the picture window's message thread did not stop within %s and has been "+
-					"ABANDONED; the window may remain on screen until the process exits", overlayCloseBudget)
+					"ABANDONED; the window may remain on screen until the process exits: %w",
+				overlayCloseBudget, ErrAbandonedThread)
 			log.Print(o.closeErr)
 		}
 	})

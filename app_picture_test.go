@@ -14,6 +14,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -596,6 +597,11 @@ func TestTeardownReportsAnOverlayThatWouldNotClose(t *testing.T) {
 	// its message thread. That error must reach the teardown log rather than
 	// being swallowed: an abandoned window is the only thing in this whole
 	// shutdown that stays on the operator's SCREEN.
+	//
+	// And it must arrive INSPECTABLE. errors.Join keeps errors.Is working
+	// through it; a fmt.Errorf summary with %v would not, and the sentinel is
+	// the only thing that tells teardownStep this step did not finish. See the
+	// next test for what that decides.
 	a, _ := newTestApp(t)
 	silencePump(a)
 	withFakePicture(a)
@@ -609,12 +615,77 @@ func TestTeardownReportsAnOverlayThatWouldNotClose(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ABANDONED") {
 		t.Fatalf("stopPictureForTeardown() error = %v, want the overlay's abandonment reported", err)
 	}
+	if !errors.Is(err, gst.ErrAbandonedThread) {
+		t.Fatalf("stopPictureForTeardown() error = %v, which does not unwrap to gst.ErrAbandonedThread. "+
+			"The join flattened it, and teardownStep cannot tell an abandoned message thread from a "+
+			"step that finished with a complaint", err)
+	}
 }
 
+// TestTeardownEndsTheProcessWhenTheOverlayAbandonedItsThread is the whole point
+// of the sentinel, and the defect it closes is the shutdown hang coming back.
+//
+// gst.PictureOverlay.Close is the FIRST Close in this application that returns
+// on a hang instead of hanging. teardownStep used to score any step that
+// returned as finished, so an overlay that gave up on its message thread was
+// counted as a clean stop: the abandoned count stayed at zero, teardown took its
+// `n == 0` branch, hardExit was never called and the process left through
+// ExitProcess — which terminates that thread wherever it is (inside
+// user32!DestroyWindow, or gstd3d11's subclass procedure) and THEN runs
+// DLL_PROCESS_DETACH for every loaded DLL under the loader lock, with GStreamer,
+// WASAPI, D3D11 and COM all in that set. That is the operator's original bug:
+// "the window closes, but in task manager I have to kill it."
+//
+// So the assertion is not that the error was logged. It is that the process was
+// ended by the one exit a wedged media library cannot veto. See exit_windows.go.
+func TestTeardownEndsTheProcessWhenTheOverlayAbandonedItsThread(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+	withFakePicture(a)
+
+	stubborn := &stubbornOverlay{fakeOverlay: *newFakeOverlay()}
+	a.picViewMu.Lock()
+	a.picOverlay = stubborn
+	a.picViewMu.Unlock()
+
+	exited := make(chan struct{}, 1)
+	a.exitProcess = func() {
+		select {
+		case exited <- struct{}{}:
+		default:
+		}
+	}
+
+	// Nothing here is slow: the stubborn overlay answers at once. A teardown that
+	// took a budget would mean the abandonment was detected by the TIMER, which
+	// is the case that already worked and is not what this test is about.
+	start := time.Now()
+	a.teardown()
+	if elapsed := time.Since(start); elapsed >= pictureStopBudget {
+		t.Fatalf("teardown took %v, reaching the picture step's %v budget; this test must exercise the "+
+			"step that RETURNS with a thread abandoned, not the step that overruns", elapsed, pictureStopBudget)
+	}
+
+	select {
+	case <-exited:
+	default:
+		t.Fatal("the overlay abandoned its message thread, said so, and teardown still returned through " +
+			"the ordinary exit. ExitProcess terminates that thread wherever it is and then runs " +
+			"DLL_PROCESS_DETACH over it under the loader lock, with GStreamer, WASAPI, D3D11 and COM " +
+			"loaded — which is the shutdown that leaves wslcomms.exe in Task Manager. A step that " +
+			"abandoned a thread is not a step that finished")
+	}
+}
+
+// stubbornOverlay is an overlay whose Close gave up on its message thread: it
+// returns PROMPTLY, with the abandonment wrapped, exactly as the real one does
+// when overlayCloseBudget expires. The prompt return is the point — it is what
+// made this indistinguishable from success.
 type stubbornOverlay struct{ fakeOverlay }
 
 func (o *stubbornOverlay) Close() error {
-	return errors.New("gst: overlay: the message thread did not stop and has been ABANDONED")
+	return fmt.Errorf("gst: overlay: the message thread did not stop and has been ABANDONED: %w",
+		gst.ErrAbandonedThread)
 }
 
 // waitForCond polls cond until it holds or the deadline passes. The forwarding

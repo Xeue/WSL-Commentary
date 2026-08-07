@@ -1027,6 +1027,24 @@ func (a *App) teardownOrdered() int {
 // GStreamer state change inside cgo that the process is about to exit out from
 // under. See the file comment for what that costs, which is nothing the OS does
 // not reclaim.
+//
+// # A step can finish and STILL have abandoned a thread
+//
+// Returning is not the same as finishing, and the difference is not cosmetic.
+// gst.PictureOverlay.Close is bounded: at gst's overlayCloseBudget it stops
+// waiting for its message thread, says so, and RETURNS. Scoring that as a
+// finished step is how the abandoned-thread count stays at zero, hardExit is
+// never called, and the process leaves through ExitProcess — which terminates
+// that thread wherever it is (inside user32!DestroyWindow, or gstd3d11's
+// subclass procedure) and then runs DLL_PROCESS_DETACH over the wreckage under
+// the loader lock with GStreamer, WASAPI, D3D11 and COM all loaded. That is the
+// shutdown hang exit_windows.go exists to prevent, arriving through the one
+// door that used to be unwatched.
+//
+// So a step that comes back wrapping gst.ErrAbandonedThread is NOT finished.
+// The picture is the first subsystem whose Close returns on a hang rather than
+// hanging, so it is the first that could reach this; anything else that grows a
+// bounded Close must wrap the same sentinel.
 func teardownStep(what string, budget time.Duration, stop func() error) (finished bool) {
 	done := make(chan error, 1)
 	go func() { done <- stop() }()
@@ -1038,6 +1056,12 @@ func teardownStep(what string, budget time.Duration, stop func() error) (finishe
 	case err := <-done:
 		if err != nil {
 			log.Printf("wslcomms: stopping %s during shutdown: %v", what, err)
+		}
+		if errors.Is(err, gst.ErrAbandonedThread) {
+			log.Printf("wslcomms: %s returned, but it ABANDONED a thread rather than joining it. "+
+				"Counting the step as unfinished: the process must end by TerminateProcess rather "+
+				"than run a DLL detach over a thread that was killed mid-call", what)
+			return false
 		}
 		return true
 	case <-timer.C:

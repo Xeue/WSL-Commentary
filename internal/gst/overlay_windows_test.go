@@ -29,9 +29,123 @@ package gst
 
 import (
 	"errors"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
+
+func TestOverlayWindowIsCreatedWithNoParentNotify(t *testing.T) {
+	// WS_EX_NOPARENTNOTIFY, and the reason it is worth a test of its own is that
+	// it looks like a bit somebody set for tidiness and is in fact the whole
+	// difference between an ordinary quit and a teardown that abandons the
+	// picture every time.
+	//
+	// Without it Windows SENDS the parent a WM_PARENTNOTIFY on create and on
+	// destroy. The parent is the Wails top-level window, owned by another thread,
+	// and a cross-thread SendMessage blocks with no timeout until that thread
+	// pumps. During teardown the Wails thread is inside OnShutdown → teardown,
+	// parked in a select and NOT pumping — so DestroyWindow blocks for the whole
+	// shutdown, the picture step overruns pictureStopBudget and is abandoned.
+	//
+	// The window itself is unreachable from here (see the file header), so what
+	// is asserted is the style word CreateWindowExW is given, plus the fact that
+	// the call site still uses it. Both halves are needed: the constant is where
+	// the bit gets dropped and the call site is where the constant gets bypassed.
+	if wsExNoParentNotify != 0x00000004 {
+		t.Fatalf("wsExNoParentNotify = 0x%08x, want 0x00000004 (WS_EX_NOPARENTNOTIFY)", wsExNoParentNotify)
+	}
+	if overlayExStyle&wsExNoParentNotify == 0 {
+		t.Fatalf("overlayExStyle = 0x%08x and does not contain WS_EX_NOPARENTNOTIFY. Every DestroyWindow "+
+			"on this overlay will now SendMessage the Wails window, whose thread is inside teardown and "+
+			"is not pumping, and the picture step will be abandoned on an ordinary quit", overlayExStyle)
+	}
+
+	src, err := os.ReadFile("overlay_windows.go")
+	if err != nil {
+		t.Fatalf("reading overlay_windows.go: %v", err)
+	}
+	// The first argument of CreateWindowExW is dwExStyle. It was a literal 0
+	// once; a change back to a literal would leave the constant above correct and
+	// the window wrong, which no value-level assertion can see.
+	call := regexp.MustCompile(`procCreateWindowExW\.Call\(\s*\n\s*([A-Za-z0-9_|]+),`)
+	m := call.FindSubmatch(src)
+	if m == nil {
+		t.Fatal("could not find the CreateWindowExW call site to check its dwExStyle argument")
+	}
+	if !strings.Contains(string(m[1]), "overlayExStyle") {
+		t.Fatalf("CreateWindowExW is passed dwExStyle = %q, not overlayExStyle; "+
+			"WS_EX_NOPARENTNOTIFY is not reaching the window", m[1])
+	}
+}
+
+func TestOverlayStyleKeepsTheChildDisabledAndClipping(t *testing.T) {
+	// The other three bits, so that naming the style word did not quietly drop
+	// one of them. wsDisabled is the one with teeth: an enabled native child can
+	// take the keyboard focus off the WebView by being clicked, which is exactly
+	// what somebody does to a picture they want to look at.
+	for _, bit := range []struct {
+		name string
+		want uintptr
+	}{
+		{"WS_CHILD", wsChild},
+		{"WS_CLIPSIBLINGS", wsClipSiblings},
+		{"WS_CLIPCHILDREN", wsClipChildren},
+		{"WS_DISABLED", wsDisabled},
+	} {
+		if overlayStyle&bit.want == 0 {
+			t.Errorf("overlayStyle = 0x%08x is missing %s (0x%08x)", overlayStyle, bit.name, bit.want)
+		}
+	}
+	// And NOT visible: the window is shown by SetVisible, never at creation.
+	const wsVisible = 0x10000000
+	if overlayStyle&wsVisible != 0 {
+		t.Error("overlayStyle has WS_VISIBLE: the overlay would appear at 0x0 before the page has " +
+			"measured a rectangle for it")
+	}
+}
+
+func TestOverlayCloseMarksAnAbandonedThreadWithTheSentinel(t *testing.T) {
+	// Close is bounded, and when the bound is reached it RETURNS — which is the
+	// property that makes the whole shutdown safe to drive, and also the property
+	// that makes this error easy to mistake for success. App.teardownStep counts
+	// a step that returns as finished unless it can see WHY it returned, so the
+	// abandonment has to be an errors.Is-able value and not just a word in a
+	// sentence. Without it teardown's abandoned count stays at zero, hardExit is
+	// never called, and the process leaves through ExitProcess with this thread
+	// killed mid-DestroyWindow and DLL_PROCESS_DETACH still to run.
+	//
+	// o.done is never closed and no window exists, so Close takes the timer
+	// branch. That costs overlayCloseBudget in real time and is the only way to
+	// reach the branch at all.
+	o := &overlay{created: make(chan error, 1), done: make(chan struct{})}
+
+	start := time.Now()
+	err := o.Close()
+	if err == nil {
+		t.Fatal("Close() on an overlay whose pump never answers returned nil; the caller cannot " +
+			"tell an abandoned thread from a clean close")
+	}
+	if elapsed := time.Since(start); elapsed < overlayCloseBudget {
+		t.Fatalf("Close() gave up after %v, before its %v budget", elapsed, overlayCloseBudget)
+	}
+	if !errors.Is(err, ErrAbandonedThread) {
+		t.Fatalf("Close() error = %v; it does not wrap gst.ErrAbandonedThread, so App.teardownStep "+
+			"will score the picture step as FINISHED and the process will exit through "+
+			"DLL_PROCESS_DETACH over an abandoned thread", err)
+	}
+	// The sentence still has to name what happened, because it is what the
+	// operator's log shows.
+	if !strings.Contains(err.Error(), "ABANDONED") {
+		t.Errorf("Close() error = %q, which does not say it abandoned anything", err)
+	}
+	// Idempotent, and the second answer is the same one.
+	if again := o.Close(); !errors.Is(again, ErrAbandonedThread) {
+		t.Errorf("second Close() error = %v, want the same abandonment", again)
+	}
+}
 
 func TestOverlayWindowClassRegisters(t *testing.T) {
 	// This is the WNDCLASSEXW layout test and the overlayWndProc

@@ -433,7 +433,15 @@ input[type='range'] {
    The rule below is not about hiding anything — nothing the page draws here is
    visible anyway — it is so that the ONE frame between "SRT is showing" and the
    overlay actually appearing does not flash a soft mosaic under a badge that
-   says SRT. Black is what a picture that has not arrived should look like. */
+   says SRT. Black is what a picture that has not arrived should look like.
+
+   THE CLASS MEANS "THE NATIVE WINDOW IS ON SCREEN" AND NOTHING ELSE. It is set
+   from the overlay controller's own visibility, through home.setPictureOverlaid.
+   It once meant "SRT is the chosen source", which is not the same thing: the
+   overlay is hidden whenever the mixer drawer, Settings or a modal must appear
+   above it, so this rule went on hiding the mosaic after the native picture had
+   gone and the commentator was left looking at black. Whenever the overlay is
+   not visible, the mosaic is. */
 .pgm-tile-overlaid video {
   visibility: hidden;
 }

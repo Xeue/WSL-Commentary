@@ -89,6 +89,9 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   setPictureSource(source)            srt / mosaic — WHICH PICTURE, not audio
  *   setPictureAvailable(available, why) disables the SRT option with a reason
  *   setPictureState(state)              the native receiver's own status
+ *   setPictureOverlaid(on)              whether the native window is ON SCREEN
+ *                                       over the tile. The ONLY thing that may
+ *                                       suppress the mosaic; see the function.
  *   measurePictureRect()                the reserved box, in CSS pixels
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
@@ -595,14 +598,17 @@ export function createHomeView(handlers) {
   let currentPictureState = null;
 
   /**
-   * renderPicture is the ONE place the picture's appearance is decided: the
-   * badge over the tile, the status line under the control, and whether the
-   * mosaic <video> is the thing being looked at.
+   * renderPicture draws what the SELECTION and the RECEIVER'S STATE mean: the
+   * badge over the tile, the segmented control, and the status line under it.
    *
-   * Both the selection and the receiver's state feed it, because neither alone
-   * says what is on screen: "SRT selected" with the receiver in BACKOFF is a
-   * commentator watching the mosaic, and saying "SRT" over the top of that
-   * would be a lie told in large letters.
+   * Both feed it, because neither alone says what is on screen: "SRT selected"
+   * with the receiver in BACKOFF is a commentator watching the mosaic, and
+   * saying "SRT" over the top of that would be a lie told in large letters.
+   *
+   * IT DOES NOT DECIDE WHETHER THE MOSAIC IS SUPPRESSED, and it used to. That
+   * is setPictureOverlaid's job and it answers a different question — is the
+   * native window actually on screen — which the selection cannot answer. See
+   * setPictureOverlaid.
    */
   function renderPicture() {
     const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
@@ -612,12 +618,6 @@ export function createHomeView(handlers) {
     pictureBadge.textContent = showing.text;
     pictureBadge.title = showing.detail;
     pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
-
-    // The mosaic is marked, not removed. It stays in the document and stays
-    // decoding: it is the fallback, and a fallback that has to re-establish
-    // itself when it is needed is not one. The class only tells the stylesheet
-    // that something opaque is expected on top of it.
-    pgmTile.classList.toggle('pgm-tile-overlaid', effects.showingSRT);
 
     sourceNote.textContent = [describePictureSource(effects.source), PICTURE_NOTE, LATENCY_NOTE].join(' ');
 
@@ -668,6 +668,35 @@ export function createHomeView(handlers) {
   function setPictureState(state) {
     currentPictureState = state ? String(state) : null;
     renderPicture();
+  }
+
+  /**
+   * setPictureOverlaid says whether the native overlay window is ACTUALLY ON
+   * SCREEN over this tile. It is the only thing that may suppress the mosaic.
+   *
+   * ================== IT IS NOT "SRT IS THE CHOSEN SOURCE" ====================
+   *
+   * This used to be driven from renderPicture, off `effects.showingSRT`, and
+   * that is a different fact. The overlay is a native child window and it is
+   * HIDDEN whenever anything must appear above it — the mixer drawer, Settings,
+   * a modal — none of which changes the picture source at all. So opening the
+   * drawer took the native video away and left the mosaic suppressed
+   * underneath, and the commentator got BLACK.
+   *
+   * The rule is one sentence and it has no exceptions: whenever the overlay is
+   * not visible, the mosaic is. The mosaic exists to be the thing underneath,
+   * and something underneath that is hidden is not a fallback.
+   *
+   * app.js is the caller, driven from the overlay controller's own visibility —
+   * the same expression that decides the native SetVisible — so the page and the
+   * window cannot disagree about what is on screen.
+   *
+   * The mosaic is MARKED, not removed. It stays in the document and stays
+   * decoding: a fallback that has to re-establish itself when it is needed is
+   * not one.
+   */
+  function setPictureOverlaid(overlaid) {
+    pgmTile.classList.toggle('pgm-tile-overlaid', overlaid === true);
   }
 
   /**
@@ -729,6 +758,7 @@ export function createHomeView(handlers) {
     setPictureSource,
     setPictureAvailable,
     setPictureState,
+    setPictureOverlaid,
     measurePictureRect,
     setLevel,
     setRunning,
