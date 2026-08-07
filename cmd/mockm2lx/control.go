@@ -28,9 +28,19 @@ type controlState struct {
 	StallStatus    bool        `json:"stallStatus"`
 	LieStreamState string      `json:"lieStreamState,omitempty"`
 	DropAudio      bool        `json:"dropAudio"`
+	DecoyDelta     string      `json:"decoyDelta"`
+	TransitionPush string      `json:"transitionPush"`
 	SRT            srtSnapshot `json:"srt"`
 	WSClients      int         `json:"wsClients"`
 	Sessions       int         `json:"sessions"`
+
+	// StatusKey and StatusKeyIsInput say which node carries the SRT truth,
+	// and whether it is a router input at all. They are here because
+	// "-status-key names nothing" is a supported case rather than a
+	// misconfiguration (see main.go), and a test looking at grey lamps needs
+	// to be able to tell which of the two situations it is in.
+	StatusKey        string `json:"statusKey"`
+	StatusKeyIsInput bool   `json:"statusKeyIsInput"`
 }
 
 func (a *App) handleControlState(w http.ResponseWriter, r *http.Request) {
@@ -41,9 +51,14 @@ func (a *App) handleControlState(w http.ResponseWriter, r *http.Request) {
 		StallStatus:    a.stallStatus,
 		LieStreamState: a.lieStreamState,
 		DropAudio:      a.dropAudio,
+		DecoyDelta:     a.decoyDelta,
+		TransitionPush: a.transitionPush,
 		Sessions:       len(a.sessions),
 	}
 	a.mu.RUnlock()
+
+	st.StatusKey = a.opts.StatusKey
+	_, st.StatusKeyIsInput = a.statusKeyInput()
 
 	st.SRT = a.srt.snapshot()
 
@@ -161,6 +176,74 @@ func (a *App) handleControlDropAudio(w http.ResponseWriter, r *http.Request) {
 	a.setDropAudio(req.Enabled)
 	a.logf("control", "drop-audio set to %v", req.Enabled)
 	writeJSON(w, http.StatusOK, map[string]bool{"dropAudio": req.Enabled})
+}
+
+type decoyDeltaRequest struct {
+	Mode string `json:"mode"`
+}
+
+// handleControlDecoyDelta implements POST /control/decoy-delta: start (or
+// stop) sending a subtree delta that a parser ignoring "path" would read as a
+// whole node.
+//
+// This is the fault this endpoint exists for. The device really does send
+//
+//	{"node":"cam1","path":"/statistics","state":{"bitrate":6523.6,...}}
+//
+// and a parser that unmarshals that "state" as a node finds no stream_state,
+// concludes cam1 is not a router input, and condemns the only input on the
+// switcher that is actually working — once a second, forever, with the lamps
+// grey and nothing saying why. It was a live defect and it must be
+// reproducible somewhere; this is that somewhere. See App.decoyFrame for the
+// two modes and what a correct parser does with each.
+func (a *App) handleControlDecoyDelta(w http.ResponseWriter, r *http.Request) {
+	var req decoyDeltaRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	switch req.Mode {
+	case "", decoyDeltaOff:
+		a.setDecoyDelta(decoyDeltaOff)
+	case decoyDeltaStatistics, decoyDeltaStreamState:
+		a.setDecoyDelta(req.Mode)
+	default:
+		http.Error(w, `{"error":"mode must be off, statistics or stream-state"}`, http.StatusBadRequest)
+		return
+	}
+	a.logf("control", "decoy delta set to %q", a.getDecoyDelta())
+	writeJSON(w, http.StatusOK, map[string]string{"decoyDelta": a.getDecoyDelta()})
+}
+
+type transitionPushRequest struct {
+	Mode string `json:"mode"`
+}
+
+// handleControlTransitionPush implements POST /control/transition-push: choose
+// how a change in the status-key node's stream_state or formats is published,
+// or suppress it entirely.
+//
+// "none" is the interesting one. Nobody has ever observed a real input change
+// state on this socket, so it is genuinely unknown whether a transition is
+// pushed at all — and internal/m2lx's resyncInterval is an explicit backstop
+// against the answer being "no". Setting this to "none" makes the mock behave
+// as though the answer were "no", which is the only way to test that backstop
+// without starting and stopping a feed on a live switcher.
+func (a *App) handleControlTransitionPush(w http.ResponseWriter, r *http.Request) {
+	var req transitionPushRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	switch req.Mode {
+	case "", transitionPushNode:
+		a.setTransitionPush(transitionPushNode)
+	case transitionPushDelta, transitionPushNone:
+		a.setTransitionPush(req.Mode)
+	default:
+		http.Error(w, `{"error":"mode must be node, delta or none"}`, http.StatusBadRequest)
+		return
+	}
+	a.logf("control", "transition push set to %q", a.getTransitionPush())
+	writeJSON(w, http.StatusOK, map[string]string{"transitionPush": a.getTransitionPush()})
 }
 
 type expireTokenRequest struct {

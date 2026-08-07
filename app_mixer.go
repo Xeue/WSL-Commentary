@@ -219,15 +219,27 @@ func (a *App) GetMixerSnapshot() (mixer.Snapshot, error) {
 		return mixer.Snapshot{}, fmt.Errorf("wslcomms: reading the mixer from the status socket: %w", err)
 	}
 
-	// The frame has to carry the mixer node as a WHOLE node. internal/mixer's
-	// parser matches the advanced_audio_mixer entry by node name alone and does
-	// not look at "path", so a subtree delta — "/levels" is pushed about
-	// fifteen times a second — would be read as the node's entire state. That
-	// yields a mixer with no strips and no matrix, i.e. "nothing is routed to
-	// the clean feed", which is the most dangerous false statement this drawer
-	// can make. RawSnapshot already returns only whole-document frames; this is
-	// the second check, on the one node that matters, because the cost of being
-	// wrong here is a client hearing commentary on their clean feed.
+	// The frame has to carry the mixer node as a WHOLE node.
+	//
+	// A subtree delta — "/levels" is pushed about ten times a second on this
+	// very node, 1501 frames in 150 s of live capture — read as the node's
+	// entire state yields a mixer with no strips and no matrix. That renders as
+	// "nothing is routed to the clean feed", which is the most dangerous false
+	// statement this drawer can make.
+	//
+	// THIS IS THE THIRD CHECK, NOT THE ONLY ONE, and the distinction matters
+	// because an earlier version of this comment said internal/mixer "does not
+	// look at path" — which was true when written and is not now. Reading that
+	// and concluding the parser is unsafe is one step from deleting the parser's
+	// own check as redundant. All three are deliberate:
+	//
+	//   1. internal/m2lx's RawSnapshot returns only whole-document frames.
+	//   2. internal/mixer's ParseSnapshot refuses an entry whose path is not "/",
+	//      and names the offending path when it does.
+	//   3. this call, on the one node whose emptiness is dangerous.
+	//
+	// The cost of being wrong here is a client hearing commentary on their clean
+	// feed, so a redundant check is the correct trade.
 	if err := checkMixerNodeIsWhole(raw); err != nil {
 		return mixer.Snapshot{}, err
 	}

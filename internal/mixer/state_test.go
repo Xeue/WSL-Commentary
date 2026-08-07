@@ -657,6 +657,485 @@ func TestParseSnapshotFatalCases(t *testing.T) {
 	}
 }
 
+// ======================= snapshot-then-delta: "path" ========================
+//
+// switcher_status is a SNAPSHOT-THEN-DELTA socket — see wholeNodePath in
+// state.go and the 3180-frame measurement at the top of internal/m2lx/wire.go.
+// Frame 0 of a connection carries whole nodes at path "/"; every frame after it
+// carries ONE entry whose "path" names a SUBTREE and whose "state" is the value
+// at that path. This parser used to match advanced_audio_mixer by NAME alone,
+// so a "/levels" delta — about ten a second on this very node — was read as
+// the node's entire state: no "matrix", no "inputs", an empty mixer, which the
+// drawer renders as "nothing is in the clean feed".
+//
+// WHY THESE TESTS ARE MOSTLY SYNTHETIC. The captured frames cannot pin this on
+// their own, and the way they fail to is instructive. Feeding the real
+// "/levels" delta to the buggy parser DID produce an error — a *ParseError,
+// because "matrix" is critical — so a test that only asserted "this must not
+// parse cleanly" passed against the bug. What separates the two is WHICH error
+// and what came back beside it, so every case below asserts ErrNoMixerNode
+// specifically and refuses a *ParseError; and the synthetic cases put a
+// COMPLETE, VALID mixer state behind the wrong path, which the bug parses
+// perfectly happily with no warning at all.
+
+// liveDeltaLevelsFile is a real "/levels" delta ON THE MIXER NODE, captured
+// from the live instance on 2026-08-01. liveDeltaStatisticsFile is a real
+// "/statistics" delta on an input node, i.e. a frame with no mixer entry of any
+// kind. Both are owned by internal/m2lx; these tests skip if they move, as
+// loadLiveFrame does.
+const (
+	liveDeltaLevelsFile     = "../m2lx/testdata/switcher_status-delta-levels-2026-08-01.json"
+	liveDeltaStatisticsFile = "../m2lx/testdata/switcher_status-delta-statistics-2026-08-01.json"
+)
+
+func loadFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.FromSlash(name))
+	if err != nil {
+		t.Skipf("fixture not available (%v)", err)
+	}
+	return raw
+}
+
+// statusEntry renders one element of the status array.
+//
+// rawPath is written RAW and unquoted-by-the-caller, so a test can supply a
+// JSON string, a number, null, or the empty Go string meaning OMIT THE KEY
+// ENTIRELY — the ways a "path" can fail to be "/" without naming a subtree.
+func statusEntry(node, rawPath, state string) string {
+	if rawPath == "" {
+		return fmt.Sprintf(`{"node":%q,"state":%s}`, node, state)
+	}
+	return fmt.Sprintf(`{"node":%q,"path":%s,"state":%s}`, node, rawPath, state)
+}
+
+// statusFrame wraps entries into a whole switcher_status frame. It is
+// buildFrame's lower-level sibling: buildFrame always writes a mixer node at
+// "/", which is exactly what these tests need to vary.
+func statusFrame(entries ...string) []byte {
+	return []byte(fmt.Sprintf(`{"status":[%s],"timestamp":1785522083212}`, strings.Join(entries, ",")))
+}
+
+// TestMixerNodeMustArriveWhole is the defect stated as a test.
+//
+// EVERY case below carries a complete, valid mixer state — minimalState, the
+// same one TestParseSnapshotMinimalFrame proves parses cleanly — so the ONLY
+// thing under test is the entry's "path". A parser that ignores path returns a
+// perfect one-strip Snapshot and a nil error for every row marked wantErr, and
+// there is nothing else in the frame for it to trip over.
+func TestMixerNodeMustArriveWhole(t *testing.T) {
+	tests := []struct {
+		name     string
+		rawPath  string // raw JSON for "path"; "" omits the key
+		wantErr  bool
+		wantText string // substring the error must name, if any
+	}{
+		// The control. Without it a parser that refused EVERY frame would pass
+		// the rest of this table.
+		{"the whole node at /", `"/"`, false, ""},
+
+		// The three paths measured on this node, at 1501, 1500 and 163 frames
+		// in 150 seconds. These are not hypothetical traffic.
+		{"a /levels delta", `"/levels"`, true, "/levels"},
+		{"a /peak_levels delta", `"/peak_levels"`, true, "/peak_levels"},
+		{"a /peak_hold_levels delta", `"/peak_hold_levels"`, true, "/peak_hold_levels"},
+
+		// A delta naming the one subtree the parse cannot do without. Its
+		// state IS a matrix, so a parser that special-cased "does the state
+		// look usable?" instead of reading the path would take it — and would
+		// then present one subtree as the whole mixer.
+		{"a /matrix delta", `"/matrix"`, true, "/matrix"},
+		{"a deeper delta", `"/levels/cam22-1"`, true, "/levels/cam22-1"},
+
+		// Not "/" by string equality, and each of these breaks a different
+		// sloppy test: a prefix check, a "contains a slash" check, a
+		// non-empty check.
+		{"a doubled root", `"//"`, true, "//"},
+		{"a path with a trailing space", `"/ "`, true, "/ "},
+		{"a relative path", `"levels"`, true, "levels"},
+
+		// The three ways there is no path to read. All refuse, and the message
+		// says so rather than printing an empty pair of quotes: an operator
+		// reading "carries it only as a "" subtree update" would reasonably
+		// conclude the message was broken.
+		{"no path key at all", ``, true, `no readable "path"`},
+		{"an empty path", `""`, true, `no readable "path"`},
+		{"a null path", `null`, true, `no readable "path"`},
+		{"a path that is not a string", `7`, true, "7"},
+		{"a path that is an object", `{}`, true, `no readable "path"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := statusFrame(statusEntry(mixerNodeName, tt.rawPath, minimalState), inputNode("cam1", "Input 1"))
+
+			snap, err := ParseSnapshot(raw)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("ParseSnapshot: %v", err)
+				}
+				if len(snap.Strips) != 1 {
+					t.Fatalf("len(Strips) = %d, want 1", len(snap.Strips))
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("ParseSnapshot returned nil error and %d strips; a subtree update read as the whole "+
+					"node yields a mixer with no matrix, which the drawer renders as \"nothing is in the clean feed\"",
+					len(snap.Strips))
+			}
+			// ErrNoMixerNode specifically, and NOT a *ParseError. This is the
+			// assertion the real fixtures cannot make: the buggy parser also
+			// errored on a real "/levels" delta, but with a *ParseError about
+			// a missing matrix, alongside a Snapshot a caller is documented to
+			// render.
+			if !errors.Is(err, ErrNoMixerNode) {
+				t.Errorf("error = %v, want it to be ErrNoMixerNode", err)
+			}
+			var parseErr *ParseError
+			if errors.As(err, &parseErr) {
+				t.Errorf("error = %T %v, want a refusal to parse rather than a degraded snapshot "+
+					"the caller is told to render", err, err)
+			}
+			if len(snap.Strips) != 0 || len(snap.Buses) != 0 {
+				t.Errorf("refused frame returned %d strips and %d buses, want none", len(snap.Strips), len(snap.Buses))
+			}
+			if tt.wantText != "" && !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error = %q, want it to name %q", err.Error(), tt.wantText)
+			}
+		})
+	}
+}
+
+// TestRealDeltaFramesAreRefused runs the two captured deltas through the
+// contract entry point.
+//
+// The fixtures are the authority for the shape, so their shape is asserted
+// first: if either is ever replaced by a whole-node frame, this test must say
+// WHY it stopped testing anything rather than quietly passing.
+func TestRealDeltaFramesAreRefused(t *testing.T) {
+	t.Run("a /levels delta on the mixer node", func(t *testing.T) {
+		raw := loadFixture(t, liveDeltaLevelsFile)
+
+		// Shape first: one entry, the mixer node, path "/levels", and a state
+		// carrying NEITHER of the two keys the parse needs. That last pair is
+		// the whole danger in one assertion — this state read as a node is a
+		// mixer with no strips and no routing.
+		var frame struct {
+			Status []struct {
+				Node  string                     `json:"node"`
+				Path  string                     `json:"path"`
+				State map[string]json.RawMessage `json:"state"`
+			} `json:"status"`
+		}
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			t.Fatalf("fixture is not a status frame: %v", err)
+		}
+		if len(frame.Status) != 1 {
+			t.Fatalf("fixture has %d entries, want 1; it is meant to be a single delta", len(frame.Status))
+		}
+		if frame.Status[0].Node != mixerNodeName || frame.Status[0].Path != "/levels" {
+			t.Fatalf("fixture entry is %q at %q, want %q at %q",
+				frame.Status[0].Node, frame.Status[0].Path, mixerNodeName, "/levels")
+		}
+		for _, key := range []string{"matrix", "inputs"} {
+			if _, ok := frame.Status[0].State[key]; ok {
+				t.Fatalf("fixture state carries %q, so it no longer demonstrates the danger", key)
+			}
+		}
+
+		snap, err := ParseSnapshot(raw)
+		if err == nil {
+			t.Fatal("ParseSnapshot returned nil error for a mixer /levels delta")
+		}
+		if !errors.Is(err, ErrNoMixerNode) {
+			t.Errorf("error = %v, want ErrNoMixerNode", err)
+		}
+		var parseErr *ParseError
+		if errors.As(err, &parseErr) {
+			t.Errorf("error = %v, want a refusal; a *ParseError comes with a Snapshot the caller is "+
+				"documented to render, and rendering this one says \"nothing is in the clean feed\"", err)
+		}
+		if len(snap.Strips) != 0 {
+			t.Errorf("refused frame returned %d strips, want none", len(snap.Strips))
+		}
+		if !strings.Contains(err.Error(), "/levels") {
+			t.Errorf("error = %q, want it to name the path it refused", err.Error())
+		}
+	})
+
+	t.Run("a /statistics delta on an input node", func(t *testing.T) {
+		// No mixer entry of any kind, so this is the PLAIN absence, not the
+		// partial one — and it must not be reported as a subtree update, which
+		// would send whoever reads the log looking for a mixer entry that is
+		// not there.
+		raw := loadFixture(t, liveDeltaStatisticsFile)
+
+		_, err := ParseSnapshot(raw)
+		if !errors.Is(err, ErrNoMixerNode) {
+			t.Fatalf("error = %v, want ErrNoMixerNode", err)
+		}
+		if strings.Contains(err.Error(), "subtree") {
+			t.Errorf("error = %q, want the plain absence rather than a partial-node report", err.Error())
+		}
+	})
+}
+
+// TestPartialMixerErrorNamesTheFirstDeltaPath pins the message to the FIRST
+// delta in the array.
+//
+// A frame carrying two mixer deltas has not been observed, and if one ever
+// arrives the message must not depend on which of them the loop happened to
+// keep — the same reason the warning list is sorted and duplicate nodes resolve
+// to "using the first".
+func TestPartialMixerErrorNamesTheFirstDeltaPath(t *testing.T) {
+	raw := statusFrame(
+		statusEntry(mixerNodeName, `"/peak_levels"`, minimalState),
+		statusEntry(mixerNodeName, `"/levels"`, minimalState),
+	)
+
+	_, err := ParseSnapshot(raw)
+	if !errors.Is(err, ErrNoMixerNode) {
+		t.Fatalf("error = %v, want ErrNoMixerNode", err)
+	}
+	if !strings.Contains(err.Error(), "/peak_levels") {
+		t.Errorf("error = %q, want it to name the first delta, %q", err.Error(), "/peak_levels")
+	}
+	if strings.Contains(err.Error(), `"/levels"`) {
+		t.Errorf("error = %q, want only the first delta named", err.Error())
+	}
+}
+
+// TestWholeMixerNodeWinsOverADeltaInTheSameFrame covers a frame carrying both,
+// IN BOTH ORDERS.
+//
+// The order matters and is the point: a parser that stops at the first entry
+// whose node name matches would take the delta when the delta comes first, and
+// the array order is the device's choice, not this package's. The whole node
+// must win either way, and the ignored delta must be reported — it is a newer
+// reading of its own subtree, so a meter drawn from this frame may be one push
+// stale, which is worth a line in a log and is emphatically not critical.
+func TestWholeMixerNodeWinsOverADeltaInTheSameFrame(t *testing.T) {
+	whole := statusEntry(mixerNodeName, `"/"`, minimalState)
+	delta := statusEntry(mixerNodeName, `"/levels"`, `{"cam1-1":[-3,-3]}`)
+
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{"the delta first", statusFrame(delta, whole, inputNode("cam1", "Input 1"))},
+		{"the whole node first", statusFrame(whole, delta, inputNode("cam1", "Input 1"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap, warnings, err := ParseSnapshotWithWarnings(tt.frame)
+			if err != nil {
+				t.Fatalf("ParseSnapshotWithWarnings: %v", err)
+			}
+			if len(snap.Strips) != 1 || snap.Strips[0].Name != "cam1-1" {
+				t.Fatalf("Strips = %+v, want the one strip from the whole node", snap.Strips)
+			}
+			// From minimalState, not from the delta: the whole node was used.
+			if !snap.Strips[0].Metered || snap.Strips[0].Level != [2]float64{-20, -21} {
+				t.Errorf("Level = %v metered=%v, want [-20 -21] from the whole node's own levels",
+					snap.Strips[0].Level, snap.Strips[0].Metered)
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("warnings = %v, want exactly one reporting the ignored update", warnings)
+			}
+			w := warnings[0]
+			if w.Critical {
+				t.Errorf("warning is critical: %s; an ignored levels update cannot affect routing", w)
+			}
+			if !strings.Contains(w.Reason, "/levels") || !strings.Contains(w.Reason, mixerNodeName) {
+				t.Errorf("warning = %s, want it to name the node and the ignored path", w)
+			}
+			// Non-critical, so the contract entry point still succeeds.
+			if _, err := ParseSnapshot(tt.frame); err != nil {
+				t.Errorf("ParseSnapshot = %v, want nil for a non-critical warning", err)
+			}
+		})
+	}
+}
+
+// firstEntry returns a captured single-delta frame's one status entry, so it
+// can be planted in another frame.
+func firstEntry(t *testing.T, fixture string) json.RawMessage {
+	t.Helper()
+	var frame struct {
+		Status []json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(loadFixture(t, fixture), &frame); err != nil {
+		t.Fatalf("%s: %v", fixture, err)
+	}
+	if len(frame.Status) != 1 {
+		t.Fatalf("%s has %d entries, want 1", fixture, len(frame.Status))
+	}
+	return frame.Status[0]
+}
+
+// withEntriesFirst returns base with extra entries PREPENDED to its status
+// array, everything else byte-identical.
+//
+// Prepended, not appended, and that is the point of the helper: a parser that
+// treated an entry it cannot use as the end of the frame rather than as one
+// skipped element would sail through a delta bolted on the end, and lose all 36
+// real nodes behind one bolted on the front. The device chooses the order.
+func withEntriesFirst(t *testing.T, base []byte, extra ...json.RawMessage) []byte {
+	t.Helper()
+	var frame struct {
+		Status    []json.RawMessage `json:"status"`
+		Timestamp json.RawMessage   `json:"timestamp"`
+	}
+	if err := json.Unmarshal(base, &frame); err != nil {
+		t.Fatalf("base frame: %v", err)
+	}
+	frame.Status = append(append([]json.RawMessage{}, extra...), frame.Status...)
+	out, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatalf("recomposing the frame: %v", err)
+	}
+	return out
+}
+
+// TestRealDeltaBesideTheOpeningSnapshot is the whole rule on real data: the
+// captured 36-node snapshot with a captured delta planted in front of it.
+//
+// This is the one composition the fixtures cannot supply on their own — the
+// device sends the snapshot and the deltas as separate frames — and it is what
+// the synthetic cases above are standing in for. Both sub-cases demand a
+// snapshot IDENTICAL to the one the pristine capture yields: not "close", not
+// "still has 54 strips", identical, because the only honest effect a subtree
+// update can have on a frame that also carries the whole node is none.
+func TestRealDeltaBesideTheOpeningSnapshot(t *testing.T) {
+	live := loadLiveFrame(t)
+	want := parseLive(t)
+
+	t.Run("a /statistics delta on an input node", func(t *testing.T) {
+		raw := withEntriesFirst(t, live, firstEntry(t, liveDeltaStatisticsFile))
+
+		got, warnings, err := ParseSnapshotWithWarnings(raw)
+		if err != nil {
+			t.Fatalf("ParseSnapshotWithWarnings: %v", err)
+		}
+		// Silence matters as much as correctness here. Deltas are the ordinary
+		// traffic on this socket, roughly twenty entries a second, and a parser
+		// that warned about each would bury the warnings that mean something
+		// under the ones that mean "the socket is working".
+		for _, w := range warnings {
+			t.Errorf("unexpected warning on a snapshot carrying an ordinary delta: %s", w)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("a delta on cam1 changed the parsed mixer: %d strips and %d buses, want %d and %d",
+				len(got.Strips), len(got.Buses), len(want.Strips), len(want.Buses))
+		}
+	})
+
+	t.Run("a /levels delta on the mixer node itself", func(t *testing.T) {
+		raw := withEntriesFirst(t, live, firstEntry(t, liveDeltaLevelsFile))
+
+		got, warnings, err := ParseSnapshotWithWarnings(raw)
+		if err != nil {
+			t.Fatalf("ParseSnapshotWithWarnings: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("a /levels delta displaced the whole mixer node: %d strips, want %d",
+				len(got.Strips), len(want.Strips))
+		}
+		// cam22-1 is the commentary strip and the reason the drawer exists.
+		// Spelled out because "identical" above would also be satisfied if the
+		// live parse itself had collapsed.
+		if s, ok := got.Strip("cam22-1"); !ok || len(s.Outputs) != 3 {
+			t.Errorf("Strip(\"cam22-1\") = %+v found=%v, want the strip with its three buses", s, ok)
+		}
+		if len(warnings) != 1 || warnings[0].Critical {
+			t.Fatalf("warnings = %v, want exactly one non-critical report of the ignored update", warnings)
+		}
+		if !strings.Contains(warnings[0].Reason, "/levels") {
+			t.Errorf("warning = %s, want it to name the ignored path", warnings[0])
+		}
+	})
+}
+
+// TestDisplayNameIsNeverTakenFromADelta holds the display-name join to the same
+// rule as the mixer node.
+//
+// An entry's state is the value AT ITS PATH, so a subtree whose value happens
+// to carry a "display_name" key is not the node's display name. Taking it would
+// put a wrong but entirely plausible label on a strip — on a drawer whose job is
+// to let an operator find their own feed by the name they gave it, and decide
+// from that row whether their commentary is in a client's clean feed.
+//
+// No observed delta does this, which is exactly why it has to be synthetic.
+func TestDisplayNameIsNeverTakenFromADelta(t *testing.T) {
+	const wrong = "WRONG-NAME"
+	poison := statusEntry("cam1", `"/streams"`, fmt.Sprintf(`{"display_name":%q}`, wrong))
+	whole := statusEntry(mixerNodeName, `"/"`, minimalState)
+
+	tests := []struct {
+		name  string
+		frame []byte
+		want  string
+	}{
+		{"the delta after the real node", statusFrame(whole, inputNode("cam1", "Input 1"), poison), "Input 1"},
+		{"the delta before the real node", statusFrame(whole, poison, inputNode("cam1", "Input 1")), "Input 1"},
+		// With no whole node for cam1 the join has nothing, and the fallback
+		// is the strip's own display_name — never the delta's.
+		{"the delta alone", statusFrame(whole, poison), "cam1-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap, warnings, err := ParseSnapshotWithWarnings(tt.frame)
+			if err != nil {
+				t.Fatalf("ParseSnapshotWithWarnings: %v", err)
+			}
+			for _, w := range warnings {
+				t.Errorf("unexpected warning: %s", w)
+			}
+			if len(snap.Strips) != 1 {
+				t.Fatalf("len(Strips) = %d, want 1", len(snap.Strips))
+			}
+			if got := snap.Strips[0].DisplayName; got != tt.want {
+				t.Errorf("DisplayName = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReadEntryPath is the path test in isolation, including the value it hands
+// back for the error message.
+func TestReadEntryPath(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		wantPath  string
+		wantWhole bool
+	}{
+		{"the root", `"/"`, "/", true},
+		{"a levels delta", `"/levels"`, "/levels", false},
+		{"a nested delta", `"/levels/cam22-1"`, "/levels/cam22-1", false},
+		{"a doubled root", `"//"`, "//", false},
+		{"a root with whitespace", `" /"`, " /", false},
+		{"an empty path", `""`, "", false},
+		{"absent", ``, "", false},
+		{"null", `null`, "", false},
+		{"a number", `7`, "7", false},
+		{"an object", `{}`, "", false},
+		{"a boolean", `true`, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, whole := readEntryPath(json.RawMessage(tt.raw))
+			if whole != tt.wantWhole {
+				t.Errorf("readEntryPath(%s) whole = %v, want %v", tt.raw, whole, tt.wantWhole)
+			}
+			if path != tt.wantPath {
+				t.Errorf("readEntryPath(%s) path = %q, want %q", tt.raw, path, tt.wantPath)
+			}
+		})
+	}
+}
+
 // TestParseSnapshotMinimalFrame checks the synthetic base parses cleanly, so
 // that a failure in the degradation tests below is attributable to the
 // degradation rather than to the fixture.

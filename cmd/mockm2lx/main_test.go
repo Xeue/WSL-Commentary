@@ -33,6 +33,24 @@ func TestParseFlags_Defaults(t *testing.T) {
 	if opts.StatusKey != "cam7" {
 		t.Errorf("StatusKey = %q, want cam7", opts.StatusKey)
 	}
+	// The measured device pushed about 21 frames a second. The default is that
+	// rate and not a round number, because the mock's job is to be the thing
+	// the app meets in production.
+	if opts.StatusInterval != 48*time.Millisecond {
+		t.Errorf("StatusInterval = %s, want 48ms (~21 frames a second, as measured)", opts.StatusInterval)
+	}
+	if opts.DecoyDelta != decoyDeltaOff {
+		t.Errorf("DecoyDelta = %q, want %q", opts.DecoyDelta, decoyDeltaOff)
+	}
+	if opts.TransitionPush != transitionPushNode {
+		t.Errorf("TransitionPush = %q, want %q", opts.TransitionPush, transitionPushNode)
+	}
+
+	// The default status key must be one the mock actually serves, or the
+	// out-of-the-box Gate A loop reports it as unknown.
+	if _, ok := lookupRouterInput(opts.StatusKey); !ok {
+		t.Errorf("the default -status-key %q is not one of the measured router inputs", opts.StatusKey)
+	}
 }
 
 func TestParseFlags_Overrides(t *testing.T) {
@@ -51,6 +69,8 @@ func TestParseFlags_Overrides(t *testing.T) {
 		"-stall-status=true",
 		"-lie-stream-state=starting",
 		"-drop-audio=true",
+		"-decoy-delta=stream-state",
+		"-transition-push=none",
 		"-verbose=true",
 	})
 	if err != nil {
@@ -72,6 +92,8 @@ func TestParseFlags_Overrides(t *testing.T) {
 		StallStatus:    true,
 		LieStreamState: m2lx.StreamStateStarting,
 		DropAudio:      true,
+		DecoyDelta:     decoyDeltaStreamState,
+		TransitionPush: transitionPushNone,
 		Verbose:        true,
 	}
 	if opts != want {
@@ -100,6 +122,18 @@ func TestParseFlags_RejectsNegativeRefusalWindow(t *testing.T) {
 func TestParseFlags_RejectsZeroStatusInterval(t *testing.T) {
 	if _, err := parseFlags([]string{"-status-interval=0s"}); err == nil {
 		t.Fatalf("expected an error for a zero -status-interval")
+	}
+}
+
+func TestParseFlags_RejectsBadDecoyDelta(t *testing.T) {
+	if _, err := parseFlags([]string{"-decoy-delta=whole-node"}); err == nil {
+		t.Fatalf("expected an error for an invalid -decoy-delta")
+	}
+}
+
+func TestParseFlags_RejectsBadTransitionPush(t *testing.T) {
+	if _, err := parseFlags([]string{"-transition-push=maybe"}); err == nil {
+		t.Fatalf("expected an error for an invalid -transition-push")
 	}
 }
 

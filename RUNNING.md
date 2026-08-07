@@ -1,122 +1,144 @@
 # RUNNING — how to work on this today
 
-**You are at Gate A.** This machine has Go 1.25.0 and Node 24.6.0 and nothing
-else: no MinGW gcc, no GStreamer, no Wails CLI, and the M2L-X dev instance is
-powered off. That is not a broken checkout — the project was deliberately built
-so that almost all of it works anyway.
+**Gates A, B and C are all open, and the application is in use.** This machine
+has Go 1.25.0, Node 24.6.0, MinGW gcc, GStreamer 1.28.5 (mingw-x86_64, devel)
+and the Wails CLI. `wslcomms.exe` is built, in `build\bin\`, and has been run
+on air against the live M2L-X instance
+`m2lx-wslstudios-matcht.etapsiota.com`, event `dl9-5p5ah0bd-empd`.
+
+That is a change from the previous revision of this note, which opened by
+saying the toolchain was absent and the instance was powered off. Both were
+true when it was written. Neither is true now.
+
+Two things follow, and they are the two most important lines in this file:
+
+- **Do not launch the GUI.** The operator uses it. Nothing here needs it —
+  see §4 for why every command below stops at the Wails boundary on purpose.
+- **Do not write to the live mixer.** Reading `switcher_status`, reading the
+  REST API and dialling outputs are all fine. `set_routing` and its siblings
+  change a clean feed that is on air.
 
 Read [`CONTRACT.md`](CONTRACT.md) before editing anything. Authority for *what*
-is built is [`docs/windows-app-spec.md`](docs/windows-app-spec.md) v2.
+is built is [`docs/windows-app-spec.md`](docs/windows-app-spec.md) **v3**.
+v2 is archived beside it and is materially wrong in several places; v3's §0
+lists exactly where.
 
 ---
 
 ## 1. The one command that tells you the tree is healthy
 
-From the repository root, in PowerShell:
+From the repository root, in PowerShell, **after dot-sourcing the build
+environment**:
 
 ```powershell
-$env:CGO_ENABLED='0'
-go build ./...
-go vet ./...
-go test ./... -count=1
-go test -tags dev . -count=1
+. .\build\env.ps1
+go build -tags 'dev gststub' ./...
+go vet -tags 'dev gststub' ./...
+go test -race -tags 'dev gststub' ./... -count=1
 gofmt -l .
 ```
 
-All five must be silent (bar `go test`'s `ok` lines). `gofmt -l .` printing a
+All four must be silent (bar `go test`'s `ok` lines). `gofmt -l .` printing a
 filename means that file needs formatting; it should print nothing.
 
-**The `-tags dev` line is not optional and is easy to leave out.** `main.go` and
-`app.go` are behind `//go:build dev || production || bindings`, so the plain
-`go test ./...` reports `? wslcomms [no test files]` and compiles neither them
-nor `app_test.go`. `-tags dev` is what brings the root package — the whole
-lifecycle, the event pump, `Start`/`Stop`, the shutdown ordering, and the 52
-tests over them — into the run. Nothing about that tag builds or runs a GUI:
-see §4.
+**Both tags are load-bearing and both are easy to leave out.**
 
-**At Gate B the tag is `dev gststub`, not `dev`.** Everything above assumes
-`CGO_ENABLED=0`. Once the toolchain is installed and you are working with
-`build\env.ps1` — which sets `CGO_ENABLED=1` — the same command fails to
-compile:
+`dev` — `main.go`, `app.go`, `app_mixer.go`, `app_picture.go` and
+`app_return.go` are behind `//go:build dev || production || bindings`, so a
+plain `go test ./...` reports `? wslcomms [no test files]` and compiles neither
+them nor their tests. `dev` is what brings the root package — the whole
+lifecycle, the event pump, `Start`/`Stop`, the picture and return paths, the
+mixer bindings and the shutdown ordering — into the run. Nothing about that tag
+builds or runs a GUI: see §4.
+
+`gststub` — `build\env.ps1` sets `CGO_ENABLED=1`, which selects
+`internal/gst`'s real GStreamer implementation and excludes the pure-Go stub.
+But the root package's tests and `internal/gst`'s own tests are written against
+that stub, and rightly so: no unit test should be driving a live media
+pipeline. Without the tag you get
 
 ```
 .\app_test.go:919:30: undefined: gst.StubPipeline
 ```
 
-With cgo enabled, `internal/gst` selects its real GStreamer implementation and
-excludes the pure-Go stub. But `app_test.go` and `internal/gst`'s own tests are
-written against that stub, and rightly so: no unit test should be driving a live
-media pipeline. So at Gate B the command is
+and — this is the part that matters — **it does not fail loudly for the whole
+run.** The root package fails to build while every other package reports `ok`,
+so a hurried reader sees mostly green and moves on, and the tests over the
+lifecycle, the picture path and the shutdown ordering are never executed.
+`build\env.ps1` prints the correct command when you dot-source it.
 
-```powershell
-go test -race -tags 'dev gststub' ./... -count=5
-```
+`go test -race` works now that cgo is available, and should be used: the root
+package has four locks, an `atomic.Pointer` for the Wails context and five
+concurrent subsystems, and `internal/sender` and the two `internal/gst`
+monitors are all reconnect state machines.
 
-This matters more than a missing tag usually would. `go test -tags dev ./...`
-under Gate B does not fail loudly for the whole run — the root package fails to
-build while every other package reports `ok`, so a hurried reader sees mostly
-green and moves on, and the 52 tests over the lifecycle and shutdown ordering
-are never executed. `build\env.ps1` prints the correct command when you
-dot-source it.
-
-Last run, 2026-07-30, whole tree:
+Last run, 2026-08-07, whole tree, `go test -tags 'dev gststub' ./... -count=1`:
 
 ```
-?       wslcomms                        [no test files]
-ok      wslcomms/cmd/mockm2lx           1.606s
-ok      wslcomms/internal/config        0.589s
-ok      wslcomms/internal/gst           0.448s
-ok      wslcomms/internal/kvs           1.109s
-ok      wslcomms/internal/m2lx          2.101s
-ok      wslcomms/internal/secrets       0.494s
-ok      wslcomms/internal/sender        1.008s
-```
-
-and the root package, which that run skipped — 52 tests, measured separately on
-the same day:
-
-```
-ok      wslcomms                        0.215s
+ok      wslcomms                        4.554s
+ok      wslcomms/cmd/mockm2lx           1.461s
+ok      wslcomms/internal/config        0.472s
+ok      wslcomms/internal/gst           2.525s
+ok      wslcomms/internal/kvs           0.935s
+ok      wslcomms/internal/m2lx          4.786s
+ok      wslcomms/internal/mixer         1.461s
+ok      wslcomms/internal/secrets       0.465s
+ok      wslcomms/internal/sender        1.090s
 ```
 
 If a package is red when you pull, check whether the failure is in a file you
 own before you spend an afternoon on it: this tree is worked on by several
 packages at once, and a compile error in someone else's test file is theirs.
 
+**Gate A still works and is still worth keeping.** On a machine with Go and
+Node and nothing else, everything except `internal/gst`'s cgo half still builds
+and tests:
+
+```powershell
+$env:CGO_ENABLED='0'
+go build ./...; go vet ./...; go test ./... -count=1; go test -tags dev . -count=1
+```
+
+That property is not a historical artefact — it is what lets anyone pick this
+up without a 2 GB toolchain install, and it is enforced by the guard in §4. Do
+not break it.
+
 The frontend has its own tests, which use Node's built-in runner because
 `package.json` is frozen and has no test framework in it:
 
 ```powershell
 cd frontend
-node --test "src/monitor/*.test.js"     # 260 tests — WP-5a, the KVS monitor
-node --test "src/ui/*.test.js"          #  40 tests — WP-5b, the shell
+node --test "src/monitor/*.test.js" "src/ui/*.test.js" "src/ui/mixer/*.test.js"
 ```
 
-`src/ui/` covers the two pure modules the shell cannot get subtly wrong without
+**612 tests, all passing, 2026-08-07.** The three globs are the KVS monitor
+(WP-5a), the shell (WP-5b) and the mixer drawer (WP-M4); running them
+separately is fine and is what the per-package sections below assume.
+
+`src/ui/` covers the pure modules the shell cannot get subtly wrong without
 somebody noticing on air: `tile.js`, which rescales `config.monitorTile` from
-the mosaic it was measured against onto the one that actually arrived, and
+the mosaic it was measured against onto the one that actually arrived;
 `liveurl.js`, which parses the pasted live-operation URL into a host and an
-event ID. `liveurl.js`'s `bareHost` is a mirror of `internal/config`'s
-`hostOnly` and is tested against the same cases, because if they disagree the
-Settings screen's "same as M2L-X" placeholder is telling the operator something
-untrue.
+event ID; `lamps.js`, including `deriveHonestLine`, which has no caller in this
+build and is tested anyway; and `picturesource.js`, whose tests read the source
+file's own text to assert that the picture control says nothing about audio —
+because the last time a control on that screen touched two things at once,
+selecting it silenced the operator. `liveurl.js`'s `bareHost` is a mirror of
+`internal/config`'s `hostOnly` and is tested against the same cases, because if
+they disagree the Settings screen's "same as M2L-X" placeholder is telling the
+operator something untrue.
 
 Use the quoted glob. `node --test src/monitor/` — the directory form — fails on
 this Node version.
 
-### `CGO_ENABLED=0` is not optional
+### Repetition still finds things `-race` does not
 
-Set it for every command. At `CGO_ENABLED=1` the cgo half of `internal/gst`
-enters the build, there is no gcc to compile it, and you learn nothing you did
-not already know. It is also how you summon the modal dialog described in §4.
-
-`go test -race` **does not work here at all.** Go's race detector on Windows
-requires cgo and a C compiler. Race verification is deferred to Gate B. Until
-then the substitute is repetition and deliberate contention:
+`-race` works now. It is not a substitute for running the concurrent packages
+many times, because a state machine whose transitions are all correctly locked
+can still deadlock or leak a goroutine:
 
 ```powershell
-go test ./... -count=20
-go test -tags dev . -count=20
+go test -race -tags 'dev gststub' ./... -count=5
 ```
 
 ---
@@ -126,14 +148,15 @@ go test -tags dev . -count=20
 | Thing | State |
 |---|---|
 | `internal/config`, `internal/secrets` | Working and tested. The Credential Manager tests hit the **real** vault, backing up and restoring anything already stored. |
-| `internal/m2lx` | Working and tested against its own fakes, **and now against `cmd/mockm2lx` over a real socket** — see §5.1. |
-| `internal/sender` | Working and tested in full against a fake pipeline. This is where §6 of the spec lives. |
-| `internal/gst` | The **stub twin** works and is what everything else runs against. The real cgo implementation cannot be compiled until Gate B. |
-| `internal/kvs` | Written; unverifiable until Gate C, because it needs the live endpoints. |
+| `internal/m2lx` | Working. Tested against its own fakes, against `cmd/mockm2lx` over a real socket (§5.1), and against captured live frames in `testdata/`. The socket is snapshot-then-delta; see spec v3 §8.2 before touching the parser. |
+| `internal/sender` | Working and tested in full against a fake pipeline. This is where spec §6 lives. |
+| `internal/gst` | **Working for real.** Three paths: the contribution pipeline (`gst.go`), the SRT picture (`picture.go`), the SRT audio return (`return.go`), plus the native overlay window. Each has a cgo half and a stub twin; the stub is what the unit tests drive. |
+| `internal/kvs` | Working, and verified against the live endpoints. |
+| `internal/mixer` | Working. Read path parses a live `switcher_status` frame; write path is arm-gated. **Do not point its write path at the live instance.** |
 | `cmd/mockm2lx` | Working. REST, status WebSocket, a real SRT listener, and fault injection. |
-| Frontend | Runs in a browser against an in-memory fake backend. |
-| `main.go` / `app.go` | Working, and covered by 52 tests that run at Gate A with `go test -tags dev .` — see §5.2. |
-| `wslcomms.exe` | **Cannot be built.** Needs the Wails CLI, MinGW gcc and GStreamer. Gate B. |
+| Frontend | 612 tests. Also runs in a browser against an in-memory fake backend (§3.2). |
+| `main.go`, `app.go`, `app_picture.go`, `app_return.go`, `app_mixer.go` | Working and covered, and exercised on air. |
+| `wslcomms.exe` | **Built**, in `build\bin\`, and in use by the operator. Do not launch it (§4). |
 
 ---
 
@@ -199,20 +222,35 @@ npm ci
 npm run build      # writes frontend/dist, which main.go go:embeds
 ```
 
-`frontend/dist` is committed and current as of 2026-07-30, so you only need this
-if you change the frontend.
+`frontend/dist` is committed, so you only need this if you change the frontend.
+
+The mixer drawer has its own harness that does not need the app or the backend:
+open `frontend/src/ui/mixer/demo.html`, which drives `drawer.js` from
+`demo-fixture.js` — a captured live `switcher_status` frame. `frontend/src/monitor/harness.html`
+does the same for the KVS monitor.
 
 ### 3.3 The whole application
 
-Not as a window: that needs the Wails CLI, MinGW gcc and GStreamer, and is Gate B
-(§4, §6).
+**Not as a window. The operator is using it.** Building it is
+`wails build -webview2 embed` (§6) and that is a build, not a launch; opening
+`build\bin\wslcomms.exe` takes the SRT input's one peer slot away from the
+position that is on air.
 
-What you *can* run today is everything behind the window. `go test -tags dev .`
-exercises the real `App` — the bound surface, the session lifecycle and the
-shutdown ordering — against the `internal/gst` stub, and §5.1 drives the real
+What you *can* run is everything behind the window.
+`go test -tags 'dev gststub' .` exercises the real `App` — the bound surface,
+the session lifecycle, the picture and return paths, the mixer bindings and the
+shutdown ordering — against the `internal/gst` stubs, and §5.1 drives the real
 control plane against the real `cmd/mockm2lx` over a real socket, including its
-fault injection. Between those two and the browser-hosted frontend of §3.2, the
-only untested seam left at Gate A is GStreamer itself.
+fault injection.
+
+**Reading the live instance is fine, and is how most of spec v3 §5.2 and §8.2
+were measured.** Sign in with `POST /api/local_auth/signin`, body
+`{"alias":"…","password":"…"}` — the field is `alias`; `username` returns 500 —
+then read the REST API, watch `switcher_status`, or dial an output with
+`gst-launch-1.0` (`build\env.ps1` puts it on `PATH`). Dialling M2L-X **Output
+1** on 40501 while the operator's app is running will fail: an SRT listener
+accepts one peer and never displaces the incumbent. Use a different output, or
+do it between matches.
 
 ---
 
@@ -225,19 +263,20 @@ opens a web browser. An earlier agent run produced a stream of them.
 The tree is arranged so that this is structurally impossible:
 
 ```go
-main.go, app.go    //go:build dev || production || bindings
-main_nocgo.go      //go:build !(dev || production || bindings)
+main.go, app.go, app_mixer.go,      //go:build dev || production || bindings
+app_picture.go, app_return.go
+main_nocgo.go                       //go:build !(dev || production || bindings)
 ```
 
 `dev`, `production` and `bindings` are the tags the Wails CLI sets. **Any other
 build gets `main_nocgo.go`**, whose `main` prints one line to stderr and exits 1.
 So a stray `go build .` produces an inert binary rather than a dialog.
 
-`go test -tags dev .` is safe and is part of Gate A (§1). The tag decides which
-`main` is compiled; it does not run one. Nothing in `app_test.go` calls
-`wails.Run`, and nothing in it reaches a `wailsruntime` function that needs a
-live runtime context — the only such caller is `eventPump.start`, and every test
-that would reach it neutralises its `sync.Once` first.
+`go test -tags 'dev gststub' .` is safe and is the command in §1. The tag
+decides which `main` is compiled; it does not run one. Nothing in `app_test.go`
+calls `wails.Run`, and nothing in it reaches a `wailsruntime` function that
+needs a live runtime context — the only such caller is `eventPump.start`, and
+every test that would reach it neutralises its `sync.Once` first.
 
 **Do not "simplify" these constraints.** They used to read
 `cgo && (dev || production || bindings)`, which cost roughly a thousand lines of
@@ -273,9 +312,15 @@ coordinator's.
 
 ## 5. The two things that used to block integration, and how they were resolved
 
-Both of these were open in the previous revision of this note. Both are closed.
-The end-to-end walkthrough in §5.1 is the thing they were blocking, and it now
-runs on this machine, at Gate A, with no cloud instance.
+Both of these were open two revisions ago. Both are closed. The end-to-end
+walkthrough in §5.1 is the thing they were blocking, and it runs on this
+machine with no cloud instance at all — which is why it is still here now that
+there is one. It is the only way to exercise the fault injection.
+
+The commands in this section are the Gate A ones (`CGO_ENABLED=0`,
+`-tags dev`), because the mock needs neither cgo nor GStreamer. If you have
+dot-sourced `build\env.ps1` in the same shell, add `gststub` to the tag list or
+open a fresh shell.
 
 ### 5.1 `wslcomms` can now talk to `cmd/mockm2lx`
 
@@ -382,8 +427,10 @@ curl.exe -s http://127.0.0.1:18081/control/state
 # rather than panic on Audio[0].
 curl.exe -s -X POST http://127.0.0.1:18081/control/drop-audio -d '{\"enabled\":true}'
 
-# Lie about stream_state: claim streaming with nobody connected. This is the
-# whole reason for the honest line under the lamps — stream_state is not proof.
+# Lie about stream_state: claim streaming with nobody connected. This is why
+# stream_state is not proof of anything, and was the whole reason for the
+# honest line the operator has since had withdrawn (spec v3 §10). The fault is
+# still real; only the sentence about it is gone.
 curl.exe -s -X POST http://127.0.0.1:18081/control/lie -d '{\"streamState\":\"streaming\"}'
 curl.exe -s -X POST http://127.0.0.1:18081/control/lie -d '{\"streamState\":\"\"}'
 
@@ -406,60 +453,61 @@ Each one answers with the state it just set, so you can see it took:
 {"status":"reset"}
 ```
 
-**Not executed here, and honestly labelled:** the SRT half. `/control/drop-srt`
-and the re-accept refusal window exercise the path from `internal/sender` through
-`srtsink` to the mock's listener, and there is no `srtsink` at Gate A — the
-`internal/gst` stub only pretends to connect and dials nothing. `internal/sender`
-is fully tested against that stub, and the mock's listener is fully tested by its
-own in-process `gosrt` dials, but **the two have never met over a real SRT
-socket.** That meeting is Gate B, and it is the first thing to do once Gate B
-opens. See `cmd/mockm2lx/README.md` for the worked example to run then.
+**The SRT half of the mock has still never met a real `srtsink`.**
+`/control/drop-srt` and the re-accept refusal window exercise the path from
+`internal/sender` through `srtsink` to the mock's listener. `internal/sender` is
+fully tested against the `internal/gst` stub, which dials nothing, and the
+mock's listener is fully tested by its own in-process `gosrt` dials — but the
+two have never been joined, even now that `srtsink` exists. The real send path
+has instead been proven against the **live instance**, which is a better
+test of the same thing but a worse one for fault injection: you cannot ask
+M2L-X to hold its listener socket open for six seconds on demand. See
+`cmd/mockm2lx/README.md` for the worked example, which is still worth running.
 
-### 5.2 `main.go` and `app.go` are inside the Gate A build
+### 5.2 `main.go` and `app.go` are inside the ordinary build
 
 They used to be behind `cgo && (dev || production || bindings)`, and since
 `CGO_ENABLED=0` never sets the `cgo` tag, `go build ./...` and `go test ./...`
 skipped them entirely — roughly a thousand lines of wire-up outside the safety
 net that covered every other package. The `cgo &&` clause has been removed (§4),
-and `app_test.go` now lives at the repository root under the same constraint as
+and the root tests live at the repository root under the same constraint as
 `app.go`.
 
-It is **52 tests** (plus 35 subtests) covering the bound surface, the SRT
-passphrase policy, the event pump under concurrent producers, the session
-lifecycle, the shutdown ordering and races, the connection-failure reporting, and
-the control plane against the mock. Two of them skip unless `WSLCOMMS_MOCK_ADDR`
-is set (§5.1). Run them:
+They cover the bound surface, the SRT passphrase policy, the event pump under
+concurrent producers, the session lifecycle, the shutdown ordering and races,
+the connection-failure reporting, the picture overlay and its lock order, the
+return path, the mixer bindings, and the control plane against the mock. Two
+skip unless `WSLCOMMS_MOCK_ADDR` is set (§5.1). Run them:
 
 ```powershell
-$env:CGO_ENABLED='0'
-go test -tags dev . -count=1
+. .\build\env.ps1
+go test -race -tags 'dev gststub' . -count=1
 ```
 
-```
-ok      wslcomms        0.215s
-```
-
-If you want proof the package compiles without producing anything anyone could
-run, `go vet -tags dev .` type-checks it and links no executable. There is no
-longer any need for the shadow-tree recipe that used to live here.
+`go vet -tags 'dev gststub' .` type-checks the package and links no executable,
+if you want proof it compiles without producing anything anyone could run.
 
 ---
 
-## 6. Opening Gate B
+## 6. The toolchain, and rebuilding the executable
 
-Gate B is what lets you compile cgo, build the real pipeline and produce an
-actual `wslcomms.exe`. It is about 2 GB and half an hour, all unattended, all on
-this machine.
+All of this is installed on this machine already. It is written down because it
+is what a fresh machine needs, and because `build\env.ps1` assumes the paths.
 
-1. **MinGW-w64 gcc** on `PATH`.
+1. **MinGW-w64 gcc** — `C:\msys64\mingw64\bin`.
 2. **GStreamer 1.28.5 mingw-x86_64 — the *development* installer**, not just the
-   runtime.
+   runtime — `C:\gstreamer\1.0\mingw_x86_64`.
 3. **pkgconfiglite**, then
    `PKG_CONFIG_PATH=C:\gstreamer\1.0\mingw_x86_64\lib\pkgconfig`.
 4. **The Wails CLI**, version-matched:
    ```powershell
    go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
    ```
+
+`build\env.ps1` sets `PATH`, `PKG_CONFIG_PATH` and `CGO_ENABLED=1`, and puts
+the real MinGW runtime ahead of GStreamer's `lib\`, which ships its own
+`libmingw32.a`/`libmingwex.a` and otherwise breaks the link. Dot-source it; do
+not copy its contents into your shell profile.
 
 Then, and only then:
 
@@ -468,22 +516,24 @@ cd frontend; npm ci; npm run build; cd ..
 wails build -webview2 embed
 ```
 
-`wails build` sets `CGO_ENABLED=1` and the `production` tag itself, which is what
-brings `main.go`, `app.go` and `internal/gst/gst_cgo.go` into the build.
+`wails build` sets `CGO_ENABLED=1` and the `production` tag itself, which is
+what brings `main.go`, `app.go`, the four `app_*.go` files and
+`internal/gst`'s cgo halves into the build. `build\bundle-gst.ps1` then copies
+the DLL allowlist into `dist\gst\` from an explicit file list and verifies the
+result against the expected set, so a plugin silently gained or lost is a build
+failure rather than a runtime one on the installed machine.
 
-Two spikes are waiting at Gate B and should be run before anything else:
+**The two spikes that used to be listed here are both resolved**, and the
+answers are in the spec rather than here:
 
-- **SP-2** — does `go-gst` v0.0.2 actually build under MinGW? One timeboxed day.
-  If it fights, the agreed fallback is a ~200-line hand-written cgo shim behind
-  the same `internal/gst` signatures. Do not spend a week on someone else's CI
-  gap. See [`internal/gst/BUILD-NOTES.md`](internal/gst/BUILD-NOTES.md).
-- **SP-3** — is the top-ranked H.264 encoder called `mfh264enc` on this machine,
-  and does it emit a conformant IDR every 100 frames? Resolve the element **by
-  rank at runtime**; do not hardcode the name.
-
-Once Gate B is open, `go test -race` becomes available. Run it against
-`internal/sender` and the root package first — those are the two with the most
-concurrency and the least verification.
+- **SP-2** — `go-gst` v0.0.2 **does** build under MinGW. The ~200-line cgo shim
+  fallback was not needed. See
+  [`internal/gst/BUILD-NOTES.md`](internal/gst/BUILD-NOTES.md), which is the
+  long-form record of that work.
+- **SP-3** — the top-ranked H.264 encoder is **not** `mfh264enc`; on this
+  machine it is `nvh264enc` at rank 257. The encoder is now chosen **by
+  preference, not by rank**, and the whole argument is spec v3 §5.1. Rank is
+  used only to exclude unusable factories and to tie-break.
 
 ---
 
@@ -511,9 +561,13 @@ app reach the mock (§5.1). It is also a downgrade to cleartext that
 `config.json` and nowhere else. A production instance is a bare host, which
 resolves to `https`/`wss`.
 
-The ports above match the mock invocation in §5.1. The SRT half of this cannot be
-exercised until Gate B — `srtsink` dials the mock's listener directly, and there
-is no `srtsink` without GStreamer.
+The ports above match the mock invocation in §5.1.
+
+A production `config.json` also carries the picture and return fields — the full
+list with defaults is spec v3 §9. The two worth knowing here are
+`returnSource`, which must be `"webrtc"` for the picture to start (they dial the
+same M2L-X output and it accepts one peer), and `pictureSource`, which chooses
+between the native SRT picture and the KVS mosaic fallback.
 
 The **M2L-X password** and the **two SRT passphrases** never go in that file.
 They go in Windows Credential Manager:
@@ -522,7 +576,7 @@ They go in Windows Credential Manager:
 |---|---|
 | `WSLComms/m2lx` | the M2L-X sign-in password |
 | `WSLComms/srt` | the SRT passphrase for the **send** path — the commentary input this app dials |
-| `WSLComms/srtreturn` | the SRT passphrase for the **return** path — the M2L-X output the monitor dials |
+| `WSLComms/srtreturn` | the SRT passphrase for the **inbound** path — the M2L-X output the picture, and the SRT audio return, dial |
 
 The two SRT passphrases are separate credentials because **M2L-X sets encryption
 per output**, measured on the live instance:
@@ -540,12 +594,18 @@ are separate too, and they are not secrets, so they live in `config.json` as
 `pbkeylen` (send) and `srtReturnPBKeyLen` (return); both are `0`, `16` or `32`,
 with `0` meaning no encryption is negotiated.
 
+One consequence of "per output" that is easy to get wrong: the **picture** reads
+`WSLComms/srtreturn` and `srtReturnPBKeyLen`, not the send path's. That is
+correct — it is the same M2L-X *output* as the SRT audio return — but the field
+names now describe two different features, and it is reported as a gap in spec
+v3 §9.1 rather than quietly lived with.
+
 Normally the Settings screen writes all three through `SetSecret`. There is
 deliberately no getter — a secret goes in and does not come back out across the
 Wails boundary, so the Settings screen can only ever show "set this session",
 never the value.
 
-To seed them by hand before the GUI exists:
+To seed them by hand, or to set them without opening the GUI:
 
 ```powershell
 cmdkey /generic:WSLComms/m2lx      /user:wslcomms /pass:changeme
@@ -564,58 +624,85 @@ hit the real vault, is the authority.
 
 | Path | Owner | What |
 |---|---|---|
-| `main.go`, `app.go`, `main_nocgo.go` | WP-8 | Wails bindings, wire-up, events, lifecycle |
+| `main.go`, `app.go`, `main_nocgo.go`, `exit_windows.go` | WP-8 | Wails bindings, wire-up, events, lifecycle, the hard-exit path |
+| `app_picture.go` | WP-P | the SRT picture's bound surface, the native overlay, the `picture` event |
+| `app_return.go` | WP-R | the SRT audio return's bound surface and the `return` event |
+| `app_mixer.go` | WP-8 | the mixer drawer's bound surface: snapshot, arm, send, golden |
 | `internal/config`, `internal/secrets` | WP-1 | `config.json`, Credential Manager |
-| `internal/m2lx` | WP-2 | sign-in, token refresh, status WebSocket |
-| `internal/gst` | WP-3a | the only cgo surface, plus the stub twin |
+| `internal/m2lx` | WP-2 | sign-in, token refresh, status WebSocket, the snapshot/delta document |
+| `internal/gst` | WP-3a / WP-P / WP-R | the only cgo surface: send pipeline, picture pipeline, return pipeline, overlay window — each with a stub twin |
 | `internal/sender` | WP-3b | timestamp pinning, reconnect state machine, backoff |
 | `internal/kvs` | WP-4 | M2L-X → Cognito credential chain |
-| `frontend/src/monitor` | WP-5a | KVS viewer, mosaic crop, return audio |
-| `frontend/src/ui`, `frontend/src/styles` | WP-5b | controls, lamps, Settings |
-| `build/` | WP-6 | DLL allowlist, LGPL notices, installer |
+| `internal/mixer` | WP-M0…M3 | bus model, `switcher_status` parse, golden/compare, `switcher_controller` client |
+| `frontend/src/monitor` | WP-5a | KVS viewer, mosaic crop, bus and channel selection, return audio |
+| `frontend/src/ui`, `frontend/src/styles` | WP-5b | controls, lamps, Settings, picture source |
+| `frontend/src/ui/mixer` | WP-M4 | the drawer: contract, model, DOM, demo harness |
+| `build/` | WP-6 | `env.ps1`, DLL allowlist, LGPL notices, Inno Setup installer |
 | `cmd/mockm2lx` | WP-7 | mock M2L-X and fault injection |
 
 Each package's doc comment is its real contract; the table above is only an
-index. `docs/architecture.md` and `docs/test-results.md` are the measurement
-record behind the numbers — when a constant looks arbitrary, it is usually
-measured, and the comment beside it says which measurement.
+index, and the doc comments in this tree are unusually long on purpose — they
+carry the measurement that justifies each constant. When a number looks
+arbitrary it is usually measured, and the comment beside it says which
+measurement.
+
+`docs/architecture.md` and `docs/test-results.md` are the **2026-07-29/30
+measurement record**. They are historical and were written before the picture
+path, the mixer drawer and the snapshot/delta discovery existed; where they
+disagree with `docs/windows-app-spec.md` v3, v3 is later and was measured
+against the same instance. They are still the authority for the things only they
+recorded — the tone-injection bus map, the KVS bitrates, the bus summing
+measurement.
 
 ---
 
 ## 9. Things that are known-unfinished, so you do not rediscover them
 
-- **The SRT socket has never carried real media.** `internal/sender` is tested
-  against the `internal/gst` stub, which dials nothing, and `cmd/mockm2lx`'s
-  listener is tested by its own in-process `gosrt` dials. The two have never met
-  (§5.1). Gate B, first job.
-- **The GUI has never been built or opened.** Every command in this note stops at
-  the Wails boundary on purpose (§4).
-- **SP-1** — the two KVS endpoint shapes rest on a *single* captured sample from
-  an instance that is now powered off. `internal/kvs` codes defensively and every
-  error it returns names the exact field that was missing or the wrong shape.
-  Expect to be surprised at Gate C.
-- **SP-4 / SP-5** — the production `statusKey`, and whether the commentary INPUT
-  has an SRT passphrase set and at what `pbkeylen`, are both unmeasured. They are
-  config, not code. The three programme OUTPUTS have since been measured (§7):
-  40501 is unencrypted, 40502 and 40503 are not. That is why the return has its
-  own passphrase and its own `srtReturnPBKeyLen` rather than borrowing the send
-  path's — the input's answer says nothing about the outputs'.
-- **A wrong or missing RETURN passphrase cannot be named precisely yet.** libsrt
+Ordered by how much it would cost to be wrong about them. The full list with
+the tests that would settle each is spec v3 §14; this is the working summary.
+
+- **No match-length soak has been run.** The application has been used on air;
+  it has not been left running for the length of a match, unattended, with the
+  log kept. The two bugs that will actually hurt — the backwards-DTS jump and
+  the reconnect window — only appear over hours, and everything defending
+  against them is defended by construction and by unit tests rather than by
+  having survived one.
+- **Nobody knows whether a `stream_state` CHANGE is ever pushed as a delta**, or
+  whether it only ever appears in the connect snapshot. Over 150 s and 3180
+  observed frames no input changed state, so the question was never put, and
+  putting it means changing an input's state on a live switcher.
+  `internal/m2lx`'s `resyncInterval` is an explicit backstop against exactly
+  this assumption. The same answer decides whether the mixer drawer can stop
+  polling one dial per refresh.
+- **The negotiated SRT latency has never been read**, on any of the three paths.
+  `srtsrc`'s `stats` property is not reachable from `gst-launch` and nothing at
+  `GST_DEBUG=srtobject:7` prints it, so what spec v3 §5.2 has is end-to-end
+  time-to-first-frame at three settings, which is evidence and not the number.
+- **Absolute glass-to-glass picture latency is unmeasured and currently
+  unmeasurable** — it needs a reference clock at the source. What is measured is
+  1.2 ms of transit from `srtsrc`'s src pad to the sink, which is the part this
+  application controls and is not the whole path. The operator's verdict that
+  the picture is now good is a real data point and is not a measurement.
+- **A wrong or missing INBOUND passphrase cannot be named precisely.** libsrt
   distinguishes `ERROR:BADSECRET` from `ERROR:UNSECURE` and `internal/gst` logs
-  whichever it got, but `gst.ReturnOpts` has no `OnConnectError` callback the way
-  `sender.Opts` does, so that reason reaches the log and stops there. After three
-  consecutive failed attempts `app_return.go` emits one message naming the
-  endpoint and the encryption it offered, and points at the log for the exact
-  reason. Giving `gst.ReturnOpts` an `OnConnectError func(error)` would let the
-  operator be told which of the two it was; it is reported, not worked around.
-- **No race detector until Gate B.** The concurrency in `internal/sender` and in
-  `app.go` has been read by hand and stressed with `go test -tags dev . -count=20`
-  and `go test ./... -count=20`, which is not the same thing. `app.go` has four
-  locks, an `atomic.Pointer` for the Wails context and five concurrent
-  subsystems; run `-race` over the root package the hour Gate B opens.
-- **The honest line is permanent.** *"Your feed is reaching the switcher. This
-  does not confirm you are audible on the broadcast output."* There is no
-  reliable in-app proof that commentary is on air. It is not a placeholder and it
-  does not get removed when something better is found, because nothing better
-  exists.
-</content>
+  whichever it got, but neither `gst.ReturnOpts` nor `gst.PictureOpts` has an
+  `OnConnectError` callback the way `sender.Opts` does, so the reason reaches
+  the log and stops there. After three consecutive failures the app emits one
+  message naming the endpoint and the encryption it offered, and points at the
+  log. It is reported, not worked around.
+- **The mixer write path has never been exercised against the live instance from
+  a test.** It has been used once, by the operator, through the GUI, to take
+  commentary out of the clean feed. Responses are not correlated to commands and
+  cannot honestly be — see spec v3 §11 — so confirmation is always "read the
+  next snapshot back".
+- **The mock's SRT listener and a real `srtsink` have still never met** (§5.1).
+- **`internal/secrets` writing a UTF-16LE `CredentialBlob` interoperates with
+  `cmdkey` in theory only.** The round-trip test through the package's own API
+  hits the real vault and is the authority; the `cmdkey` path is untested.
+- **The honest line is withdrawn from the GUI, at the operator's instruction.**
+  `deriveHonestLine` and its wording are kept and tested in
+  `frontend/src/ui/lamps.js` with no caller, exactly as `internal/mixer`'s
+  golden/compare machinery was kept when the drift panel was withdrawn. Putting
+  it back is a change to `home.js` alone. The fact underneath it has not
+  changed and is not going to: **there is no reliable in-app proof that
+  commentary is on air.** Do not build a lamp that claims otherwise.

@@ -98,7 +98,7 @@ type frameEffect struct {
 	// by whole-node replacement or by a merged delta. It is how the Watch loop
 	// knows a frame is worth re-reading its own node for: a "/levels" delta
 	// about advanced_audio_mixer touches nothing the lamps read, and there are
-	// about fifteen of those a second.
+	// about ten of those a second.
 	Touched map[string]bool
 
 	// Merged and Skipped count the delta entries that did and did not apply.

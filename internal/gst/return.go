@@ -281,6 +281,81 @@ type ReturnOpts struct {
 	// exactly this reason. Empty means wasapi2sink's default endpoint, which is
 	// whatever Windows currently calls the default playback device.
 	OutputDeviceID string
+
+	// OnConnectError, if set, is called with the reason every failed attempt
+	// failed, immediately before the transition to ReturnStateBackoff. It is
+	// modelled on sender.Opts.OnConnectError and obeys the same rules; the one
+	// place the two differ is spelled out below.
+	//
+	// # What this is for
+	//
+	// Retrying for ever is the requirement and this does not change it. What it
+	// changes is that the reason stops being discarded. Without it the whole
+	// vocabulary available to the application is the RETURN lamp, which shows
+	// BACKOFF for a wrong passphrase, for an output nobody has started, and for
+	// a peer that has gone away for ten seconds — three faults with three
+	// different fixes and one appearance. That cost the operator an afternoon.
+	//
+	// # What libsrt tells you, and what it does not
+	//
+	// It DOES name the two ways encryption goes wrong, and it names them
+	// differently: a handshake refused with ERROR:BADSECRET means a passphrase
+	// was offered and the far end is configured with a different one, and
+	// ERROR:UNSECURE means the two ends disagree about whether there should be
+	// a passphrase at all. Both arrive inside the GStreamer bus error's debug
+	// string and are passed to this callback verbatim, wrapped but not
+	// rewritten. On the measured instance those two are clean and reliable.
+	//
+	// It does NOT tell you anything else worth acting on:
+	//
+	//   - It cannot distinguish "the M2L-X output is not started" from "the
+	//     host is not there" from "a firewall dropped the packets". All three
+	//     are a "Connection timeout (16)" after libsrt's 3 s SRTO_CONNTIMEO.
+	//   - It says nothing at all about the media. An output that is up and
+	//     carrying no AAC produces no libsrt error whatsoever; that failure
+	//     arrives here as this package's own audio-pad timeout instead. See
+	//     returnAudioPadTimeout.
+	//   - It is not involved at all in the other two things reported through
+	//     this callback: a pipeline that could not be built (a plugin missing
+	//     from the bundle) and a peer that went away after a successful
+	//     connect.
+	//
+	// The text is therefore NOT a stable interface. It is a GStreamer message
+	// plus libsrt's own wording and it changes between versions. A caller may
+	// match it to say something more useful to an operator — matching
+	// BADSECRET and UNSECURE is what this exists for — but a reason it does not
+	// recognise must be passed through verbatim rather than mapped to a guess.
+	// An unrecognised string an operator can search for beats a confident wrong
+	// summary.
+	//
+	// # What it is called for
+	//
+	// Every failed attempt, once each, including one that failed AFTER reaching
+	// ReturnStateReceiving. That is the difference from
+	// sender.Opts.OnConnectError, which is deliberately silent about losing the
+	// peer because the send path has a DRAINING state that already says so.
+	// This path has no such state — the whole pipeline is rebuilt per attempt,
+	// so every failure ends an attempt in exactly the same way — and a monitor
+	// that has been dropping its peer every eight seconds for two minutes is
+	// something the operator wants the words for, not another amber lamp.
+	//
+	// It is not called for a successful attempt, and not called by Stop.
+	//
+	// # The rules
+	//
+	// It is called on the monitor's own state-machine goroutine, the one
+	// running the reconnect loop and the only goroutine that can reconnect. So
+	// it must not block, and it must not call back into the ReturnMonitor —
+	// calling Stop from inside it deadlocks, because Stop waits for that
+	// goroutine. A nil value disables reporting and is the normal case for
+	// tests and for any caller that only wants the log. A panic is recovered
+	// and logged rather than allowed to take down the process carrying the
+	// commentary.
+	//
+	// The error never contains the passphrase. It cannot: the passphrase is set
+	// with g_object_set and is never put in a URI, and endpointForLog is the
+	// only thing in this package that renders these options at all.
+	OnConnectError func(error)
 }
 
 // normalise fills in the documented defaults and reports any option that cannot
@@ -540,6 +615,10 @@ type ReturnMonitor interface {
 	// channel mode that is not one of the three — IS an error from Start, and it
 	// names the field, because that one will not fix itself and the operator is
 	// standing in front of the settings screen.
+	//
+	// Because connection failures are not returned, the only route out for the
+	// reason one failed is ReturnOpts.OnConnectError. A caller that leaves it
+	// nil gets the log and nothing else.
 	//
 	// It returns ErrReturnAlreadyStarted if the monitor is already running or
 	// has been stopped.
@@ -817,8 +896,8 @@ func (m *returnMonitor) loop(opts ReturnOpts) error {
 			// plugin. Retrying will not fix that, but it costs nothing and the
 			// alternative is a monitor that is dead for the rest of the match
 			// because the bundle was repaired while it was running. The reason
-			// is logged on every attempt, so it is not silent.
-			m.report(err, attempt)
+			// is logged and reported on every attempt, so it is not silent.
+			m.report(opts.OnConnectError, err, attempt)
 		} else {
 			err = pipe.Play(opts)
 			if err == nil {
@@ -859,7 +938,7 @@ func (m *returnMonitor) loop(opts ReturnOpts) error {
 				lastCloseErr = cerr
 				log.Printf("gst: return monitor: closing a failed pipeline: %v", cerr)
 			}
-			m.report(err, attempt)
+			m.report(opts.OnConnectError, err, attempt)
 		}
 
 		if m.quitting() {
@@ -875,7 +954,9 @@ func (m *returnMonitor) loop(opts ReturnOpts) error {
 	}
 }
 
-// report logs why one attempt failed.
+// report announces why one attempt failed: to the log always, and to the
+// caller's ReturnOpts.OnConnectError if it set one. It is called on the run
+// goroutine, immediately before the transition to ReturnStateBackoff.
 //
 // It always logs, and it logs the attempt count, because the pair is what
 // distinguishes a network blip from the case that matters: a fault that cannot
@@ -884,18 +965,45 @@ func (m *returnMonitor) loop(opts ReturnOpts) error {
 // reason never changes. Retrying forever is still correct; not saying why is
 // not.
 //
-// There is no OnConnectError callback here, unlike internal/sender's Opts. The
-// send path has one because a contribution feed that is silently down is a
-// broadcast failure the operator must be interrupted about. A monitor that is
-// down is something the operator can see on the RETURN lamp and hear in the
-// headphones, and adding a second source of rate-limited error toasts during a
-// match buries the ones that mean the feed is off air.
-func (m *returnMonitor) report(err error, attempt int) {
+// The log used to be the ONLY destination, and that was the defect. libsrt
+// distinguishes ERROR:BADSECRET from ERROR:UNSECURE, this function wrote
+// whichever it got into the log, and there the reason stopped: ReturnOpts had
+// no callback, so the application could say "it will not connect" while the one
+// fact that would have fixed it in a minute sat in a file nobody had open.
+//
+// # Why the callback lives here and not in a returnPipe
+//
+// Both twins — return_cgo.go and return_stub.go — supply only newReturnPipe.
+// Neither sees ReturnOpts.OnConnectError and neither should: an implementation
+// that has to remember to call a callback is an implementation that can forget
+// to, and the two builds would then differ in the one behaviour an operator
+// depends on. Reporting happens once, here, in the build-tag-free half, so a
+// cgo build and a Gate A build report identically by construction and the
+// tests that prove it (return_test.go, which carries no build tag) run in both.
+//
+// # The recover
+//
+// The failure mode is asymmetric. A panic in a caller's callback would take
+// down the whole process — Go gives no way to contain a panic raised on another
+// goroutine — and this process is carrying live commentary. Keeping the
+// reconnect loop alive beats failing fast on somebody else's bug, and the log
+// line preserves both the reason and the fact that the callback misbehaved.
+func (m *returnMonitor) report(notify func(error), err error, attempt int) {
 	if err == nil {
 		return
 	}
 	log.Printf("gst: return monitor: attempt %d failed: %v; retrying in %v",
 		attempt+1, err, returnBackoffDelay(attempt))
+
+	if notify == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("gst: return monitor: OnConnectError panicked: %v; the reconnect loop is continuing", r)
+		}
+	}()
+	notify(err)
 }
 
 // emit offers a state to the channel without blocking. It drops rather than

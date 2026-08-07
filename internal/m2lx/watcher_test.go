@@ -838,7 +838,7 @@ func TestWatcher_AStreamStateDeltaMovesTheLamp(t *testing.T) {
 }
 
 func TestWatcher_ABurstOfLevelsDeltasProducesNoStatus(t *testing.T) {
-	// "/levels" arrives about fifteen times a second and carries nothing any
+	// "/levels" arrives about ten times a second and carries nothing any
 	// lamp reads. Merging it is right; announcing it is not. Emitting a Status
 	// per delta would put ~21 events a second on the Wails bus to say
 	// precisely nothing, and would make the event stream useless as a signal

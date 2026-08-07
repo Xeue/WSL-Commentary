@@ -342,7 +342,7 @@ func TestGetMixerSnapshotParsesTheLiveFrame(t *testing.T) {
 // parser, which matches the advanced_audio_mixer entry by node name alone and
 // ignores "path".
 //
-// A "/levels" delta arrives about fifteen times a second on a live instance.
+// A "/levels" delta arrives about ten times a second on a live instance.
 // Read as a whole node it yields a mixer with no strips and no matrix — which
 // the drawer renders as "nothing is routed to the clean feed".
 func TestGetMixerSnapshotRefusesASubtreeDelta(t *testing.T) {

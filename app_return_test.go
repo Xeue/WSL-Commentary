@@ -13,6 +13,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"reflect"
 	"strconv"
 	"strings"
@@ -78,6 +79,28 @@ func (m *fakeReturnMonitor) States() <-chan gst.ReturnState { return m.states }
 
 func (m *fakeReturnMonitor) emit(s gst.ReturnState) { m.states <- s }
 
+// fail is one failed attempt, reported the way the real monitor reports one:
+// gst.ReturnOpts.OnConnectError first, then the transition to BACKOFF.
+//
+// That ORDER is the contract app_return.go relies on — the reason for a failure
+// is stored before the failure is counted — so the fake has to keep it or the
+// tests would prove something the real machine does not do. See
+// internal/gst/return.go's loop, where report runs immediately before
+// emit(ReturnStateBackoff).
+//
+// A nil err is a failure with no reason attached, which is what a monitor built
+// by an older caller or a path that never reached libsrt looks like.
+func (m *fakeReturnMonitor) fail(err error) {
+	m.mu.Lock()
+	notify := m.opts.OnConnectError
+	m.mu.Unlock()
+
+	if notify != nil && err != nil {
+		notify(err)
+	}
+	m.states <- gst.ReturnStateBackoff
+}
+
 func (m *fakeReturnMonitor) startedWith() (gst.ReturnOpts, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,6 +130,52 @@ func setConfig(a *App, c *config.Config) {
 	a.cfgMu.Lock()
 	a.cfg = c
 	a.cfgMu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Reading the log
+// ---------------------------------------------------------------------------
+
+// logCapture collects everything the application logs during one test.
+//
+// It exists for one assertion that cannot be made any other way: emitError
+// writes the diagnostic to the standard logger as well as pushing it across the
+// Wails boundary, and the log is what gets mailed in a support bundle. A test
+// that only read the event would let a secret through in the half of the output
+// that travels furthest.
+type logCapture struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, p...)
+	return len(p), nil
+}
+
+func (c *logCapture) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.buf)
+}
+
+// captureLog redirects the standard logger for one test and returns the sink.
+// The previous destination and flags are restored by a t.Cleanup, so a failure
+// part-way through cannot leave the rest of the binary writing into a dead
+// buffer.
+func captureLog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(c)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return c
 }
 
 // ---------------------------------------------------------------------------
@@ -868,6 +937,11 @@ func TestTheDiagnosticNamesTheEncryptionItOffered(t *testing.T) {
 	// Two ways to get encryption wrong, two different messages. Reporting "not
 	// connected" for both is what made the fault undiagnosable in the first
 	// place.
+	//
+	// The reason is nil throughout: this is the half of the message that is built
+	// from what THIS process knows, and it has to stand on its own for a caller
+	// that set no callback. What libsrt said is the other half and is tested
+	// below.
 	tests := []struct {
 		name       string
 		opts       gst.ReturnOpts
@@ -906,7 +980,7 @@ func TestTheDiagnosticNamesTheEncryptionItOffered(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := returnDiagnostic(tt.opts)
+			got := returnDiagnostic(tt.opts, nil)
 			for _, want := range tt.want {
 				if !strings.Contains(got, want) {
 					t.Errorf("returnDiagnostic() = %q, does not contain %q", got, want)
@@ -922,23 +996,39 @@ func TestTheDiagnosticNamesTheEncryptionItOffered(t *testing.T) {
 }
 
 func TestTheDiagnosticNeverCarriesThePassphrase(t *testing.T) {
-	// It is built from gst.ReturnOpts, which HOLDS the passphrase, and it goes
-	// to the "error" event, which crosses the Wails boundary and is written to
-	// the log. Asserted rather than assumed.
+	// It is built from gst.ReturnOpts, which HOLDS the passphrase, and it goes to
+	// the "error" event — which crosses the Wails boundary AND is written to the
+	// log by emitError, which is what ends up in a support bundle. Asserted rather
+	// than assumed, over both destinations.
 	const secret = "correct-horse-battery-staple"
+
+	// Half of this message is now a string this process did not compose. The
+	// reason comes from libsrt by way of GStreamer, and the guarantee that a
+	// secret cannot appear in it must not rest on somebody else's error
+	// formatting: the worst case is put in deliberately and must come back out.
+	reasons := []error{
+		nil,
+		errors.New("gst: return monitor: retsrc: Connection setup failure: ERROR:BADSECRET"),
+		errors.New("gst: return monitor: retsrc: something went wrong with " + secret + " somehow"),
+	}
 	for _, keylen := range []int{0, 16, 32} {
-		got := returnDiagnostic(gst.ReturnOpts{
-			Host:       "m2lx.example.com",
-			Port:       40503,
-			Passphrase: secret,
-			PBKeyLen:   keylen,
-		})
-		if strings.Contains(got, secret) {
-			t.Fatalf("the diagnostic leaks the passphrase: %q", got)
+		for _, reason := range reasons {
+			got := returnDiagnostic(gst.ReturnOpts{
+				Host:       "m2lx.example.com",
+				Port:       40503,
+				Passphrase: secret,
+				PBKeyLen:   keylen,
+			}, reason)
+			if strings.Contains(got, secret) {
+				t.Fatalf("the diagnostic leaks the passphrase (reason %v): %q", reason, got)
+			}
 		}
 	}
 
-	// And end to end, through the event the frontend actually receives.
+	// And end to end, through the event the frontend actually receives and the
+	// log line emitError writes beside it.
+	logs := captureLog(t)
+
 	a, store := newTestApp(t)
 	mon := withFakeReturn(a)
 	if err := store.Set(secrets.KeySRTReturn, secret); err != nil {
@@ -954,7 +1044,7 @@ func TestTheDiagnosticNeverCarriesThePassphrase(t *testing.T) {
 	}
 	for i := 0; i < returnDiagnoseAfter; i++ {
 		mon.emit(gst.ReturnStateConnecting)
-		mon.emit(gst.ReturnStateBackoff)
+		mon.fail(errors.New("gst: return monitor: refused, and the key was " + secret))
 	}
 	_ = a.StopReturn()
 
@@ -962,6 +1052,289 @@ func TestTheDiagnosticNeverCarriesThePassphrase(t *testing.T) {
 		if s, ok := e.data.(string); ok && strings.Contains(s, secret) {
 			t.Fatalf("the %q event leaks the return passphrase: %q", e.name, s)
 		}
+	}
+	if text := logs.text(); strings.Contains(text, secret) {
+		t.Fatalf("the application log leaks the return passphrase:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What libsrt said
+// ---------------------------------------------------------------------------
+
+func TestTheDiagnosticSaysWhatLibsrtSaid(t *testing.T) {
+	// The defect, closed. libsrt names the two encryption faults differently and
+	// the reason now travels out of internal/gst on
+	// gst.ReturnOpts.OnConnectError, so the operator is told which one it was
+	// instead of being handed both and asked to choose.
+	badSecret := errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+		"(Error on SRT socket: Connection setup failure: ERROR:BADSECRET)")
+	unsecure := errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+		"(Error on SRT socket: Connection setup failure: ERROR:UNSECURE)")
+
+	tests := []struct {
+		name       string
+		opts       gst.ReturnOpts
+		reason     error
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			// A passphrase was offered and the far end has a different one.
+			// There is exactly one fix and it is one field.
+			name:   "badsecret with a passphrase offered",
+			opts:   gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k", PBKeyLen: 32},
+			reason: badSecret,
+			want: []string{
+				"AES-256",
+				"ERROR:BADSECRET",
+				"does not match",
+				"Settings",
+				// The verbatim reason is quoted even when it has been
+				// classified, so a screenshot carries the original text and
+				// not this file's paraphrase of it.
+				badSecret.Error(),
+			},
+			// It must not still be offering the operator the menu of guesses
+			// the message used to end with.
+			wantAbsent: []string{"No reason was reported"},
+		},
+		{
+			// We offered nothing and the far end wants encryption. Combined with
+			// what we offered, UNSECURE is determined: the fix is to SET a
+			// passphrase.
+			name:   "unsecure with nothing offered",
+			opts:   gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503},
+			reason: unsecure,
+			want: []string{
+				"NO encryption",
+				"ERROR:UNSECURE",
+				"requires encryption",
+				"Set the SRT return passphrase",
+			},
+		},
+		{
+			// The mirror image, and the reason the two branches exist. Here the
+			// fix is the opposite one — clear the passphrase — and a message
+			// that told this operator to set one would send them further away.
+			name:   "unsecure with a passphrase offered",
+			opts:   gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k", PBKeyLen: 16},
+			reason: unsecure,
+			want: []string{
+				"AES-128",
+				"ERROR:UNSECURE",
+				"not encrypted at all",
+				"key length to 0",
+			},
+			wantAbsent: []string{"Set the SRT return passphrase and key length on the Settings screen"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := returnDiagnostic(tt.opts, tt.reason)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("returnDiagnostic() = %q, does not contain %q", got, want)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("returnDiagnostic() = %q, must not contain %q", got, absent)
+				}
+			}
+		})
+	}
+}
+
+func TestAnUnrecognisedReasonIsQuotedAndNotGuessedAt(t *testing.T) {
+	// The more important of the two branches.
+	//
+	// Most reasons that reach here are not libsrt's at all: a plugin missing from
+	// the bundle, a headphone endpoint that has gone away, an M2L-X output that is
+	// up and carrying no AAC. Mapping one of those onto "check your passphrase"
+	// would send the operator to a setting that is correct and cost another
+	// afternoon. And the reason text is not a stable interface — it is GStreamer's
+	// wording round libsrt's, and it changes between versions — so this is also
+	// what a future rename of the two tokens degrades to.
+	//
+	// An unrecognised string an operator can paste into a search box beats a
+	// confident wrong summary.
+	reasons := []error{
+		errors.New("gst: return monitor: the bundled GStreamer is missing mpegtsdemux"),
+		errors.New("gst: return monitor: no audio arrived from srt://10.0.0.1:40503 within 10s"),
+		errors.New("gst: return monitor: retsrc: Error on SRT socket: Connection timeout (16)"),
+		errors.New("gst: return monitor: retsink: Failed to open the audio device"),
+	}
+	for _, reason := range reasons {
+		got := returnDiagnostic(gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503}, reason)
+
+		if !strings.Contains(got, reason.Error()) {
+			t.Errorf("returnDiagnostic() = %q, does not quote the reason %q verbatim", got, reason)
+		}
+		if !strings.Contains(got, "not a reason this application recognises") {
+			t.Errorf("returnDiagnostic() = %q, does not say the reason is unrecognised", got)
+		}
+		// It must not have been mapped onto either of the two it can name.
+		for _, guess := range []string{"ERROR:BADSECRET", "ERROR:UNSECURE"} {
+			if strings.Contains(got, guess) {
+				t.Errorf("returnDiagnostic() = %q, asserts %s for a reason that did not say so", got, guess)
+			}
+		}
+	}
+}
+
+func TestRedactionNeverCorruptsTheReason(t *testing.T) {
+	// Caught by this suite the first time it was written, and worth keeping.
+	//
+	// Redacting the passphrase out of a string this process did not compose is
+	// belt and braces — internal/gst guarantees it is not in there — but done
+	// blindly it destroys the thing the verbatim branch exists for. A short value
+	// occurs inside ordinary English: with the passphrase "k", "socket" became
+	// "soc[redacted]et" in the one message an operator is told to search for.
+	//
+	// libsrt will not accept a passphrase shorter than ten characters, so a value
+	// that short is not encrypting anything and there is nothing to protect.
+	reason := errors.New("gst: return monitor: retsrc: Error on SRT socket: " +
+		"Connection setup failure: ERROR:BADSECRET")
+
+	for _, short := range []string{"k", "et", "on", "or", "SRT", "socket"} {
+		got := returnDiagnostic(gst.ReturnOpts{
+			Host: "m2lx.example.com", Port: 40503, Passphrase: short, PBKeyLen: 16,
+		}, reason)
+		if !strings.Contains(got, reason.Error()) {
+			t.Errorf("a %d-character passphrase %q corrupted the quoted reason: %q", len(short), short, got)
+		}
+	}
+
+	// And the other direction: a value long enough to be a real passphrase is
+	// still taken out, wherever it appears.
+	const real = "correct-horse-battery-staple"
+	if got := redactPassphrase("prefix "+real+" suffix", real); strings.Contains(got, real) {
+		t.Errorf("redactPassphrase left a full-length passphrase in place: %q", got)
+	}
+}
+
+func TestABadSecretReasonReachesTheOperator(t *testing.T) {
+	// End to end, over the wire the operator is actually on: the monitor reports
+	// the reason on gst.ReturnOpts.OnConnectError, the forwarder counts the
+	// failures, and the one message emitted after returnDiagnoseAfter of them
+	// carries libsrt's answer.
+	//
+	// This is the whole defect in one test. Before it, the same run produced a
+	// message that named the endpoint, listed both ways encryption can be wrong,
+	// and pointed at a log file.
+	badSecret := errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+		"(Error on SRT socket: Connection setup failure: ERROR:BADSECRET)")
+
+	a, store := newTestApp(t)
+	mon := withFakeReturn(a)
+	if err := store.Set(secrets.KeySRTReturn, "wrong-passphrase"); err != nil {
+		t.Fatalf("store.Set() error = %v", err)
+	}
+	cfg := srtReturnConfig()
+	cfg.SRTReturnPBKeyLen = 32
+	setConfig(a, cfg)
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	// The callback must have been wired in before Start, or the first attempt's
+	// reason is lost.
+	opts, started := mon.startedWith()
+	if !started {
+		t.Fatal("the monitor was not started")
+	}
+	if opts.OnConnectError == nil {
+		t.Fatal("the monitor was started with no OnConnectError; the reason has no route out of internal/gst")
+	}
+
+	for i := 0; i < returnDiagnoseAfter; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.fail(badSecret)
+	}
+	_ = a.StopReturn() // joins the forwarder, so every event has been queued
+
+	msgs := errorEventsFrom(drainPump(a))
+	if len(msgs) != 1 {
+		t.Fatalf("got %d %q events, want exactly 1: %q", len(msgs), EventError, msgs)
+	}
+	for _, want := range []string{
+		"ERROR:BADSECRET", // what libsrt said
+		"does not match",  // what it means
+		"Settings",        // what to do about it
+		"AES-256",         // and what was offered, so the fix is locatable
+		badSecret.Error(), // the original text, quoted
+	} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("the diagnostic %q does not mention %q", msgs[0], want)
+		}
+	}
+}
+
+func TestTheReturnStillSpeaksWhenNoReasonArrives(t *testing.T) {
+	// A failure that reported nothing — a state transition without a preceding
+	// callback — must not silence the message. It was useful before the reason
+	// existed and it is still useful without one; it just says that it is
+	// inferring.
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.fail(nil)
+	}
+	_ = a.StopReturn()
+
+	msgs := errorEventsFrom(drainPump(a))
+	if len(msgs) != 1 {
+		t.Fatalf("got %d %q events, want exactly 1: %q", len(msgs), EventError, msgs)
+	}
+	for _, want := range []string{"40503", "NO encryption", "No reason was reported", "Settings"} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("the diagnostic %q does not mention %q", msgs[0], want)
+		}
+	}
+}
+
+func TestTheDiagnosticReportsTheLatestReason(t *testing.T) {
+	// The message is composed when it is emitted, not when the session started,
+	// and it reports why the LAST attempt failed. A fault that changes — an
+	// output that is switched on and turns out to be encrypted — must be
+	// described by what is wrong now, not by what was wrong three attempts ago.
+	first := errors.New("gst: return monitor: retsrc: Error on SRT socket: Connection timeout (16)")
+	latest := errors.New("gst: return monitor: retsrc: Connection setup failure: ERROR:BADSECRET")
+
+	a, _ := newTestApp(t)
+	mon := withFakeReturn(a)
+	setConfig(a, srtReturnConfig())
+	silencePump(a)
+
+	if err := a.StartReturn(); err != nil {
+		t.Fatalf("StartReturn() error = %v", err)
+	}
+	for i := 0; i < returnDiagnoseAfter-1; i++ {
+		mon.emit(gst.ReturnStateConnecting)
+		mon.fail(first)
+	}
+	mon.emit(gst.ReturnStateConnecting)
+	mon.fail(latest)
+	_ = a.StopReturn()
+
+	msgs := errorEventsFrom(drainPump(a))
+	if len(msgs) != 1 {
+		t.Fatalf("got %d %q events, want exactly 1: %q", len(msgs), EventError, msgs)
+	}
+	if !strings.Contains(msgs[0], "ERROR:BADSECRET") {
+		t.Errorf("the diagnostic %q reports something other than the latest reason", msgs[0])
+	}
+	if strings.Contains(msgs[0], "Connection timeout") {
+		t.Errorf("the diagnostic %q reports a stale reason", msgs[0])
 	}
 }
 

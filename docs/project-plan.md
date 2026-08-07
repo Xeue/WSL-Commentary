@@ -1,5 +1,14 @@
 # WSL Commentary — Project Plan
 
+> **HISTORICAL, 2026-07-30. Do not plan from this.** It implements
+> [windows-app-spec.md](windows-app-spec.md) **v2**, which has been superseded by v3, and it
+> describes a machine with no toolchain and a powered-off instance. All three gates are now open,
+> `wslcomms.exe` is built and in use, and four work packages that are not in this plan were added
+> afterwards: WP-P (the SRT picture), WP-R (the SRT audio return) and WP-M0…M4 (the mixer drawer).
+> Read v3 for what exists and [`../RUNNING.md`](../RUNNING.md) for how to work on it. This file is
+> kept because the *organising idea* below — split by gate, stub the cgo surface, make the whole
+> product testable without a toolchain — is the reason the project worked, and is worth reading.
+
 **Implements:** [windows-app-spec.md](windows-app-spec.md) v2. **Purpose:** break the build into work packages that can run concurrently, and define the contract that lets them.
 
 ---

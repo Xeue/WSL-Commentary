@@ -1,33 +1,41 @@
 // The switcher_status WebSocket: GET /api/v1/switcher_status?access_token=...
 //
-// Push-only, as the real socket is documented to be (spec section 8: the
-// server silently ignores client data frames — see
-// docs/archive-windows-app-spec-v1-rejected.md line 938). This mock never
-// reads application data from a client, only enough to notice when the
-// client closes the connection.
+// Push-only, as the real socket is (spec section 8: the server silently
+// ignores client data frames — docs/archive-windows-app-spec-v1-rejected.md
+// line 938). This mock never reads application data from a client, only
+// enough to notice when the client closes the connection.
 //
-// The URL and query parameter name match the one confirmed usage found in
-// the bundle for the sibling switcher_controller socket
-// (docs/architecture.md line 428, `wss://<host>/api/v1/switcher_controller
-// ?access_token=<percent-encoded>`); switcher_status uses the same scheme
+// The URL and query parameter name match the one confirmed usage found in the
+// bundle for the sibling switcher_controller socket (docs/architecture.md line
+// 428, `wss://<host>/api/v1/switcher_controller?access_token=<percent-encoded>`);
+// switcher_status uses the same scheme
 // (docs/archive-windows-app-spec-v1-rejected.md line 934).
+//
+// WHAT THIS FILE OWNS is the CONNECTION half of the protocol; switcherdoc.go
+// owns the document. The division matters because the protocol is
+// snapshot-then-delta and the snapshot is a property of the CONNECTION, not of
+// the clock: frame 0 after an upgrade is the whole document, and everything
+// after it is a subtree delta that means nothing without it. So a client is
+// tracked as baselined or not, and a client that has not had frame 0 — because
+// it connected while the stall fault was set — gets one before it is sent any
+// delta. A delta merged into an empty document is a delta discarded
+// (internal/m2lx/document.go), so sending one to an unbaselined client would
+// be sending it nothing at all.
 package main
 
 import (
 	"context"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-
-	"wslcomms/internal/m2lx"
 )
 
-// upgrader has CheckOrigin disabled: this mock is a local development and
-// test tool, never exposed beyond localhost/a test harness, and the real
-// M2L-X instance's CORS policy is not something this package needs to
-// reproduce.
+// upgrader has CheckOrigin disabled: this mock is a local development and test
+// tool, never exposed beyond localhost/a test harness, and the real M2L-X
+// instance's CORS policy is not something this package needs to reproduce.
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -37,18 +45,24 @@ var upgrader = websocket.Upgrader{
 // how a real test drives the one M2L-X instance the app under test talks to.
 //
 // writeMu serialises writes to conn. gorilla/websocket allows at most one
-// concurrent writer; without this, the immediate push-on-connect
-// (handleStatusWS) and the periodic broadcaster (runStatusBroadcaster) could
-// both write to a just-registered client at the same time, from two
-// different goroutines.
+// concurrent writer; without this, the push-on-connect (handleStatusWS) and
+// the broadcaster (runStatusBroadcaster) could both write to a just-registered
+// client at the same time, from two different goroutines.
+//
+// baselined records whether this connection has been sent frame 0. It is
+// atomic rather than guarded by writeMu because the broadcaster reads it to
+// decide what to send BEFORE taking any write lock, and a read that had to
+// queue behind an in-flight 84 KB snapshot write would serialise the whole
+// broadcast on the slowest client.
 type wsClient struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
+	baselined atomic.Bool
 }
 
-// handleStatusWS implements GET /api/v1/switcher_status. A missing or
-// invalid access_token is rejected before the WebSocket upgrade, with
-// HTTP 401 and body "Token rejected" — matching
+// handleStatusWS implements GET /api/v1/switcher_status. A missing or invalid
+// access_token is rejected before the WebSocket upgrade, with HTTP 401 and
+// body "Token rejected" — matching
 // docs/archive-windows-app-spec-v1-rejected.md line 938's description of the
 // real socket's upgrade failure, which is also exactly the condition
 // internal/m2lx's Watcher must treat as "reconnect immediately, without
@@ -75,16 +89,18 @@ func (a *App) handleStatusWS(w http.ResponseWriter, r *http.Request) {
 
 	a.logf("statusws", "client connected from %s (%d now connected)", r.RemoteAddr, clientCount)
 
-	// An immediate push on connect, respecting the stall fault exactly as
-	// the periodic broadcaster does: a client that connects while stalled
-	// must see nothing, not one free snapshot.
+	// Frame 0, immediately — that is the protocol, not a convenience. The
+	// stall fault is respected exactly as the broadcaster respects it: a
+	// client that connects while stalled must see nothing at all, not one free
+	// snapshot. It stays unbaselined and the broadcaster will hand it frame 0
+	// when the fault clears.
 	if !a.getStallStatus() {
-		a.sendStatusTo(client, a.buildStatusDoc())
+		a.sendSnapshotTo(client, a.snapshotFrame())
 	}
 
-	// The only reason to read from this socket at all is to notice the
-	// client going away; the real socket ignores client data frames
-	// entirely (see file doc comment above), and so does this one.
+	// The only reason to read from this socket at all is to notice the client
+	// going away; the real socket ignores client data frames entirely (see the
+	// file comment), and so does this one.
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			break
@@ -99,82 +115,12 @@ func (a *App) handleStatusWS(w http.ResponseWriter, r *http.Request) {
 	a.logf("statusws", "client disconnected from %s (%d remain)", r.RemoteAddr, remaining)
 }
 
-// statusNode is one node of the switcher_status snapshot: stream_state and
-// detected formats, per spec section 8. Real snapshots carry many nodes
-// (docs/architecture.md line 416 measured 36 on the dev instance); this mock
-// only synthesizes the one node under test.
-type statusNode struct {
-	StreamState string            `json:"stream_state"`
-	Streams     statusNodeStreams `json:"streams"`
-}
-
-type statusNodeStreams struct {
-	Video statusVideo   `json:"video"`
-	Audio []statusAudio `json:"audio"`
-}
-
-type statusVideo struct {
-	Format string `json:"format"`
-}
-
-type statusAudio struct {
-	Format string `json:"format"`
-}
-
-// Measured format strings, spec section 8 / CONTRACT.md internal/m2lx
-// section: "the measured wire values of streams.video.format and
-// streams.audio[].format are single strings". Reproduced verbatim.
-const (
-	measuredVideoFormat = "h264 1920x1080 50 P"
-	measuredAudioFormat = "aac 48000 2ch"
-)
-
-// buildStatusDoc renders the current switcher_status snapshot as
-// map[nodeName]statusNode. The configured -status-key node reflects (or, if
-// the lie fault is set, misreports) whether an SRT peer is connected; every
-// other field it carries reflects ground truth regardless of the lie fault,
-// which only overrides stream_state — see Options.LieStreamState's doc
-// comment.
-func (a *App) buildStatusDoc() map[string]statusNode {
-	connected := a.srtPeerConnected()
-
-	streamState := m2lx.StreamStateStopped
-	if connected {
-		streamState = m2lx.StreamStateStreaming
-	}
-	if lie := a.getLieStreamState(); lie != "" {
-		streamState = lie
-	}
-
-	var video statusVideo
-	// audio is deliberately a non-nil empty slice, not a nil one: Go's
-	// encoding/json renders a nil slice as `null` but an empty one as `[]`,
-	// and the MP2/AC-3 silent-drop signature this mock reproduces is
-	// specifically an EMPTY ARRAY (spec section 8, AUDIO OK row;
-	// internal/m2lx's Status.Audio doc comment), not a null/absent field.
-	audio := []statusAudio{}
-	if connected {
-		video.Format = measuredVideoFormat
-		if !a.getDropAudio() {
-			audio = []statusAudio{{Format: measuredAudioFormat}}
-		}
-	}
-
-	return map[string]statusNode{
-		a.opts.StatusKey: {
-			StreamState: streamState,
-			Streams: statusNodeStreams{
-				Video: video,
-				Audio: audio,
-			},
-		},
-	}
-}
-
-// runStatusBroadcaster pushes buildStatusDoc to every connected client every
-// StatusInterval, until ctx is cancelled. While the stall fault is set, it
-// skips the push entirely — sockets stay open, nothing arrives on them —
-// which is exactly the condition that must trip m2lx.StaleAfter.
+// runStatusBroadcaster pushes one tick of the document to every connected
+// client every StatusInterval, until ctx is cancelled.
+//
+// While the stall fault is set it pushes nothing — sockets stay open and
+// silent, which is exactly the condition m2lx.StaleAfter exists to catch and
+// the one failure that looks like nothing at all.
 func (a *App) runStatusBroadcaster(ctx context.Context) {
 	t := time.NewTicker(a.opts.StatusInterval)
 	defer t.Stop()
@@ -190,41 +136,92 @@ func (a *App) runStatusBroadcaster(ctx context.Context) {
 				}
 				continue
 			}
-			doc := a.buildStatusDoc()
-			n := a.broadcastStatus(doc)
-			if a.opts.Verbose {
-				a.logf("statusws", "pushed snapshot to %d client(s): %+v", n, doc[a.opts.StatusKey])
-			}
+			a.pushTick()
 		}
 	}
 }
 
-// broadcastStatus writes doc to every connected client, dropping (and
-// unregistering) any client whose write fails. It returns how many clients
-// the write was attempted on.
-func (a *App) broadcastStatus(doc map[string]statusNode) int {
+// pushTick sends one broadcaster tick's worth of frames.
+//
+// Building nothing when nobody is connected is not just an optimisation: the
+// meter sweep and the delta sequence advance as frames are built, and the
+// transition detector publishes a reading as it sends it. Advancing all of
+// that against an audience of nobody would mean a client connecting later
+// found a document whose history it had missed the announcement of.
+func (a *App) pushTick() {
+	clients := a.statusClients()
+	if len(clients) == 0 {
+		return
+	}
+
+	// Frame 0 for anyone still without one. See the file comment: this is the
+	// path a client takes when it connected while the socket was stalled.
+	if anyUnbaselined(clients) {
+		snap := a.snapshotFrame()
+		for _, c := range clients {
+			if !c.baselined.Load() {
+				a.sendSnapshotTo(c, snap)
+			}
+		}
+	}
+
+	frames := a.nextFrames()
+	sent := 0
+	for _, f := range frames {
+		for _, c := range clients {
+			// A client whose frame 0 failed to send is skipped rather than
+			// given a delta it cannot merge.
+			if c.baselined.Load() {
+				a.sendFrameTo(c, f)
+				sent++
+			}
+		}
+	}
+	a.logDeltas(frames, len(clients), sent)
+}
+
+// statusClients snapshots the client set, so the broadcast is not holding
+// wsMu while writing to sockets.
+func (a *App) statusClients() []*wsClient {
 	a.wsMu.Lock()
+	defer a.wsMu.Unlock()
 	clients := make([]*wsClient, 0, len(a.wsClients))
 	for c := range a.wsClients {
 		clients = append(clients, c)
 	}
-	a.wsMu.Unlock()
-
-	for _, c := range clients {
-		a.sendStatusTo(c, doc)
-	}
-	return len(clients)
+	return clients
 }
 
-// sendStatusTo writes doc to one client. On failure it unregisters and
-// closes the client; the client's own ReadMessage loop will also be
-// unblocked by the Close and exit, so there is no double-logging path — that
-// loop logs the disconnect, this method just cleans up the map entry so a
-// concurrent broadcast doesn't retry a dead socket.
-func (a *App) sendStatusTo(c *wsClient, doc map[string]statusNode) {
+func anyUnbaselined(clients []*wsClient) bool {
+	for _, c := range clients {
+		if !c.baselined.Load() {
+			return true
+		}
+	}
+	return false
+}
+
+// sendSnapshotTo writes frame 0 and, if it lands, marks the client baselined
+// so it starts receiving deltas.
+func (a *App) sendSnapshotTo(c *wsClient, f statusFrame) {
+	if !a.sendFrameTo(c, f) {
+		return
+	}
+	c.baselined.Store(true)
+	if a.opts.Verbose {
+		a.logf("statusws", "pushed the opening snapshot: %d nodes, every entry at path %q", len(f.Status), wholeNodePath)
+	}
+}
+
+// sendFrameTo writes one frame to one client and reports whether it landed. On
+// failure it unregisters and closes the client; the client's own ReadMessage
+// loop is unblocked by the Close and exits, so there is no double-logging path
+// — that loop logs the disconnect, this just stops a concurrent broadcast
+// retrying a dead socket.
+func (a *App) sendFrameTo(c *wsClient, f statusFrame) bool {
 	c.writeMu.Lock()
 	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err := c.conn.WriteJSON(doc)
+	err := c.conn.WriteJSON(f)
 	c.writeMu.Unlock()
 
 	if err != nil {
@@ -232,5 +229,38 @@ func (a *App) sendStatusTo(c *wsClient, doc map[string]statusNode) {
 		delete(a.wsClients, c)
 		a.wsMu.Unlock()
 		c.conn.Close()
+		return false
 	}
+	return true
+}
+
+// logDeltas writes the verbose delta log, at most once a second.
+//
+// The real socket runs at about 21 frames a second and this mock's default
+// matches it, so a line per frame would bury the connect, fault and transition
+// lines that someone watching this log is actually there for. The summary
+// names the last frame's node and path, which is the part that varies.
+func (a *App) logDeltas(frames []statusFrame, clients, writes int) {
+	if !a.opts.Verbose || len(frames) == 0 {
+		return
+	}
+	last := frames[len(frames)-1]
+	node, path := "", ""
+	if len(last.Status) > 0 {
+		node, path = last.Status[0].Node, last.Status[0].Path
+	}
+
+	a.doc.mu.Lock()
+	seq := a.doc.seq
+	due := time.Now().After(a.doc.verboseAt)
+	if due {
+		a.doc.verboseAt = time.Now().Add(time.Second)
+	}
+	a.doc.mu.Unlock()
+
+	if !due {
+		return
+	}
+	a.logf("statusws", "%d delta(s) pushed so far to %d client(s) (%d write(s) this tick); last: node=%q path=%q",
+		seq, clients, writes, node, path)
 }

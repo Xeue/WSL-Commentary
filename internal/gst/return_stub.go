@@ -16,6 +16,17 @@
 // happy path indistinguishable from the failure this whole file exists to make
 // visible, so the driving methods below make both outcomes something a test has
 // to ask for.
+//
+// # Reporting failures is not this file's job either
+//
+// FailNextPlay and InjectError take an error and hand it back unchanged, which
+// is the stub's whole obligation: a Gate A test can put a realistic libsrt
+// rejection — "... ERROR:BADSECRET ..." — into either of them and it arrives at
+// the reconnect machine byte for byte, exactly as return_cgo.go's bus errors do
+// at Gate B. What happens to it next, including
+// ReturnOpts.OnConnectError, belongs to returnMonitor.report in return.go and is
+// written once for both builds. Neither twin sees the callback, so neither twin
+// can be the reason the two builds behave differently.
 package gst
 
 import (

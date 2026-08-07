@@ -137,7 +137,7 @@ func TestDocumentMergesTheLiveStatisticsDelta(t *testing.T) {
 }
 
 func TestDocumentMergesTheLiveLevelsDelta(t *testing.T) {
-	// The frame the socket actually spends its time sending: about fifteen a
+	// The frame the socket actually spends its time sending: about ten a
 	// second, about a node that is not a router input at all.
 	d := applySnapshot(t)
 	before := nodeKeys(t, d, "advanced_audio_mixer")

@@ -13,6 +13,7 @@ package gst
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -340,6 +341,12 @@ type returnHarness struct {
 	// failPlays is how many of the next Play calls fail.
 	failPlays int
 
+	// failErr is what those failures fail with. Nil means a generic refusal.
+	// It exists so a test can put a REALISTIC libsrt rejection into the machine
+	// — the text an operator would actually be shown — and follow it out through
+	// ReturnOpts.OnConnectError unchanged.
+	failErr error
+
 	// closeErrsOnPlay makes a successful Play close its own error channel, which
 	// is the "the pipeline gave up without saying why" case.
 	closeErrsOnPlay bool
@@ -395,6 +402,9 @@ func (h *returnHarness) newPipe() (returnPipe, error) {
 	if h.failPlays > 0 {
 		h.failPlays--
 		p.playErr = fmt.Errorf("fake: connect refused")
+		if h.failErr != nil {
+			p.playErr = h.failErr
+		}
 	}
 	h.pipes = append(h.pipes, p)
 	h.mu.Unlock()
@@ -918,5 +928,374 @@ func TestFakeSinkNameSurvivesAnUnnamedPad(t *testing.T) {
 	}
 	if name == fakeSinkName("retfake", 4, "") {
 		t.Error("two unnamed pads produced the same element name")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Saying why: ReturnOpts.OnConnectError
+// ---------------------------------------------------------------------------
+//
+// These tests carry no build tag, like the rest of this file, so they run at
+// Gate A against the stub and at Gate B against the real pipeline. That is the
+// point rather than an accident: the callback is honoured once, in return.go,
+// and never by a returnPipe, so proving it here proves it for both builds.
+
+// srtBadSecretError is the shape internal/gst delivers when M2L-X refuses an
+// encrypted handshake: a bus error from srtsrc, wrapped with its source element,
+// carrying libsrt's reject reason inside GStreamer's debug string.
+//
+// It is spelled out in full rather than abbreviated to the token, because what
+// is being tested is that the WHOLE string survives the trip. app_return.go
+// classifies on the token and then quotes the rest to the operator, so a machine
+// that helpfully tidied the reason on the way past would break the half that
+// matters most — the part a support engineer searches for.
+var srtBadSecretError = errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+	"(../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): Error on SRT socket: " +
+	"Connection setup failure: ERROR:BADSECRET)")
+
+// logCapture collects everything the package logs during one test.
+type logCapture struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, p...)
+	return len(p), nil
+}
+
+func (c *logCapture) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.buf)
+}
+
+// captureLog redirects the standard logger for one test and returns the sink.
+// The previous destination and flags are restored by a t.Cleanup, so a failure
+// part-way through cannot leave the rest of the binary writing into a dead
+// buffer.
+//
+// Two properties below are only observable in the log: that the reason is still
+// logged for the callers who set no callback, and that a nil callback is
+// CHECKED rather than caught by the recover. Without reading the log those tests
+// would pass whatever the code did.
+func captureLog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(c)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return c
+}
+
+// reportSink records what OnConnectError was called with.
+type reportSink struct {
+	mu   sync.Mutex
+	seen []error
+}
+
+func (r *reportSink) errs() []error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]error(nil), r.seen...)
+}
+
+// callback returns the func to install on ReturnOpts. It records into the
+// harness's ordered event log as well, so that WHEN it fired can be asserted
+// against the pipeline's own lifecycle rather than only that it did.
+func (r *reportSink) callback(h *returnHarness) func(error) {
+	return func(err error) {
+		h.record("report")
+		r.mu.Lock()
+		r.seen = append(r.seen, err)
+		r.mu.Unlock()
+	}
+}
+
+func TestReturnOnConnectErrorCarriesTheReasonVerbatim(t *testing.T) {
+	// THE defect. libsrt knew the answer — ERROR:BADSECRET, a passphrase offered
+	// and refused — the machine logged it and discarded it, and the operator was
+	// told "it will not connect" for an afternoon.
+	//
+	// errors.Is, not a substring match: it must arrive as the SAME error and not
+	// as something built from it, because everything downstream classifies on the
+	// text and a reason summarised on the way out would be a guess again.
+	h := newReturnHarness()
+	h.failPlays = 1
+	h.failErr = srtBadSecretError
+	m := newReturnMonitor(h.newPipe, h)
+
+	sink := &reportSink{}
+	opts := validReturnOpts()
+	opts.OnConnectError = sink.callback(h)
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	expectState(t, m.States(), ReturnStateBackoff)
+	expectState(t, m.States(), ReturnStateConnecting)
+	expectState(t, m.States(), ReturnStateReceiving)
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	got := sink.errs()
+	if len(got) != 1 {
+		t.Fatalf("OnConnectError called %d times, want once (a successful attempt must not report): %v",
+			len(got), got)
+	}
+	if !errors.Is(got[0], srtBadSecretError) {
+		t.Fatalf("OnConnectError got %v, want the pipeline's own error %v", got[0], srtBadSecretError)
+	}
+	if !strings.Contains(got[0].Error(), "ERROR:BADSECRET") {
+		t.Fatalf("the reason reached the caller without libsrt's reject reason in it: %q", got[0])
+	}
+
+	// WHEN it fires is part of the contract: after the pipeline is closed and
+	// before the backoff wait. Fired after the wait it would report a failure the
+	// operator has already been staring at for seven seconds; fired before Close
+	// it would describe a socket still open.
+	events := h.events()
+	want := []string{"new", "play", "close", "report", "wait"}
+	if len(events) < len(want) {
+		t.Fatalf("event log = %v, want it to begin %v", events, want)
+	}
+	for i, w := range want {
+		if events[i] != w {
+			t.Fatalf("event log = %v, want it to begin %v; the reason must be reported after the "+
+				"pipeline is closed and before the backoff wait", events, want)
+		}
+	}
+}
+
+func TestReturnOnConnectErrorReportsAPipelineThatCannotBeBuilt(t *testing.T) {
+	// A missing plugin never reaches libsrt at all, and it is the one fault that
+	// cannot clear itself. It has to come out of the same hole: an operator whose
+	// bundle is missing mpegtsdemux otherwise gets an amber lamp and no words
+	// anywhere but the log.
+	buildErr := errors.New("gst: return monitor: the bundled GStreamer is missing mpegtsdemux")
+
+	h := newReturnHarness()
+	h.newPipeErr = buildErr
+	h.release = make(chan time.Time) // park in the first backoff
+	m := newReturnMonitor(h.newPipe, h)
+
+	sink := &reportSink{}
+	opts := validReturnOpts()
+	opts.OnConnectError = sink.callback(h)
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	expectState(t, m.States(), ReturnStateBackoff)
+
+	waitFor(t, "the build failure to be reported", func() bool { return len(sink.errs()) > 0 })
+	if got := sink.errs()[0]; !errors.Is(got, buildErr) {
+		t.Fatalf("OnConnectError got %v, want %v", got, buildErr)
+	}
+
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestReturnOnConnectErrorIsCalledForALostPeer(t *testing.T) {
+	// The documented difference from sender.Opts.OnConnectError, asserted so that
+	// it cannot be quietly "fixed" into agreement with it.
+	//
+	// The send path stays silent about losing its peer because it has a DRAINING
+	// state that already says so. This path has four states and rebuilds the whole
+	// pipeline per attempt, so every failure ends an attempt identically — and a
+	// monitor that has been dropping its peer every eight seconds for two minutes
+	// is something the operator needs the words for.
+	peerGone := errors.New("gst: return monitor: the return stream ended (the SRT peer went away)")
+
+	h := newReturnHarness()
+	h.release = make(chan time.Time)
+	m := newReturnMonitor(h.newPipe, h)
+
+	sink := &reportSink{}
+	opts := validReturnOpts()
+	opts.OnConnectError = sink.callback(h)
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	expectState(t, m.States(), ReturnStateReceiving)
+
+	if !h.lastPipe().inject(peerGone) {
+		t.Fatal("could not inject the peer loss")
+	}
+	expectState(t, m.States(), ReturnStateBackoff)
+
+	waitFor(t, "the peer loss to be reported", func() bool { return len(sink.errs()) > 0 })
+	if got := sink.errs()[0]; !errors.Is(got, peerGone) {
+		t.Fatalf("OnConnectError got %v, want %v", got, peerGone)
+	}
+
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestNilReturnOnConnectErrorIsFine(t *testing.T) {
+	// The field is optional and most callers — every other test here, and any
+	// caller that only wants the log — leave it nil. A nil callback must not
+	// panic the one goroutine that can reconnect.
+	//
+	// It asserts on the LOG and not only on survival, and it has to. The recover
+	// that contains a panicking callback would also contain a nil one, so a
+	// version with the nil check deleted passes every behavioural assertion while
+	// panicking and recovering on every failed attempt for the majority of
+	// callers. Reading the log is what tells the two apart.
+	logs := captureLog(t)
+
+	h := newReturnHarness()
+	h.failPlays = 2
+	h.failErr = srtBadSecretError
+	m := newReturnMonitor(h.newPipe, h)
+
+	opts := validReturnOpts()
+	if opts.OnConnectError != nil {
+		t.Fatal("validReturnOpts set OnConnectError; this test needs it nil")
+	}
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	for i := 0; i < 2; i++ {
+		expectState(t, m.States(), ReturnStateBackoff)
+		expectState(t, m.States(), ReturnStateConnecting)
+	}
+	expectState(t, m.States(), ReturnStateReceiving)
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	text := logs.text()
+	if strings.Contains(text, "panicked") {
+		t.Fatalf("a nil OnConnectError was called and recovered from; it must be checked, not caught:\n%s", text)
+	}
+	// The log is the half of this that survives a caller which sets no callback,
+	// and it is where a support engineer looks after the match. The reason, the
+	// attempt number and the wait all have to be in it: a reason that never
+	// changes while the attempt count climbs is the signature of a fault that
+	// cannot clear itself.
+	for _, want := range []string{"ERROR:BADSECRET", "attempt 1", "attempt 2", ReturnBackoffLadder[0].String()} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the log does not mention %q; it says:\n%s", want, text)
+		}
+	}
+}
+
+func TestReturnOnConnectErrorPanicDoesNotStopTheReconnectLoop(t *testing.T) {
+	// A panic in a caller's callback would otherwise take down the whole process:
+	// Go gives no way to contain a panic raised on another goroutine, and this
+	// goroutine is inside the process carrying live commentary. Keeping the
+	// monitor reconnecting beats failing fast on somebody else's bug.
+	logs := captureLog(t)
+
+	h := newReturnHarness()
+	h.failPlays = 2
+	m := newReturnMonitor(h.newPipe, h)
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	opts := validReturnOpts()
+	opts.OnConnectError = func(error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		panic("a UI callback with a bug in it")
+	}
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	for i := 0; i < 2; i++ {
+		expectState(t, m.States(), ReturnStateBackoff)
+		expectState(t, m.States(), ReturnStateConnecting)
+	}
+	// It reached a working monitor with a callback that panicked on every failure
+	// on the way.
+	expectState(t, m.States(), ReturnStateReceiving)
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("the panicking callback was called %d times, want 2; the loop stopped reporting", n)
+	}
+	if !strings.Contains(logs.text(), "OnConnectError panicked") {
+		t.Fatalf("a contained panic was not logged; it must not be silent:\n%s", logs.text())
+	}
+}
+
+func TestReturnOnConnectErrorNeverCarriesThePassphrase(t *testing.T) {
+	// The reason goes to the caller, which puts it on an event that crosses the
+	// Wails boundary, and to the log, which is what gets mailed in a support
+	// bundle. Neither may carry the key to a live encrypted feed.
+	//
+	// The passphrase cannot reach an error by construction — it is set with
+	// g_object_set and never put in a URI — but this asserts that rather than
+	// assuming it, over both destinations at once.
+	const secret = "correct-horse-battery-staple"
+
+	logs := captureLog(t)
+
+	h := newReturnHarness()
+	h.failPlays = 2
+	h.failErr = srtBadSecretError
+	m := newReturnMonitor(h.newPipe, h)
+
+	sink := &reportSink{}
+	opts := validReturnOpts()
+	opts.Passphrase = secret
+	opts.PBKeyLen = 32
+	opts.OnConnectError = sink.callback(h)
+
+	if err := m.Start(opts); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectState(t, m.States(), ReturnStateConnecting)
+	for i := 0; i < 2; i++ {
+		expectState(t, m.States(), ReturnStateBackoff)
+		expectState(t, m.States(), ReturnStateConnecting)
+	}
+	expectState(t, m.States(), ReturnStateReceiving)
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	for i, err := range sink.errs() {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("reported error %d carries the passphrase: %q", i, err)
+		}
+	}
+	text := logs.text()
+	if strings.Contains(text, secret) {
+		t.Fatalf("the log carries the passphrase:\n%s", text)
+	}
+	// It must still be possible to tell an encrypted session from an unencrypted
+	// one in the log: "there is no passphrase" and "the passphrase is wrong" are
+	// different faults with different fixes.
+	if !strings.Contains(text, "aes-256") {
+		t.Fatalf("the log does not say the session was encrypted at all:\n%s", text)
 	}
 }

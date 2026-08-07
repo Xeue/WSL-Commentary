@@ -16,6 +16,19 @@
 // here cannot reach it. That separation is the whole point of the file; see the
 // rule in return.go's header.
 //
+// # It does not report failures, and must not learn to
+//
+// This file's job is to fail HONESTLY: every error it returns or delivers on
+// Errors carries what GStreamer and libsrt actually said, including the
+// ERROR:BADSECRET and ERROR:UNSECURE tokens that arrive in a bus error's debug
+// string, wrapped for context but never rewritten or summarised. Getting that
+// reason to the operator is returnMonitor.report's job, and it is done once in
+// return.go so that this file and return_stub.go cannot drift on it.
+// ReturnOpts.OnConnectError is deliberately invisible here: a twin that had to
+// remember to call it is a twin that could forget, and the two builds would then
+// differ in exactly the behaviour an operator is relying on to diagnose a
+// refused handshake.
+//
 // # Dynamic pads, and the fakesink that is not laziness
 //
 // tsdemux's pads are created at run time, on a streaming thread, once the

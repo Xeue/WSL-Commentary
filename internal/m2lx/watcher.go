@@ -507,9 +507,11 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 	//               replaced; a delta is only meaningful against a baseline.
 	//   lamps       the last values EMITTED for the three WebSocket-derived
 	//               lamps. The socket pushes about 21 frames a second and
-	//               roughly fifteen of them are audio meters, so a Status per
-	//               frame would be pure noise on the Wails event bus: a Status
-	//               is emitted only when one of these three actually moves.
+	//               ALMOST ALL of them are audio meters — 3164 of 3180 in a
+	//               150 s capture were "/levels", "/peak_levels" or
+	//               "/peak_hold_levels" — so a Status per frame would be pure
+	//               noise on the Wails event bus: a Status is emitted only when
+	//               one of these three actually moves.
 	//   lampsKnown  false before the first reading, and again after any Stale
 	//               Status, so coming back from grey always re-emits even if
 	//               nothing changed while the socket was quiet.
@@ -728,7 +730,7 @@ func (w *watcher) run(ctx context.Context, statusKey string, out chan<- Status) 
 
 			sv, committed := deb.Observe(node.StreamState, now)
 
-			// The emit gate. "/levels" arrives about fifteen times a second
+			// The emit gate. "/levels" arrives about ten times a second
 			// and carries nothing any lamp reads; "/statistics" carries a
 			// bitrate this package deliberately does not read at all. Emitting
 			// on every merge would put ~21 events a second on the Wails bus to

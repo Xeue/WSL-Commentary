@@ -43,8 +43,15 @@ type Options struct {
 	// Every other node in the pushed snapshot is decorative.
 	StatusKey string
 
-	// StatusInterval is how often a status snapshot is pushed to every
-	// connected WebSocket client, absent the stall fault.
+	// StatusInterval is how often the status WebSocket pushes a frame,
+	// absent the stall fault.
+	//
+	// It is NOT a snapshot interval. The socket is snapshot-then-delta
+	// (switcherdoc.go): frame 0 of a connection is the whole document and
+	// every frame after it is a subtree delta, so this is the DELTA rate.
+	// The default is 48 ms because the measured device pushed about 21
+	// frames a second; a test that wants to watch the log can slow it down
+	// without changing anything else about the protocol.
 	StatusInterval time.Duration
 
 	// TokenTTL is the lifetime handed out in expires_in on sign-in and
@@ -92,12 +99,75 @@ type Options struct {
 	// DropAudio starts the status document with an empty audio array on
 	// every push, regardless of SRT state — the MP2/AC-3 silent-drop
 	// signature (spec section 8, table row AUDIO OK).
+	//
+	// Note what it is NOT: a STOPPED input sends audio:[{"format":null}],
+	// ONE element. The empty array is a different fault and the two must
+	// stay distinguishable; see switcherdoc.go.
 	DropAudio bool
 
-	// Verbose logs every periodic status push in addition to the connection,
-	// fault and disconnection events that are always logged.
+	// DecoyDelta starts the mock sending, in place of its ordinary meter
+	// traffic, a subtree delta that a parser ignoring "path" would read as
+	// a whole node. One of decoyDeltaOff, decoyDeltaStatistics or
+	// decoyDeltaStreamState.
+	//
+	// This is the bug that condemned a working input once a second. See
+	// App.decoyFrame for what each mode sends and what a correct parser
+	// must do with it.
+	DecoyDelta string
+
+	// TransitionPush selects how a change in the -status-key node's
+	// stream_state or formats is published: transitionPushNode,
+	// transitionPushDelta or transitionPushNone.
+	//
+	// It exists because nobody knows what the real device does. No
+	// transition has ever been observed on this socket, and
+	// m2lx.resyncInterval is an explicit backstop against that being
+	// "nothing at all". transitionPushNone is how you find out whether that
+	// backstop still earns its place; see switcherdoc.go.
+	TransitionPush string
+
+	// Verbose logs the opening snapshot and a once-a-second delta summary
+	// in addition to the connection, fault and transition events that are
+	// always logged.
 	Verbose bool
 }
+
+// The DecoyDelta modes. See Options.DecoyDelta and App.decoyFrame.
+const (
+	// decoyDeltaOff sends the measured mix of meter and statistics deltas.
+	decoyDeltaOff = "off"
+
+	// decoyDeltaStatistics sends the measured trap frame — a "/statistics"
+	// delta on the status-key node — at the full frame rate. A parser that
+	// ignores "path" reads its state as a node, finds no stream_state, and
+	// condemns the one input that is actually working.
+	decoyDeltaStatistics = "statistics"
+
+	// decoyDeltaStreamState sends a state that LOOKS like a whole node —
+	// stopped, formats null — at a subtree path. A parser that ignores
+	// "path" does not merely fail to find the node, it believes the decoy
+	// and drives the lamps from it.
+	decoyDeltaStreamState = "stream-state"
+)
+
+// The TransitionPush modes. See Options.TransitionPush and
+// App.transitionFrames.
+const (
+	// transitionPushNode publishes a change as a whole-node entry at path
+	// "/". The default: it is the shape a consumer can least ambiguously
+	// act on, and the one this mock's own end-to-end test asserts against.
+	transitionPushNode = "node"
+
+	// transitionPushDelta publishes a change as "/streams" then
+	// "/stream_state" subtree deltas, so the merge in
+	// internal/m2lx/document.go is what makes the lamps move.
+	transitionPushDelta = "delta"
+
+	// transitionPushNone publishes nothing. The change is real and the
+	// socket never mentions it, so only a reconnect reveals it — the
+	// unproven worst case m2lx.resyncInterval is a backstop against.
+	transitionPushNone = "none"
+)
 
 // App is the mock's whole runtime state.
 type App struct {
@@ -119,6 +189,16 @@ type App struct {
 	stallStatus    bool
 	lieStreamState string
 	dropAudio      bool
+	decoyDelta     string
+	transitionPush string
+
+	// doc is the switcher_status document's own synthesis state: the delta
+	// sequence, the meter sweep, the frozen statistics and the last lamp
+	// reading published. It has a separate, narrower lock (switcherdoc.go)
+	// because the broadcaster touches it on every frame — up to 21 times a
+	// second — while App.mu guards auth and the fault flags, which change a
+	// handful of times a match.
+	doc *switcherDoc
 
 	// srt is the SRT listener's own state. It has a separate, narrower lock
 	// (see srt.go) because the accept loop and the per-connection reader
@@ -154,9 +234,30 @@ func NewApp(opts Options, logger *log.Logger) *App {
 		stallStatus:    opts.StallStatus,
 		lieStreamState: opts.LieStreamState,
 		dropAudio:      opts.DropAudio,
+		decoyDelta:     normaliseDecoyDelta(opts.DecoyDelta),
+		transitionPush: normaliseTransitionPush(opts.TransitionPush),
+		doc:            newSwitcherDoc(),
 		srt:            newSRTState(),
 		wsClients:      make(map[*wsClient]struct{}),
 	}
+}
+
+// normaliseDecoyDelta maps the empty Options zero value onto the "off" mode,
+// so an App built from a partially-filled Options — every test in this package
+// does that — behaves as the flag defaults do rather than as an unknown mode.
+func normaliseDecoyDelta(v string) string {
+	if v == "" {
+		return decoyDeltaOff
+	}
+	return v
+}
+
+// normaliseTransitionPush is normaliseDecoyDelta's counterpart. See there.
+func normaliseTransitionPush(v string) string {
+	if v == "" {
+		return transitionPushNode
+	}
+	return v
 }
 
 // logf writes one human-readable, timestamped log line tagged with the
@@ -233,6 +334,30 @@ func (a *App) setDropAudio(v bool) {
 	a.mu.Unlock()
 }
 
+func (a *App) getDecoyDelta() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.decoyDelta
+}
+
+func (a *App) setDecoyDelta(v string) {
+	a.mu.Lock()
+	a.decoyDelta = normaliseDecoyDelta(v)
+	a.mu.Unlock()
+}
+
+func (a *App) getTransitionPush() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.transitionPush
+}
+
+func (a *App) setTransitionPush(v string) {
+	a.mu.Lock()
+	a.transitionPush = normaliseTransitionPush(v)
+	a.mu.Unlock()
+}
+
 // resetFaults returns every fault flag to the value it had at startup. It
 // does not touch active sessions or the SRT connection.
 func (a *App) resetFaults() {
@@ -242,5 +367,7 @@ func (a *App) resetFaults() {
 	a.stallStatus = a.opts.StallStatus
 	a.lieStreamState = a.opts.LieStreamState
 	a.dropAudio = a.opts.DropAudio
+	a.decoyDelta = normaliseDecoyDelta(a.opts.DecoyDelta)
+	a.transitionPush = normaliseTransitionPush(a.opts.TransitionPush)
 	a.mu.Unlock()
 }

@@ -14,7 +14,11 @@
 //     /webrtc_token/{event}, the measured shapes of docs/test-results.md
 //     line 141 (kvs.go).
 //   - GET /api/v1/switcher_status?access_token=... — the push-only status
-//     WebSocket that is the app's sole liveness truth (status.go).
+//     WebSocket that is the app's sole liveness truth. It is
+//     SNAPSHOT-THEN-DELTA: frame 0 of a connection is the whole 36-node
+//     document at path "/", and every frame after it is a subtree delta at
+//     about 21 a second (status.go owns the connection, switcherdoc.go owns
+//     the document).
 //   - an SRT listener with the real listener's one-peer, re-accept-refusal
 //     semantics, reporting bitrate, detected PIDs and whether DTS ever goes
 //     backwards (srt.go, mpegts.go).
@@ -31,9 +35,12 @@
 //
 // Most of this program's value is in reproducing the failure modes the
 // measurements actually found. A mock that only works when everything works
-// is not worth building. See cmd/mockm2lx/README.md for a worked example of
-// the one that matters most: the re-accept refusal window that a naive
-// reconnect loop fails against.
+// is not worth building. See cmd/mockm2lx/README.md for worked examples of
+// the three that matter most: the re-accept refusal window that a naive
+// reconnect loop fails against, the subtree delta that a parser ignoring
+// "path" reads as a whole node (-decoy-delta), and the open question of
+// whether a state change is pushed on the status socket at all
+// (-transition-push).
 package main
 
 import (
@@ -75,8 +82,8 @@ func parseFlags(args []string) (Options, error) {
 	srtAddr := fs.String("srt-addr", ":4001", "SRT listen address, host:port")
 	alias := fs.String("alias", "wsl-comms-ro", "alias POST /api/local_auth/signin must be sent")
 	password := fs.String("password", "changeme", "password POST /api/local_auth/signin must be sent")
-	statusKey := fs.String("status-key", "cam7", "switcher_status node name for our router input (spec section 9)")
-	statusInterval := fs.Duration("status-interval", 2*time.Second, "how often a status snapshot is pushed")
+	statusKey := fs.String("status-key", "cam7", "switcher_status node name for our router input (spec section 9); must be one of the 24 measured router inputs, or internal/m2lx reports it as unknown — which is itself a reachable Gate A case")
+	statusInterval := fs.Duration("status-interval", 48*time.Millisecond, "how often the status socket pushes a frame; frame 0 of a connection is the whole document and every frame after it is a subtree delta, so this is the DELTA rate (measured: ~21 frames a second)")
 	tokenTTL := fs.Duration("token-ttl", m2lx.TokenLifetime, "access token lifetime handed out in expires_in")
 	srtPassphrase := fs.String("srt-passphrase", "", "SRT passphrase required of callers; empty means none required")
 	srtPBKeylen := fs.Int("srt-pbkeylen", 16, "SRT crypto key length in bytes when srt-passphrase is set: 16, 24 or 32")
@@ -84,8 +91,10 @@ func parseFlags(args []string) (Options, error) {
 	refusalWindow := fs.Duration("refusal-window", 6*time.Second, "how long, after a disconnect, the SRT listener refuses to re-accept")
 	stallStatus := fs.Bool("stall-status", false, "start with the status WebSocket stalled (connections succeed, nothing is ever pushed)")
 	lieStreamState := fs.String("lie-stream-state", "", "start reporting this stream_state regardless of SRT truth; one of streaming/starting/stopped, empty = report the truth")
-	dropAudio := fs.Bool("drop-audio", false, "start with the status document's audio array forced empty")
-	verbose := fs.Bool("verbose", false, "also log every periodic status push, not just connection/fault events")
+	dropAudio := fs.Bool("drop-audio", false, "start with the status document's audio array forced EMPTY — the MP2/AC-3 silent-drop signature, which is not the same as a stopped input's one-element array with a null format")
+	decoyDelta := fs.String("decoy-delta", decoyDeltaOff, "send a subtree delta a naive parser would mistake for a whole node: off, statistics (the measured trap frame), or stream-state (a whole-node-looking state at a subtree path)")
+	transitionPush := fs.String("transition-push", transitionPushNode, "how a stream_state/format change is published: node (whole-node entry at \"/\"), delta (/streams then /stream_state), or none (never published — only a reconnect reveals it)")
+	verbose := fs.Bool("verbose", false, "also log the opening snapshot and a once-a-second delta summary, not just connection/fault/transition events")
 
 	if err := fs.Parse(args); err != nil {
 		return Options{}, err
@@ -98,6 +107,18 @@ func parseFlags(args []string) (Options, error) {
 	case "", m2lx.StreamStateStreaming, m2lx.StreamStateStarting, m2lx.StreamStateStopped:
 	default:
 		return Options{}, fmt.Errorf("-lie-stream-state must be streaming, starting, stopped, or empty, got %q", *lieStreamState)
+	}
+	switch *decoyDelta {
+	case decoyDeltaOff, decoyDeltaStatistics, decoyDeltaStreamState:
+	default:
+		return Options{}, fmt.Errorf("-decoy-delta must be %s, %s or %s, got %q",
+			decoyDeltaOff, decoyDeltaStatistics, decoyDeltaStreamState, *decoyDelta)
+	}
+	switch *transitionPush {
+	case transitionPushNode, transitionPushDelta, transitionPushNone:
+	default:
+		return Options{}, fmt.Errorf("-transition-push must be %s, %s or %s, got %q",
+			transitionPushNode, transitionPushDelta, transitionPushNone, *transitionPush)
 	}
 	if *refusalWindow < 0 {
 		return Options{}, fmt.Errorf("-refusal-window must be >= 0")
@@ -121,6 +142,8 @@ func parseFlags(args []string) (Options, error) {
 		StallStatus:    *stallStatus,
 		LieStreamState: *lieStreamState,
 		DropAudio:      *dropAudio,
+		DecoyDelta:     *decoyDelta,
+		TransitionPush: *transitionPush,
 		Verbose:        *verbose,
 	}, nil
 }
@@ -149,6 +172,8 @@ func run(opts Options, logger *log.Logger) error {
 	mux.HandleFunc("POST /control/stall-status", a.handleControlStallStatus)
 	mux.HandleFunc("POST /control/lie", a.handleControlLie)
 	mux.HandleFunc("POST /control/drop-audio", a.handleControlDropAudio)
+	mux.HandleFunc("POST /control/decoy-delta", a.handleControlDecoyDelta)
+	mux.HandleFunc("POST /control/transition-push", a.handleControlTransitionPush)
 	mux.HandleFunc("POST /control/expire-token", a.handleControlExpireToken)
 	mux.HandleFunc("POST /control/reset", a.handleControlReset)
 
@@ -165,7 +190,17 @@ func run(opts Options, logger *log.Logger) error {
 	}
 	logger.Printf("[http] listening on %s", httpLn.Addr())
 	logger.Printf("[http]   sign-in: alias=%q password=%q", opts.Alias, opts.Password)
-	logger.Printf("[http]   status key: %q, pushed every %s", opts.StatusKey, opts.StatusInterval)
+	logger.Printf("[http]   status key: %q, one frame every %s (frame 0 per connection is the whole document, the rest are subtree deltas)",
+		opts.StatusKey, opts.StatusInterval)
+	if _, ok := lookupRouterInput(opts.StatusKey); !ok {
+		// Not fatal, and not patched over either. The mock serves the measured
+		// 36-node inventory and lets internal/m2lx report the mismatch itself,
+		// which is how StatusKeyNotFoundError — including its "names a node
+		// that is not a router input" variant — becomes reachable at Gate A.
+		logger.Printf("[http]   NOTE: %q is not one of the %d measured router inputs, so no node will carry the SRT truth "+
+			"and internal/m2lx will report it as unknown. That is a supported case, not a misconfiguration of this mock.",
+			opts.StatusKey, len(routerInputs))
+	}
 
 	errCh := make(chan error, 2)
 

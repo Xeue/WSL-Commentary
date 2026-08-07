@@ -40,9 +40,17 @@
 //     against an ENCRYPTED M2L-X output with no passphrase set. So after
 //     returnDiagnoseAfter consecutive failed attempts — never before, so a blip
 //     is silent — this file emits exactly ONE message per StartReturn saying
-//     what is being dialled and with what encryption. One message, then quiet
-//     for the rest of the session, which is not the stream of toasts the
-//     paragraph above rules out. See returnDiagnostic.
+//     what is being dialled, with what encryption, and WHY THE LAST ATTEMPT
+//     FAILED. One message, then quiet for the rest of the session, which is not
+//     the stream of toasts the paragraph above rules out. See returnDiagnostic.
+//
+//     The last part of that used to be missing. libsrt names the two ways
+//     encryption goes wrong — ERROR:BADSECRET and ERROR:UNSECURE — and this
+//     file could only guess between them, because gst.ReturnOpts had no
+//     callback to carry the reason out of internal/gst. It has one now
+//     (gst.ReturnOpts.OnConnectError), so the message says what libsrt said
+//     rather than what this process could infer, and an unrecognised reason is
+//     quoted verbatim rather than summarised into a guess.
 //
 // # And one thing it refuses to do
 //
@@ -57,6 +65,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"wslcomms/internal/config"
@@ -88,6 +97,45 @@ const returnDiagnoseAfter = 3
 type returnSession struct {
 	mon gst.ReturnMonitor
 	wg  sync.WaitGroup
+}
+
+// returnReason carries the reason for the most recent failed attempt from the
+// goroutine that learns it to the goroutine that speaks.
+//
+// Those are two different goroutines and always will be.
+// gst.ReturnOpts.OnConnectError is called on the monitor's own reconnect loop;
+// forwardReturnStates runs on a goroutine of this file's making, ranging over
+// the state channel. Passing the error in a plain field would be a data race on
+// the first failed attempt, and the race detector runs on every build.
+//
+// The ORDER is guaranteed by internal/gst rather than assumed here: the monitor
+// calls the callback immediately before it emits ReturnStateBackoff, and that
+// emission is the channel send this file's forwarder is waiting on. So by the
+// time the forwarder counts the failure, the reason for it has been stored.
+//
+// It keeps only the latest reason, not a history. Exactly one message is emitted
+// per session and what the operator needs in it is why the attempt that has just
+// failed failed.
+type returnReason struct {
+	mu  sync.Mutex
+	err error
+}
+
+// set records the reason. It is the function handed to
+// gst.ReturnOpts.OnConnectError, so it runs on the monitor's state-machine
+// goroutine and must not block: a mutex held for one assignment is the whole
+// budget.
+func (r *returnReason) set(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.mu.Unlock()
+}
+
+// get returns the latest reason, or nil if none has arrived.
+func (r *returnReason) get() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +233,17 @@ func (a *App) StartReturn() error {
 	mon := a.newReturnMonitor()
 	opts := a.returnOpts(cfg, passphrase)
 
+	// Wired in BEFORE Start, because Start begins dialling and the first attempt
+	// can fail before this function has returned. A callback attached afterwards
+	// would miss it.
+	//
+	// It is reason.set and nothing more. The callback runs on the monitor's
+	// reconnect loop — the only goroutine that can get the return back — so
+	// anything that formats a message, takes retStateMu or touches the event pump
+	// belongs on the forwarder's side of this handoff, not here.
+	reason := &returnReason{}
+	opts.OnConnectError = reason.set
+
 	if err := mon.Start(opts); err != nil {
 		// gst.ReturnMonitor.Start only fails on a configuration it cannot use,
 		// and it leaves nothing running when it does — a monitor whose Start
@@ -194,12 +253,14 @@ func (a *App) StartReturn() error {
 	}
 
 	sess := &returnSession{mon: mon}
-	// The diagnostic is built HERE, from the options actually handed to the
-	// monitor, and captured by the forwarder below. Building it from a fresh
-	// config snapshot later would describe whatever the operator had saved by
-	// then rather than what the running pipeline is dialling, which is exactly
-	// the confusion it exists to end.
-	diag := returnDiagnostic(opts)
+	// The forwarder is given THESE options, the ones actually handed to the
+	// monitor, by value. Reading a fresh config snapshot when the message is
+	// composed would describe whatever the operator had saved by then rather than
+	// what the running pipeline is dialling, which is exactly the confusion the
+	// message exists to end.
+	//
+	// The message itself is composed later rather than here, because half of it
+	// is the reason for a failure that has not happened yet.
 	sess.wg.Add(1)
 	// Started only after Start has succeeded, for the same reason the sender's
 	// forwarder is: on failure the monitor's loop never launches, its states
@@ -207,7 +268,7 @@ func (a *App) StartReturn() error {
 	// goroutine leaked per failed StartReturn.
 	go func() {
 		defer sess.wg.Done()
-		a.forwardReturnStates(mon.States(), diag)
+		a.forwardReturnStates(mon.States(), opts, reason)
 	}()
 	a.ret = sess
 
@@ -360,33 +421,51 @@ func (a *App) returnPassphrase(cfg *config.Config) (string, error) {
 // Saying why the return will not connect
 // ---------------------------------------------------------------------------
 
+// The two libsrt rejection tokens this file can turn into an instruction.
+//
+// They are matched case-insensitively as SUBSTRINGS, and they are matched at
+// all only because they were measured against this instance — the encryption
+// trials recorded in docs/architecture.md produced clean ERROR:UNSECURE and
+// ERROR:BADSECRET rejections. gst.ReturnOpts.OnConnectError's documentation is
+// explicit that the reason text is not a stable interface: it is a GStreamer
+// message wrapped round libsrt's own wording and it changes between versions.
+//
+// That is survivable precisely because nothing here depends on a match. A
+// reason that matches neither is quoted verbatim, which is the honest answer
+// and is also what a future rename degrades to, rather than a wrong one.
+const (
+	srtRejectBadSecret = "BADSECRET"
+	srtRejectUnsecure  = "UNSECURE"
+)
+
 // returnDiagnostic renders the one message emitted after returnDiagnoseAfter
 // consecutive failed attempts: what is being dialled, with what encryption, and
-// which way the encryption could be wrong.
+// why the last attempt failed.
 //
-// # Why it says this and not what libsrt said
+// # Where each half comes from
 //
-// libsrt knows the actual answer and distinguishes the two cases by name —
-// ERROR:BADSECRET when a passphrase was offered and rejected, ERROR:UNSECURE
-// when the two ends disagree about whether there should be one at all. That
-// reason reaches internal/gst, which logs it in returnMonitor.report and then
-// discards it: gst.ReturnOpts has no OnConnectError callback, the way
-// sender.Opts does for the contribution path, so there is no route for it to
-// reach this file or the operator's screen. Contract rule 3 says report an
-// interface gap rather than edit round it, so it is REPORTED: gst.ReturnOpts
-// wants an OnConnectError func(error), and until it has one the raw libsrt
-// reason is in the log only.
+// The first half is what this process knows for certain — the endpoint it
+// dialled and the encryption it offered — and it is said whatever the reason
+// turns out to be, because "wrong passphrase" is only actionable next to which
+// passphrase was offered to which port.
 //
-// What is said instead is only what this process can actually observe: the
-// endpoint it dialled, the encryption it offered, and the fact that N attempts
-// in a row failed. No error string is invented and no cause is asserted. The
-// wording names encryption as the thing to check because it is the one input
-// the operator controls that fails exactly like this — silently, identically,
-// for ever — and because the two ways of getting it wrong are the two the
-// message enumerates.
+// The second half is libsrt's, by way of gst.ReturnOpts.OnConnectError. It used
+// to be absent: internal/gst logged the reason and discarded it, this file
+// could only enumerate the two ways encryption goes wrong and invite the
+// operator to guess between them, and the message ended by pointing at a log
+// file. See returnReasonText for what is now done with it, and for the rule
+// that an unrecognised reason is quoted rather than summarised.
 //
-// opts carries the passphrase and is taken BY VALUE and read for one boolean.
-// Nothing in the returned string is derived from its contents.
+// reason is nil when no attempt has reported one — a caller that set no
+// callback, or a monitor whose states arrived without one. That is not treated
+// as an error; the old inferred wording is what the message falls back to,
+// because it was useful before the reason existed and it is still useful
+// without it.
+//
+// opts carries the passphrase and is taken BY VALUE. Two things are read from
+// it: whether the passphrase is empty, and the passphrase itself, used only to
+// redact it back out of a string this process did not compose. See
+// redactPassphrase.
 //
 // The key length is restated here rather than read straight out of opts because
 // opts has NOT been through gst.ReturnOpts.normalise: Start takes its argument
@@ -394,7 +473,7 @@ func (a *App) returnPassphrase(cfg *config.Config) (string, error) {
 // back. normalise turns a passphrase with a zero key length into AES-128, and a
 // message that reported "AES-0" for the session actually being negotiated would
 // send the operator looking for a setting that is not wrong.
-func returnDiagnostic(opts gst.ReturnOpts) string {
+func returnDiagnostic(opts gst.ReturnOpts, reason error) string {
 	endpoint := fmt.Sprintf("srt://%s:%d", opts.Host, opts.Port)
 
 	keylen := opts.PBKeyLen
@@ -402,21 +481,133 @@ func returnDiagnostic(opts gst.ReturnOpts) string {
 		keylen = 16 // gst.ReturnOpts.normalise's default; see above
 	}
 
-	if opts.Passphrase == "" {
-		return fmt.Sprintf(
-			"the SRT return has failed to connect %d times in a row. It is dialling %s with NO "+
-				"encryption. If that M2L-X output has a passphrase set, every handshake will keep "+
-				"being refused: set the SRT return passphrase and key length on the Settings screen. "+
-				"The exact reason libsrt gave is in the application log",
-			returnDiagnoseAfter, endpoint)
+	head := fmt.Sprintf(
+		"the SRT return has failed to connect %d times in a row. It is dialling %s with NO encryption",
+		returnDiagnoseAfter, endpoint)
+	if opts.Passphrase != "" {
+		head = fmt.Sprintf(
+			"the SRT return has failed to connect %d times in a row. It is dialling %s with AES-%d encryption",
+			returnDiagnoseAfter, endpoint, keylen*8)
 	}
-	return fmt.Sprintf(
-		"the SRT return has failed to connect %d times in a row. It is dialling %s with AES-%d "+
-			"encryption. If that passphrase is wrong, or if that M2L-X output is not encrypted at "+
-			"all, every handshake will keep being refused: check the SRT return passphrase and key "+
-			"length on the Settings screen. Note that it is a different passphrase from the "+
-			"contribution feed's. The exact reason libsrt gave is in the application log",
-		returnDiagnoseAfter, endpoint, keylen*8)
+
+	return head + ". " + returnReasonText(opts, reason)
+}
+
+// returnReasonText is the second half of the diagnostic: what the last failed
+// attempt actually reported, turned into an instruction where that can be done
+// honestly and quoted where it cannot.
+//
+// # The three shapes
+//
+// ERROR:BADSECRET and ERROR:UNSECURE are the two libsrt names an operator can
+// be given an instruction for, and the instruction differs by what WE offered,
+// which this process does know:
+//
+//   - BADSECRET means a passphrase was offered and the far end is configured
+//     with a different one. There is exactly one fix and it is a field on the
+//     Settings screen.
+//   - UNSECURE means the two ends disagree about whether the session is
+//     encrypted at all. Which end is wrong is not in the reason — but combined
+//     with what we offered it is determined: if we offered nothing, that output
+//     wants a passphrase; if we offered one, that output is not encrypted.
+//
+// Anything else is QUOTED, exactly as it arrived, and said to be unrecognised.
+// That is deliberate and it is the more important of the two branches. The
+// reasons that reach here are not only libsrt's — a missing plugin, a headphone
+// endpoint that has gone away, an M2L-X output that is up and carrying no AAC
+// all arrive by the same route — and a message that mapped one of those onto
+// "check your passphrase" would send the operator to a setting that is correct
+// and cost another afternoon. A string they can paste into a search box is
+// worth more than a confident wrong summary.
+//
+// Every branch ends with the verbatim reason, including the two that name a
+// cause, so that a support engineer reading a screenshot has the original text
+// and not this file's paraphrase of it.
+func returnReasonText(opts gst.ReturnOpts, reason error) string {
+	const settings = "The SRT return has its own passphrase and its own key length on the Settings screen, " +
+		"separate from the contribution feed's."
+
+	if reason == nil {
+		// No reason arrived. Say what can be inferred, and say that it is an
+		// inference — this is the wording the message carried before libsrt's
+		// answer could reach it.
+		if opts.Passphrase == "" {
+			return "No reason was reported for the last attempt. If that M2L-X output has a passphrase " +
+				"set, every handshake will keep being refused: set the SRT return passphrase and key " +
+				"length on the Settings screen. The exact reason is in the application log"
+		}
+		return "No reason was reported for the last attempt. If that passphrase is wrong, or if that " +
+			"M2L-X output is not encrypted at all, every handshake will keep being refused: check " +
+			"the SRT return passphrase and key length on the Settings screen. Note that it is a " +
+			"different passphrase from the contribution feed's. The exact reason is in the " +
+			"application log"
+	}
+
+	text := redactPassphrase(reason.Error(), opts.Passphrase)
+	upper := strings.ToUpper(text)
+	quoted := " The reason, exactly as it arrived: " + text
+
+	switch {
+	case strings.Contains(upper, srtRejectBadSecret):
+		return "libsrt refused the handshake with ERROR:BADSECRET, which means the passphrase offered " +
+			"does not match the one that M2L-X output is configured with. " + settings + quoted
+
+	case strings.Contains(upper, srtRejectUnsecure):
+		if opts.Passphrase == "" {
+			return "libsrt refused the handshake with ERROR:UNSECURE, which means that M2L-X output " +
+				"requires encryption and this return offered none. Set the SRT return passphrase " +
+				"and key length on the Settings screen. " + settings + quoted
+		}
+		return "libsrt refused the handshake with ERROR:UNSECURE, which means the two ends disagree " +
+			"about whether this session is encrypted: a passphrase was offered and that M2L-X " +
+			"output is not encrypted at all. Set the SRT return key length to 0 and clear the " +
+			"return passphrase. " + settings + quoted
+
+	default:
+		return "It is not a reason this application recognises, so it is reproduced rather than " +
+			"summarised — search for it as it stands." + quoted
+	}
+}
+
+// srtMinPassphraseLen is libsrt's own minimum for SRTO_PASSPHRASE. Anything
+// shorter is rejected by srt_setsockflag with SRT_EINVPARAM and cannot form an
+// encrypted session at all, whatever config.json says.
+const srtMinPassphraseLen = 10
+
+// redactPassphrase removes the SRT return passphrase from a string this process
+// did not compose.
+//
+// It should never have anything to do. internal/gst sets the passphrase with
+// g_object_set, never puts it in a URI, and documents on
+// gst.ReturnOpts.OnConnectError that the reason cannot contain it; on
+// everything measured this replaces nothing at all.
+//
+// It is done anyway because this is the one place in the application where a
+// secret and a string from somebody else's library meet, and the result goes
+// straight to emitError — which writes it to the log AND pushes it across the
+// Wails boundary into the WebView. Whether the passphrase can appear in a
+// support bundle should not depend on a third party's error formatting staying
+// as it is.
+//
+// # Why the length test, which is not paranoia about nothing
+//
+// A blind ReplaceAll is worse than no redaction. Written that way and given the
+// two-character passphrase a test happened to use, it turned
+//
+//	Error on SRT socket: Connection setup failure: ERROR:BADSECRET
+//
+// into "Error on SRT soc[…]et: …" — corrupting the one thing the verbatim
+// branch exists to preserve, in the message an operator is meant to search for.
+// A substring long enough to be a legal SRT passphrase is not going to occur by
+// accident in a GStreamer error; a two-character one occurs constantly. So this
+// only acts where a match means what it says, and a value too short to be a
+// passphrase libsrt would accept is left alone — it cannot be encrypting
+// anything, so there is nothing to protect.
+func redactPassphrase(s, passphrase string) string {
+	if len(passphrase) < srtMinPassphraseLen {
+		return s
+	}
+	return strings.ReplaceAll(s, passphrase, "[return passphrase redacted]")
 }
 
 // forwardReturnStates pumps the monitor's state transitions to the frontend and
@@ -443,10 +634,24 @@ func returnDiagnostic(opts gst.ReturnOpts) string {
 // and an operator who stops and starts the return has said they want to be told
 // again.
 //
-// diag is emitted at most once, on the returnDiagnoseAfter'th consecutive
-// failure. It carries no secret: returnDiagnostic builds it from the endpoint
-// and the key length only.
-func (a *App) forwardReturnStates(states <-chan gst.ReturnState, diag string) {
+// # The message
+//
+// It is emitted at most once, on the returnDiagnoseAfter'th consecutive
+// failure, and it is composed at that moment rather than when the session
+// started, because half of it is the reason the last attempt failed and that is
+// not known until it has.
+//
+// opts is the snapshot handed to the monitor; reason is filled in by the
+// monitor's own goroutine through gst.ReturnOpts.OnConnectError. Reading it
+// here is safe and correctly ordered: the callback runs immediately before the
+// ReturnStateBackoff that this loop is receiving, so the reason for a failure
+// is always stored before the failure is counted. See returnReason.
+//
+// Neither the message nor the event carries a secret. opts holds the
+// passphrase; returnDiagnostic reads it only to redact it back out of libsrt's
+// reason, and TestTheDiagnosticNeverCarriesThePassphrase asserts that end to
+// end, over the log as well as the event.
+func (a *App) forwardReturnStates(states <-chan gst.ReturnState, opts gst.ReturnOpts, reason *returnReason) {
 	failures := 0
 	said := false
 
@@ -470,7 +675,7 @@ func (a *App) forwardReturnStates(states <-chan gst.ReturnState, diag string) {
 			said = true
 			// Emitted AFTER the state, so the RETURN lamp is already showing
 			// BACKOFF when the explanation for it arrives.
-			a.emitError(errors.New("wslcomms: " + diag))
+			a.emitError(errors.New("wslcomms: " + returnDiagnostic(opts, reason.get())))
 		}
 	}
 }

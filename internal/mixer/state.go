@@ -39,18 +39,78 @@ import (
 // buses and no strips, i.e. "nothing is routed to the clean feed".
 const mixerNodeName = "advanced_audio_mixer"
 
+// wholeNodePath is the "path" of a status entry that carries a node's ENTIRE
+// state, and the only value this parser will read a mixer node from.
+//
+// THE NODE NAME IS NOT ENOUGH, and matching on it alone was a live defect in
+// this file. MEASURED, in the 3180-frame capture recorded at the top of
+// internal/m2lx/wire.go: switcher_status is a SNAPSHOT-THEN-DELTA socket. The
+// first frame after a connection opens carries all 36 nodes, every entry at
+// "/", every state complete. Every frame after it carries ONE entry whose
+// "path" addresses a SUBTREE of one node and whose "state" is the value AT
+// THAT PATH — not the node. On this node in particular the deltas are
+// relentless: "/levels" alone arrived 1501 times in 150 seconds, i.e. ten
+// a second, and internal/m2lx/testdata/switcher_status-delta-levels-2026-08-01.json
+// is one of them, captured verbatim.
+//
+// Read as a whole node, that entry makes the mixer's entire state
+// {"levels":{...}} — no "matrix", no "inputs", so no strips and no routing.
+// The drawer renders that as "nothing is in the clean feed", which is the most
+// dangerous false statement this package can make, and the ONLY thing standing
+// between the two was ParseWarning.Critical on "matrix": a caller following the
+// documented handling — render the Snapshot AND the warnings — would have drawn
+// an empty matrix. So the path is tested here, in the parser, and not only at
+// whichever call site remembered to.
+//
+// It mirrors internal/m2lx/wire.go's constant of the same name and value. The
+// two packages parse the same socket and neither can reach the other's
+// unexported half; sharing it would mean exporting protocol trivia from a
+// package whose contract is deliberately about mixers, not about wire formats.
+const wholeNodePath = "/"
+
 // displayNameField is the key carrying an operator-facing name on a per-input
 // status node, e.g. the "cam22" node's "CLAUDE-COMMS". See Strip.DisplayName.
 const displayNameField = "display_name"
 
-// ErrNoMixerNode is returned when a frame contains no advanced_audio_mixer
-// entry.
+// ErrNoMixerNode is returned when a frame carries no WHOLE advanced_audio_mixer
+// entry — because it has none at all, or because the only one it has is a
+// subtree delta. See wholeNodePath for why the second case is the same failure
+// as the first, and errPartialMixerNode for the error that reports it: that one
+// wraps this, so errors.Is keeps "this frame has no mixer state I can use" a
+// single condition to test for.
 //
 // This is a hard error and never a degraded empty Snapshot, for the reason
 // given on ParseSnapshot: a Snapshot with no strips renders as "nothing is
 // routed to the clean feed", which is the most dangerous false statement this
 // drawer can make. Callers must show the error, not an empty mixer.
 var ErrNoMixerNode = errors.New("mixer: frame contains no " + mixerNodeName + " node")
+
+// errPartialMixerNode reports a frame whose only advanced_audio_mixer entry is
+// a subtree delta.
+//
+// It names the path, because "/levels" and "/peak_levels" mean the frame is
+// simply a mid-stream push and the caller wants the next whole-document frame,
+// whereas a path nobody has seen before means the device's vocabulary has moved
+// and somebody should look. Both are the same refusal; only the diagnosis
+// differs, and an error that will not say which is which wastes the one clue
+// the frame gave.
+func errPartialMixerNode(path string) error {
+	return fmt.Errorf("mixer: the frame carries %s only as %s, not its whole state; "+
+		"the state of such an entry is the value at that path, so reading it as the node "+
+		"would show a mixer with no strips and no routing, i.e. %q: %w",
+		mixerNodeName, describeDeltaPath(path), "nothing is in the clean feed", ErrNoMixerNode)
+}
+
+// describeDeltaPath renders a delta's path for an operator-facing message. An
+// absent or unreadable path is named as such rather than printed as an empty
+// pair of quotes, which reads like a bug in the message rather than a fact
+// about the frame.
+func describeDeltaPath(path string) string {
+	if path == "" {
+		return `an entry with no readable "path"`
+	}
+	return fmt.Sprintf("a %q subtree update", path)
+}
 
 // ParseWarning is one field the parser could not read, or read only partly.
 //
@@ -145,8 +205,10 @@ func (e *ParseError) CriticalWarnings() []ParseWarning {
 // should.
 //
 // The error result is non-nil ONLY when no usable Snapshot could be produced at
-// all — the bytes are not JSON, or there is no mixer node (ErrNoMixerNode). Any
-// other problem is a warning against a Snapshot that is still worth rendering.
+// all — the bytes are not JSON, or the frame carries no WHOLE mixer node, which
+// covers both "no such entry" and "the only entry for it is a subtree delta"
+// and is ErrNoMixerNode either way (see wholeNodePath). Any other problem is a
+// warning against a Snapshot that is still worth rendering.
 // Warnings are returned even alongside a fatal error, because the warnings
 // collected before the failure usually say why it failed.
 //
@@ -170,10 +232,14 @@ func ParseSnapshotWithWarnings(raw []byte) (Snapshot, []ParseWarning, error) {
 		return Snapshot{}, nil, fmt.Errorf("mixer: parse switcher_status frame: %w", err)
 	}
 
-	mixerState, displayNames := c.indexNodes(frame.Status)
-	if mixerState == nil {
+	idx := c.indexNodes(frame.Status)
+	if idx.mixerState == nil {
+		if idx.sawDelta {
+			return Snapshot{}, c.sorted(), errPartialMixerNode(idx.deltaPath)
+		}
 		return Snapshot{}, c.sorted(), ErrNoMixerNode
 	}
+	mixerState, displayNames := idx.mixerState, idx.displayNames
 
 	snap := Snapshot{TakenAt: c.frameTime(frame.Timestamp)}
 
@@ -271,9 +337,34 @@ func (c *collector) sorted() []ParseWarning {
 
 // ============================== frame walking ===============================
 
+// nodeIndex is what one pass over the status array found.
+//
+// It is a struct rather than a handful of results because two of its fields
+// exist only to explain the absence of the first, and a caller that has to
+// remember which of four returned values means "the mixer was there but only as
+// a delta" will eventually stop checking it — which is precisely how the bug
+// wholeNodePath describes survived.
+type nodeIndex struct {
+	// mixerState is the mixer node's WHOLE state, or nil if the frame carried
+	// none. A subtree delta never lands here.
+	mixerState map[string]json.RawMessage
+
+	// displayNames maps an input's wire name to the operator-facing name from
+	// its own status node, e.g. "cam22" -> "CLAUDE-COMMS".
+	displayNames map[string]string
+
+	// sawDelta records that an entry named the mixer node at a path other than
+	// "/", and deltaPath and deltaAt are that entry's path and its position in
+	// the status array. The FIRST such entry wins, so the message a frame
+	// produces does not depend on how many deltas it happened to carry.
+	sawDelta  bool
+	deltaPath string
+	deltaAt   string
+}
+
 // indexNodes makes one pass over the status array, returning the mixer node's
-// state and the input-name -> operator-facing-name map built from every OTHER
-// node's display_name.
+// whole state and the input-name -> operator-facing-name map built from every
+// OTHER node's display_name.
 //
 // Both results come from the same pass because the display-name join is the
 // whole reason ParseSnapshot takes the entire frame rather than the mixer node:
@@ -281,17 +372,30 @@ func (c *collector) sorted() []ParseWarning {
 // (MEASURED: strip cam22-1 has "display_name":"cam22-1"), while the name a
 // human recognises — "CLAUDE-COMMS" — is on the per-input node "cam22".
 //
+// ONLY WHOLE-NODE ENTRIES ARE READ, mixer node and display names alike. See
+// wholeNodePath for the mixer half, which is the dangerous one. The display
+// names are held to the same rule for a smaller but real reason: an entry's
+// state is the value at its path, so a delta at, say, "/streams" whose value
+// happened to carry a display_name key would otherwise be harvested as the
+// NODE's display name and put a wrong, plausible label on a strip — and a
+// drawer that exists to let an operator find their own feed by its name must
+// not invent one. Nothing observed does this; the rule costs one condition and
+// removes the whole question.
+//
 // A malformed element is skipped with a warning rather than aborting the pass,
-// so one bad node cannot cost the mixer node that follows it.
-func (c *collector) indexNodes(status []json.RawMessage) (map[string]json.RawMessage, map[string]string) {
-	var mixerState map[string]json.RawMessage
-	displayNames := make(map[string]string, len(status))
+// so one bad node cannot cost the mixer node that follows it. A delta is
+// skipped SILENTLY: deltas are the normal traffic on this socket, roughly
+// twenty entries a second, and warning about each would drown the warnings that
+// mean something in the ones that mean "the socket is working".
+func (c *collector) indexNodes(status []json.RawMessage) nodeIndex {
+	idx := nodeIndex{displayNames: make(map[string]string, len(status))}
 
 	for i, element := range status {
 		path := fmt.Sprintf("status[%d]", i)
 
 		var node struct {
 			Node  json.RawMessage `json:"node"`
+			Path  json.RawMessage `json:"path"`
 			State json.RawMessage `json:"state"`
 		}
 		if err := json.Unmarshal(element, &node); err != nil {
@@ -303,6 +407,21 @@ func (c *collector) indexNodes(status []json.RawMessage) (map[string]json.RawMes
 			c.warn(path+".node", "node name is not a string")
 			continue
 		}
+
+		entryPath, whole := readEntryPath(node.Path)
+		if !whole {
+			// Remembered, not warned about, and only for the mixer: it is the
+			// difference between "this frame has no mixer in it" and "this
+			// frame is a mid-stream meter push", which are the same refusal
+			// with very different next steps for whoever reads the error.
+			if name == mixerNodeName && !idx.sawDelta {
+				idx.sawDelta = true
+				idx.deltaPath = entryPath
+				idx.deltaAt = path
+			}
+			continue
+		}
+
 		state, err := decodeObject(node.State)
 		if err != nil {
 			c.warn(path+".state", "state of node %q is not an object: %v", name, err)
@@ -310,14 +429,14 @@ func (c *collector) indexNodes(status []json.RawMessage) (map[string]json.RawMes
 		}
 
 		if name == mixerNodeName {
-			if mixerState != nil {
+			if idx.mixerState != nil {
 				// Two mixer nodes in one frame is not something the device has
 				// been seen to do; if it ever happens, silently taking the last
 				// one would make the drawer's contents depend on array order.
 				c.warn(path, "duplicate %s node ignored; using the first", mixerNodeName)
 				continue
 			}
-			mixerState = state
+			idx.mixerState = state
 			continue
 		}
 
@@ -331,10 +450,46 @@ func (c *collector) indexNodes(status []json.RawMessage) (map[string]json.RawMes
 			continue
 		}
 		if display = strings.TrimSpace(display); display != "" {
-			displayNames[name] = display
+			idx.displayNames[name] = display
 		}
 	}
-	return mixerState, displayNames
+
+	// A frame carrying the mixer node BOTH whole and as a delta has never been
+	// observed — the opening snapshot and the deltas that follow it are
+	// different frames — and the whole node is used, because a partial value
+	// can never be preferred to a complete one. It is reported because the two
+	// disagree by construction: the delta is the newer reading of its subtree,
+	// so a meter drawn from this frame may be one push stale. Not critical:
+	// routing lives in "matrix", which a levels delta does not touch.
+	if idx.mixerState != nil && idx.sawDelta {
+		c.warn(idx.deltaAt, "%s also arrived as %s in the same frame; the whole-node entry is used and the update ignored",
+			mixerNodeName, describeDeltaPath(idx.deltaPath))
+	}
+	return idx
+}
+
+// readEntryPath decodes a status entry's "path" and reports whether it
+// addresses the WHOLE node.
+//
+// Anything that is not exactly "/" is treated as a subtree: an absent path, an
+// empty one, a path that is not a string at all, and any real path such as
+// "/levels". That is deliberately fail-closed and it is not symmetric with the
+// rest of this file, where a field of the wrong type degrades to a warning. The
+// asymmetry is the point — every other tolerated oddity costs one field, while
+// getting this one wrong costs the whole matrix and shows an operator a clean
+// feed that is not clean. A device that starts omitting "path" will produce a
+// loud refusal here rather than a quiet empty mixer, and that is the right way
+// round.
+//
+// The path is returned even when it is not whole so the caller can name it in
+// the error; an unreadable one comes back as "", which describeDeltaPath
+// renders as such.
+func readEntryPath(raw json.RawMessage) (string, bool) {
+	value, ok := decodeString(raw)
+	if !ok {
+		return "", false
+	}
+	return value, value == wholeNodePath
 }
 
 // frameTime converts the frame's own timestamp to a time.Time.
