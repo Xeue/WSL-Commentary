@@ -9,10 +9,25 @@ import { createSettingsView } from './settings.js';
 import { createMixerHost } from './mixerhost.js';
 import {
   RETURN_SOURCE_SRT,
+  RETURN_SOURCE_WEBRTC,
   DEFAULT_RETURN_SOURCE,
-  normaliseReturnSource,
   deriveReturnSourceEffects,
 } from './returnsource.js';
+// The PICTURE source. Separate module, separate control, and deliberately
+// nothing to do with the one above: SRT carries the picture and Kinesis carries
+// the audio, and the whole reason this pair of modules is two modules is that
+// they were once one and the operator lost their audio to it.
+import {
+  PICTURE_SOURCE_SRT,
+  PICTURE_SOURCE_MOSAIC,
+  PICTURE_SOURCE_KEY,
+  DEFAULT_PICTURE_SOURCE,
+  PICTURE_STATE_STOPPED,
+  normalisePictureSource,
+  derivePictureSourceEffects,
+} from './picturesource.js';
+// The native overlay's geometry and its visibility rules.
+import { createOverlay, BLOCK_SETTINGS, BLOCK_MIXER, BLOCK_HIDDEN } from './overlay.js';
 // The return path state machine. Every stop, start, mute and un-mute of either
 // return path goes through it — this file no longer calls startReturn,
 // stopReturn or setAudioEnabled itself, and must not start again. See the header
@@ -88,13 +103,13 @@ export function mountApp(root) {
 
   const home = createHomeView({
     onSettings: showSettings,
-    onMixer: () => mixerHost.toggle(),
+    onMixer: () => toggleMixer(),
     onStartStop: onStartStopClick,
     onInputChange: onInputChange,
     onHeadphoneChange: onHeadphoneChange,
     onReturnChange: onReturnChange,
     onReturnChannelChange: onReturnChannelChange,
-    onReturnSourceChange: onReturnSourceChange,
+    onPictureSourceChange: onPictureSourceChange,
     onLevelChange: onLevelChange,
   });
 
@@ -112,8 +127,95 @@ export function mountApp(root) {
   root.append(home.el, settings.el, mixerMount);
   home.setDevBadge(backend.usingFakeBackend);
 
+  // --- the picture ----------------------------------------------------------
+  //
+  // ===================== THE PICTURE COMES FROM SRT ==========================
+  //
+  // A native child window, decoding H.265 from M2L-X Output 1 (src=pgm, port
+  // 40501, 1920x1080 50p), painted OVER this page. The frontend's whole job is
+  // to reserve a rectangle, describe it in physical pixels, and say when it must
+  // be hidden.
+  //
+  // ===================== THE AUDIO COMES FROM KINESIS ========================
+  //
+  // Unchanged, and NOT REACHABLE FROM THE PICTURE CONTROL. Every function in
+  // this section may be read with that in mind: none of them calls into
+  // returnPath, none of them touches the monitor's audio, and none of them
+  // writes returnSource. The previous revision made SRT an audio path, which is
+  // the opposite of what was asked for, and selecting it silenced the operator.
+  //
+  /** 'srt' | 'mosaic' — which picture the operator has asked for. */
+  let currentPictureSource = DEFAULT_PICTURE_SOURCE;
+  /** The last "picture" event, or null before one has arrived. */
+  let currentPictureState = null;
+  /** Whether this build has the five native picture bindings at all. */
+  let pictureBindingsPresent = false;
+
+  /**
+   * pictureFault reports a failure of the native picture ONCE, to the console,
+   * and not as a banner.
+   *
+   * The mosaic is still on screen and the commentator still has a picture, so
+   * this is a degradation and not an outage. A red banner for every failed
+   * SetPictureRect against a build that has no such binding is how people learn
+   * to ignore the banner that matters.
+   */
+  let lastPictureFault = '';
+  function pictureFault(err) {
+    const message = String(err?.message || err);
+    if (message === lastPictureFault) return;
+    lastPictureFault = message;
+    console.info('wslcomms: the native picture overlay is not answering:', message);
+  }
+
+  /**
+   * overlay owns the rectangle and the visibility rule. It is pure; everything
+   * effectful is here.
+   *
+   * setRect and setVisible are fire-and-forget with a catch. They cannot be
+   * awaited: they are driven from a ResizeObserver and a resize listener, and a
+   * chain of awaited IPC calls behind a resize is how a window drag turns into a
+   * queue of stale rectangles arriving after the user has stopped moving.
+   */
+  const overlay = createOverlay({
+    measure: () => home.measurePictureRect(),
+    // Read FRESH on every sync rather than captured: a DPI change alters this
+    // number without moving the CSS box by a pixel, and a captured ratio would
+    // keep reporting the old geometry as correct.
+    dpr: () => (typeof window !== 'undefined' && window.devicePixelRatio) || 1,
+    // CSS pixels and the ratio, together, because that is what
+    // App.SetPictureRect takes: gst.ScaleRect multiplies on the Go side, since
+    // the ratio Go could read for itself — GetDpiForWindow — is the monitor's
+    // scale factor and not the WebView's, and Ctrl+scroll moves one without the
+    // other. The physical rectangle is computed here too, but only to decide
+    // whether to send and what to log.
+    setRect: (css, dpr) => {
+      Promise.resolve()
+        .then(() => backend.setPictureRect(css, dpr))
+        .catch(pictureFault);
+    },
+    setVisible: (on) => {
+      Promise.resolve()
+        .then(() => backend.setPictureVisible(on))
+        .catch(pictureFault);
+    },
+    log: (message) => console.info(message),
+  });
+
   const mixerHost = createMixerHost({
     mount: mixerMount,
+    // THE DRAWER MUST NEVER BE UNDER THE PICTURE OVERLAY. The overlay is a
+    // native child window: it is opaque, it is outside the page's stacking
+    // context, and no z-index in mixer.css reaches it. A drawer opened
+    // underneath it is a routing matrix an operator can read two thirds of and
+    // click all of.
+    //
+    // This fires for a drawer closed from inside itself as well — its Close
+    // button, the scrim, Escape — none of which app.js is otherwise told about.
+    onOpenChange: (open) => {
+      if (open) overlay.block(BLOCK_MIXER);
+      else overlay.unblock(BLOCK_MIXER);
+    },
     onStatus: (message, isError) => {
       if (!message) return;
       // The host's own failures — arming, polling — reach the operator through
@@ -148,9 +250,12 @@ export function mountApp(root) {
     isNotRunning: backend.isReturnNotRunningError,
     showError: (message) => home.showError(message),
     log: (message) => console.info(message),
+    // There is no control on screen to keep in step any more: the audio path is
+    // fixed at Kinesis and the picture control cannot reach this machine. What
+    // is left is the mirror the rest of this file reads, and the Headphones
+    // list, which is chosen by identifier space rather than by preference.
     onSource: (source) => {
       currentReturnSource = source;
-      home.setReturnSource(source);
       renderHeadphoneList();
     },
   });
@@ -180,6 +285,14 @@ export function mountApp(root) {
     // modal, and one that outlived the screen it was opened from is a write
     // path nobody can see.
     mixerHost.close();
+    // AND IT MUST NOT BE OPENED BEHIND THE PICTURE OVERLAY EITHER. Two separate
+    // reasons are raised, and both have to be released before the picture comes
+    // back: BLOCK_SETTINGS because Settings is on screen, BLOCK_HIDDEN because
+    // the home view — and with it the rectangle the overlay was measured
+    // against — is not. Hiding on one reason and showing on the other's release
+    // is precisely the bug the reason SET exists to make unwritable.
+    overlay.block(BLOCK_SETTINGS);
+    overlay.block(BLOCK_HIDDEN);
     home.el.hidden = true;
     settings.el.hidden = false;
     settings.open();
@@ -188,6 +301,22 @@ export function mountApp(root) {
   function showHome() {
     settings.el.hidden = true;
     home.el.hidden = false;
+    overlay.unblock(BLOCK_SETTINGS);
+    overlay.unblock(BLOCK_HIDDEN);
+    // Re-measure before painting: the window may have been resized while
+    // Settings was up, and an overlay restored at yesterday's rectangle is a
+    // picture in the wrong place for as long as nothing else moves.
+    overlay.sync();
+  }
+
+  /**
+   * toggleMixer opens or closes the drawer. The overlay is hidden and restored
+   * by the host's onOpenChange rather than from here, because the drawer can
+   * also close itself — Escape, the scrim, its own Close button — and a hide
+   * written at the call site would never see that.
+   */
+  function toggleMixer() {
+    mixerHost.toggle();
   }
 
   // --- lamps -------------------------------------------------------------
@@ -228,12 +357,21 @@ export function mountApp(root) {
     home.showError(String(message));
   });
 
-  // The native return's own state. Rendered only while SRT is the selected
-  // path: a status line for a receiver nobody asked for reads as a fault in the
-  // return that IS running.
+  // The native PICTURE receiver's own state. This is what drives the fallback:
+  // the moment it stops SHOWING, the overlay is hidden and the mosaic
+  // underneath is what the commentator is looking at — with the badge over the
+  // picture saying so. Nothing about the audio changes at any point in that.
+  backend.onPicture((state) => {
+    currentPictureState = state ? String(state) : null;
+    renderPicture();
+  });
+
+  // The native AUDIO return's state. It is kept as a capability on the Go side
+  // and is never selected by this UI any more — audio always comes from
+  // Kinesis — so an event from it means something started it that this page did
+  // not, which is worth a console line and nothing on screen.
   backend.onReturn((state) => {
-    if (currentReturnSource !== RETURN_SOURCE_SRT) return;
-    home.setSRTReturnState(state);
+    console.info('wslcomms: the native SRT audio return reported', String(state));
   });
 
   // --- start / stop --------------------------------------------------------
@@ -469,63 +607,147 @@ export function mountApp(root) {
       );
   }
 
+  // --- the picture source ---------------------------------------------------
+
   /**
-   * onReturnSourceChange is the ONE place that switches audio paths, and the
-   * ordering in it is the whole safety property:
+   * renderPicture pushes the current selection and the current receiver state
+   * everywhere they are shown, and moves the overlay to match.
    *
-   *   SILENCE THE OUTGOING PATH FIRST, THEN START THE INCOMING ONE.
-   *
-   * Never the other way round. Both paths carry the same programme at different
-   * offsets, so an overlap — even a few hundred milliseconds of one while the
-   * other spins up — is a slapback echo in the ears of somebody talking over
-   * it. Failing to start the new path leaves the commentator in silence, which
-   * is recoverable and visible; starting it before the old one stops is not.
-   *
-   * The PICTURE is untouched throughout. It rides the WebRTC peer connection
-   * whichever audio path is selected, and setAudioEnabled(false) severs the Web
-   * Audio graph only.
+   * It is the only writer of overlay.setWanted, and what it passes is
+   * `showingSRT` — the selection AND the receiver actually delivering. Not the
+   * selection alone: a receiver in CONNECTING or BACKOFF is running and holding
+   * a fan-out slot, and painting an opaque native window over the page for it
+   * would replace a soft picture of the match with a black rectangle.
    */
-  async function onReturnSourceChange(source) {
-    const next = normaliseReturnSource(source);
+  function renderPicture() {
+    const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
+    home.setPictureSource(effects.source);
+    home.setPictureState(effects.wantSRT ? currentPictureState : null);
+    overlay.setWanted(effects.showingSRT);
+    overlay.sync();
+  }
+
+  /**
+   * onPictureSourceChange switches which picture the commentator is looking at.
+   *
+   * ============ IT DOES NOT TOUCH THE AUDIO, AND MUST NEVER LEARN HOW ========
+   *
+   * There is no call to returnPath here, no setAudioEnabled, no setSinkId, no
+   * write to returnSource. The commentator hears Kinesis before this function
+   * runs and hears Kinesis after it, whichever way it goes and whether or not it
+   * fails. That is the entire correction this work exists to make: the control
+   * that used to sit in this position switched the HEADPHONES, and selecting
+   * "SRT" on it took the operator's audio away.
+   *
+   * A failure to start the picture leaves the selection on SRT and the mosaic on
+   * screen, which is exactly what the fallback is for — the badge over the
+   * picture says so, and the status line says why.
+   */
+  async function onPictureSourceChange(source) {
+    const next = normalisePictureSource(source);
+    if (next === currentPictureSource) return;
     home.clearError();
 
-    const result = await returnPath.select(next);
-    afterReturnOperation(result, () => home.setReturnSource(returnPath.source));
+    currentPictureSource = next;
+    // Drawn before the IPC, not after: the mosaic is on screen either way and
+    // the control must follow the press immediately, or an operator who is not
+    // sure whether the click landed presses it again.
+    renderPicture();
+    persistConfig({ [PICTURE_SOURCE_KEY]: next });
 
-    // The control follows the machine, not the click. On every path — applied,
-    // refused, or recovered onto WebRTC after a failed start — onSource has
-    // already put the segmented control and the Headphones list where the audio
-    // actually is, and this only fills in the two things the machine cannot
-    // know about.
-    if (returnPath.source === RETURN_SOURCE_SRT) {
-      // The status line for a return that is now running. It is a separate call
-      // because it can fail on its own — a build without GetReturnState — and a
-      // failure to READ the state must not be mistaken for a failure to start.
-      try {
-        home.setSRTReturnState(await backend.getReturnState());
-      } catch (err) {
-        console.info('wslcomms: the SRT return state could not be read:', err.message);
+    try {
+      if (next === PICTURE_SOURCE_SRT) {
+        await backend.startPicture();
+        // Resolving means the reconnect loop is running, not that a picture has
+        // arrived. Read the state so the status line is right before the first
+        // event lands.
+        currentPictureState = await backend.getPictureState();
+      } else {
+        await backend.stopPicture();
+        currentPictureState = PICTURE_STATE_STOPPED;
       }
-    } else {
-      // Asked, not assumed. App.IsSRTReturnSelected is the single place that
-      // decides which path owns the headphones; comparing returnSource to a
-      // string literal here would put the same decision in two languages.
-      //
-      // It is a CHECK, not the mechanism: returnPath has already stopped the SRT
-      // return and un-muted WebRTC in that order. If Go disagrees with what just
-      // happened, that is worth a line in the console and is not a reason to
-      // re-mute a commentator who is listening.
-      try {
-        if (await backend.isSRTReturnSelected()) {
-          console.warn(
-            'wslcomms: the Go side still reports the SRT return as selected after a switch to WebRTC',
-          );
-        }
-      } catch (err) {
-        console.info('wslcomms: could not confirm which path owns the headphones:', err.message);
-      }
-      safeMonitorCall((m) => m.setSinkId(selectedHeadphoneId(returnPath.source)));
+    } catch (err) {
+      currentPictureState = null;
+      home.showError(
+        `Could not switch the picture to ${next.toUpperCase()}: ${err?.message || err}. ` +
+          'You are watching the multiviewer mosaic; your audio is unaffected.',
+      );
     }
+    renderPicture();
+  }
+
+  /**
+   * watchPictureRect reports the reserved rectangle whenever it moves.
+   *
+   * Three sources, and all three are needed:
+   *
+   *   ResizeObserver   the box itself changing size — which happens without a
+   *                    window resize, because the controls above it wrap.
+   *   window resize    the window changing size, and, in WebView2, a DPI change
+   *                    as well.
+   *   a dppx media query  the DPI change on its own, for the case where the
+   *                    window is dragged to a differently-scaled monitor and the
+   *                    CSS box does not move by a single pixel while every
+   *                    physical coordinate in it changes.
+   *
+   * There is deliberately NO window-move report. The overlay is a child of the
+   * same top-level window and its rectangle is relative to the client area, so a
+   * drag moves both together — which is fortunate, because a page cannot observe
+   * its own window being dragged.
+   */
+  function watchPictureRect() {
+    if (typeof window === 'undefined') return;
+    const sync = () => overlay.sync();
+
+    window.addEventListener('resize', sync);
+
+    if (typeof ResizeObserver === 'function' && home.pictureEl) {
+      try {
+        new ResizeObserver(sync).observe(home.pictureEl);
+      } catch (err) {
+        console.info('wslcomms: could not observe the picture box for resizes:', err?.message || err);
+      }
+    }
+
+    watchDevicePixelRatio(sync);
+    sync();
+  }
+
+  /**
+   * watchDevicePixelRatio fires onChange when the display scaling changes.
+   *
+   * There is no event for it. The standard construction is a media query pinned
+   * to the CURRENT ratio, which stops matching the moment the ratio moves; it
+   * has to be re-armed against the new value each time, which is what the
+   * recursion below does.
+   */
+  function watchDevicePixelRatio(onChange) {
+    if (typeof window.matchMedia !== 'function') return;
+    const arm = () => {
+      const dpr = window.devicePixelRatio || 1;
+      let mq;
+      try {
+        mq = window.matchMedia(`(resolution: ${dpr}dppx)`);
+      } catch {
+        return; // an engine without the resolution feature; resize still fires
+      }
+      const handler = () => {
+        onChange();
+        arm();
+      };
+      if (typeof mq.addEventListener === 'function') {
+        mq.addEventListener('change', handler, { once: true });
+      } else if (typeof mq.addListener === 'function') {
+        // Legacy MediaQueryList. No `once`, so it is removed by hand before the
+        // re-arm, or every DPI change would leave another listener behind.
+        const legacy = () => {
+          mq.removeListener(legacy);
+          handler();
+        };
+        mq.addListener(legacy);
+      }
+    };
+    arm();
   }
 
   function onLevelChange(fraction) {
@@ -542,6 +764,13 @@ export function mountApp(root) {
     // would silently switch a commentator's audio path because somebody
     // pressed Save on an unrelated screen. The channel is safe to re-apply
     // because it cannot silence anything.
+    //
+    // Nor is the PICTURE source, and for a smaller version of the same reason:
+    // Settings has no control for it either, and a Save that switched the
+    // picture out from under somebody would at best cost them a few seconds of
+    // reconnect. The tile geometry above IS re-applied, because changing it is
+    // the whole point of that field — and it can change the reserved box's
+    // aspect ratio, which the ResizeObserver in watchPictureRect will notice.
     const channel = normaliseChannelMode(config.returnChannel);
     home.setReturnChannel(channel);
     renderHeadphoneList();
@@ -684,6 +913,10 @@ export function mountApp(root) {
     // ever take audio away. The machine owns the two directions that can make
     // something audible.
     backend.stopReturn().catch(() => {});
+    // And the picture receiver, for the same reason and with the same
+    // best-effort caveat: it holds an M2L-X fan-out slot and a native window
+    // that would otherwise outlive the page that asked for them.
+    backend.stopPicture().catch(() => {});
   });
 
   // --- startup ---------------------------------------------------------
@@ -710,36 +943,41 @@ export function mountApp(root) {
     home.setReturnChannel(normaliseChannelMode(currentConfig.returnChannel));
     home.setLevel(1);
 
-    // Whether the SRT option can be offered at all.
+    // Whether the SRT PICTURE can be offered at all.
     //
     // Against the fake backend it IS offered, because the fake drives its own
-    // state machine and the point of the fake is that the UI runs without Go —
-    // and the fake says "fake backend" in every payload it emits, so nothing on
-    // screen claims audio is arriving. Against a REAL Wails build the option is
-    // disabled unless the bindings are actually there, with the reason on the
-    // control: a build without them is a real possibility while the native side
-    // lands, and an option that always fails when pressed is worse than one
-    // that says why it cannot be pressed.
-    const srtAvailable = backend.usingFakeBackend || backend.srtReturnAvailable();
-    home.setSRTAvailable(
-      srtAvailable,
-      srtAvailable
+    // state machine and the point of the fake is that the UI runs without Go.
+    // Against a REAL Wails build the option is disabled unless all five
+    // bindings are there, with the reason on the control: a build without them
+    // is a real possibility while the native side lands, and an option that
+    // always fails when pressed is worse than one that says why it cannot be.
+    pictureBindingsPresent = backend.usingFakeBackend || backend.pictureAvailable();
+    home.setPictureAvailable(
+      pictureBindingsPresent,
+      pictureBindingsPresent
         ? ''
-        : 'This build has no native SRT return. The WebRTC return is unaffected.',
+        : 'This build has no native SRT picture. You are watching the multiviewer mosaic; ' +
+            'your audio is unaffected either way.',
     );
 
-    // The saved path, honoured — but never a path this build cannot run.
+    // ================= THE AUDIO PATH IS NOW FIXED AT KINESIS =================
     //
-    // This is the one assignment to currentReturnSource outside onSource, and it
-    // has to be here: createMonitor below is told at CONSTRUCTION whether to
-    // build its audio silent, and returnPath.adoptSaved — which is what sets the
-    // mirror everywhere else — cannot run before the monitor it drives exists.
-    // adoptSaved re-establishes it a few lines later through the same callback
-    // every other transition uses.
-    const savedSource = normaliseReturnSource(currentConfig.returnSource);
-    currentReturnSource =
-      savedSource === RETURN_SOURCE_SRT && !srtAvailable ? DEFAULT_RETURN_SOURCE : savedSource;
-    home.setReturnSource(currentReturnSource);
+    // It is not read from the saved config any more, and this is not a
+    // simplification — it is the correction.
+    //
+    // The native SRT AUDIO return still exists on the Go side and is deliberately
+    // kept there as a capability. What has gone is the UI offering it, because
+    // the control that did so was a misreading of what was asked for: SRT is the
+    // PICTURE and Kinesis is the AUDIO. A config file written by the previous
+    // revision can still hold returnSource: "srt", and left alone it would
+    // silence the commentator on every launch with no control on screen to undo
+    // it — which is the failure this whole change removes, arriving by the one
+    // route that outlives a rebuild.
+    //
+    // So the saved value is overruled, once, and written back so the next launch
+    // does not have to do it again.
+    currentReturnSource = RETURN_SOURCE_WEBRTC;
+    const savedAudioSource = currentConfig.returnSource;
 
     await Promise.all([loadInputDevices(), loadHeadphoneDevices(), loadOutputDevices()]);
     renderHeadphoneList();
@@ -748,32 +986,66 @@ export function mountApp(root) {
     // if SRT is the saved path, so there is no window in which both are live.
     setUpMonitor(currentConfig);
 
-    // Bring the saved path into force.
+    // Put the commentator on Kinesis, through the one machine that is allowed to
+    // make a path audible.
     //
-    // This runs even when the saved path is WEBRTC, and it is not a no-op then:
-    // adoptSaved asks the Go side to stop before it un-mutes, because "the saved
-    // path is WebRTC" does not prove nothing is running. A page that reloaded
-    // after a failed switch — or one whose beforeunload stopReturn() did not
-    // complete before the context died — can find an orphaned monitor playing
-    // into the same headphones, and nothing else in the application would ever
-    // stop it. The cost of asking is one StopReturn that usually rejects with
-    // errReturnNotRunning; the cost of assuming is a commentator hearing the
-    // match twice from the moment the page loads.
-    //
-    // No save is needed for the SRT case: currentReturnSource came from the
-    // saved config, so what StartReturn is about to read is already on disk.
-    const adopted = await returnPath.adoptSaved(currentReturnSource);
+    // adoptSaved is NOT a no-op on the WebRTC side and never was: it asks the Go
+    // side to stop before it un-mutes, because "this page is on WebRTC" does not
+    // prove nothing else is running. A page that reloaded after a failed switch —
+    // or one whose beforeunload stopReturn() did not complete before the context
+    // died — can find an orphaned SRT audio monitor playing into the same
+    // headphones, and nothing else in the application would ever stop it. That
+    // matters MORE now, not less: the UI no longer has a control that would stop
+    // one, so this is the only thing that ever will.
+    const adopted = await returnPath.adoptSaved(RETURN_SOURCE_WEBRTC);
     afterReturnOperation(adopted);
 
-    if (returnPath.source === RETURN_SOURCE_SRT) {
+    // Written back only if it was wrong, so that a config already correct is not
+    // rewritten on every launch. The audio is already right by this point; this
+    // is the record of it catching up.
+    if (savedAudioSource !== undefined && savedAudioSource !== RETURN_SOURCE_WEBRTC) {
+      console.info(
+        `wslcomms: the saved audio return source was "${savedAudioSource}". Audio now always ` +
+          'comes from Kinesis — SRT is the picture — so it has been corrected to webrtc.',
+      );
+      persistConfig({ returnSource: RETURN_SOURCE_WEBRTC });
+    }
+
+    // --- and now the picture -------------------------------------------------
+    //
+    // LAST, and deliberately so. Everything above is audio, and the commentator
+    // being able to hear the match outranks the commentator being able to see it
+    // at full resolution — the mosaic is on screen throughout all of this.
+    currentPictureSource = pictureBindingsPresent
+      ? normalisePictureSource(currentConfig[PICTURE_SOURCE_KEY])
+      : PICTURE_SOURCE_MOSAIC;
+
+    // Begin reporting the rectangle before anything is started, so the native
+    // window is never painted at a default position it was not told to be at.
+    //
+    // showHome releases BLOCK_HIDDEN, which the overlay is constructed holding.
+    // It starts blocked on purpose: an overlay that has not yet been told where
+    // to be, painted wherever a native default puts it, is an opaque box over an
+    // application somebody is trying to read.
+    showHome();
+    watchPictureRect();
+    renderPicture();
+
+    if (currentPictureSource === PICTURE_SOURCE_SRT) {
       try {
-        home.setSRTReturnState(await backend.getReturnState());
+        await backend.startPicture();
+        currentPictureState = await backend.getPictureState();
       } catch (err) {
-        // A build with StartReturn but no GetReturnState. The return IS running;
-        // only its status line is missing, and this is the throw that used to
-        // land in the recovery above and un-mute WebRTC over the top of it.
-        console.info('wslcomms: the SRT return state could not be read:', err.message);
+        // The mosaic is already on screen and the audio is already up. This is a
+        // degraded picture, not an outage, and it is said once in the banner
+        // because the operator asked for the good one and is not getting it.
+        currentPictureState = null;
+        home.showError(
+          `The high-quality SRT picture did not start: ${err?.message || err}. ` +
+            'You are watching the multiviewer mosaic; your audio is unaffected.',
+        );
       }
+      renderPicture();
     }
   })();
 }

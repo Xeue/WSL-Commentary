@@ -44,7 +44,6 @@ import {
   DEVICE_SOURCE_SRT,
   WEBRTC_LATENCY_MS,
   LATENCY_NOTE,
-  PICTURE_NOTE,
   isValidReturnSource,
   normaliseReturnSource,
   deriveReturnSourceEffects,
@@ -222,12 +221,43 @@ test('the WebRTC option is described as monitor-grade, not as the lesser default
   assert.match(describeReturnSource(RETURN_SOURCE_WEBRTC), /monitor-grade/i);
 });
 
-test('the UI says the picture is unchanged by this control', () => {
-  // "Switch the return to SRT" reads like "switch everything to SRT". The video
-  // keeps coming from WebRTC either way.
-  assert.match(PICTURE_NOTE, /picture/i);
-  assert.match(PICTURE_NOTE, /audio only|audio\b/i);
-  assert.ok(ui('home.js').includes('PICTURE_NOTE'), 'home.js must render it');
+test('returnsource.js no longer claims the picture comes from WebRTC', () => {
+  // It used to export PICTURE_NOTE — "The picture comes from WebRTC either way;
+  // this control changes audio only." — and home.js rendered it. Both halves of
+  // that sentence are now false: the picture comes from SRT and this module
+  // drives no control at all.
+  //
+  // The constant is DELETED rather than corrected. A stale export with the right
+  // name is how the wrong sentence gets rendered again by somebody grepping for
+  // where the note lives; picturesource.js owns the replacement.
+  const src = ui('returnsource.js');
+  assert.ok(
+    !/^export const PICTURE_NOTE/m.test(src),
+    'returnsource.js must not export PICTURE_NOTE any more',
+  );
+  assert.ok(
+    !/^export const CHANNEL_REBUILD_NOTE/m.test(src),
+    'nor a warning about a control the GUI no longer has',
+  );
+  // And home.js must take the replacement from the module that owns it. The
+  // two imports are checked by NAME, not by proximity: both modules export a
+  // PICTURE_NOTE now, and taking it from the wrong one would compile, build and
+  // print a sentence that is the opposite of the truth.
+  const home = ui('home.js');
+  const importFrom = (module) => {
+    const at = home.indexOf(`from './${module}.js'`);
+    if (at < 0) return '';
+    const open = home.lastIndexOf('import', at);
+    return home.slice(open, at);
+  };
+  assert.ok(
+    !importFrom('returnsource').includes('PICTURE_NOTE'),
+    'home.js must not import PICTURE_NOTE from returnsource.js',
+  );
+  assert.ok(
+    importFrom('picturesource').includes('PICTURE_NOTE'),
+    'home.js must import PICTURE_NOTE from picturesource.js',
+  );
 });
 
 // --------------------------------------------------------------------------
@@ -285,7 +315,12 @@ test('nothing outside the machine can make a return path AUDIBLE', () => {
 
 test('every transition in app.js goes through the one machine', () => {
   const src = codeOnly(ui('app.js'));
-  for (const entry of ['select', 'applyOption', 'adoptSaved']) {
+  // `select` is deliberately NOT in this list any more. Nothing in the GUI
+  // switches the audio path: audio always comes from Kinesis, so there is no
+  // caller left. It stays in returnpath.js, tested there, because the machinery
+  // is kept as a capability — but a call site here would mean a control
+  // somewhere that can silence the commentator, and there is not one.
+  for (const entry of ['applyOption', 'adoptSaved']) {
     assert.match(
       src,
       new RegExp(`returnPath\\s*\\.\\s*${entry}\\(`),
@@ -293,9 +328,36 @@ test('every transition in app.js goes through the one machine', () => {
     );
   }
   assert.ok(
+    !/returnPath\s*\.\s*select\(/.test(src),
+    'nothing in the UI may switch the audio path any more — SRT is the picture, ' +
+      'Kinesis is the audio, and a select() call site is the bug this work removed',
+  );
+  assert.ok(
     !src.includes('sourceSwitchInFlight'),
     'the in-flight guard belongs to the machine, which is the only thing that can hold it ' +
-      'across a source switch AND a channel change AND a headphone change',
+      'across a channel change AND a headphone change',
+  );
+});
+
+test('startup drives the audio to Kinesis and corrects a saved SRT audio path', () => {
+  // THE FAILURE THIS EXISTS FOR: a config.json written by the previous revision
+  // holds returnSource: "srt". Read and honoured, it silences the commentator on
+  // every launch, and there is no longer a control on any screen that would undo
+  // it. Overruling it is the only route out.
+  const src = codeOnly(ui('app.js'));
+  assert.match(
+    src,
+    /returnPath\.adoptSaved\(RETURN_SOURCE_WEBRTC\)/,
+    'startup must adopt WebRTC explicitly, not whatever is on disk',
+  );
+  assert.match(
+    src,
+    /persistConfig\(\{ returnSource: RETURN_SOURCE_WEBRTC \}\)/,
+    'and write the correction back, so the next launch does not repeat it',
+  );
+  assert.ok(
+    !/normaliseReturnSource\(currentConfig\.returnSource\)/.test(src),
+    'the saved audio path must not be read back into force',
   );
 });
 
@@ -511,20 +573,24 @@ test('StartReturn takes no arguments, so the config is saved before it is called
   );
 });
 
-test('which path owns the headphones is asked of Go, not decided twice', () => {
-  // app_return.go's IsSRTReturnSelected exists so that ONE place decides. The
-  // frontend comparing returnSource to "srt" itself would put the same decision
-  // in two languages, and the failure of the two disagreeing is both paths
-  // playing at once.
-  assert.match(ui('app.js'), /backend\.isSRTReturnSelected\(\)/);
+test('app_return.go still answers which path owns the headphones', () => {
+  // IsSRTReturnSelected exists so that ONE place decides. The frontend no longer
+  // asks — it does not switch audio paths at all any more, so there is nothing
+  // to disagree about — but the binding stays wired in backend.js, because the
+  // Go-side capability stays and srtReturnAvailable() counts it.
+  assert.match(ui('backend.js'), /export async function isSRTReturnSelected\(/);
+  assert.match(read(repoRoot, 'app_return.go'), /func \(a \*App\) IsSRTReturnSelected\(/);
 });
 
 test('a build without the bindings says so instead of failing opaquely', () => {
   const js = ui('backend.js');
   assert.match(js, /class BindingMissingError extends Error/, 'the missing-method case is named');
-  assert.match(js, /export function srtReturnAvailable\(\)/, 'and the UI can ask before offering the option');
-  assert.match(ui('app.js'), /srtReturnAvailable\(\)/, 'and app.js does ask');
-  assert.match(ui('home.js'), /setSRTAvailable/, 'and the option can be disabled with a reason');
+  assert.match(js, /export function srtReturnAvailable\(\)/, 'the audio capability can be asked about');
+  // The question the UI actually asks now is about the PICTURE, because that is
+  // the only one of the two it offers.
+  assert.match(js, /export function pictureAvailable\(\)/, 'and so can the picture one');
+  assert.match(ui('app.js'), /backend\.pictureAvailable\(\)/, 'and app.js does ask');
+  assert.match(ui('home.js'), /setPictureAvailable/, 'and the option can be disabled with a reason');
 });
 
 test('srtReturnAvailable checks EVERY binding the SRT path calls, not just two', () => {
@@ -659,11 +725,22 @@ test('exactly one function fills the Headphones dropdown, and it picks by path',
   );
 });
 
-test('the home screen relabels the dropdown when the path changes', () => {
-  // An unlabelled dropdown that silently swaps its contents is how a WASAPI id
-  // ends up in the browser's field.
+test('the Headphones dropdown says it holds the BROWSER list, and never swaps', () => {
+  // It used to swap between the browser's mediaDeviceIds and Windows' WASAPI
+  // endpoint ids as the return-source control moved. That control is gone, so
+  // the list is always the browser's — but the label stays, because a dropdown
+  // of device names gives no clue which identifier space it belongs to and the
+  // WASAPI field still exists on the Settings screen.
   const src = ui('home.js');
-  assert.match(src, /headphoneLabel\.textContent = `Headphones — \$\{effects\.deviceSource\}`/);
+  assert.match(
+    src,
+    /headphoneLabel\.textContent = `Headphones — \$\{DEVICE_SOURCE_WEBRTC\}`/,
+    'the label must name the browser list, from the module that owns both names',
+  );
+  assert.ok(
+    !/DEVICE_SOURCE_SRT/.test(src),
+    'home.js must never put the WASAPI list behind this dropdown again',
+  );
 });
 
 test('home.js does not fetch either device list itself', () => {

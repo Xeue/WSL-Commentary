@@ -1,17 +1,25 @@
 import { createLampRow } from './lamps.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
+// The headphone list is ALWAYS the browser's. Audio always comes from Kinesis
+// and is no longer switchable, so this is a constant now rather than a function
+// of a control — but it is still imported from the module that owns the two
+// identifier spaces, so that the WASAPI list and the browser list never come to
+// be described by two different sentences written in two different files.
+import { DEVICE_SOURCE_WEBRTC, LATENCY_NOTE } from './returnsource.js';
 import {
-  RETURN_SOURCES,
-  RETURN_SOURCE_SRT,
-  DEFAULT_RETURN_SOURCE,
-  normaliseReturnSource,
-  describeReturnSource,
-  deriveReturnSourceEffects,
-  LATENCY_NOTE,
+  PICTURE_SOURCES,
+  PICTURE_SOURCE_SRT,
+  DEFAULT_PICTURE_SOURCE,
+  normalisePictureSource,
+  describePictureSource,
+  derivePictureSourceEffects,
+  describePictureShowing,
   PICTURE_NOTE,
-  CHANNEL_REBUILD_NOTE,
-} from './returnsource.js';
+  PICTURE_STATE_WORDS,
+  PICTURE_STATE_BACKOFF,
+  normalisePictureState,
+} from './picturesource.js';
 // The channel table comes from the monitor module because that is where it is
 // ENFORCED — it is the wiring of a ChannelSplitter to a ChannelMerger, and the
 // words here have to be the words for that wiring. It is pure data with no
@@ -53,21 +61,6 @@ import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../mo
 
 const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
 
-// The four gst.ReturnState values, each with the sentence that says whether the
-// commentator should be worried. The state name alone is not enough: "BACKOFF"
-// tells a broadcast engineer that a connection attempt failed and another is
-// coming, and tells a commentator nothing at all.
-//
-// The strings are app.go's, forwarded on the "return" event. Any state not in
-// this table still prints, with no gloss — an unknown state is shown as itself
-// rather than swallowed.
-const RETURN_STATE_WORDS = Object.freeze({
-  STOPPED: ' — not running',
-  CONNECTING: ' — dialling M2L-X',
-  RECEIVING: ' — audio is arriving',
-  BACKOFF: ' — the last attempt failed; retrying',
-});
-
 // The Return dropdown offers all seven audio tracks. It used to offer two, CLN
 // and PGM. That was fine as long as the documented routing held. It did not:
 // the commentator on mid 2 could hear themselves delayed, which means
@@ -93,9 +86,10 @@ const RETURN_STATE_WORDS = Object.freeze({
  *   setHeadphoneDevices(devices, sel)   populates the headphones dropdown
  *   setReturnMid(mid)                   selects one of the seven buses, 1..7
  *   setReturnChannel(mode)              stereo / left / right
- *   setReturnSource(source)             webrtc / srt; also relabels Headphones
- *   setSRTAvailable(available, reason)  disables the SRT option with a reason
- *   setSRTReturnState(state)            the native return's own status line
+ *   setPictureSource(source)            srt / mosaic — WHICH PICTURE, not audio
+ *   setPictureAvailable(available, why) disables the SRT option with a reason
+ *   setPictureState(state)              the native receiver's own status
+ *   measurePictureRect()                the reserved box, in CSS pixels
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
  *   setBusy(busy)                       disables the button while a call is in flight
@@ -105,9 +99,21 @@ const RETURN_STATE_WORDS = Object.freeze({
  * handlers = {
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
- *   onReturnChange(mid), onReturnChannelChange(mode), onReturnSourceChange(src),
+ *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
  *   onLevelChange(fraction),
  * }
+ *
+ * ===================== THE PICTURE AREA IS NOW A RESERVATION ================
+ *
+ * The high-quality picture is decoded in Go and painted by a NATIVE CHILD
+ * WINDOW over this page — a browser element cannot play SRT. So `.pgm-tile` is
+ * two things at once: it is the mosaic's crop box, exactly as it always was, and
+ * it is the RECTANGLE the native overlay is told to occupy. Both pictures use
+ * the same box on purpose, so that falling back from one to the other does not
+ * move a single control on the screen.
+ *
+ * This file does not talk to Go and does not know the overlay exists. It exposes
+ * measurePictureRect(), and app.js does the rest.
  */
 export function createHomeView(handlers) {
   const el = document.createElement('section');
@@ -179,12 +185,18 @@ export function createHomeView(handlers) {
     errorText.textContent = '';
   }
 
-  // --- PGM tile --------------------------------------------------------
+  // --- the picture area -------------------------------------------------
   //
-  // The return is the main thing a commentator looks at, so it gets every
+  // The picture is the main thing a commentator looks at, so it gets every
   // pixel left after the controls: .pgm-stage is the flex child that grows,
   // and .pgm-tile is sized inside it from the tile's own aspect ratio — height
   // -limited on a wide window, width-limited on a narrow one. See main.css.
+  //
+  // TWO PICTURES, ONE BOX. The <video> inside it is the WebRTC mosaic, cropped
+  // to the PGM tile; the native SRT overlay is painted over the same rectangle
+  // from outside the page entirely. Sharing the box is what makes the fallback
+  // invisible as a layout event: when SRT drops, the mosaic underneath is
+  // already the right size and in the right place.
   const pgmStage = document.createElement('div');
   pgmStage.className = 'pgm-stage';
   const pgmTile = document.createElement('div');
@@ -194,6 +206,19 @@ export function createHomeView(handlers) {
   videoEl.playsInline = true;
   videoEl.muted = true; // the mosaic video track carries no audio we want; return audio is separate
   pgmTile.appendChild(videoEl);
+
+  // WHICH PICTURE IS ON SCREEN, said permanently, over the picture.
+  //
+  // The two look alike at a glance — the same framing of the same match — and
+  // differ enough in quality that somebody will ask out loud during a match
+  // whether they are looking at the good one. It is drawn INSIDE the tile so
+  // that it is over the mosaic; while the SRT overlay is up the overlay covers
+  // it, which is correct, because the overlay is only ever up when the answer
+  // is "SRT" and there is a second copy of the answer beside the control.
+  const pictureBadge = document.createElement('div');
+  pictureBadge.className = 'picture-badge';
+  pgmTile.appendChild(pictureBadge);
+
   pgmStage.appendChild(pgmTile);
 
   const audioEl = document.createElement('audio');
@@ -411,33 +436,39 @@ export function createHomeView(handlers) {
   channelLabel.textContent = 'Return Channel';
   channelGroup.append(channelLabel, channelSegmented.el);
 
-  // --- return SOURCE: which path feeds the headphones ----------------------
+  // --- PICTURE source: which picture the commentator is looking at ---------
+  //
+  // THIS IS NOT THE CONTROL THAT USED TO BE HERE. There was a "Return Source"
+  // segmented control in this position that switched the HEADPHONES between
+  // WebRTC and SRT, and it was backwards: the operator asked for SRT PICTURES
+  // with the audio staying on Kinesis, and selecting "SRT" silenced them.
+  //
+  // Audio is not switchable from this screen any more. The bus dropdown and the
+  // channel selector above are the audio controls, and they are unchanged.
   const sourceSegmented = makeSegmented(
-    'return-source',
-    RETURN_SOURCES.map((s) => ({ value: s.value, label: s.label, hint: s.summary })),
-    (source) => handlers.onReturnSourceChange(source),
+    'picture-source',
+    PICTURE_SOURCES.map((s) => ({ value: s.value, label: s.label, hint: s.summary })),
+    (source) => handlers.onPictureSourceChange(source),
   );
-  sourceSegmented.set(DEFAULT_RETURN_SOURCE);
+  sourceSegmented.set(DEFAULT_PICTURE_SOURCE);
 
   const sourceGroup = document.createElement('div');
   sourceGroup.className = 'control-group control-group-source';
   const sourceLabel = document.createElement('span');
   sourceLabel.className = 'control-label';
-  sourceLabel.textContent = 'Return Source';
+  sourceLabel.textContent = 'Picture';
   sourceGroup.append(sourceLabel, sourceSegmented.el);
 
-  // The note under the control. It carries three things the commentator cannot
-  // work out by listening: what the selected path IS and what it costs, the one
-  // latency figure anybody has measured (and the plain statement that the other
-  // has not been), and the fact that the picture is unchanged either way.
+  // The note under the control: what the selected picture IS, what it costs,
+  // and — fixed, on both options — that the audio does not move.
   const sourceNote = document.createElement('p');
-  sourceNote.className = 'return-source-note';
+  sourceNote.className = 'picture-note';
 
-  // The native return's own status. Separate from the note because it is the
+  // The native receiver's own status. Separate from the note because it is the
   // only line on this screen that reports something happening rather than
   // something configured, and it must not be mistaken for the WebRTC lamps.
   const srtStatusLine = document.createElement('p');
-  srtStatusLine.className = 'return-source-status';
+  srtStatusLine.className = 'picture-status';
   srtStatusLine.hidden = true;
 
   const levelGroup = document.createElement('div');
@@ -456,16 +487,20 @@ export function createHomeView(handlers) {
   levelGroup.append(levelLabel, levelSlider);
 
   // The Headphones row is built by hand rather than through makeRow because its
-  // LABEL changes: the two return paths address the same hardware through
-  // different identifier spaces — a browser mediaDeviceId and a WASAPI endpoint
-  // id — and the list in this dropdown is whichever set belongs to the selected
-  // path. An unlabelled dropdown that silently swaps its contents is how the
-  // wrong id ends up in the wrong config field.
+  // label says WHOSE device list is in it.
+  //
+  // It used to CHANGE, because the return-source control swapped the dropdown
+  // between the browser's mediaDeviceIds and Windows' WASAPI endpoint ids. That
+  // control is gone: audio always comes from Kinesis, so this is always the
+  // browser's list and always writes config.headphoneDeviceId. The label is
+  // still drawn because a dropdown of device names gives no clue which
+  // identifier space it belongs to, and the WASAPI field still exists on the
+  // Settings screen for the native return that is kept as a capability.
   const headphoneRow = document.createElement('div');
   headphoneRow.className = 'control-group';
   const headphoneLabel = document.createElement('label');
   headphoneLabel.htmlFor = 'headphone-select';
-  headphoneLabel.textContent = 'Headphones';
+  headphoneLabel.textContent = `Headphones — ${DEVICE_SOURCE_WEBRTC}`;
   headphoneRow.append(headphoneLabel, headphoneSelect);
 
   controls.append(
@@ -556,68 +591,107 @@ export function createHomeView(handlers) {
     channelSegmented.set(normaliseChannelMode(mode));
   }
 
-  let currentReturnSource = DEFAULT_RETURN_SOURCE;
+  let currentPictureSource = DEFAULT_PICTURE_SOURCE;
+  let currentPictureState = null;
 
   /**
-   * setReturnSource selects a path AND relabels the Headphones dropdown to say
-   * whose device list is in it. The two always move together: the label is the
-   * only thing on screen that distinguishes a mediaDeviceId list from a WASAPI
-   * endpoint list, and they name the same headphones.
+   * renderPicture is the ONE place the picture's appearance is decided: the
+   * badge over the tile, the status line under the control, and whether the
+   * mosaic <video> is the thing being looked at.
    *
-   * It does not fetch or swap the list itself — app.js does that, because only
-   * app.js can reach either device source.
+   * Both the selection and the receiver's state feed it, because neither alone
+   * says what is on screen: "SRT selected" with the receiver in BACKOFF is a
+   * commentator watching the mosaic, and saying "SRT" over the top of that
+   * would be a lie told in large letters.
    */
-  function setReturnSource(source) {
-    currentReturnSource = normaliseReturnSource(source);
-    sourceSegmented.set(currentReturnSource);
-    const effects = deriveReturnSourceEffects(currentReturnSource);
-    headphoneLabel.textContent = `Headphones — ${effects.deviceSource}`;
-    const parts = [describeReturnSource(currentReturnSource), LATENCY_NOTE, PICTURE_NOTE];
-    // Only on the SRT path, where it is true: there the channel selector is a
-    // mix matrix inside the GStreamer pipeline and changing it rebuilds the
-    // receiver. On WebRTC it is two Web Audio nodes and the change is instant.
-    if (effects.srtRunning) parts.push(CHANNEL_REBUILD_NOTE);
-    sourceNote.textContent = parts.join(' ');
-    if (!effects.srtRunning) setSRTReturnState(null);
-  }
+  function renderPicture() {
+    const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
+    sourceSegmented.set(effects.source);
 
-  /**
-   * setSRTAvailable disables the SRT option, with the reason on the control.
-   * Used when the build has no SRT-return bindings — a genuine possibility while
-   * the native side lands — so the option is visibly unavailable rather than
-   * silently failing when it is pressed.
-   */
-  function setSRTAvailable(available, reason) {
-    sourceSegmented.setOptionEnabled(RETURN_SOURCE_SRT, available !== false, reason);
-  }
+    const showing = describePictureShowing(effects, currentPictureState);
+    pictureBadge.textContent = showing.text;
+    pictureBadge.title = showing.detail;
+    pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
 
-  /**
-   * setSRTReturnState renders the native return's own status. `state` is a
-   * gst.ReturnState string. Pass null or undefined to hide the line entirely,
-   * which is what "the SRT path is not selected" looks like — an empty status
-   * line beside a running WebRTC return reads as a fault.
-   *
-   * The state is printed, not reduced to a colour. BACKOFF with no audio is a
-   * normal state that resolves itself; STOPPED with no audio is not; and a
-   * commentator who can hear the difference has to be able to see it too.
-   */
-  function setSRTReturnState(state) {
-    if (!state) {
+    // The mosaic is marked, not removed. It stays in the document and stays
+    // decoding: it is the fallback, and a fallback that has to re-establish
+    // itself when it is needed is not one. The class only tells the stylesheet
+    // that something opaque is expected on top of it.
+    pgmTile.classList.toggle('pgm-tile-overlaid', effects.showingSRT);
+
+    sourceNote.textContent = [describePictureSource(effects.source), PICTURE_NOTE, LATENCY_NOTE].join(' ');
+
+    // The status line is drawn only while the SRT picture is being ASKED for.
+    // A status line for a receiver nobody wants running reads as a fault.
+    if (!effects.wantSRT || !currentPictureState) {
       srtStatusLine.hidden = true;
       srtStatusLine.textContent = '';
       return;
     }
-    const name = String(state).toUpperCase();
-    srtStatusLine.textContent = `SRT return: ${name}${RETURN_STATE_WORDS[name] || ''}`;
-    // Only BACKOFF is called out. It is the one state that means something is
-    // wrong and is retrying — the others are all normal parts of coming up.
-    srtStatusLine.classList.toggle('return-source-status-bad', name === 'BACKOFF');
+    // The wire value is lowercase — it is internal/gst's PictureState — and it
+    // is SHOUTED here, beside the uppercase lamp states, because a commentator
+    // reading this line at a glance is reading a status word and not a Go
+    // identifier. An unrecognised state still prints, with no gloss: a state
+    // this build does not know is shown as itself rather than swallowed.
+    const name = normalisePictureState(currentPictureState) || String(currentPictureState);
+    const words = PICTURE_STATE_WORDS[name];
+    srtStatusLine.textContent = `SRT picture: ${name.toUpperCase()}${words ? ` — ${words}` : ''}`;
+    // Only BACKOFF is called out. It is the one state that means something went
+    // wrong and is retrying; the others are normal parts of coming up.
+    //
+    // Compared against the CONSTANT, not against the shouted string above: the
+    // wire value is lowercase and `name.toUpperCase()` is display only.
+    srtStatusLine.classList.toggle('picture-status-bad', name === PICTURE_STATE_BACKOFF);
     srtStatusLine.hidden = false;
   }
 
-  // Draw the note once at construction so the panel is never blank before any
-  // config has loaded.
-  setReturnSource(DEFAULT_RETURN_SOURCE);
+  /** setPictureSource selects which picture the application should try for. */
+  function setPictureSource(source) {
+    currentPictureSource = normalisePictureSource(source);
+    renderPicture();
+  }
+
+  /**
+   * setPictureAvailable disables the SRT option, with the reason on the control.
+   * Used when the build has no native picture bindings — a real possibility
+   * while the Go side lands — so the option is visibly unavailable rather than
+   * silently failing when it is pressed.
+   */
+  function setPictureAvailable(available, reason) {
+    sourceSegmented.setOptionEnabled(PICTURE_SOURCE_SRT, available !== false, reason);
+  }
+
+  /**
+   * setPictureState records the native receiver's own state, one of the four
+   * strings on the "picture" event. Null hides the status line.
+   */
+  function setPictureState(state) {
+    currentPictureState = state ? String(state) : null;
+    renderPicture();
+  }
+
+  /**
+   * measurePictureRect reports the reserved box in CSS pixels, relative to the
+   * viewport — which is the WebView client area.
+   *
+   * It is deliberately raw: no rounding, no device pixel ratio, no opinion. CSS
+   * pixels and the ratio are what App.SetPictureRect takes — gst.ScaleRect does
+   * the multiplication — and ./overlay.js is the only module on this side that
+   * has anything to say about the conversion. Returns null when the element has
+   * no box to measure, which is what a hidden view looks like.
+   *
+   * @returns {{x: number, y: number, width: number, height: number}|null}
+   */
+  function measurePictureRect() {
+    if (typeof pgmTile.getBoundingClientRect !== 'function') return null;
+    const r = pgmTile.getBoundingClientRect();
+    if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+    return { x: r.left, y: r.top, width: r.width, height: r.height };
+  }
+
+  // Draw the note and the badge once at construction so neither is blank before
+  // any config has loaded.
+  renderPicture();
 
   function setLevel(fraction) {
     levelSlider.value = String(Math.round(Math.max(0, Math.min(1, fraction)) * 100));
@@ -642,6 +716,9 @@ export function createHomeView(handlers) {
     el,
     videoEl,
     audioEl,
+    // The element whose box the native overlay is told to occupy. app.js
+    // observes it; nothing here knows what it is for.
+    pictureEl: pgmTile,
     lamps,
     setDevBadge,
     setTile,
@@ -649,9 +726,10 @@ export function createHomeView(handlers) {
     setHeadphoneDevices,
     setReturnMid,
     setReturnChannel,
-    setReturnSource,
-    setSRTAvailable,
-    setSRTReturnState,
+    setPictureSource,
+    setPictureAvailable,
+    setPictureState,
+    measurePictureRect,
     setLevel,
     setRunning,
     setBusy,

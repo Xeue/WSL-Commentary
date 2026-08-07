@@ -1,7 +1,41 @@
 /**
- * The return SOURCE control: which path feeds the commentator's headphones.
+ * The return audio path: which software feeds the commentator's headphones.
  *
  * Owner: WP-5b.
+ *
+ * ================== THIS IS NO LONGER A CONTROL ON ANY SCREEN ===============
+ *
+ * IT IS ALWAYS WEBRTC. Audio comes from Kinesis, full stop, and there is nothing
+ * in the GUI that will change it.
+ *
+ * There WAS a control, in the position the picture control now occupies, and it
+ * was a misreading of what was asked for. The operator's words were:
+ *
+ *   "I want DIRTY PICTURES. I want PGM high res pictures in what the
+ *    commentator sees. With the audio coming from Kinesis."
+ *
+ * SRT is the PICTURE. It was built here as an AUDIO path, so selecting "SRT"
+ * silenced the operator — the exact opposite of the request. See
+ * ./picturesource.js for the control that replaced it.
+ *
+ * ======================= AND YET NONE OF THIS IS DELETED ====================
+ *
+ * The native SRT audio return still exists on the Go side, app_return.go is
+ * untouched, and everything below still describes it correctly. It is kept as a
+ * CAPABILITY: it works, it is tested, and the day somebody needs full-bitrate
+ * audio into a WASAPI endpoint the machinery is here rather than in a git
+ * history nobody reads.
+ *
+ * What app.js does with it now is narrow and deliberate: at startup it drives
+ * returnpath.js to the WebRTC path — which STOPS any SRT audio monitor left
+ * running by an older build or an orphaned page — and corrects a saved
+ * returnSource of "srt" back to "webrtc". Without that, a config file written by
+ * the previous revision would go on silencing the commentator on every launch,
+ * with no control on screen able to undo it.
+ *
+ * Everything from here down is a description of that capability, and of the
+ * invariant that made it safe. Read it as documentation of something the UI can
+ * no longer reach, not as a description of a control.
  *
  * ======================= THE TWO PATHS ARE NOT ALIKE ========================
  *
@@ -91,8 +125,8 @@ export const WEBRTC_LATENCY_MS = 489;
  * SRT here until there is a measurement to cite.
  */
 export const LATENCY_NOTE =
-  `Latency: WebRTC is a measured ${WEBRTC_LATENCY_MS} ms upper bound, control to audible. ` +
-  'The SRT return has not been measured — no figure is shown because none exists.';
+  `Return audio latency: a measured ${WEBRTC_LATENCY_MS} ms upper bound, control to audible. ` +
+  'The SRT picture has not been measured — no figure is shown because none exists.';
 
 /**
  * RETURN_SOURCES is the control, in the order it is drawn.
@@ -204,25 +238,19 @@ export function describeReturnSource(source) {
   return `${found.summary} ${found.cost}`;
 }
 
-/**
- * PICTURE_NOTE is fixed text, not conditional, because it is true of both
- * options and a line that only appears on one of them reads as a difference
- * between them.
- */
-export const PICTURE_NOTE = 'The picture comes from WebRTC either way; this control changes audio only.';
-
-/**
- * CHANNEL_REBUILD_NOTE is shown only while SRT is selected.
- *
- * On the WebRTC path the channel selector is two Web Audio nodes being rewired
- * and the change is instant. On the SRT path it is a mix matrix baked into the
- * GStreamer pipeline when it is built — gst.ReturnOpts.Channel, with no live
- * setter — so changing it stops and rebuilds the receiver, and the commentator
- * gets a second or two of nothing.
- *
- * Saying so is cheaper than the alternatives, which are a control that appears
- * to have broken the return, or one that silently does nothing until the next
- * restart.
- */
-export const CHANNEL_REBUILD_NOTE =
-  'On this path, changing the return channel rebuilds the receiver, so it goes quiet for a moment.';
+// PICTURE_NOTE USED TO BE HERE AND IS GONE, because what it said is now false.
+//
+// It read: "The picture comes from WebRTC either way; this control changes
+// audio only." That was true of the control this module used to drive. It is
+// not true of anything now — the picture comes from SRT, the audio comes from
+// Kinesis, and the sentence has been replaced by picturesource.js's PICTURE_NOTE,
+// which says the opposite thing about the opposite control.
+//
+// It is deleted rather than corrected on purpose. A stale constant with the
+// right name is how the wrong sentence gets rendered again by somebody grepping
+// for where the note lives.
+//
+// CHANNEL_REBUILD_NOTE is gone with it. It warned that changing the return
+// channel on the SRT audio path rebuilds the GStreamer pipeline and goes quiet
+// for a moment — still true of that path, and no longer reachable from the GUI,
+// so a warning about it would be a warning about something nobody can do.

@@ -63,9 +63,25 @@ const MIXER_POLL_MS = 1000;
  *   onStatus(message, isError)   optional. Where the host's own failures — not
  *                the drawer's internal ones — are shown. Called with ('', false)
  *                to clear.
+ *   onOpenChange(open)           optional. Fired whenever the drawer opens or
+ *                closes, INCLUDING when it closes itself.
  * }
  *
  * Returns { toggle(), open(), close(), isOpen() }.
+ *
+ * ==================== WHY onOpenChange EXISTS ===============================
+ *
+ * Because the drawer can close without the host asking it to — its own Close
+ * button, the scrim, Escape — and there is now something outside this module
+ * that has to know: the native picture overlay. The overlay is an opaque child
+ * window painted over the page, outside its stacking context, and no z-index in
+ * mixer.css reaches it. A drawer opened underneath it is a live routing matrix
+ * an operator can read two thirds of and click all of.
+ *
+ * The OPENING edge is reported synchronously, before the drawer paints, because
+ * that is the direction where being late is dangerous. The self-closing edge is
+ * noticed by the poll, so it can be up to MIXER_POLL_MS late — the picture comes
+ * back a beat after the drawer goes, which is the harmless direction.
  */
 export function createMixerHost(opts) {
   const o = opts || {};
@@ -74,13 +90,30 @@ export function createMixerHost(opts) {
     throw new Error('wslcomms: createMixerHost needs opts.mount');
   }
   const report = typeof o.onStatus === 'function' ? o.onStatus : () => {};
+  const reportOpen = typeof o.onOpenChange === 'function' ? o.onOpenChange : () => {};
 
   let mixerDrawer = null;
   let mixerPollTimer = null;
   let mixerPollInFlight = false;
+  /** The last state reported, so the callback fires only on an actual edge. */
+  let reportedOpen = false;
 
   function setMixerStatus(message, isError) {
     report(message || '', !!isError);
+  }
+
+  /**
+   * announceOpen fires onOpenChange on a real edge only. It never throws into
+   * the caller: a listener that fails must not leave the drawer half-opened.
+   */
+  function announceOpen(open) {
+    if (open === reportedOpen) return;
+    reportedOpen = open;
+    try {
+      reportOpen(open);
+    } catch (err) {
+      console.error('wslcomms: mixer onOpenChange threw', err);
+    }
   }
 
   /**
@@ -188,8 +221,11 @@ export function createMixerHost(opts) {
     if (!mixerDrawer || mixerPollInFlight) return;
     if (!mixerDrawer.isOpen()) {
       // The operator closed the drawer from inside it — its Close button, the
-      // scrim or Escape — none of which the host is told about directly.
+      // scrim or Escape — none of which the host is told about directly. This is
+      // the only place that notices, so it is also where the picture overlay is
+      // told it may come back.
       stopMixerPolling();
+      announceOpen(false);
       return;
     }
     mixerPollInFlight = true;
@@ -235,11 +271,16 @@ export function createMixerHost(opts) {
     stopMixerPolling();
     if (mixerDrawer && mixerDrawer.isOpen()) mixerDrawer.close();
     setMixerStatus('', false);
+    announceOpen(false);
   }
 
   function openMixer() {
     const drawer = ensureMixerDrawer();
     if (drawer.isOpen()) return;
+    // BEFORE drawer.open(), not after. Whatever is listening — today, the native
+    // picture overlay — has to get out of the way before the drawer paints, not
+    // a frame after it.
+    announceOpen(true);
     drawer.open();
     startMixerPolling();
   }

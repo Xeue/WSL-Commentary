@@ -561,13 +561,14 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	// the feed is up. The sender only emits on transitions, so the current state
 	// is replayed here instead.
 	//
-	// domReady replays TWO lamps, not one: the return monitor emits only on
-	// transitions for the same reason, and a reloaded page would otherwise show
-	// the RETURN lamp grey with audio in the commentator's ears. The count is
-	// asserted exactly so that a third replay has to be a decision — every event
-	// queued here is delivered to a page that has just loaded, and the ones the
-	// status lamps would need are deliberately NOT replayed because a cached
-	// Status risks showing stale green (specification section 8).
+	// domReady replays THREE, not one: the return monitor and the picture monitor
+	// both emit only on transitions for the same reason, and a reloaded page
+	// would otherwise show the RETURN lamp grey with audio in the commentator's
+	// ears, and draw the fallback mosaic over a working high-resolution picture.
+	// The count is asserted exactly so that a fourth replay has to be a decision
+	// — every event queued here is delivered to a page that has just loaded, and
+	// the ones the status lamps would need are deliberately NOT replayed because
+	// a cached Status risks showing stale green (specification section 8).
 	a, _ := newTestApp(t)
 	silencePump(a)
 
@@ -578,14 +579,18 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 2 {
-		t.Fatalf("domReady queued %d events, want the sender and return replays: %+v", len(queued), queued)
+	if len(queued) != 3 {
+		t.Fatalf("domReady queued %d events, want the sender, return and picture replays: %+v",
+			len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[0], EventSender, sender.StateConnected)
 	}
 	if queued[1].name != EventReturn || queued[1].data != gst.ReturnStateStopped {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[1], EventReturn, gst.ReturnStateStopped)
+	}
+	if queued[2].name != EventPicture || queued[2].data != gst.PictureStateStopped {
+		t.Fatalf("domReady queued %+v, want %s = %s", queued[2], EventPicture, gst.PictureStateStopped)
 	}
 }
 
@@ -596,8 +601,8 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 2 {
-		t.Fatalf("domReady queued %+v, want a sender and a return replay", queued)
+	if len(queued) != 3 {
+		t.Fatalf("domReady queued %+v, want a sender, a return and a picture replay", queued)
 	}
 	if queued[0].data != sender.StateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any session has run", queued, sender.StateStopped)
@@ -605,6 +610,10 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	if queued[1].data != gst.ReturnStateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any return monitor has run",
 			queued, gst.ReturnStateStopped)
+	}
+	if queued[2].data != gst.PictureStateStopped {
+		t.Fatalf("domReady queued %+v, want %s before any picture monitor has run",
+			queued, gst.PictureStateStopped)
 	}
 }
 
@@ -806,6 +815,15 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // separate validation path from the contribution feed. They are listed third for
 // the same reason the mixer six are listed second: so that each group stays
 // legible as one decision.
+//
+// The five picture methods are the twentieth to twenty-fourth, added when SRT
+// became the PICTURE path and documented in the same header. Three of them
+// exist because the picture is a NATIVE CHILD WINDOW painted over the page
+// rather than an element in it: SetPictureRect and SetPictureVisible are the
+// frontend telling an overlay that does not participate in CSS layout where to
+// sit and when to get out of the way, and they are on this surface precisely
+// because there is no other way for the page to say it. They are listed fourth
+// so that group stays legible too.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -831,6 +849,12 @@ func assertBoundSurface(t *testing.T) {
 		"StopReturn":          true,
 		"GetReturnState":      true,
 		"IsSRTReturnSelected": true,
+
+		"StartPicture":      true,
+		"StopPicture":       true,
+		"GetPictureState":   true,
+		"SetPictureRect":    true,
+		"SetPictureVisible": true,
 	}
 
 	got := exportedMethodsOfApp()
@@ -1360,11 +1384,17 @@ func TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned(t *testing.T) {
 // shutdownTimeout comment now claims.
 //
 // shutdownTimeout stopped being the thing that bounds the work and became the
-// backstop for these five adding up. If they ever exceed it the backstop fires
+// backstop for these six adding up. If they ever exceed it the backstop fires
 // first, teardown is cut off mid-sequence again, and the steps behind the cut
 // stop running — which is exactly the defect the per-step budgets removed.
+//
+// pictureStopBudget is the sixth. It was added with the SRT picture, and adding
+// it is what took shutdownTimeout from twenty seconds to twenty-four: the sum
+// is the bound, so a new step is a new term on both sides or this test fails,
+// which is the whole point of it being written as a sum rather than a constant.
 func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
-	total := senderStopBudget + returnStopBudget + mixerCloseBudget + controlPlaneStopBudget + rootJoinBudget
+	total := senderStopBudget + returnStopBudget + pictureStopBudget +
+		mixerCloseBudget + controlPlaneStopBudget + rootJoinBudget
 	if total > shutdownTimeout {
 		t.Fatalf("the per-step budgets total %v, over shutdownTimeout's %v: the overall bound would "+
 			"cut the ordered teardown short and the last steps would stop running again", total, shutdownTimeout)
@@ -1374,6 +1404,7 @@ func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
 	// goes first and it is the one path given every chance to finish.
 	for name, budget := range map[string]time.Duration{
 		"returnStopBudget":       returnStopBudget,
+		"pictureStopBudget":      pictureStopBudget,
 		"mixerCloseBudget":       mixerCloseBudget,
 		"controlPlaneStopBudget": controlPlaneStopBudget,
 		"rootJoinBudget":         rootJoinBudget,

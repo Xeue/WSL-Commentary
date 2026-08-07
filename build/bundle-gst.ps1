@@ -134,6 +134,14 @@ $ScriptVersion = '1.0.0'
 # section 3's 60-110 MB was an estimate made before anyone could build one, and
 # it is superseded by this.
 #
+# RE-MEASURED 2026-08-07, after the d3d11 plugin was added for the picture:
+# 54.1 MB (56,675,770 bytes), 15 plugins and 35 runtime files, closure again
+# reported complete. The picture cost 1.6 MB - libgstd3d11.dll at 899 KB plus
+# libgstcodecs at 310 KB and libgstdxva at 115 KB - which is comfortably inside
+# the band below, so the band is UNCHANGED. It is restated rather than silently
+# left because the 52.5 MB figure above is no longer what a clean run produces
+# and the next person to compare should be comparing against this line.
+#
 # The band below is the measured figure with room either side: enough slack that
 # a GStreamer point release does not trip it, tight enough that a directory copy
 # (the whole install is 2.4 GB) or a silently dropped plugin still does.
@@ -221,29 +229,41 @@ function Get-PluginEntries {
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
 
-        There has been exactly one addition since section 3 was written:
-        mpegtsdemux, for the SRT return monitor. It is stated here rather than
-        slipped into the list because that is the rule this function exists to
-        enforce on everyone else.
+        There have been exactly two additions since section 3 was written, and
+        both are stated here rather than slipped into the list, because that is
+        the rule this function exists to enforce on everyone else:
 
-        Two plugins were CONSIDERED for the return and deliberately not added:
+          mpegtsdemux   for the SRT return monitor.
+          d3d11         for the SRT PICTURE. See its Why line below.
+
+        One plugin was CONSIDERED and deliberately NOT added:
 
           libav       gst-libav is FFmpeg. Its licence depends on how it was
                       built and is not ours to assume, which is the same
                       commercial-shipping concern that keeps x264 out and the
                       reason *libav* and *avcodec* are in $ForbiddenPatterns.
-                      avdec_aac ranks primary on the dev machine and must not be
-                      selected; the AAC decoder is mfaacdec, from the
-                      mediafoundation plugin already in this list.
-          d3d11       d3d11h265dec would decode the return's H.265 picture. The
-                      return is AUDIO ONLY - the picture is a separate, larger
-                      decision the operator has not taken - so the video pad is
-                      sent to a fakesink and this plugin is not bundled.
-                      (libgstd3d11-1.0-0.dll appears in Get-RuntimeEntries as an
-                      optional RUNTIME library because the Media Foundation
-                      plugin links it. That is a different thing from bundling
-                      the d3d11 PLUGIN, and adding the plugin would be a new
-                      decision.)
+                      avdec_aac and avdec_h265 both rank primary on the dev
+                      machine and NEITHER may be selected: the AAC decoder is
+                      mfaacdec (mediafoundation) and the HEVC decoder is
+                      d3d11h265dec (d3d11), both LGPL wrappers over decoders
+                      that are already on the machine.
+
+        THE d3d11 DECISION WAS TAKEN ON 2026-08-07 AND IT IS RECORDED HERE
+        BECAUSE THIS COMMENT USED TO SAY THE OPPOSITE. It said the return was
+        audio only, that the picture was "a separate, larger decision the
+        operator has not taken", and that the H.265 video pad was fakesinked.
+        The operator has now taken that decision the other way round: SRT
+        carries the PICTURE and Kinesis carries the AUDIO. So the plugin is in
+        the list, the video pad is decoded, and it is the AUDIO pad that is
+        fakesinked. See internal/gst/picture.go.
+
+        Note that libgstd3d11-1.0-0.dll in Get-RuntimeEntries is a different
+        file from libgstd3d11.dll here: the first is the runtime LIBRARY, which
+        was already bundled because the Media Foundation plugin links it, and
+        the second is the PLUGIN, which was not. Adding the plugin also pulled
+        in two runtime libraries that nothing previously bundled needed -
+        libgstcodecs and libgstdxva - both verified by objdump against
+        libgstd3d11.dll on this machine and both marked as such below.
 
         The gstreamer plugin file naming convention (libgst<name>.dll) is the
         same in the MSVC and MinGW builds, so these names are the ones this
@@ -277,7 +297,10 @@ function Get-PluginEntries {
         New-BundleEntry -Kind Plugin -Names 'libgstmpegtsdemux.dll' `
             -Why 'tsdemux: the RETURN path''s demuxer. The commentator''s off-air monitor dials an M2L-X output as an SRT caller and gets MPEG-TS back, and this is the only element in the tree that can take the AAC out of it. Audio only - the H.265 video pad is fakesinked, not decoded.'
         New-BundleEntry -Kind Plugin -Names 'libgstsrt.dll' `
-            -Why 'srtsink, mode=caller, auto-reconnect=false. The contribution path. Also srtsrc, mode=caller, for the return monitor.'
+            -Why 'srtsink, mode=caller, auto-reconnect=false. The contribution path. Also srtsrc, mode=caller, for the return monitor and for the picture.'
+        New-BundleEntry -Kind Plugin -Names 'libgstd3d11.dll' `
+            -Why 'd3d11h265dec AND d3d11videosink: the commentator''s PICTURE. The programme feed arrives as H.265 1920x1080 50p on an M2L-X output and there is no other way to decode or show it here. mfh265dec is ABSENT on the target (the Windows HEVC extension is not installed and buying it from the Store is not a deployment step) and avdec_h265 is FFmpeg, which $ForbiddenPatterns refuses. d3d11h265dec is DXVA in the GPU driver, wrapped LGPL by gst-plugins-bad; measured on 2026-08-07 decoding 1178 frames in 25 s off port 40501, hardware=true, NV12 1920x1080 50/1. One plugin file supplies both the decoder and the sink, so this single entry is the whole picture path.' `
+            -Fix 'If this file is missing, the machine has a partial GStreamer install: libgstd3d11.dll ships with gst-plugins-bad in every official build. Do NOT substitute libav.'
     )
 }
 
@@ -320,8 +343,13 @@ function Get-RuntimeEntries {
             -Why 'RIFF helpers. Some builds have pbutils or the parsers link it; most do not. Copied if present.'
         New-BundleEntry -Kind Runtime -Names 'gstnet-1.0-0.dll', 'libgstnet-1.0-0.dll' -Optional `
             -Why 'net clock. We pin the system clock (spec section 6.1) so this should not be needed; some builds have core import it anyway.'
-        New-BundleEntry -Kind Runtime -Names 'gstd3d11-1.0-0.dll', 'libgstd3d11-1.0-0.dll' -Optional `
-            -Why 'The Media Foundation plugin uses D3D11 for GPU-backed MFTs in recent releases. UNVERIFIED for 1.28.5 - if the dependency report shows libgstmediafoundation.dll importing it, this stops being optional.'
+        New-BundleEntry -Kind Runtime -Names 'gstd3d11-1.0-0.dll', 'libgstd3d11-1.0-0.dll' `
+            -Why 'VERIFIED REQUIRED, 1.28.5, 2026-08-07: libgstd3d11.dll (the PICTURE plugin) imports it, per objdump. It was optional while it was only a maybe-dependency of the Media Foundation plugin; it is not optional now, because without it the d3d11 plugin does not load and there is no decoder and no video sink.' `
+            -Fix 'This file must exist. If it does not, -GstRoot is pointing at a tree without gst-plugins-bad.'
+        New-BundleEntry -Kind Runtime -Names 'gstcodecs-1.0-0.dll', 'libgstcodecs-1.0-0.dll' `
+            -Why 'VERIFIED REQUIRED, 1.28.5, 2026-08-07: libgstd3d11.dll imports it, per objdump. It is GstH265Decoder, the stateless-decoder base class d3d11h265dec derives from through GstDxvaH265Decoder. Nothing bundled before the picture path needed it.'
+        New-BundleEntry -Kind Runtime -Names 'gstdxva-1.0-0.dll', 'libgstdxva-1.0-0.dll' `
+            -Why 'VERIFIED REQUIRED, 1.28.5, 2026-08-07: libgstd3d11.dll imports it, per objdump. It is the DXVA layer between GstH265Decoder and Direct3D 11. Nothing bundled before the picture path needed it.'
         New-BundleEntry -Kind Runtime -Names 'gstdxgi-1.0-0.dll', 'libgstdxgi-1.0-0.dll' -Optional `
             -Why 'Companion to gstd3d11 in some releases. UNVERIFIED - copied only if present.'
         New-BundleEntry -Kind Runtime -Names 'gstd3dshader-1.0-0.dll', 'libgstd3dshader-1.0-0.dll' `
@@ -433,14 +461,16 @@ function Assert-ManifestSane {
         }
     }
 
-    # The plugin allowlist is closed and must equal specification section 3,
-    # plus mpegtsdemux, which is the one deliberate addition since: the return
-    # monitor's demuxer. Adding a plugin remains a specification change and this
-    # list is where it has to be made, not somewhere it can be drifted into.
+    # The plugin allowlist is closed and must equal specification section 3, plus
+    # the two deliberate additions since: mpegtsdemux, the return monitor's
+    # demuxer, and d3d11, the picture's HEVC decoder and video sink. Adding a
+    # plugin remains a specification change and this list is where it has to be
+    # made, not somewhere it can be drifted into - which is why this check exists
+    # at all and why it caught d3d11 on the first run of this change.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
-        'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt'
+        'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {

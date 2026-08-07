@@ -44,6 +44,13 @@
 //	GetReturnState()            gst.ReturnState            caller: WP-5b
 //	IsSRTReturnSelected()       bool                       caller: WP-5b
 //
+// and the five added for the SRT PICTURE, which live in app_picture.go:
+//
+//	StartPicture() / StopPicture()      error              caller: WP-5b
+//	GetPictureState()                   gst.PictureState   caller: WP-5b
+//	SetPictureRect(x,y,w,h,ratio)       error              caller: WP-5b
+//	SetPictureVisible(visible)          error              caller: WP-5b
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
@@ -359,7 +366,13 @@ const (
 	// the abandonment is for, and why a teardown that abandons anything ends the
 	// process itself rather than returning into an exit path that would have to
 	// step over the wedged thread. See teardown.
-	shutdownTimeout = 20 * time.Second
+	// a.stopPictureForTeardown is two bounded halves in sequence. The monitor's
+	// Stop is prompt for the same reasons StopReturn's is; the overlay window's
+	// Close posts a quit to its own message thread and waits gst's
+	// overlayCloseBudget, two seconds, before abandoning that thread and saying
+	// so. pictureStopBudget is four seconds, which is that pair with room, and it
+	// is why shutdownTimeout is twenty-four and not twenty.
+	shutdownTimeout = 24 * time.Second
 
 	// senderStopBudget bounds step 2, a.Stop. Fifteen seconds is the sender's own
 	// bounded worst case; see above.
@@ -369,6 +382,17 @@ const (
 	// case with room to spare; a Play in flight is expected to be cut off and is
 	// accounted for above.
 	returnStopBudget = 2 * time.Second
+
+	// pictureStopBudget bounds the picture step: stop the monitor, then destroy
+	// the overlay window. Four seconds is two for the pipeline and two for the
+	// window's message thread; see the arithmetic above shutdownTimeout.
+	//
+	// The window half is the unusual one. Everything else in this teardown is
+	// releasing a socket or a device, which the process exit would release
+	// anyway. A window is on the operator's SCREEN, so an abandoned one is
+	// visible until the process goes — which is why gst's overlay Close says in
+	// its error that it abandoned the thread rather than returning a bare nil.
+	pictureStopBudget = 4 * time.Second
 
 	// mixerCloseBudget bounds step 4, closeMixerController. Closing a
 	// switcher_controller socket is a Close and a goroutine join, both prompt.
@@ -597,6 +621,76 @@ type App struct {
 	// show the RETURN lamp grey while audio was in the commentator's ears.
 	lastReturn gst.ReturnState
 
+	// The SRT PICTURE path takes THREE locks, and the split between them is not
+	// fastidiousness — two of the three arrangements deadlock. The rule is:
+	//
+	//	picMu       →  picViewMu  →  picStateMu
+	//
+	// taken in that order, never any other, and picMu is the only one ever held
+	// across something that blocks.
+	//
+	// picMu guards pic, the running session. It is held for the whole of
+	// StartPicture and StopPicture, INCLUDING the blocking wait inside
+	// gst.PictureMonitor.Stop and the join of the state-forwarding goroutine.
+	//
+	// It is a THIRD subsystem lock, not a reuse of retMu, for the reason that
+	// made retMu a second lock rather than a reuse of sessMu: the picture and the
+	// audio return reach different hardware — a GPU decoder and a window against
+	// a WASAPI endpoint — and either can wedge without the other. One lock over
+	// both would mean a StartPicture waiting on a wedged headphone endpoint.
+	picMu sync.Mutex
+
+	// pic is the running picture session, or nil when the picture is stopped.
+	pic *pictureSession
+
+	// picViewMu guards picOverlay, picRect and picWantVisible: everything about
+	// WHERE THE PICTURE IS DRAWN, as opposed to whether it is running.
+	//
+	// IT IS SEPARATE FROM picMu BECAUSE THE FORWARDING GOROUTINE NEEDS IT WHILE
+	// StopPicture IS HOLDING picMu AND WAITING FOR THAT GOROUTINE TO EXIT. Every
+	// state transition drives the overlay's visibility, so the forwarder touches
+	// these fields on every transition; if they lived under picMu, the first Stop
+	// that arrived while a transition was in flight would deadlock — the Stop
+	// holding picMu waiting on the join, the forwarder waiting on picMu. That is
+	// not hypothetical: it was written that way first and it hung.
+	//
+	// Nothing held under it may block. Every gst.PictureOverlay method records
+	// and posts; see overlay_windows.go's header for why that is the property the
+	// whole design rests on.
+	picViewMu sync.Mutex
+
+	// picOverlay is the native child window the picture is rendered into, or nil
+	// before the first layout call. It OUTLIVES pic: the monitor is rebuilt
+	// whenever the configuration changes, and a window destroyed and recreated
+	// underneath a running WebView2 is a z-order fight with nothing to gain. Only
+	// teardown destroys it.
+	picOverlay gst.PictureOverlay
+
+	// picRect is the last rectangle the frontend gave, in PHYSICAL pixels
+	// relative to the window's client area, and picWantVisible is the last
+	// visibility it asked for. Both are kept even when picOverlay is nil, so that
+	// an overlay created later is positioned before it is ever shown.
+	picRect        gst.PictureRect
+	picWantVisible bool
+
+	// picStateMu guards lastPicture. It is the innermost of the three and it is a
+	// leaf: nothing is taken while it is held.
+	picStateMu sync.Mutex
+
+	// lastPicture is the most recent gst.PictureState forwarded to the frontend,
+	// replayed by domReady for the same reason lastSender and lastReturn are: the
+	// monitor emits only on transitions, so a page that reloaded mid-match would
+	// otherwise draw the fallback mosaic over a working high-resolution picture.
+	lastPicture gst.PictureState
+
+	// pictureDial builds the picture monitor, and overlayDial builds the native
+	// overlay window. Both are gst's real constructors in the application and
+	// fakes in the tests, which is the only way to exercise the wire-up without a
+	// GPU and without a window. Nil means the real one; see
+	// App.newPictureMonitor and App.newPictureOverlay.
+	pictureDial func() gst.PictureMonitor
+	overlayDial func() (gst.PictureOverlay, error)
+
 	// returnDial builds the return monitor. It is gst.NewReturnMonitor in the
 	// application and a fake in the tests, which is how the wire-up is exercised
 	// without a GStreamer pipeline. Nil means the real one; see
@@ -680,6 +774,7 @@ func NewApp(appDir string, gstInitErr error) *App {
 		store:       secrets.New(),
 		lastSender:  sender.StateStopped,
 		lastReturn:  gst.ReturnStateStopped,
+		lastPicture: gst.PictureStateStopped,
 		exitProcess: forceExit,
 	}
 }
@@ -748,6 +843,17 @@ func (a *App) domReady(ctx context.Context) {
 	lastRet := a.lastReturn
 	a.retStateMu.Unlock()
 	a.events.send(EventReturn, lastRet)
+
+	// The picture, for the same reason and with one extra consequence. A page
+	// that reloaded mid-match has forgotten that it asked for the overlay, so
+	// picWantVisible is still true on this side while the page believes nothing
+	// is showing. Replaying the state is what lets the page put its own view back
+	// in step; it will call SetPictureRect from its layout code either way, which
+	// is what re-establishes the rectangle.
+	a.picStateMu.Lock()
+	lastPic := a.lastPicture
+	a.picStateMu.Unlock()
+	a.events.send(EventPicture, lastPic)
 }
 
 // secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
@@ -883,6 +989,13 @@ func (a *App) teardownOrdered() int {
 		}
 		return nil
 	})
+
+	// The picture after the return monitor, never before it. It holds an SRT
+	// socket, a GPU decoder and a WINDOW; the window is the only thing in this
+	// whole teardown that the operator can see, so it goes as late as it can
+	// while still going before the control plane — and it goes after both audio
+	// paths, because a commentator would rather lose the picture last.
+	step("the picture", pictureStopBudget, a.stopPictureForTeardown)
 
 	step("the mixer write path", mixerCloseBudget, a.closeMixerController)
 

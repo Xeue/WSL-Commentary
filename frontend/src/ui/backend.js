@@ -758,6 +758,223 @@ export function onReturn(cb) {
 }
 
 // ---------------------------------------------------------------------------
+// The native picture overlay
+// ---------------------------------------------------------------------------
+//
+// Five bindings and one event, for the path a browser cannot be in at all:
+// srtsrc ! tsdemux ! h265parse ! d3d11h265dec ! a native child window painted
+// over this page. Entirely inside Go.
+//
+// THE PICTURE IS SRT. THE AUDIO IS KINESIS. Nothing in this section touches
+// audio, and the SRT stream's own AAC track is discarded on the Go side. A
+// previous revision of this application built SRT as an AUDIO path, which is the
+// opposite of what was asked for, and it is why selecting "SRT" used to silence
+// the operator.
+//
+// # SetPictureRect takes CSS PIXELS AND THE DEVICE PIXEL RATIO, in one call
+//
+// gst.PictureRect is in PHYSICAL pixels, and gst.ScaleRect is what converts —
+// on the Go side, from the numbers this call carries. The page cannot send only
+// physical pixels and Go cannot read the factor for itself: GetDpiForWindow is
+// the monitor's scale factor, which equals the WebView's device pixel ratio only
+// at 100% zoom, and Ctrl+scroll on a WebView2 changes one and not the other.
+//
+// The two travel together so a rectangle can never be paired with a ratio
+// measured at a different moment. See setPictureRect below.
+//
+// The origin is the client area rather than the screen because the native window
+// is a child of the same top-level window: dragging the window moves both
+// together and needs no report, which is fortunate, because a page cannot
+// observe its own window moving.
+//
+// # SetPictureVisible is not a convenience
+//
+// The overlay is opaque and it is outside the page's stacking context — no
+// z-index reaches it. Anything the page draws over that rectangle is invisible
+// until this is called with false. Settings and the mixer drawer both do.
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const PICTURE_METHODS = Object.freeze({
+  start: 'StartPicture',
+  stop: 'StopPicture',
+  rect: 'SetPictureRect',
+  visible: 'SetPictureVisible',
+  state: 'GetPictureState',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const PICTURE_METHOD_NAMES = Object.freeze(Object.values(PICTURE_METHODS));
+
+// EventPicture: the native picture receiver's state. The payload is one of
+// PICTURE_STATE below.
+export const EVENT_PICTURE = 'picture';
+
+/**
+ * PICTURE_STATE mirrors internal/gst's PictureState EXACTLY, and it is
+ * lowercase.
+ *
+ * gst.ReturnState is uppercase and this is not. The two enums are neighbours,
+ * they carry nearly the same four words, and a copy made from the wrong one
+ * would compare unequal to every event that arrives — leaving the status line
+ * sitting on whatever was last recognised while the picture came and went.
+ * picturesource.test.js asserts these four strings against picture.go itself.
+ *
+ * SHOWING is where RETURN_STATE says RECEIVING, because a picture that is being
+ * received and a picture that is on screen are different claims, and only the
+ * second one is worth making to a commentator.
+ */
+export const PICTURE_STATE = Object.freeze({
+  STOPPED: 'stopped',
+  CONNECTING: 'connecting',
+  SHOWING: 'showing',
+  BACKOFF: 'backoff',
+});
+
+/**
+ * pictureAvailable reports whether this build can do the native SRT picture at
+ * all.
+ *
+ * It checks ALL FIVE, for the reason srtReturnAvailable does: every one of them
+ * is called on a path that has already assumed the option was offered. A build
+ * with StartPicture but no SetPictureRect would start a receiver and then paint
+ * it at whatever rectangle a native default puts it at — an opaque box over the
+ * application, which is worse than no picture at all.
+ */
+export function pictureAvailable() {
+  return PICTURE_METHOD_NAMES.every(hasBinding);
+}
+
+let fakePictureState = PICTURE_STATE.STOPPED;
+let fakePictureTimer = null;
+let fakePictureRect = null;
+let fakePictureVisible = false;
+
+function setFakePictureState(next) {
+  fakePictureState = next;
+  fakeEmit(EVENT_PICTURE, fakePictureState);
+}
+
+/**
+ * Starts the native SRT picture receiver.
+ *
+ * NO ARGUMENTS: like StartReturn it reads the saved configuration — host, port,
+ * latency, key length — so a caller that changes any of those must save first.
+ *
+ * Resolving means the reconnect loop is running, not that a picture is on
+ * screen. Watch the "picture" event for that.
+ */
+export async function startPicture() {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.start);
+  if (fakePictureState !== PICTURE_STATE.STOPPED) {
+    throw new Error('wslcomms: the picture receiver is already running (fake)');
+  }
+  if (fakePictureTimer) clearTimeout(fakePictureTimer);
+  setFakePictureState(PICTURE_STATE.CONNECTING);
+  // AND IT NEVER REACHES SHOWING. There is no native decoder and no child
+  // window in a browser tab, so a fake that claimed a picture was on screen
+  // would hide the mosaic behind an overlay that does not exist — a black
+  // rectangle, in the one session where somebody is looking at the layout.
+  //
+  // BACKOFF is the honest answer and it is also the more useful one: it is the
+  // FALLBACK that a dev session needs to be able to see, and it is the state
+  // this application spends its worst minutes in.
+  fakePictureTimer = setTimeout(() => {
+    fakePictureTimer = null;
+    setFakePictureState(PICTURE_STATE.BACKOFF);
+    console.info(
+      'wslcomms: the fake backend cannot decode SRT — there is no native window in a browser ' +
+        'tab — so the picture stays in BACKOFF and the mosaic fallback is what you are seeing. ' +
+        'That is the intended behaviour of the fake, not a failure of the picture path.',
+    );
+  }, 1200);
+}
+
+/** Stops the receiver, hides the overlay and releases the M2L-X fan-out slot. */
+export async function stopPicture() {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.stop);
+  if (fakePictureTimer) {
+    clearTimeout(fakePictureTimer);
+    fakePictureTimer = null;
+  }
+  fakePictureVisible = false;
+  setFakePictureState(PICTURE_STATE.STOPPED);
+}
+
+/**
+ * Positions the overlay.
+ *
+ * ============ IT SENDS CSS PIXELS AND THE RATIO, IN ONE CALL ================
+ *
+ * Not physical pixels, and this is gst.PictureRect's contract rather than a
+ * convenience. Go multiplies, in gst.ScaleRect, and it does so because the
+ * factor cannot be read on the Go side without being a DIFFERENT NUMBER
+ * MEASURED AT A DIFFERENT MOMENT: GetDpiForWindow is the monitor's scale
+ * factor, which equals the WebView's device pixel ratio only at 100% zoom, and
+ * Ctrl+scroll changes one and not the other. The page's own ratio is
+ * authoritative because the page's own layout is what the rectangle has to line
+ * up with.
+ *
+ * The ratio travels WITH the rectangle, in the same call, so that a rectangle
+ * can never be paired with a ratio measured before or after it. That is the
+ * whole reason this is not two bindings.
+ *
+ * overlay.js still computes the physical rectangle. It does not send it: it uses
+ * it to decide WHETHER to send — a DPI change with an unchanged CSS box has to
+ * re-report, and only the physical rectangle knows that — and it applies the
+ * same edge-rounding rule gst.ScaleRect does, so the number in the console line
+ * is the number Go will land on.
+ *
+ * @param {{x: number, y: number, width: number, height: number}} cssRect
+ * @param {number} devicePixelRatio  window.devicePixelRatio, as measured
+ */
+export async function setPictureRect(cssRect, devicePixelRatio) {
+  const { x, y, width, height } = cssRect || {};
+  if (hasWails()) {
+    return callGoBound(PICTURE_METHODS.rect, x, y, width, height, devicePixelRatio);
+  }
+  fakePictureRect = { x, y, width, height, devicePixelRatio };
+}
+
+/**
+ * Shows or hides the overlay without stopping the receiver.
+ *
+ * Hiding is what Settings and the mixer drawer need: the overlay is opaque and
+ * on top of its rectangle whatever the page does, so a screen drawn underneath
+ * it is a screen the operator can only read two thirds of. Hiding rather than
+ * stopping means coming back from Settings does not re-dial M2L-X.
+ *
+ * @param {boolean} visible
+ */
+export async function setPictureVisible(visible) {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.visible, visible === true);
+  fakePictureVisible = visible === true;
+}
+
+/**
+ * Reads the picture receiver's state now, for a page that has just loaded and
+ * has not yet seen a "picture" event. One of PICTURE_STATE.
+ *
+ * @returns {Promise<string>}
+ */
+export async function getPictureState() {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.state);
+  return fakePictureState;
+}
+
+/** Subscribes to the "picture" event. Returns an unsubscribe function. */
+export function onPicture(cb) {
+  return subscribe(EVENT_PICTURE, cb);
+}
+
+/**
+ * The fake overlay's last known geometry, for a dev session in the browser where
+ * there is no native window to look at. Diagnostics only; nothing reads it.
+ */
+export function fakePictureOverlay() {
+  return { rect: fakePictureRect, visible: fakePictureVisible, state: fakePictureState };
+}
+
+// ---------------------------------------------------------------------------
 // The mixer drawer
 // ---------------------------------------------------------------------------
 //

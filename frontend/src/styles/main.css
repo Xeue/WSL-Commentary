@@ -392,6 +392,53 @@ input[type='range'] {
 }
 
 /* ------------------------------------------------------------------ */
+/* Which picture is on screen                                          */
+/*                                                                      */
+/* There are two, they look alike at a glance — the same framing of     */
+/* the same match — and they differ enough in quality that somebody     */
+/* will ask out loud during a match whether they are looking at the     */
+/* good one. So the answer is drawn permanently over the picture.       */
+/*                                                                      */
+/* Bottom-left, small, and NEVER in the centre: this is a confidence    */
+/* label, not an alarm, and it must not sit over the ball.              */
+/* ------------------------------------------------------------------ */
+
+.picture-badge {
+  position: absolute;
+  left: 0.6rem;
+  bottom: 0.6rem;
+  z-index: 2;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* The FALLBACK state: SRT was asked for and is not delivering, so the soft
+   mosaic is what is being watched. Amber, not red — the commentator has a
+   picture and the match is describable; what they do not have is the one they
+   chose, and that is worth noticing without being alarming. */
+.picture-badge-fallback {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+/* While the native overlay is up it covers this whole box, badge included.
+   The rule below is not about hiding anything — nothing the page draws here is
+   visible anyway — it is so that the ONE frame between "SRT is showing" and the
+   overlay actually appearing does not flash a soft mosaic under a badge that
+   says SRT. Black is what a picture that has not arrived should look like. */
+.pgm-tile-overlaid video {
+  visibility: hidden;
+}
+
+/* ------------------------------------------------------------------ */
 /* Controls: input / headphones / return + level                       */
 /* ------------------------------------------------------------------ */
 
@@ -526,44 +573,48 @@ input[type='range'] {
   background: var(--grey);
 }
 
-/* The channel control is three short words; the source control is two. Neither
-   needs the width the dropdowns do. */
+/* The channel control is three short words. The PICTURE control is two long
+   ones — "High quality (SRT)" and "Mosaic (WebRTC)" — and they are long on
+   purpose: "SRT" and "WebRTC" alone name transports, not pictures, and the
+   commentator choosing between them is not choosing a transport. So it gets
+   room for both segments side by side rather than wrapping to two lines. */
 .control-group-channel {
   flex: 1 1 260px;
 }
 
 .control-group-source {
-  flex: 1 1 200px;
+  flex: 1 1 340px;
 }
 
 /* ------------------------------------------------------------------ */
-/* What the selected return source actually is                          */
+/* What the selected picture actually is                                */
 /* ------------------------------------------------------------------ */
 
-/* Two lines, not a tooltip. The difference between the paths — monitor-grade
-   audio already arriving, against a real 15 Mbit/s stream and one of M2L-X's
-   four fan-out slots — is the whole basis on which the choice is made, and a
-   commentator cannot hear a bitrate. The measured 489 ms WebRTC figure is
-   printed; the SRT figure is NOT, because nobody has measured it. */
+/* Two lines, not a tooltip. The difference between the pictures — a soft tile
+   of a multiviewer already being received, against a real 15 Mbit/s stream and
+   one of M2L-X's four fan-out slots — is the whole basis on which the choice is
+   made, and it is not something you can judge by looking at a control. The
+   measured 489 ms figure below it is the RETURN AUDIO's, and says so; nobody
+   has measured the picture's, so no figure is printed for it. */
 .return-notes {
   flex: 0 0 auto;
   margin: 0 0 0.6rem;
 }
 
-.return-source-note {
+.picture-note {
   margin: 0;
   color: var(--text-muted);
   font-size: 0.8rem;
   line-height: 1.45;
 }
 
-.return-source-status {
+.picture-status {
   margin: 0.25rem 0 0;
   font-size: 0.8rem;
   color: var(--text);
 }
 
-.return-source-status-bad {
+.picture-status-bad {
   color: var(--red);
 }
 
