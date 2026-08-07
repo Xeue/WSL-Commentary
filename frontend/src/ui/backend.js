@@ -193,6 +193,7 @@ function defaultFakeConfig() {
     returnChannel: 'stereo', // config.DefaultReturnChannel
     srtReturnPort: 40501, // config.DefaultSRTReturnPort — Output 1, src=pgm (DIRTY programme)
     srtReturnPBKeyLen: 0, // config.DefaultSRTReturnPBKeyLen — Output 1 measured encrypted=false
+    pictureLatencyMs: 120, // config.DefaultPictureLatencyMs — the picture window's SRT buffer
     returnMid: 2, // config.DefaultReturnMid (aux1/CLN)
     monitorTile: { x: 0, y: 360, w: 640, h: 360 }, // config.DefaultMonitorTile
     returnGainDb: 18, // config.DefaultReturnGainDB

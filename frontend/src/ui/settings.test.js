@@ -78,6 +78,7 @@ function validForm() {
     returnSource: 'webrtc',
     srtReturnPort: 40501,
     srtReturnPBKeyLen: 0,
+    pictureLatencyMs: 120,
     monitorTile: { x: 0, y: 360, w: 640, h: 360 },
     returnGainDb: 18,
     slatePath: 'slate.png',
@@ -496,4 +497,166 @@ test('the return passphrase never reaches config.json', () => {
         'Manager; config.json is plain text in %APPDATA%.',
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// The picture monitor's SRT buffer
+// ---------------------------------------------------------------------------
+//
+// THE FAILURE THESE PREVENT. The commentator's picture ran about a second
+// behind the match. Two causes, both the same shape as the return-port defect
+// above: a number with no control on any screen, and a number that meant
+// something else.
+//
+//   - pictureLatencyMs did not exist. app_picture.go handed the monitor
+//     cfg.srtLatencyMs — the CONTRIBUTION FEED's retransmission budget — so the
+//     only way to make the picture quicker was to thin the protection on the
+//     match going to air.
+//   - and it had no field, so nobody could have done either.
+//
+// Measured on the live instance on 2026-08-07: 993.7 ms of the delay was the
+// video sink synchronising to the pipeline clock, which is fixed in
+// internal/gst. This field is the rest of the control, and its hint carries the
+// one fact that makes it usable — that the far end sets a floor.
+
+test('the picture latency is bounded, and 0 means the default', () => {
+  for (const value of [0, 1, 40, 120, 300, 8000]) {
+    const errors = validateConfig({ ...validForm(), pictureLatencyMs: value });
+    assert.equal(errors.pictureLatencyMs, undefined, `picture latency ${value} is in range`);
+  }
+
+  // 0 is ACCEPTED, unlike srtReturnPort, and the difference has teeth. Go's
+  // EffectivePictureLatencyMs substitutes the default for 0, and every
+  // config.json written before this field existed holds 0 — so refusing it
+  // would make Settings unsavable on the first launch after an upgrade, over a
+  // field the operator never touched.
+  assert.equal(validateConfig({ ...validForm(), pictureLatencyMs: 0 }).pictureLatencyMs, undefined);
+
+  for (const value of [-1, -120, 8001, 1.5, '120', null, undefined, NaN]) {
+    const errors = validateConfig({ ...validForm(), pictureLatencyMs: value });
+    assert.ok(errors.pictureLatencyMs, `pictureLatencyMs ${String(value)} must be rejected`);
+  }
+});
+
+test('the picture latency and the send latency are separate fields', () => {
+  // The whole point of the change. A monitor set as quick as it goes must not
+  // drag the contribution feed's protection down with it, and a heavily
+  // protected feed must not hold the commentator's picture a second behind.
+  const quickMonitor = validateConfig({
+    ...validForm(),
+    srtLatencyMs: 2000,
+    pictureLatencyMs: 40,
+  });
+  assert.deepEqual(quickMonitor, {}, 'a protected feed with a quick monitor is the point');
+
+  // And an error on one must not light the other's box.
+  const sendBad = validateConfig({ ...validForm(), srtLatencyMs: 0, pictureLatencyMs: 120 });
+  assert.ok(sendBad.srtLatencyMs, 'the send latency is out of range and must be reported');
+  assert.equal(sendBad.pictureLatencyMs, undefined, 'the picture latency is fine');
+
+  const pictureBad = validateConfig({ ...validForm(), srtLatencyMs: 120, pictureLatencyMs: -1 });
+  assert.ok(pictureBad.pictureLatencyMs, 'the picture latency is out of range');
+  assert.equal(pictureBad.srtLatencyMs, undefined, 'the send latency is fine');
+});
+
+test('the picture latency has a real control, populated and collected', () => {
+  // Exactly the guard the return port carries, for exactly its defect: a field
+  // read in populate and written back in collectConfig but never rendered is a
+  // field nobody can fix. See the note at carriedReturnSource in settings.js.
+  const js = ui('settings.js');
+  assert.match(js, /numberInput\('f-pictureLatencyMs'\)/, 'the picture latency needs a numeric input');
+  assert.match(
+    js,
+    /addField\(\s*'pictureLatencyMs',/,
+    'the picture latency must be a real field, not a carried value',
+  );
+  assert.match(
+    js,
+    /pictureLatencyMs: Number\(fields\.pictureLatencyMs\.input\.value\)/,
+    'collectConfig must send the latency as a number, not a string',
+  );
+  assert.match(
+    js,
+    /fields\.pictureLatencyMs\.input\.value = String\(\s*config\.pictureLatencyMs/,
+    'populate must show what is saved, or the operator corrects a value they cannot see',
+  );
+  assert.equal(
+    /carriedPictureLatency/.test(js),
+    false,
+    'the picture latency is carried; that is precisely how srtReturnPort became uneditable',
+  );
+});
+
+test('the picture latency hint states the floor the far end sets', () => {
+  // THE MOST IMPORTANT STRING ON THIS SCREEN. SRT negotiates the LARGER of the
+  // two peers' latencies, and the operator's M2L-X Output 1 is set to
+  // Buffer (msec) = 300. An operator who drops this to 40, sees nothing change
+  // and is told nothing concludes the control is broken — when in fact it works
+  // and the far end is overriding it. Without this sentence the field is worse
+  // than no field.
+  const js = ui('settings.js');
+  const field = js.slice(
+    js.indexOf("addField(\n    'pictureLatencyMs',"),
+    js.indexOf('returnEncryptionHeading.textContent'),
+  );
+  assert.ok(field.length > 0, 'the picture latency field must sit above the encryption controls');
+  assert.match(field, /300/, 'the hint must name the 300 ms floor M2L-X imposes');
+  assert.match(field, /M2L-X/, 'and say where the floor comes from');
+  assert.match(field, /larger/i, 'and why: SRT takes the larger of the two ends');
+});
+
+test('the picture latency sits beside the return port it shares a session with', () => {
+  // The port picks which M2L-X output the picture comes from; this picks how
+  // much delay it is buffered with. Read apart, the hint's talk of "this M2L-X
+  // output" has no referent.
+  const js = ui('settings.js');
+  const port = js.indexOf("addField(\n    'srtReturnPort',");
+  const latency = js.indexOf("addField(\n    'pictureLatencyMs',");
+  const encryption = js.indexOf("returnEncryptionHeading.textContent = 'SRT return encryption'");
+  assert.ok(port > 0 && latency > 0 && encryption > 0);
+  assert.ok(latency > port, 'the picture latency belongs immediately below the return port');
+  assert.ok(latency < encryption, 'and inside the return group, not after it');
+});
+
+test('pictureLatencyMs is spelled the same way in the form and in config.go', () => {
+  // Same silent failure as srtReturnPBKeyLen and srtReturnPort: a key mismatch
+  // is not an error, Go keeps 0, EffectivePictureLatencyMs substitutes 120, and
+  // the screen shows whatever the operator typed while the monitor dials
+  // something else. Their conclusion is that the control does nothing — the
+  // very conclusion the M2L-X floor already risks, arriving for a second reason.
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(
+    go,
+    /PictureLatencyMs int `json:"pictureLatencyMs"`/,
+    'internal/config no longer tags the picture latency "pictureLatencyMs"',
+  );
+  for (const file of ['settings.js', 'validate.js', 'backend.js']) {
+    assert.ok(ui(file).includes('pictureLatencyMs'), `${file} must use the same key as config.go`);
+  }
+});
+
+test('the picture latency range matches internal/config.ValidateReturn', () => {
+  // Two validators that disagree mean either a Save the form accepts and
+  // StartPicture then refuses, or the reverse — and the reverse reaches an
+  // operator as "the picture just does not come up".
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(
+    go,
+    /pictureLatencyMs must be between 0 and 8000 milliseconds/,
+    'internal/config no longer bounds the picture latency at 0..8000',
+  );
+  // And it is checked by ValidateReturn, not Validate: a monitor setting must
+  // never be a reason the contribution feed does not go on air.
+  const validateReturn = go.slice(go.indexOf('func (c *Config) ValidateReturn()'));
+  assert.ok(
+    validateReturn.indexOf('pictureLatencyMs') > -1,
+    'the picture latency must be validated by ValidateReturn, not by the gate on Start',
+  );
+});
+
+test('the default picture latency is 120 everywhere it is written down', () => {
+  assert.match(ui('backend.js'), /pictureLatencyMs: 120/);
+  assert.match(ui('settings.js'), /pictureLatencyMs: 120/);
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(go, /DefaultPictureLatencyMs = 120/);
 });

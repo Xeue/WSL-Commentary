@@ -615,6 +615,21 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		return errors.New("gst: picture monitor: could not add the first-frame probe to " + namePicDecode)
 	}
 
+	// sync=false. THE SINGLE BIGGEST THING THIS PIPELINE DOES ABOUT LATENCY, and
+	// the whole argument for it — including the measured 993.7 ms it removes, and
+	// the one condition under which it becomes wrong again — is at
+	// pictureSinkSync in picture.go rather than restated here.
+	//
+	// It is set unconditionally, with no hasProperty guard, because "sync" is
+	// GstBaseSink's own property: every sink in GStreamer has it, and a guard here
+	// would turn a renamed or replaced sink into a silent return of the second
+	// this line exists to remove. If it is ever missing, that is a fault to see.
+	p.sink.SetObjectProperty("sync", pictureSinkSync)
+
+	// qos=false, decided together with sync above and argued at pictureSinkQoS.
+	// Also a GstBaseSink property, also unguarded, for the same reason.
+	p.sink.SetObjectProperty("qos", pictureSinkQoS)
+
 	// force-aspect-ratio: the picture is 16:9 and the rectangle the page gives
 	// the overlay may not be. Letterboxing inside the rectangle is right;
 	// stretching a football pitch is not, and a commentator judging a distance

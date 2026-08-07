@@ -414,3 +414,184 @@ func TestTheTwoKeyLengthsAreIndependent(t *testing.T) {
 		t.Fatalf("Validate() = %v; the return's key length must not gate Start", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The picture monitor's SRT latency
+// ---------------------------------------------------------------------------
+//
+// PictureLatencyMs is tested in this file rather than config_test.go for the
+// reason the header gives: it is validated by ValidateReturn and not by
+// Validate, because it is a monitor setting and no monitor setting may be a
+// reason the contribution feed does not go on air.
+
+// TestDefaults_PictureLatencyMs pins the default against a literal, so that
+// changing the constant is a two-place decision rather than a silent one.
+func TestDefaults_PictureLatencyMs(t *testing.T) {
+	if got := Defaults().PictureLatencyMs; got != 120 {
+		t.Fatalf("default pictureLatencyMs = %d, want 120", got)
+	}
+
+	// And it is the same figure as the send path's, which is worth stating rather
+	// than leaving to look like sharing: they are separate fields now, free to
+	// diverge, and should only ever do so on purpose. The picture's was not
+	// lowered as part of the change that created it — the second the operator
+	// reported was the video sink synchronising to the pipeline clock, which is
+	// fixed in internal/gst, and spending retransmission budget on top of that
+	// would have been chasing a fraction of what had just been fixed for free.
+	if Defaults().PictureLatencyMs != DefaultSRTLatencyMs {
+		t.Logf("pictureLatencyMs (%d) and srtLatencyMs (%d) have diverged; that is allowed, "+
+			"but it should be deliberate", Defaults().PictureLatencyMs, DefaultSRTLatencyMs)
+	}
+}
+
+// TestEffectivePictureLatencyMsSubstitutesForZero is the upgrade path.
+//
+// Every config.json written before this field existed decodes with 0 in it. A
+// zero-millisecond SRT latency is not a setting anybody wants — it disables the
+// retransmission window, so one lost packet is a visible tear — so zero has to
+// mean "unset" and come up on the default.
+func TestEffectivePictureLatencyMsSubstitutesForZero(t *testing.T) {
+	var c Config
+	if got := c.EffectivePictureLatencyMs(); got != DefaultPictureLatencyMs {
+		t.Fatalf("EffectivePictureLatencyMs() on a zero value = %d, want the default %d; "+
+			"a config.json written before this field existed would dial srtsrc with no "+
+			"retransmission window at all", got, DefaultPictureLatencyMs)
+	}
+
+	// A negative cannot come from the form, which refuses it, but it can come
+	// from a hand-edited file — config.json is hand-editable by design. It is not
+	// a latency, so it takes the default too rather than reaching srtsrc.
+	c.PictureLatencyMs = -1
+	if got := c.EffectivePictureLatencyMs(); got != DefaultPictureLatencyMs {
+		t.Errorf("EffectivePictureLatencyMs() on a negative = %d, want the default %d", got,
+			DefaultPictureLatencyMs)
+	}
+}
+
+// TestEffectivePictureLatencyMsReturnsAnExplicitSetting is the other half: the
+// substitution must not mask a real choice, including a deliberately small one.
+func TestEffectivePictureLatencyMsReturnsAnExplicitSetting(t *testing.T) {
+	for _, ms := range []int{1, 40, 300, 500, 8000} {
+		c := Config{PictureLatencyMs: ms}
+		if got := c.EffectivePictureLatencyMs(); got != ms {
+			t.Errorf("EffectivePictureLatencyMs() with %d set = %d, want %d", ms, got, ms)
+		}
+	}
+}
+
+// TestValidateReturn_PictureLatencyMs bounds the field, and pins the bounds the
+// frontend validator restates.
+func TestValidateReturn_PictureLatencyMs(t *testing.T) {
+	base := func() *Config {
+		c := Defaults()
+		c.M2LXHost = "m2lx.example.com"
+		return c
+	}
+
+	// 0 is ACCEPTED, and that is the case with teeth. It means "use the default"
+	// — see EffectivePictureLatencyMs — and every installation upgrading to this
+	// revision has 0 in its file. Refusing it would make StartReturn fail on the
+	// first launch after an upgrade, over a field the operator never touched.
+	for _, ms := range []int{0, 1, 40, 120, 300, 8000} {
+		c := base()
+		c.PictureLatencyMs = ms
+		if err := c.ValidateReturn(); err != nil {
+			t.Errorf("ValidateReturn() with pictureLatencyMs = %d: %v; want accepted", ms, err)
+		}
+	}
+
+	for _, ms := range []int{-1, -120, 8001, 1 << 20} {
+		c := base()
+		c.PictureLatencyMs = ms
+		err := c.ValidateReturn()
+		if err == nil {
+			t.Errorf("ValidateReturn() accepted pictureLatencyMs = %d", ms)
+			continue
+		}
+		if !strings.Contains(err.Error(), "pictureLatencyMs") {
+			t.Errorf("ValidateReturn() with %d = %v; the message must name the field so the "+
+				"form can point at the right box", ms, err)
+		}
+	}
+}
+
+// TestPictureLatencyDoesNotGateStart is the property this whole file exists to
+// keep true, applied to the new field.
+//
+// The picture monitor is the commentator's programme window. A latency somebody
+// typed wrongly into it must never be the reason a match does not go out.
+func TestPictureLatencyDoesNotGateStart(t *testing.T) {
+	c := Defaults()
+	c.M2LXHost = "m2lx.example.com"
+	c.Alias = "commentary"
+	c.EventID = "dl9-5p5ah0bd-empd"
+	c.SRTPort = 40001
+	c.AudioDeviceID = "{0.0.1.00000000}.{bbbb}"
+	c.PictureLatencyMs = -999 // refused by ValidateReturn
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v; a broken picture latency must not stop the feed going "+
+			"on air", err)
+	}
+	if err := c.ValidateReturn(); err == nil {
+		t.Fatal("ValidateReturn() accepted pictureLatencyMs = -999")
+	}
+}
+
+// TestPictureLatencyIsNamedTheWayTheFrontendSpellsIt is the same silent-mismatch
+// guard the two key lengths carry.
+//
+// A key mismatch between config.go and the form is not an error anywhere: Go
+// keeps 0, EffectivePictureLatencyMs substitutes 120, and the Settings screen
+// shows whatever the operator typed while the monitor dials something else. The
+// operator's conclusion is that the control does nothing — which is exactly the
+// conclusion the M2L-X floor already risks, arriving for a second reason.
+func TestPictureLatencyIsNamedTheWayTheFrontendSpellsIt(t *testing.T) {
+	c := Defaults()
+	c.PictureLatencyMs = 300
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"pictureLatencyMs":300`) {
+		t.Fatalf("config.json does not carry \"pictureLatencyMs\":300; got %s", data)
+	}
+
+	// And the send path's latency is still its own separate key. Sharing them is
+	// what put the contribution feed's retransmission budget in charge of how far
+	// behind the commentator's picture ran.
+	if !strings.Contains(string(data), `"srtLatencyMs"`) {
+		t.Fatal("config.json no longer carries the send path's \"srtLatencyMs\"")
+	}
+}
+
+// TestPictureLatencyRoundTripsThroughTheFile covers the pair of failures a new
+// field can have on disk: not being written, and not being read back.
+func TestPictureLatencyRoundTripsThroughTheFile(t *testing.T) {
+	dir := withAppData(t)
+
+	c := Defaults()
+	c.M2LXHost = "m2lx.example.com"
+	c.PictureLatencyMs = 300
+	if err := c.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	path := filepath.Join(dir, AppDataDirName, FileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	if !strings.Contains(string(raw), `"pictureLatencyMs"`) {
+		t.Fatalf("the saved file has no pictureLatencyMs; a field that is not written is a "+
+			"control that forgets what it was told. Got:\n%s", raw)
+	}
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.PictureLatencyMs != 300 {
+		t.Fatalf("pictureLatencyMs came back as %d, want 300", got.PictureLatencyMs)
+	}
+}

@@ -220,6 +220,65 @@ type Config struct {
 	// inside libsrt as ERROR:UNSECURE with nothing on screen to say so.
 	SRTReturnPBKeyLen int `json:"srtReturnPBKeyLen"`
 
+	// PictureLatencyMs is srtsrc's latency, in MILLISECONDS, for the PICTURE
+	// monitor — the commentator's programme window. Default 120.
+	//
+	// # Why it is its own field and not SRTLatencyMs
+	//
+	// It was SRTLatencyMs until this revision: app_picture.go read the SEND
+	// path's latency and handed it to the picture. That is two unrelated
+	// decisions sharing one number. SRTLatencyMs is how much reordering and
+	// retransmission budget the CONTRIBUTION FEED carries on its way out — a
+	// figure that trades delay against the feed breaking up on air, where
+	// breaking up is unacceptable and delay is nearly free. This is how much
+	// budget the commentator's MONITOR carries, where the trade runs the other
+	// way: a monitor is a thing to react to, delay is the whole complaint, and a
+	// dropped frame on it costs nobody anything. Lowering one to fix the other
+	// would have thinned the protection on the feed that actually goes to air.
+	//
+	// # It is not the only latency on the picture path, and it is not the largest
+	//
+	// Measured against the live instance on 2026-08-07, GStreamer's own latency
+	// query on the picture pipeline reported 855 ms, made up of srtsrc 120 ms,
+	// tsdemux 700 ms, h265parse 20 ms and d3d11videosink's 15 ms processing
+	// deadline. The dominant term is tsdemux's default and has nothing to do with
+	// this field; it is dealt with in internal/gst by not letting the video sink
+	// honour it (see pictureSinkSync). An operator who moves this number and
+	// expects the whole delay to move with it will be disappointed by roughly
+	// seven hundred milliseconds.
+	//
+	// # THE FAR END CAN FLOOR THIS, AND ON THIS INSTANCE IT APPEARS NOT TO
+	//
+	// SRT buffers to the LARGER of the two peers' latencies, so a receiver
+	// cannot unilaterally get below what the sender demands. The operator's
+	// M2L-X Output 1 is configured with Buffer (msec) = 300, which is the reason
+	// to expect a floor at 300 — and the Settings hint warns about one, because
+	// an operator who lowers this, sees no change and is told nothing concludes
+	// the control is broken.
+	//
+	// MEASURED, 2026-08-07, and it did NOT behave like a floor. Time from
+	// process start to first decoded frame:
+	//
+	//	latency=40     1803, 1884, 1909, 2053, 2341 ms   (n=5, mean 1998)
+	//	latency=300    2407, 2430, 2430, 2447, 4045 ms   (n=5, mean 2752)
+	//	latency=2000   3865, 3869 ms                     (n=2, mean 3867)
+	//
+	// The two lower groups do not overlap at all: the slowest latency=40 run
+	// (2341 ms) beat the fastest latency=300 run (2407 ms), five times out of
+	// five. A floor at 300 would have made them indistinguishable. So on this
+	// instance the setting appears to take effect across its whole range, and
+	// lowering it below 300 is worth trying rather than pointless.
+	//
+	// That measurement is NOT conclusive about the mechanism, and the difference
+	// matters enough to say why: time-to-first-frame also contains DNS, the SRT
+	// handshake, PMT discovery and a wait of up to one GOP for something
+	// decodable, which is why the deltas above overshoot the nominal setting
+	// differences. The negotiated latency itself was not read — srtsrc's "stats"
+	// property is not reachable from gst-launch and nothing at GST_DEBUG
+	// srtobject:7 prints it — so this is inferred from end-to-end timing rather
+	// than read off the socket.
+	PictureLatencyMs int `json:"pictureLatencyMs"`
+
 	// ReturnMid is the WebRTC transceiver mid whose audio is routed to the
 	// headphones. Default 2, which is aux1/CLN — effects without commentary.
 	// Mid 1 is master/PGM.
@@ -299,6 +358,27 @@ const (
 	// to stop happening.
 	DefaultSRTReturnPBKeyLen = 0
 
+	// DefaultPictureLatencyMs is the picture monitor's SRT latency in
+	// milliseconds. It matches DefaultSRTLatencyMs and internal/gst's
+	// DefaultPictureLatencyMs — roughly five times the measured 21 ms median
+	// round-trip time to the M2L-X instance.
+	//
+	// It is restated here rather than imported from internal/gst for the reason
+	// ReturnChannelStereo and the rest are: internal/config must not depend on
+	// the cgo package, because a configuration package that cannot be tested
+	// without GStreamer is a configuration package that stops being tested.
+	// TestPictureLatencyDefaultMatchesGst pins the two together.
+	//
+	// It is deliberately NOT lowered as part of the change that introduced it.
+	// The second the operator was complaining about was the video sink
+	// synchronising to the pipeline clock — 993.7 ms of it, removed in
+	// internal/gst — and nothing about this number. Lowering the default as well
+	// would have spent real retransmission budget, on an unprotected internet
+	// path that already shows continuity errors, to chase a fraction of what had
+	// just been fixed for nothing. It is a control now; the operator can lower it
+	// and watch, which is the point of making it a field.
+	DefaultPictureLatencyMs = 120
+
 	// DefaultReturnGainDB is the measured offset between the SRT-ingested peak
 	// level and the level the KVS monitor arrives at.
 	DefaultReturnGainDB = 18.0
@@ -341,6 +421,7 @@ func Defaults() *Config {
 		// absent from it reads as "nobody decided", which for an encryption
 		// setting is not the same as "decided: none".
 		SRTReturnPBKeyLen: DefaultSRTReturnPBKeyLen,
+		PictureLatencyMs:  DefaultPictureLatencyMs,
 	}
 }
 
@@ -503,6 +584,24 @@ func (c *Config) EffectiveSRTReturnPort() int {
 	return DefaultSRTReturnPort
 }
 
+// EffectivePictureLatencyMs returns the SRT latency the picture monitor dials
+// with, substituting DefaultPictureLatencyMs for a zero value.
+//
+// Zero and "unset" are the same thing here, as they are for the return port: a
+// zero-millisecond SRT latency is not a setting anyone wants — it disables the
+// retransmission window entirely, so a single lost packet is a visible tear —
+// and every config.json written before this field existed has zero in it. Those
+// files must come up on the default rather than on nothing.
+//
+// It is also what internal/gst.PictureOpts.normalise would do with a zero, so
+// the substitution happens once, here, rather than differently in two places.
+func (c *Config) EffectivePictureLatencyMs() int {
+	if c.PictureLatencyMs > 0 {
+		return c.PictureLatencyMs
+	}
+	return DefaultPictureLatencyMs
+}
+
 // UsesSRTReturn reports whether the SRT return path is the configured one.
 func (c *Config) UsesSRTReturn() bool {
 	return c.EffectiveReturnSource() == ReturnSourceSRT
@@ -548,6 +647,24 @@ func (c *Config) ValidateReturn() error {
 
 	if p := c.EffectiveSRTReturnPort(); p < 1 || p > 65535 {
 		errs = append(errs, fmt.Errorf("srtReturnPort must be between 1 and 65535, got %d", p))
+	}
+
+	// The PICTURE monitor's SRT latency. Checked here, with the other monitor
+	// fields, and deliberately NOT in Validate, for the reason this method's
+	// header gives at length: no monitor setting may be a reason the
+	// contribution feed does not go on air. A commentator with a mistyped
+	// picture latency should still be able to send.
+	//
+	// A negative value is the only one refused outright. Zero means "use the
+	// default" — see EffectivePictureLatencyMs, and note that every config.json
+	// written before this field existed has zero in it — so refusing zero would
+	// make every upgraded installation fail this check on first launch. The
+	// upper bound is generous on purpose: an operator on a bad satellite path
+	// may legitimately want seconds of retransmission budget, and this is a
+	// monitor, so the cost of them being wrong is their own picture.
+	if ms := c.PictureLatencyMs; ms < 0 || ms > 8000 {
+		errs = append(errs, fmt.Errorf(
+			"pictureLatencyMs must be between 0 and 8000 milliseconds, got %d", ms))
 	}
 
 	// The same three values Validate allows for the send path's pbkeylen, and

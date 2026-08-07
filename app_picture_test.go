@@ -701,3 +701,74 @@ func waitForCond(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// ---------------------------------------------------------------------------
+// The picture's SRT latency
+// ---------------------------------------------------------------------------
+
+// TestPictureLatencyComesFromItsOwnFieldAndNotTheFeeds is the regression test
+// for the operator's report that the picture ran about a second behind.
+//
+// pictureOpts read cfg.SRTLatencyMs — the CONTRIBUTION FEED's retransmission
+// budget — and handed it to the monitor. That is one number answering two
+// questions that pull in opposite directions: the feed trades delay for not
+// breaking up on air, where breaking up is unacceptable and delay is nearly
+// free; the monitor trades the other way round. While they were the same field,
+// the only way to make the commentator's picture quicker was to thin the
+// protection on the match going out.
+func TestPictureLatencyComesFromItsOwnFieldAndNotTheFeeds(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	cfg := config.Defaults()
+	cfg.M2LXHost = "m2lx.example.com"
+	cfg.SRTLatencyMs = 2000   // the feed going to air: heavily protected
+	cfg.PictureLatencyMs = 40 // the commentator's monitor: as quick as it goes
+
+	got := a.pictureOpts(cfg, "", 0x1234)
+	if got.LatencyMs != 40 {
+		t.Fatalf("the monitor was given LatencyMs = %d, want 40. It is reading the "+
+			"contribution feed's srtLatencyMs (%d) again, which is how the picture came "+
+			"to be a second behind the match", got.LatencyMs, cfg.SRTLatencyMs)
+	}
+}
+
+// TestPictureLatencyFallsBackToTheDefaultOnAnOldConfig is the upgrade path.
+//
+// Every config.json written before pictureLatencyMs existed decodes with 0 in
+// it. Zero must not reach srtsrc: it disables the retransmission window
+// entirely, so a single lost packet on an unprotected internet path is a
+// visible tear. EffectivePictureLatencyMs is what makes that true, and this
+// asserts pictureOpts actually calls it rather than reading the field raw.
+func TestPictureLatencyFallsBackToTheDefaultOnAnOldConfig(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	cfg := config.Defaults()
+	cfg.M2LXHost = "m2lx.example.com"
+	cfg.PictureLatencyMs = 0 // what an upgraded installation has on disk
+
+	got := a.pictureOpts(cfg, "", 0x1234)
+	if got.LatencyMs != config.DefaultPictureLatencyMs {
+		t.Fatalf("the monitor was given LatencyMs = %d on a config with no picture latency, "+
+			"want the default %d; pictureOpts is reading the field raw instead of through "+
+			"EffectivePictureLatencyMs", got.LatencyMs, config.DefaultPictureLatencyMs)
+	}
+}
+
+// TestPictureLatencyDefaultMatchesGst pins the two constants that must agree.
+//
+// internal/config deliberately does not import internal/gst — a configuration
+// package that cannot be tested without GStreamer stops being tested — so the
+// default is stated twice. This package imports both and is the only place the
+// pair can be compared.
+//
+// If they drift, nothing fails: gst.PictureOpts.normalise substitutes its own
+// figure for a zero it never receives, because config already substituted a
+// different one. The operator gets a latency neither file documents.
+func TestPictureLatencyDefaultMatchesGst(t *testing.T) {
+	if config.DefaultPictureLatencyMs != gst.DefaultPictureLatencyMs {
+		t.Fatalf("config.DefaultPictureLatencyMs = %d but gst.DefaultPictureLatencyMs = %d. "+
+			"They are restated rather than shared because internal/config must not depend on "+
+			"the cgo package; restated means they have to be kept level here.",
+			config.DefaultPictureLatencyMs, gst.DefaultPictureLatencyMs)
+	}
+}

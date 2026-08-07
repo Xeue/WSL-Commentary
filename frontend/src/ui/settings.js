@@ -54,6 +54,7 @@ function blankConfig() {
     returnChannel: 'stereo',
     returnSource: 'webrtc',
     srtReturnPort: 40501,
+    pictureLatencyMs: 120,
     srtReturnPBKeyLen: 0,
     monitorTile: { x: 0, y: 360, w: 640, h: 360 },
     returnGainDb: 18,
@@ -455,6 +456,34 @@ export function createSettingsView(handlers) {
       'handshake is refused in silence.',
   );
 
+  // HOW MUCH SRT BUFFER THE COMMENTATOR'S PICTURE CARRIES. A real control, for
+  // the same reason the port above it is one: it had no field at all until the
+  // operator reported the picture running about a second behind the main feed,
+  // and a number nobody can reach is a number nobody can correct.
+  //
+  // It sits immediately below the port because they describe the same session —
+  // the port picks which M2L-X output the picture comes from, this picks how
+  // much delay it is buffered with — and because the hint below has to be read
+  // next to the output it applies to.
+  //
+  // The hint names the far end's floor. An operator who drops this, sees no
+  // change and is told nothing will conclude the control is broken, when the
+  // truth may be the opposite: the control works and the far end is overriding
+  // it. It is phrased as a thing that CAN happen rather than a thing that
+  // definitely does, because that is as far as the measurement goes — see the
+  // note on the floor at internal/config.Config.PictureLatencyMs.
+  addField(
+    'pictureLatencyMs',
+    'Picture buffer (ms)',
+    numberInput('f-pictureLatencyMs'),
+    'SRT retransmission budget for the picture window — lower is quicker, and more likely to ' +
+      'tear when a packet is lost. Default 120. THE FAR END CAN SET A FLOOR: SRT buffers to ' +
+      'the LARGER of the two ends’ latencies, and this M2L-X output is set to ' +
+      'Buffer (msec) = 300. If lowering this stops making any difference, that is why, and it ' +
+      'has to be lowered on M2L-X itself. This is separate from the SRT output latency above, ' +
+      'which protects the feed going to air.',
+  );
+
   // --- SRT return encryption ---------------------------------------------
   //
   // Grouped with the return settings above rather than with the SRT OUTPUT
@@ -647,6 +676,14 @@ export function createSettingsView(handlers) {
     // form that showed 0 would be showing a port the return never dials, and
     // the validator below would then refuse to save the screen it just drew.
     fields.srtReturnPort.input.value = String(config.srtReturnPort || blankConfig().srtReturnPort);
+    // `||`, not `??`, for the reason above: 0 is what
+    // internal/config.EffectivePictureLatencyMs substitutes the default FOR, and
+    // every config.json written before this field existed holds 0. Showing 0
+    // would show a latency the monitor never dials with, and the validator
+    // below would then refuse to save the screen it had just drawn.
+    fields.pictureLatencyMs.input.value = String(
+      config.pictureLatencyMs || blankConfig().pictureLatencyMs,
+    );
     // Held, not shown. See the note beside the returnChannel field.
     carriedReturnSource = normaliseReturnSource(config.returnSource);
     fields.returnGainDb.input.value = String(config.returnGainDb ?? 18);
@@ -698,6 +735,7 @@ export function createSettingsView(handlers) {
       returnMid: Number(fields.returnMid.input.value),
       returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
       srtReturnPort: Number(fields.srtReturnPort.input.value),
+      pictureLatencyMs: Number(fields.pictureLatencyMs.input.value),
       srtReturnPBKeyLen: Number(fields.srtReturnPBKeyLen.input.value),
       // Carried through from the loaded config, not collected from a control.
       // See the declaration above for why. It is the LAST such field; every

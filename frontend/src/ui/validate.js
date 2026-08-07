@@ -105,6 +105,30 @@ export function validateConfig(config) {
     errors.srtReturnPort = 'SRT return port must be a whole number from 1 to 65535 — 40501 is the programme output.';
   }
 
+  // The PICTURE monitor's SRT buffer, in milliseconds. A different endpoint
+  // again from srtLatencyMs above: that one is the retransmission budget the
+  // contribution feed carries on its way OUT, this one is the budget the
+  // commentator's picture window carries on the way IN. They were one field
+  // until the picture was measured running about a second behind, and sharing
+  // them meant the only way to make the monitor quicker was to thin the
+  // protection on the feed going to air.
+  //
+  // The bounds match internal/config.ValidateReturn exactly — 0 to 8000 — and
+  // the two must not drift: a value this form accepts and Go then refuses
+  // reaches the operator as a monitor that will not start, with the reason on a
+  // screen they are not looking at.
+  //
+  // Zero is ACCEPTED here, unlike srtReturnPort, and the difference is
+  // deliberate. Go's EffectivePictureLatencyMs substitutes the default for 0 and
+  // every config.json written before this field existed holds 0, so refusing it
+  // would make the Settings screen unsavable on the first launch after an
+  // upgrade — the form is populated from a stored 0, and the operator would be
+  // told to fix a field they never touched.
+  if (!isInt(config.pictureLatencyMs) || config.pictureLatencyMs < 0 || config.pictureLatencyMs > 8000) {
+    errors.pictureLatencyMs =
+      'Picture buffer must be a whole number of milliseconds from 0 to 8000 — 120 is the default.';
+  }
+
   // The RETURN path's key length. Same three values, a different endpoint, and
   // deliberately not the same field as pbkeylen above: M2L-X sets encryption
   // per output — Output 1 (pgm, 40501) measured encrypted=false while Outputs 2

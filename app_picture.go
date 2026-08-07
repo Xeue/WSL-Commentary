@@ -526,8 +526,19 @@ func (a *App) pictureOpts(cfg *config.Config, passphrase string, handle uintptr)
 		// picture. It is the AUDIO return's config field being read for the
 		// picture, which is an interface gap and is reported as one in the file
 		// header rather than worked around here.
-		Port:      cfg.EffectiveSRTReturnPort(),
-		LatencyMs: cfg.SRTLatencyMs,
+		Port: cfg.EffectiveSRTReturnPort(),
+
+		// EffectivePictureLatencyMs, and NOT SRTLatencyMs, which is what this
+		// read until the operator reported the picture running about a second
+		// behind the main feed.
+		//
+		// SRTLatencyMs is the CONTRIBUTION FEED's retransmission budget: the
+		// delay the match tolerates on its way out so it does not break up on
+		// air. Handing it to the monitor made one number answer two questions
+		// that pull in opposite directions, and it meant the only way to make the
+		// commentator's picture quicker was to thin the protection on the feed
+		// going to air. They are separate fields now, and this is the monitor's.
+		LatencyMs: cfg.EffectivePictureLatencyMs(),
 
 		Passphrase: passphrase,
 		PBKeyLen:   cfg.SRTReturnPBKeyLen,

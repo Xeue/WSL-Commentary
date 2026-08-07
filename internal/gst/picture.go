@@ -106,6 +106,91 @@ import (
 // matches the other two rather than guessing.
 const DefaultPictureLatencyMs = 120
 
+// pictureSinkSync is d3d11videosink's "sync" property, and it is FALSE.
+//
+// It is a named constant rather than a literal at the call site for the reason
+// overlayExStyle is one: this is a property that reads like tidy-up-able default
+// noise, the pipeline works either way, and the cost of it being quietly
+// reverted is a second of latency that nobody would attribute to a deleted line.
+// picture_cgo_guard_test.go asserts both the value here and the fact that
+// buildLocked still passes it.
+//
+// # Why a video sink on a live feed must not sync, HERE
+//
+// sync=true is right for playback and is GStreamer's default for good reason: a
+// sink holds each buffer until its running time arrives on the pipeline clock,
+// which is what keeps a video track lined up with the audio track beside it.
+//
+// THERE IS NO AUDIO IN THIS PIPELINE. The demuxer's audio pad goes to a
+// fakesink — see onPadAdded in picture_cgo.go, which throws it away deliberately
+// — and the commentator's audio arrives over an entirely separate path, from
+// Kinesis, with its own clock, its own buffering and no relationship to this
+// pipeline's clock at all. So there is nothing here for the clock to synchronise
+// the video AGAINST. The sink was paying the whole accumulated pipeline latency
+// and buying nothing with it.
+//
+// # What that cost, measured
+//
+// Dialled at the live instance on 2026-08-07, port 40501, 1080p50, two 30 s
+// runs of the shipped element chain differing only in this property. GStreamer's
+// own latency query, from the sink's log:
+//
+//	min(855 ms) = upstream(840 ms) + processing_deadline(15 ms) + render_delay(0)
+//	upstream 840 ms = srtsrc 120 + tsdemux 700 + h265parse 20 + d3d11h265dec 0
+//
+// and the latency tracer's srtsrc-src-pad to sink-pad transit time:
+//
+//	sync=true    mean 993.7 ms   (n=1309, min 944.6, max 1022.7)
+//	sync=false   mean   1.2 ms   (n=1404, min   0.3, max   49.5)
+//
+// That is the operator's "about a second behind the main feed", in full, and it
+// is very nearly all one number: tsdemux's own "latency" property, which
+// defaults to 700 ms. That property is a CLAIM made to the latency query and not
+// a queue — tsdemux is not holding buffers for 700 ms, which is exactly why the
+// transit time collapses to about a millisecond the moment the sink stops
+// honouring the claim.
+//
+// # The condition that makes this wrong again
+//
+// IF THIS PIPELINE EVER CARRIES THE AUDIO THE COMMENTATOR HEARS, SYNC MUST COME
+// BACK. The instant there is an audio branch that reaches their headphones — the
+// fakesink in onPadAdded replaced by a real sink, or the Kinesis return retired
+// in favour of the audio already present in this transport — the two branches
+// have to be paced by the same clock, and a video sink rendering on arrival while
+// an audio sink renders on the clock will drift apart without limit. There is no
+// warning for that failure other than this paragraph.
+const pictureSinkSync = false
+
+// pictureSinkQoS is d3d11videosink's "qos" property, and it is FALSE.
+//
+// The element's default is TRUE, so this is a change, and it is made together
+// with pictureSinkSync rather than left unexamined because the two interact.
+//
+// A QoS-enabled sink measures how late each buffer is against its render
+// deadline, drops the ones it judges too late, and sends the lateness upstream
+// so the decoder can skip ahead. On a monitor that is a defensible trade: a
+// current picture with holes beats a complete picture falling further behind.
+//
+// But with sync=false THERE IS NO RENDER DEADLINE. GstBaseSink short-circuits
+// its sync step, so no lateness is ever computed and "late" stops having a
+// meaning to measure a drop against. That is not inference; it is in the sink's
+// own log. Measured over the same runs:
+//
+//	sync=true    1309 clock waits, GST_CLOCK_OK, mean jitter -18.9 ms
+//	sync=false   1290 buffers, every one logged "sync disabled", clock return
+//	             GST_CLOCK_BADTIME and a jitter of exactly 0
+//
+// Neither run dropped a frame and neither emitted a QoS event.
+//
+// So turning it off changes nothing observable today. What it removes is a
+// frame-dropping heuristic left armed against a deadline the sink no longer
+// honours — one that upstream d3d11h265dec would act on by skipping frames, on
+// a 50p feed, producing judder on a picture that was never actually late.
+//
+// It pairs with pictureSinkSync: if sync comes back for the reason above, this
+// should come back with it, because then the deadline is real again.
+const pictureSinkQoS = false
+
 // pictureFirstFrameTimeout is how long Play waits, after the pipeline reaches
 // PLAYING, for a DECODED FRAME to leave the decoder.
 //
