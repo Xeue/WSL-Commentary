@@ -862,10 +862,12 @@ input[type='range'] {
    Devices fields then land on one row from 1440px, two-plus-one at 1024px and
    stacked at 800px, and the field this application's worst configuration bug is
    entered through is never a box you scroll sideways inside. Per-group track
-   minimums are the right lever throughout — one line each. */
-.settings-group--devices {
-  --settings-track: 27rem;
-}
+   minimums are the right lever throughout — one line each.
+
+   .settings-group--devices (27rem) is gone WITH its group: the operator
+   removed the device-id fields from Settings entirely — selection happens on
+   the main screen's dropdowns only. The ids survive as hidden inputs in
+   settings.js so a save still round-trips them. */
 
 .settings-form h2 {
   font-size: 1.02rem;
@@ -1303,6 +1305,9 @@ input[type='range'] {
   font-size: 0.65rem;
   line-height: 1;
   color: #6b7683;
+  /* The prefix is for the linter only: this page renders in WebView2
+     (Chromium), never Safari. */
+  -webkit-user-select: none;
   user-select: none;
 }
 

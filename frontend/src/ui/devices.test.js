@@ -144,6 +144,27 @@ test('the DVS wall itself is in natural order, 2-3 before 10-11', () => {
   assert.deepEqual(sorted.map((d) => d.id), ['c', 'b', 'a']);
 });
 
+test('Dante’s mixed-width padding cannot put 11 above 1', () => {
+  // THE REGRESSION THE OPERATOR REPORTED: Dante pads for column alignment, so
+  // single digits carry a DOUBLE space ("DVS Receive  1-2") while double
+  // digits carry a single one ("DVS Receive 11-12") — these are the literal
+  // names from the machine's registry. Chunked without normalising, the text
+  // chunks differ at the padding and the shorter one wins, so 11-12 sorted
+  // ABOVE 1-2 and the previous test never saw it because it padded every name
+  // the same way.
+  const sorted = sortDevices([
+    dev('k', 'DVS Receive 15-16 (Dante Virtual Soundcard)'),
+    dev('j', 'DVS Receive 11-12 (Dante Virtual Soundcard)'),
+    dev('i', 'DVS Receive  7-8 (Dante Virtual Soundcard)'),
+    dev('h', 'DVS Receive  1-2 (Dante Virtual Soundcard)'),
+  ]);
+  assert.deepEqual(
+    sorted.map((d) => d.id),
+    ['h', 'i', 'j', 'k'],
+    '1-2, 7-8, 11-12, 15-16 — numeric order regardless of alignment padding',
+  );
+});
+
 test('an unrecognised device is presumed real hardware, rank 0', () => {
   // The measured failure of the mixer's ranking was the useful precedent: a
   // family nobody predicted should surface where the operator will see it,

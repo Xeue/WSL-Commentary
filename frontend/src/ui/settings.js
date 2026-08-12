@@ -34,11 +34,12 @@ import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
 //
 // Owner: WP-5b.
 //
-// audioDeviceId and headphoneDeviceId are included here even though they are
-// normally written by the two dropdowns on the main screen, because section
-// 9 lists them as part of the configuration and an engineer may need to
-// paste a known endpoint GUID before the corresponding hardware is patched
-// in. They are ordinary text fields, not re-implementations of the dropdowns.
+// The device-id fields are REGISTERED but never rendered: device selection
+// belongs to the main screen's dropdowns alone (operator's request, and the
+// free-text route was how a playback GUID once reached wasapi2src). They live
+// in the fields map as hidden inputs so a save round-trips them unchanged —
+// collectConfig replaces the whole document, and a field this form does not
+// restate is a field a save silently deletes.
 
 // Fallback shape used only if backend.getConfig() itself fails, so the form
 // still renders instead of the Settings screen going blank. Mirrors
@@ -489,31 +490,48 @@ export function createSettingsView(handlers) {
   connectionHeading.textContent = 'M2L-X connection';
   openGroup(connectionHeading);
 
-  // The primary input: the address bar of the M2L-X GUI the operator is
-  // already looking at. Both the host and the event ID are in it, and the
-  // event ID is the one field nothing in the API can supply — there is no
-  // event-list endpoint (/api/event/list, /api/events, /api/live_operation*
-  // and /api/user/me were all checked) and it is an opaque string nobody
-  // remembers. One paste fills both fields, which stay visible and editable
-  // below so nothing here becomes un-fixable.
+  // THREE BOXES: address, username, password — at the operator's request.
+  //
+  // The host and the event ID used to be two more editable fields under this
+  // one, and they were waffle in field form: both are read out of the pasted
+  // live-operation address, an instance only ever has the one event, and the
+  // API has NO way to list events — probed again on 2026-08-12 against the
+  // live instance (/api/live_operation/events and friends all 404) and
+  // confirmed by reading the SPA bundle, whose only real endpoints are
+  // sign-in, refresh, the two KVS calls and the two websockets. So the URL is
+  // not merely the convenient source of the event id; it is the ONLY source,
+  // and a picker for "multiple events" has nothing to ask. The two derived
+  // values still exist as config fields and still travel in presets — they
+  // are kept as HIDDEN inputs (never appended to the DOM) so populate,
+  // collectConfig, validation and the preset diff all work unchanged, and the
+  // derived line under the address shows the operator what was read.
   const liveURLInput = textInput('f-liveUrl');
   liveURLInput.placeholder = 'https://m2lx-…/live-operation/…';
   liveURLInput.autocomplete = 'off';
   liveURLInput.spellcheck = false;
-  const liveURLRow = row(
-    'M2L-X address (paste from the browser)',
-    'f-liveUrl',
-    liveURLInput,
-    'The page you use to operate the event. The host and the event ID are read out of it into the two fields below.',
-  );
+  const liveURLRow = row('M2L-X address', 'f-liveUrl', liveURLInput);
   const liveURLNote = document.createElement('p');
   liveURLNote.className = 'field-hint field-note';
   liveURLNote.hidden = true;
   liveURLRow.wrap.insertBefore(liveURLNote, liveURLRow.errorEl);
   currentGroup.appendChild(liveURLRow.wrap);
 
-  addField('m2lxHost', 'M2L-X host', textInput('f-m2lxHost'), 'Bare host, e.g. "m2lx.example.com" — no scheme.');
-  addField('alias', 'Alias', textInput('f-alias'), 'The sign-in alias. Note: not "username".');
+  // Hidden, deliberately: see the comment above. addHiddenField registers a
+  // field exactly like addField without giving it a row on screen.
+  function addHiddenField(key, input) {
+    const errorEl = document.createElement('p');
+    errorEl.className = 'field-error';
+    errorEl.hidden = true;
+    fields[key] = { input, errorEl };
+    return input;
+  }
+  addHiddenField('m2lxHost', textInput('f-m2lxHost'));
+  addHiddenField('eventId', textInput('f-eventId'));
+
+  // "the alias is literally the username" — so the label says Username. The
+  // config field stays `alias` because that is the JSON key M2L-X's sign-in
+  // endpoint requires and the name every stored config already uses.
+  addField('alias', 'Username', textInput('f-alias'));
 
   const m2lxPasswordInput = textInput('f-m2lxPassword', 'password');
   m2lxPasswordInput.autocomplete = 'new-password';
@@ -525,24 +543,15 @@ export function createSettingsView(handlers) {
   fields.m2lxPassword = { input: m2lxPasswordInput, errorEl: m2lxPasswordRow.errorEl };
   currentGroup.appendChild(m2lxPasswordRow.wrap);
 
-  addField(
-    'eventId',
-    'Event ID',
-    textInput('f-eventId'),
-    'The last part of the live-operation address, e.g. "dl9-5p5ah0bd-empd". Filled in by the paste above.',
-  );
-
-  // Typing in either field keeps the pasted address honest rather than leaving
-  // a stale URL sitting above two edited fields.
-  const syncLiveURL = () => {
-    liveURLInput.value = formatLiveOperationURL(fields.m2lxHost.input.value, fields.eventId.input.value);
-    hideLiveURLMessages();
+  // The derived line is now the only rendering of host and event, so it is
+  // shown whenever they are known rather than only after a paste — populate
+  // calls this on open.
+  const showDerived = () => {
+    const host = fields.m2lxHost.input.value;
+    const event = fields.eventId.input.value;
+    liveURLNote.hidden = !(host || event);
+    liveURLNote.textContent = `Host "${host}", event "${event}".`;
   };
-  fields.m2lxHost.input.addEventListener('input', () => {
-    syncLiveURL();
-    refreshSRTPlaceholder();
-  });
-  fields.eventId.input.addEventListener('input', syncLiveURL);
 
   // --- SRT output ---------------------------------------------------------
   const srtHeading = document.createElement('h2');
@@ -557,10 +566,10 @@ export function createSettingsView(handlers) {
     'srtHost',
     'SRT host — optional',
     textInput('f-srtHost'),
-    'Leave blank to use the M2L-X host. Only fill this in if SRT ingest is on a different name.',
+    'Blank = same host as M2L-X.',
   );
   addField('srtPort', 'SRT port', numberInput('f-srtPort'));
-  addField('srtLatencyMs', 'SRT latency (ms)', numberInput('f-srtLatencyMs'), 'Default 120 — about 5x the measured median round-trip time.');
+  addField('srtLatencyMs', 'SRT latency (ms)', numberInput('f-srtLatencyMs'), 'Default 120.');
   addField(
     'pbkeylen',
     'Passphrase key length',
@@ -584,8 +593,7 @@ export function createSettingsView(handlers) {
   const secretsHint = document.createElement('p');
   secretsHint.className = 'field-hint secrets-hint';
   secretsHint.textContent =
-    'Passwords are write-only: this app never reads them back. "set" only means this field was ' +
-    'saved successfully during the current run of the app.';
+    'Passwords are write-only; "set" means saved during this run.';
   currentGroup.appendChild(secretsHint);
 
   // --- status ---------------------------------------------------------
@@ -596,8 +604,7 @@ export function createSettingsView(handlers) {
     'statusKey',
     'Status key — optional',
     textInput('f-statusKey'),
-    'The switcher_status node for our router input, e.g. "cam7". Blank is allowed: the three ' +
-    'WebSocket lamps then read NO STATUS and everything else works normally.',
+    'Our router input in switcher_status, e.g. "cam7". Blank = the three lamps read NO STATUS.',
   );
 
   // The suggestions. There is no endpoint that names this node, so the app
@@ -679,35 +686,23 @@ export function createSettingsView(handlers) {
   // the candidate appear rather than have to leave and come back.
   backend.onStatusKeyCandidates((candidates) => renderSuggestions(candidates));
 
-  // --- devices ---------------------------------------------------------
-  const devicesHeading = document.createElement('h2');
-  devicesHeading.textContent = 'Devices';
-  openGroup(devicesHeading, 'settings-group--devices');
-  addField(
-    'audioDeviceId',
-    'Commentary input device ID',
-    textInput('f-audioDeviceId'),
-    'Normally set from the Commentary input dropdown on the main screen.',
-  );
-  addField(
-    'headphoneDeviceId',
-    'Headphone device ID — WebRTC return',
-    textInput('f-headphoneDeviceId'),
-    'A browser mediaDeviceId, used when the return source is WebRTC. Normally set from the ' +
-      'Headphones dropdown on the main screen.',
-  );
-  // A SECOND device field, not a duplicate. The two return paths address the
-  // same headphones through different identifier spaces — a browser
-  // mediaDeviceId and a WASAPI endpoint id — and one put in the other's field
-  // does not fail: it plays on the default device. Two labelled fields is the
-  // cheapest way to make that visible to whoever is pasting a GUID.
-  addField(
-    DEVICE_KEY_SRT,
-    'Headphone device ID — SRT return',
-    textInput('f-headphoneEndpointId'),
-    'A Windows WASAPI endpoint id, used when the return source is SRT. Not interchangeable with ' +
-      'the field above even though both name the same headphones.',
-  );
+  // --- devices: THE GROUP IS GONE ---------------------------------------
+  //
+  // Device selection is the main screen's job — the operator's words: "drop
+  // the devices ID selection entirely from that page, that should be solely
+  // done from the main page". The free-text device fields were also the entry
+  // route for the render-endpoint fault fixed in 6bd5d8a: a GUID pasted here
+  // bypassed every dropdown filter. The three fields stay REGISTERED as
+  // hidden inputs because collectConfig replaces the whole document — a field
+  // this form does not restate is a field a save silently deletes — and
+  // because the loaded values must round-trip untouched. Note the SRT
+  // return's output device (headphoneEndpointId) now has NO editable control
+  // anywhere; an empty value falls back to the default output device
+  // (return_cgo.go documents the fallback), and a value set by an older build
+  // is carried through unchanged.
+  addHiddenField('audioDeviceId', textInput('f-audioDeviceId'));
+  addHiddenField('headphoneDeviceId', textInput('f-headphoneDeviceId'));
+  addHiddenField(DEVICE_KEY_SRT, textInput('f-headphoneEndpointId'));
 
   // --- monitor / return ---------------------------------------------------
   const monitorHeading = document.createElement('h2');
@@ -738,7 +733,7 @@ export function createSettingsView(handlers) {
       'f-returnChannel',
       CHANNEL_MODES.map((m) => ({ value: m.value, label: m.label })),
     ),
-    CHANNEL_MODES.map((m) => `${m.label}: ${m.hint}`).join(' '),
+    '"Left only" = the left source channel in both ears.',
   );
   // Beside the bus and channel controls it trims, NOT below the encryption
   // heading it used to sit under: this is a monitor-wide gain, and a field that
@@ -748,7 +743,7 @@ export function createSettingsView(handlers) {
     'returnGainDb',
     'Return gain (dB)',
     numberInput('f-returnGainDb', 0.1),
-    'Default 18 dB — the measured offset between the SRT-ingested level and the KVS monitor level.',
+    'Default 18 dB (measured).',
   );
   // The return SOURCE — WebRTC or the native SRT path — has NO control here on
   // purpose. It decides what the commentator can hear right now, and a
@@ -769,14 +764,10 @@ export function createSettingsView(handlers) {
   // well mean changing the two controls below it as well.
   addField(
     'srtReturnPort',
-    'SRT return port — which M2L-X output to listen to',
+    'SRT return port',
     numberInput('f-srtReturnPort'),
-    'Measured on the live instance. 40501 — Output 1, src=pgm: the DIRTY programme feed, the ' +
-      'default, and what a commentator watches (encrypted=false). 40502 — Output 2, src=pvw: its ' +
-      'AUDIO is the master bus, the same as pgm (encrypted=true). 40503 — Output 3, src=cln: the ' +
-      'clean feed (encrypted=true). 40504 and up — Outputs 4 to 7, byte-transparent relays of ' +
-      'router inputs. An encrypted output needs the passphrase and key length below, or every ' +
-      'handshake is refused in silence.',
+    '40501 pgm (dirty, the default) / 40502 pvw (encrypted) / 40503 cln (encrypted) / 40504+ relays. ' +
+      'Encrypted outputs need the key and passphrase below.',
   );
 
   // HOW MUCH SRT BUFFER THE COMMENTATOR'S PICTURE CARRIES. A real control, for
@@ -799,12 +790,8 @@ export function createSettingsView(handlers) {
     'pictureLatencyMs',
     'Picture buffer (ms)',
     numberInput('f-pictureLatencyMs'),
-    'SRT retransmission budget for the picture window — lower is quicker, and more likely to ' +
-      'tear when a packet is lost. Default 120. THE FAR END CAN SET A FLOOR: SRT buffers to ' +
-      'the LARGER of the two ends’ latencies, and this M2L-X output is set to ' +
-      'Buffer (msec) = 300. If lowering this stops making any difference, that is why, and it ' +
-      'has to be lowered on M2L-X itself. This is separate from the SRT output latency above, ' +
-      'which protects the feed going to air.',
+    'Default 120. SRT uses the larger end: this M2L-X output sets 300 ms, so below that, ' +
+      'change it on M2L-X.',
   );
 
   // --- SRT return encryption ---------------------------------------------
@@ -836,9 +823,7 @@ export function createSettingsView(handlers) {
       { value: 16, label: '16' },
       { value: 32, label: '32' },
     ]),
-    'Leave at 0 unless the M2L-X output being monitored has a passphrase set. Setting this ' +
-      'without entering a passphrase below stops the return from starting, with a message ' +
-      'saying so — an encrypted session with no key cannot connect to anything.',
+    'Match the M2L-X output; 0 unless it is encrypted.',
   );
 
   const srtReturnPassphraseInput = textInput('f-srtReturnPassphrase', 'password');
@@ -848,9 +833,7 @@ export function createSettingsView(handlers) {
     'SRT return passphrase',
     'f-srtReturnPassphrase',
     srtReturnPassphraseInput,
-    'A DIFFERENT passphrase from the SRT one above: that one is the key to the commentary ' +
-      'input this app sends to, this one is the key to the M2L-X output it listens back on. ' +
-      'Stored in Windows Credential Manager, never in config.json.',
+    'Not the SRT passphrase above — this is the key to the return output.',
   );
   const srtReturnPassphraseBadge = document.createElement('span');
   srtReturnPassphraseBadge.className = 'secret-badge';
@@ -862,7 +845,7 @@ export function createSettingsView(handlers) {
   currentGroup.appendChild(srtReturnPassphraseRow.wrap);
 
   const tileHeading = document.createElement('h3');
-  tileHeading.textContent = 'Monitor tile (position within the 2240x1440 mosaic)';
+  tileHeading.textContent = 'Monitor tile (in the 2240x1440 mosaic)';
   currentGroup.appendChild(tileHeading);
   const tileGrid = document.createElement('div');
   tileGrid.className = 'tile-grid';
@@ -886,7 +869,7 @@ export function createSettingsView(handlers) {
   const slateHeading = document.createElement('h2');
   slateHeading.textContent = 'Slate';
   openGroup(slateHeading);
-  addField('slatePath', 'Slate image path', textInput('f-slatePath'), 'Defaults to the bundled slate.png.');
+  addField('slatePath', 'Slate image path', textInput('f-slatePath'), 'Blank = the bundled slate.png.');
 
   // --- actions ---------------------------------------------------------
   const saveMessage = document.createElement('p');
@@ -1027,6 +1010,7 @@ export function createSettingsView(handlers) {
     fields.srtPassphrase.input.value = '';
     fields.srtReturnPassphrase.input.value = '';
     liveURLInput.value = formatLiveOperationURL(config.m2lxHost, config.eventId);
+    showDerived();
     hideLiveURLMessages();
     refreshSRTPlaceholder();
     refreshSecretBadges();
@@ -1089,13 +1073,29 @@ export function createSettingsView(handlers) {
     }
   }
 
+  // Errors against fields with no row on screen surface where the operator can
+  // act on them. m2lxHost and eventId are hidden inputs derived from the
+  // address, so their errors belong on the address row; a hidden field's own
+  // errorEl is attached to nothing and an error written there is a save that
+  // fails with no visible reason.
+  const ERROR_SURROGATES = Object.freeze({
+    m2lxHost: () => ({ errorEl: liveURLRow.errorEl, input: liveURLInput }),
+    eventId: () => ({ errorEl: liveURLRow.errorEl, input: liveURLInput }),
+  });
+
   function displayErrors(errors) {
     clearAllErrors();
+    liveURLRow.errorEl.hidden = true;
+    liveURLRow.errorEl.textContent = '';
     let first = null;
     for (const [key, message] of Object.entries(errors)) {
-      const field = fields[key];
+      const field = ERROR_SURROGATES[key] ? ERROR_SURROGATES[key]() : fields[key];
       if (!field) continue;
-      field.errorEl.textContent = message;
+      // Two derived errors share the address row; the second appends rather
+      // than silently replacing the first.
+      field.errorEl.textContent = field.errorEl.textContent
+        ? `${field.errorEl.textContent} ${message}`
+        : message;
       field.errorEl.hidden = false;
       if (!first) first = field.input;
     }

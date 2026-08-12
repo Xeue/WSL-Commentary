@@ -86,7 +86,6 @@ test('every h2 on the Settings form opens a group section', () => {
   assert.match(js, /openGroup\(connectionHeading\)/);
   assert.match(js, /openGroup\(srtHeading\)/);
   assert.match(js, /openGroup\(statusHeading\)/);
-  assert.match(js, /openGroup\(devicesHeading, 'settings-group--devices'\)/);
   assert.match(js, /openGroup\(monitorHeading\)/);
   assert.match(js, /openGroup\(slateHeading\)/);
   assert.equal(
@@ -264,18 +263,36 @@ test('the widest fields are named by ids settings.js actually creates', () => {
   }
 });
 
-test('the device fields get a track wide enough for a WASAPI endpoint id', () => {
-  const m = sheet.match(/\.settings-group--devices\s*\{[^}]*--settings-track:\s*([\d.]+)rem/);
-  assert.ok(m, 'main.css must give the Devices group its own track minimum');
-  assert.ok(
-    Number(m[1]) >= 27,
-    'at 18rem a 55-character endpoint id is a box you scroll sideways inside, ' +
-      'and that field is how the phantom-endpoint failure is diagnosed',
+test('the Devices group is gone: device selection is the main screen, only', () => {
+  // The group used to exist as three free-text GUID fields with a 27rem track
+  // wide enough for a WASAPI endpoint id. The operator removed it: "drop the
+  // devices ID selection entirely from that page, that should be solely done
+  // from the main page" — and the free-text route was how a playback GUID
+  // once reached wasapi2src. The fields survive as HIDDEN inputs so a save
+  // round-trips them (collectConfig replaces the whole document), which is
+  // what the second and third assertions pin: gone from the SCREEN must never
+  // come to mean gone from the SAVE.
+  assert.equal(
+    /openGroup\(devicesHeading/.test(js),
+    false,
+    'no Devices group may be opened; device selection belongs to the main screen',
   );
   assert.match(
     js,
-    /openGroup\(devicesHeading, 'settings-group--devices'\)/,
-    'settings.js must open the Devices group with the modifier the wide track hangs off',
+    /addHiddenField\('audioDeviceId'/,
+    'audioDeviceId must stay registered as a hidden field or a save deletes it',
+  );
+  assert.match(
+    js,
+    /addHiddenField\('headphoneDeviceId'/,
+    'headphoneDeviceId must stay registered as a hidden field or a save deletes it',
+  );
+  // Comments stripped: the rule's tombstone in main.css names the selector in
+  // prose, and prose about a selector is not the selector.
+  assert.equal(
+    /settings-group--devices/.test(stripComments(sheet)),
+    false,
+    'the orphaned 27rem track rule should go with the group it sized',
   );
 });
 

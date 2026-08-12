@@ -169,8 +169,17 @@ function deviceRank(name) {
  * @returns {number}
  */
 export function compareDevicesForDisplay(a, b) {
-  const nameA = str(a && a.name);
-  const nameB = str(b && b.name);
+  // Whitespace runs are collapsed BEFORE chunking, because Dante pads its
+  // numbers for column alignment: single digits get a double space
+  // ("DVS Receive  1-2") and double digits a single one ("DVS Receive 11-12").
+  // Chunked as-is, the TEXT chunks differ — "DVS Receive  " vs "DVS Receive "
+  // — and the comparison is decided there, before the numbers are ever looked
+  // at: the shorter text chunk wins and 11-12 lands ABOVE 1-2. The operator
+  // saw exactly that. Collapsing makes the text chunks equal, so the walk
+  // reaches the digits and compares 1 against 11 as numbers. Display names
+  // keep their real spacing; only the comparison key is normalised.
+  const nameA = str(a && a.name).replace(/\s+/g, ' ').trim();
+  const nameB = str(b && b.name).replace(/\s+/g, ' ').trim();
   const ra = deviceRank(nameA);
   const rb = deviceRank(nameB);
   if (ra !== rb) return ra - rb;
