@@ -1,4 +1,8 @@
 import { createLampRow } from './lamps.js';
+// The dropdowns' pure logic: display order and the saved-but-missing marker.
+// It lives in its own module so `node --test` can drive it without a DOM —
+// this file is wiring, devices.test.js is where the behaviour is proved.
+import { sortDevices, describeDeviceSelection } from './devices.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import {
@@ -627,15 +631,38 @@ export function createHomeView(handlers) {
       return;
     }
     select.disabled = false;
-    for (const d of devices) {
+    // Display order, not arrival order: real microphones above the NDI/webcam
+    // virtual sources, the Dante wall last, numbers compared as numbers. The
+    // measured machine offers eight "DVS Receive N-M" pairs, and byte order
+    // both interleaves 1-2 with 10-11 and files them above the one Focusrite
+    // the commentator actually uses. sortDevices copies; the caller's array
+    // (app.js's currentInputDevices) is not reordered under it.
+    const ordered = sortDevices(devices);
+    for (const d of ordered) {
       const opt = document.createElement('option');
       opt.value = d.id;
       opt.textContent = d.name;
       select.appendChild(opt);
     }
-    if (previousValue && devices.some((d) => d.id === previousValue)) {
-      select.value = previousValue;
+    const selection = describeDeviceSelection(ordered, previousValue);
+    if (selection.present) {
+      if (selection.savedId !== '') select.value = selection.savedId;
+      return;
     }
+    // The saved id is not in today's list — a docked USB interface, a stopped
+    // Dante Virtual Soundcard, a config.json from another machine. This used
+    // to fall through silently, leaving device #1 showing as selected: the
+    // operator reads a plausible device on screen while Start refuses the id
+    // actually saved, and cannot reconcile the two. Show the truth instead —
+    // a marker option that cannot be chosen, selected, with the missing id in
+    // it. The control is left VISIBLY WRONG on purpose; picking any real
+    // device is the way out, and that gesture overwrites the stale id.
+    const missing = document.createElement('option');
+    missing.value = selection.savedId;
+    missing.textContent = selection.label;
+    missing.disabled = true;
+    select.insertBefore(missing, select.firstChild);
+    select.value = selection.savedId;
   }
 
   function setInputDevices(devices, selectedId) {

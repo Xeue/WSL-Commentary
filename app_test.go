@@ -1090,6 +1090,210 @@ func TestStartReportsAFailedGstInit(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The audio-device pre-flight
+// ---------------------------------------------------------------------------
+//
+// startSession checks the saved commentary input id BEFORE building a
+// pipeline, because both bad ids used to fail twenty seconds too late and
+// blame the network: wasapi2src accepts any id at Start and fails
+// asynchronously, and the sender read that bus error as a connection failure —
+// "the commentary feed to <host>:40005 is not connected and is retrying",
+// measured live, about a playback endpoint in config.json. These tests pin the
+// two refusals AND the two deliberate non-refusals: an enumeration hiccup must
+// never become a new way to be unable to go on air.
+
+// withStubDevices replaces the gst stub's input device list for one test and
+// restores the default three afterwards. Pass an empty (non-nil) slice for the
+// empty-list case — nil is the stub's "restore defaults" sentinel.
+func withStubDevices(t *testing.T, devices []gst.Device) {
+	t.Helper()
+	gst.SetStubDevices(devices)
+	t.Cleanup(func() { gst.SetStubDevices(nil) })
+}
+
+// withStubDeviceError makes the stub's ListInputDevices fail for one test.
+func withStubDeviceError(t *testing.T, err error) {
+	t.Helper()
+	gst.SetStubDeviceError(err)
+	t.Cleanup(func() { gst.SetStubDeviceError(nil) })
+}
+
+// renderEndpointID is a Windows RENDER (playback) endpoint id in the measured
+// shape of the operator's live failure — the namespace is the discriminator:
+// 0.0.0 is render, 0.0.1 is capture.
+const renderEndpointID = "{0.0.0.00000000}.{8678ce58-7b71-4bd4-810f-1c4a7f11ec71}"
+
+// assertNoSession fails the test if a refused Start left a session behind.
+func assertNoSession(t *testing.T, a *App) {
+	t.Helper()
+	a.sessMu.Lock()
+	sess := a.session
+	a.sessMu.Unlock()
+	if sess != nil {
+		t.Fatal("a refused Start left a session behind")
+	}
+}
+
+func TestStartRefusesAVanishedAudioDevice(t *testing.T) {
+	// The saved id is a well-formed CAPTURE id that this machine no longer has
+	// — a Dante Virtual Soundcard channel whose source has gone, or a
+	// config.json copied from another machine. Without the pre-flight this
+	// prerolls, fails asynchronously and is retried as a network fault.
+	a, _ := newTestApp(t)
+	withStubDevices(t, []gst.Device{
+		{ID: "{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}", Name: "DVS Receive  3-4 (Dante Virtual Soundcard)"},
+		{ID: "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}", Name: "Microphone (Focusrite Scarlett 2i2 USB)"},
+	})
+
+	cfg := validConfig()
+	cfg.AudioDeviceID = "{0.0.1.00000000}.{aaaaaaaa-0004-438e-9003-51a46e139bfc}"
+	setConfig(a, cfg)
+
+	err := a.Start()
+	if err == nil {
+		_ = a.Stop()
+		t.Fatal("Start() succeeded with a saved device id that is not on this machine")
+	}
+	for _, want := range []string{
+		cfg.AudioDeviceID,
+		"not present on this machine",
+		"2 inputs were found",
+		"Commentary input dropdown",
+		"belongs to another machine",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Start() error %q does not say %q", err, want)
+		}
+	}
+	assertNoSession(t, a)
+}
+
+func TestStartRefusesARenderEndpointWhetherOfferedOrNot(t *testing.T) {
+	// The operator's live defect: "we had an output selected as an input".
+	// The namespace check fires FIRST, before enumeration is even consulted,
+	// so the refusal is the playback message in both cases — including the
+	// case where a stale enumeration would have offered the device, which is
+	// exactly how the id got saved in the first place.
+	tests := []struct {
+		name    string
+		devices []gst.Device
+	}{
+		{
+			// The dropdown-regression case: enumeration still lists the render
+			// endpoint (an old build, or a future filter regression). Presence
+			// in the list must not launder a playback device into a microphone.
+			name: "offered by enumeration",
+			devices: []gst.Device{
+				{ID: renderEndpointID, Name: "Speakers (Realtek(R) Audio)"},
+				{ID: "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}", Name: "Microphone (Focusrite Scarlett 2i2 USB)"},
+			},
+		},
+		{
+			// The filtered case: enumeration no longer offers it, so the id
+			// would ALSO fail the presence check — but the operator must be
+			// told it is a playback endpoint, not merely that it is absent,
+			// because their next move differs.
+			name: "not offered by enumeration",
+			devices: []gst.Device{
+				{ID: "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}", Name: "Microphone (Focusrite Scarlett 2i2 USB)"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := newTestApp(t)
+			withStubDevices(t, tt.devices)
+
+			cfg := validConfig()
+			cfg.AudioDeviceID = renderEndpointID
+			setConfig(a, cfg)
+
+			err := a.Start()
+			if err == nil {
+				_ = a.Stop()
+				t.Fatal("Start() opened a Windows PLAYBACK endpoint as the commentary input")
+			}
+			for _, want := range []string{
+				renderEndpointID,
+				"PLAYBACK",
+				gst.CaptureEndpointPrefix,
+				gst.RenderEndpointPrefix,
+				"Commentary input dropdown",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Start() error %q does not say %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), "not present") {
+				t.Errorf("Start() error %q reads as the vanished-device refusal; "+
+					"the namespace check must fire first", err)
+			}
+			assertNoSession(t, a)
+		})
+	}
+}
+
+func TestStartProceedsWhenDeviceEnumerationFails(t *testing.T) {
+	// The presence check is advisory. A device monitor that could veto Start
+	// would be a NEW way to be off air — with the saved device possibly
+	// sitting there working the whole time — so an enumeration failure is
+	// logged and the start proceeds.
+	a, _ := newTestApp(t)
+	withStubDeviceError(t, errors.New("the wasapi2 device monitor did not start"))
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v; an enumeration failure must not block the feed", err)
+	}
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestStartProceedsWhenDeviceEnumerationIsEmpty(t *testing.T) {
+	// An empty list is a device-monitor hiccup until proven otherwise: zero
+	// capture devices on a commentary machine is far less likely than the
+	// monitor coming up empty, and refusing would strand a working device.
+	a, _ := newTestApp(t)
+	withStubDevices(t, []gst.Device{})
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v; an empty enumeration must not block the feed", err)
+	}
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestStartAcceptsThePresentSavedDevice(t *testing.T) {
+	// The check is not vacuous in either direction: validConfig's id is the
+	// stub's first capture device, so a Start that refused here would be
+	// refusing every correctly saved configuration.
+	a, _ := newTestApp(t)
+
+	devices, err := a.ListInputDevices()
+	if err != nil {
+		t.Fatalf("ListInputDevices() error = %v", err)
+	}
+	var present bool
+	for _, d := range devices {
+		if d.ID == validConfig().AudioDeviceID {
+			present = true
+		}
+	}
+	if !present {
+		t.Fatal("validConfig's device id is no longer in the stub's default list; this test would prove nothing")
+	}
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v; the saved device is present and must be accepted", err)
+	}
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
 func TestStartForwardsSenderStates(t *testing.T) {
 	a, _ := newTestApp(t)
 
@@ -1161,6 +1365,143 @@ func TestRepeatedStartStopCyclesLeakNothing(t *testing.T) {
 			t.Fatal("a pipeline was reused across a Stop/Start cycle; gst.Pipeline is single-use")
 		}
 		seen[p] = true
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The self-stop reaper
+// ---------------------------------------------------------------------------
+
+// fakeSelfStoppingSender is a sender.Sender the test can stop from the
+// SENDER'S side, modelling the contract the real sender honours on
+// gst.ErrPipelineFatal: it emits sender.StateStopped and closes its states
+// channel without anyone having called App.Stop. That close is the reaper's
+// trigger, so a fake that performs exactly it — and nothing else — is what
+// isolates the reaper from the reconnect choreography the real sender would
+// need to reach the same place.
+//
+// Stop performs the same sequence, once, whoever asks first: the real sender's
+// Stop is idempotent in effect, and the race test below relies on a self-stop
+// and an operator Stop landing together being indistinguishable from either
+// alone.
+type fakeSelfStoppingSender struct {
+	states chan sender.State
+	once   sync.Once
+}
+
+func newFakeSelfStoppingSender() *fakeSelfStoppingSender {
+	return &fakeSelfStoppingSender{states: make(chan sender.State, 8)}
+}
+
+func (f *fakeSelfStoppingSender) Start(sender.Opts) error { return nil }
+
+func (f *fakeSelfStoppingSender) Stop() error {
+	f.selfStop()
+	return nil
+}
+
+func (f *fakeSelfStoppingSender) States() <-chan sender.State { return f.states }
+
+// selfStop is the sender deciding on its own that the session is over: emit
+// StateStopped, close the channel. Safe to race with Stop; only one wins.
+func (f *fakeSelfStoppingSender) selfStop() {
+	f.once.Do(func() {
+		f.states <- sender.StateStopped
+		close(f.states)
+	})
+}
+
+var _ sender.Sender = (*fakeSelfStoppingSender)(nil)
+
+// withFakeSender installs the senderDial seam and returns a function that
+// yields the most recently dialled fake.
+func withFakeSender(a *App) (latest func() *fakeSelfStoppingSender) {
+	var mu sync.Mutex
+	var current *fakeSelfStoppingSender
+	a.senderDial = func(gst.Pipeline) sender.Sender {
+		f := newFakeSelfStoppingSender()
+		mu.Lock()
+		current = f
+		mu.Unlock()
+		return f
+	}
+	return func() *fakeSelfStoppingSender {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+}
+
+func TestASelfStoppedSessionIsReapedSoStartWorksAgain(t *testing.T) {
+	// The defect this pins: a.session used to be cleared only by App.Stop, so
+	// a sender that stopped itself — gst.ErrPipelineFatal, the capture chain
+	// dead — left the pointer in place and every later Start returned
+	// errAlreadySending. The operator saw a grey SENDING lamp, a button
+	// reading START, and a START that refused because a session that had
+	// already died was still on the books; the only way out was restarting
+	// the application.
+	a, _ := newTestApp(t)
+	latest := withFakeSender(a)
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	latest().selfStop()
+
+	waitFor(t, 5*time.Second, "the reaper to clear the self-stopped session", func() bool {
+		a.sessMu.Lock()
+		defer a.sessMu.Unlock()
+		return a.session == nil
+	})
+
+	// And the point of the reaping: the next START is accepted.
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() after a self-stop error = %v; the dead session was never reaped", err)
+	}
+	if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestSelfStopRacingAnOperatorStopNeverDeadlocks(t *testing.T) {
+	// The reaper is deliberately NOT tracked by sess.wg: App.Stop holds sessMu
+	// across sess.wg.Wait(), so a reaper counted in that WaitGroup — parked on
+	// the sessMu that Stop holds — would deadlock every Stop that raced a
+	// self-stop. This drives the two together repeatedly, under -race in the
+	// Gate A suite, and accepts either documented outcome per cycle: Stop won
+	// the session, or the reaper did and Stop returned errNotSending — the
+	// button had already flipped back to START either way.
+	a, _ := newTestApp(t)
+	latest := withFakeSender(a)
+
+	for i := 0; i < 50; i++ {
+		if err := a.Start(); err != nil {
+			t.Fatalf("Start() on cycle %d error = %v", i, err)
+		}
+		f := latest()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			f.selfStop()
+		}()
+		go func() {
+			defer wg.Done()
+			if err := a.Stop(); err != nil && !errors.Is(err, errNotSending) {
+				t.Errorf("Stop() racing a self-stop error = %v; want nil or errNotSending", err)
+			}
+		}()
+		wg.Wait()
+
+		// Whichever won, the session must be gone before the next cycle — by
+		// Stop's own clearing or by the reaper's.
+		waitFor(t, 5*time.Second, "the session to be cleared after the race", func() bool {
+			a.sessMu.Lock()
+			defer a.sessMu.Unlock()
+			return a.session == nil
+		})
 	}
 }
 
@@ -1807,6 +2148,68 @@ func TestConnectErrorReporterShowsAChangedReasonImmediately(t *testing.T) {
 	}
 	if !strings.Contains(sent[1], "connection refused") {
 		t.Fatalf("the second message %q does not carry the changed reason", sent[1])
+	}
+}
+
+func TestConnectErrorReporterTreatsAPipelineFatalAsTerminal(t *testing.T) {
+	// gst.ErrPipelineFatal is the sender's last word — it reports once, emits
+	// StateStopped and closes its states channel — so the reporter must treat
+	// it as a terminal announcement, not one more failed attempt: say the
+	// session has STOPPED, blame the input device and not the network, and
+	// never let the repeat filter swallow it. The pre-sentinel behaviour was
+	// the measured misdiagnosis: a playback endpoint in config.json reported
+	// forever as "the commentary feed to <host>:40005 is not connected and is
+	// retrying".
+	r, rec, _ := newTestReporter()
+
+	fatal := fmt.Errorf("%w: wasapi2src rbuf: Failed to open device %s "+
+		"(the capture or mux chain has failed; recover with Stop, New, Start)",
+		gst.ErrPipelineFatal, "{0.0.0.00000000}.{8678ce58-7b71-4bd4-810f-1c4a7f11ec71}")
+
+	r.report(fatal)
+
+	sent := rec.all()
+	if len(sent) != 1 {
+		t.Fatalf("published %d messages for a pipeline-fatal error, want 1: %q", len(sent), sent)
+	}
+	for _, want := range []string{
+		"STOPPED",
+		"input",
+		"device",
+		"START",
+		// The underlying reason, device id included, must survive the wrap:
+		// it is the only thing that names WHICH device failed.
+		"{0.0.0.00000000}.{8678ce58-7b71-4bd4-810f-1c4a7f11ec71}",
+	} {
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("the terminal message %q does not say %q", sent[0], want)
+		}
+	}
+	// It must NOT be framed as a network failure: no SRT host, no port, no
+	// "not connected and is retrying".
+	for _, banned := range []string{"127.0.0.1", "4001", "not connected"} {
+		if strings.Contains(sent[0], banned) {
+			t.Errorf("the terminal message %q names %q; a capture-chain death is not a network fault",
+				sent[0], banned)
+		}
+	}
+
+	// The repeat filter must not apply: an identical fatal a moment later is
+	// still published, with no clock movement at all.
+	r.report(fatal)
+	if got := len(rec.all()); got != 2 {
+		t.Fatalf("published %d messages after a repeated fatal, want 2; "+
+			"the connectErrorRepeat suppression swallowed a terminal message", got)
+	}
+
+	// And it leaves the ordinary bookkeeping alone: a non-fatal failure shown
+	// before the fatal is still suppressed as a repeat after it.
+	ordinary := errors.New("gst: replace sink: connection refused")
+	r.report(ordinary)
+	r.report(ordinary)
+	if got := len(rec.all()); got != 3 {
+		t.Fatalf("published %d messages, want 3 — the fatal branch must not touch the repeat "+
+			"bookkeeping either way: %q", got, rec.all())
 	}
 }
 

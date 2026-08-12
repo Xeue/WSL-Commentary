@@ -1,6 +1,7 @@
 package sender
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -249,8 +250,10 @@ func (s *senderImpl) watchErrors(errs <-chan error) {
 	}
 }
 
-// loop is the state machine of specification section 6.2. It returns only when
-// quit has been closed.
+// loop is the state machine of specification section 6.2. It returns when quit
+// has been closed, and on exactly one failure of its own accord: a ReplaceSink
+// error wrapping gst.ErrPipelineFatal, the latched capture-or-mux-chain death
+// that no reconnect can repair — see the branch after the ReplaceSink call.
 //
 //	CONNECTING --connect ok--> CONNECTED --error on srtout--> DRAINING --> BACKOFF --> CONNECTING
 //	     '--connect fails-------------------------------------------------> BACKOFF
@@ -332,6 +335,32 @@ func (s *senderImpl) loop(opts Opts) {
 			return
 		}
 
+		// A latched pipeline-fatal is the one failure the ladder must never
+		// absorb. errors.Is(err, gst.ErrPipelineFatal) means the capture or
+		// mux chain itself is dead — the measured case is the operator
+		// selecting a RENDER endpoint as the commentary input, whose wasapi2
+		// buffer fails asynchronously after preroll — and internal/gst latches
+		// the condition, so every further ReplaceSink on this pipeline returns
+		// the same error instantly, forever. Retrying that is not persistence,
+		// it is the misdiagnosis this branch exists to end: the sender used to
+		// climb to the thirty second cap telling the operator the feed "is not
+		// connected and is retrying" — blaming the SRT network for a local
+		// device fault no reconnect could ever repair.
+		//
+		// Returning here runs run's ordinary shutdown unchanged — p.Stop(),
+		// StateStopped emitted, states closed — so the SENDING lamp goes grey
+		// STOPPED rather than sitting amber for the rest of the match. That is
+		// not merely less misleading, it is the documented recovery performed
+		// halfway: a latched fatal is repaired only by Stop, New, Start, and a
+		// stopped sender is precisely the machine asking the operator to do
+		// that. The report goes out first, once, with the real reason; d is
+		// zero because no wait follows, and reportConnectError words the log
+		// accordingly.
+		if err != nil && errors.Is(err, gst.ErrPipelineFatal) {
+			s.reportConnectError(opts.OnConnectError, err, attempt+1, 0)
+			return
+		}
+
 		if err == nil {
 			// Force an IDR before announcing the connection. The encoder's GOP
 			// is 100 frames at 50p (specification section 5), so without this
@@ -391,10 +420,15 @@ func (s *senderImpl) loop(opts Opts) {
 
 		// BACKOFF. The wait happens here, on the state machine's own goroutine,
 		// never inside a pad probe or a bus callback — a blocked bus callback
-		// stalls the whole pipeline. There is no attempt limit: on total network
-		// loss libsrt declares the peer dead at about 5.27 s and exits, and
-		// M2L-X never recovers by itself, so a sender that gave up would leave
-		// the commentary off air for the rest of the match.
+		// stalls the whole pipeline. There is no attempt limit for anything a
+		// retry could ever fix: on total network loss libsrt declares the peer
+		// dead at about 5.27 s and exits, and M2L-X never recovers by itself,
+		// so a sender that gave up on a NETWORK fault would leave the
+		// commentary off air for the rest of the match. The one exception
+		// never reaches this line: a ReplaceSink error wrapping
+		// gst.ErrPipelineFatal returned out of the loop above, because that
+		// condition is latched and local and every retry is guaranteed to fail
+		// identically.
 		d := backoffDelay(attempt)
 		attempt++
 		if err != nil {
@@ -413,16 +447,18 @@ func (s *senderImpl) loop(opts Opts) {
 
 // reportConnectError announces why one connection attempt failed: to the log
 // always, and to the caller's Opts.OnConnectError if it set one. It is called on
-// the state-machine goroutine immediately before the transition to StateBackoff.
+// the state-machine goroutine — immediately before the transition to
+// StateBackoff for a retryable failure, and immediately before loop returns
+// into run's shutdown for the pipeline-fatal failure that stops the machine.
 //
 // attempt is the number of consecutive failures including this one, and d the
-// wait about to be served. Both are in the message because the pair is what
-// distinguishes a network blip from the case this exists for: a pipeline that
-// has gone permanently fatal — the commentator's Dante endpoint unplugged, say —
-// where internal/gst marks it fatal and every subsequent ReplaceSink returns the
-// same error instantly, so the attempt count climbs while the reason never
-// changes and the sender sits at the thirty second cap for the rest of the
-// match. Retrying forever is still correct; not saying why is not.
+// wait about to be served. d == 0 means no wait follows because the sender is
+// stopping, and the log line says so rather than promising a retry "in 0s":
+// this code path exists to end a message that misled the operator, so its own
+// message is not allowed to mislead. For retryable failures the attempt/delay
+// pair is in the message because a climbing count with an unchanging reason is
+// the after-the-match signature of a fault that was never transient, and the
+// log is where a support engineer reconstructs that.
 //
 // The callback is invoked on this goroutine, so a caller that blocks in it
 // blocks the reconnect. That is documented on Opts. The recover is there because
@@ -431,7 +467,14 @@ func (s *senderImpl) loop(opts Opts) {
 // during a live match keeping the commentary path alive beats failing fast on
 // someone else's bug, which the log line preserves either way.
 func (s *senderImpl) reportConnectError(report func(error), err error, attempt int, d time.Duration) {
-	log.Printf("sender: connect attempt %d failed: %v; retrying in %v", attempt, err, d)
+	if d > 0 {
+		log.Printf("sender: connect attempt %d failed: %v; retrying in %v", attempt, err, d)
+	} else {
+		// The pipeline-fatal stop. The wrapped error already carries the
+		// recovery instruction ("recover with Stop, New, Start"), so the log
+		// only needs to be honest about what happens next: nothing.
+		log.Printf("sender: connect attempt %d failed: %v; stopping instead of retrying", attempt, err)
+	}
 
 	if report == nil {
 		return

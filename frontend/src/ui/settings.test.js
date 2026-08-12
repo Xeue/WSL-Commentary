@@ -189,6 +189,93 @@ test('the return key length error names the control the operator is looking at',
 });
 
 // ---------------------------------------------------------------------------
+// validateConfig: the two pasted device ids
+// ---------------------------------------------------------------------------
+//
+// THE FAILURE THESE PREVENT. wasapi2 republishes every Windows RENDER
+// (playback) endpoint as a capture "loopback" device; an operator selected one
+// as the commentary input, the pipeline prerolled, the device failed
+// ASYNCHRONOUSLY, and the sender blamed the SRT network and retried forever.
+// The dropdown filter fixes the selection route; these fields are the PASTE
+// route — "an engineer may need to paste a known endpoint GUID before the
+// corresponding hardware is patched in" — and a pasted GUID gives no other
+// clue which of Windows' two namespaces it belongs to.
+
+test('audioDeviceId refuses a Windows RENDER (playback) endpoint id', () => {
+  // The operator's actual failing id, verbatim from wasapi2src's 1551 error.
+  const measured = '{0.0.0.00000000}.{8678ce58-90c0-4827-8ff7-c9edd8d074ed}';
+  const errors = validateConfig({ ...validForm(), audioDeviceId: measured });
+  assert.ok(errors.audioDeviceId, 'a playback endpoint cannot be a commentary input');
+  assert.match(errors.audioDeviceId, /PLAYBACK/i, 'the message must say what the id IS');
+  assert.ok(
+    errors.audioDeviceId.includes('{0.0.1.00000000}.'),
+    'and name the capture namespace, because the GUID itself gives the operator no clue',
+  );
+
+  // Case-insensitively: GUID casing is not stable across the APIs that print
+  // these ids, and a case-sensitive refusal is a refusal that sometimes works.
+  const upper = measured.toUpperCase();
+  assert.ok(validateConfig({ ...validForm(), audioDeviceId: upper }).audioDeviceId);
+});
+
+test('audioDeviceId accepts capture ids, unknown shapes and empty', () => {
+  // The asymmetric rule from internal/gst/device_id.go: refuse only a
+  // POSITIVELY identified render id. Refusing unknown shapes would turn a
+  // future Windows id-shape change into a Settings screen that cannot be
+  // saved over a field the operator never touched.
+  for (const value of [
+    '', // optional, as ever
+    '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}', // a real capture id
+    'default', // an unknown shape
+    '{0.0.2.00000000}.{11111111-2222-3333-4444-555555555555}', // a namespace that does not exist yet
+  ]) {
+    const errors = validateConfig({ ...validForm(), audioDeviceId: value });
+    assert.equal(errors.audioDeviceId, undefined, `${JSON.stringify(value)} must be accepted`);
+  }
+});
+
+test('headphoneEndpointId refuses a CAPTURE id — the same mistake, mirrored', () => {
+  // wasapi2sink plays through a RENDER endpoint; a capture id pasted here is
+  // the input list's id in the output field. Same silent symptom family, so
+  // the same defence, pointed the other way.
+  const capture = '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}';
+  const errors = validateConfig({ ...validForm(), headphoneEndpointId: capture });
+  assert.ok(errors.headphoneEndpointId, 'a recording endpoint cannot be the headphones');
+  assert.match(errors.headphoneEndpointId, /CAPTURE|recording/i);
+  assert.ok(errors.headphoneEndpointId.includes('{0.0.0.00000000}.'), 'and the render namespace is named');
+
+  for (const value of ['', '{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}', 'default']) {
+    const ok = validateConfig({ ...validForm(), headphoneEndpointId: value });
+    assert.equal(ok.headphoneEndpointId, undefined, `${JSON.stringify(value)} must be accepted`);
+  }
+});
+
+test('the two device-id checks light their own field, not each other', () => {
+  // Blaming one field for the other sends the operator to the wrong control —
+  // the same rule the two ports and the two key lengths already follow.
+  const render = '{0.0.0.00000000}.{8678ce58-90c0-4827-8ff7-c9edd8d074ed}';
+  const capture = '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}';
+
+  const inputBad = validateConfig({ ...validForm(), audioDeviceId: render, headphoneEndpointId: render });
+  assert.ok(inputBad.audioDeviceId, 'the render id in the input field must be reported');
+  assert.equal(inputBad.headphoneEndpointId, undefined, 'a render id is CORRECT for headphones');
+
+  const outputBad = validateConfig({ ...validForm(), audioDeviceId: capture, headphoneEndpointId: capture });
+  assert.ok(outputBad.headphoneEndpointId, 'the capture id in the headphone field must be reported');
+  assert.equal(outputBad.audioDeviceId, undefined, 'a capture id is CORRECT for the commentary input');
+});
+
+test('headphoneDeviceId — the browser mediaDeviceId — is deliberately not namespace-checked', () => {
+  // It is a different identifier space with no namespace rule to test: a
+  // browser mediaDeviceId is an opaque hash. A WASAPI-shaped string in it is
+  // wrong, but there is no POSITIVE identification to refuse it on, and the
+  // asymmetric rule refuses only what is positively identified.
+  const render = '{0.0.0.00000000}.{8678ce58-90c0-4827-8ff7-c9edd8d074ed}';
+  const errors = validateConfig({ ...validForm(), headphoneDeviceId: render });
+  assert.equal(errors.headphoneDeviceId, undefined);
+});
+
+// ---------------------------------------------------------------------------
 // The secret key, and the fact that it is a THIRD one
 // ---------------------------------------------------------------------------
 

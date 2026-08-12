@@ -1174,6 +1174,240 @@ func TestOnConnectErrorPanicDoesNotKillTheReconnectLoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// pipeline-fatal stops the machine; everything else still retries forever
+// ---------------------------------------------------------------------------
+
+// The three tests below drive the real internal/gst stub rather than this
+// package's fakePipeline, deliberately: the property under test is a CONTRACT
+// between the two packages — a ReplaceSink error wrapping gst.ErrPipelineFatal
+// latches and stops the sender — and the stub's MarkFatal wraps the sentinel
+// exactly as the real build's bus handler does, so these tests break if either
+// side of the contract drifts, not just this one.
+
+// TestPipelineFatalStopsTheSenderInsteadOfRetrying is the sender's half of the
+// render-endpoint defect fix. The measured failure: the operator selected a
+// playback endpoint as the commentary input, wasapi2's buffer failed
+// asynchronously after preroll, and the sender retried forever telling them
+// the feed "is not connected and is retrying" — a network message about a
+// local device fault no reconnect could ever repair. With the fatal latched,
+// the sender must report the real reason exactly once and stop: grey STOPPED
+// lamp, which is the documented recovery (Stop, New, Start) being asked of
+// the operator, instead of amber forever.
+func TestPipelineFatalStopsTheSenderInsteadOfRetrying(t *testing.T) {
+	logs := captureLog(t)
+
+	p := gst.NewStubPipeline()
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	// The shape of the live error, latched before the first connect attempt —
+	// wasapi2 fails the device open asynchronously, so by the time the sender
+	// reaches ReplaceSink the pipeline is already marked.
+	boom := errors.New("wasapi2: Failed to open device {0.0.0.00000000}.{8678ce58-7e5d-4bd3-b83e-d47ce7bba971}")
+	p.MarkFatal(boom)
+
+	var (
+		mu   sync.Mutex
+		seen []error
+	)
+	opts := testOpts()
+	opts.OnConnectError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, err)
+	}
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// No BACKOFF between them: the machine goes from its first CONNECTING
+	// straight to STOPPED, and the channel closes, exactly as an operator
+	// Stop would leave things.
+	expectStates(t, s.States(), StateConnecting, StateStopped)
+	expectClosed(t, s.States())
+
+	mu.Lock()
+	got := append([]error(nil), seen...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("OnConnectError called %d times, want exactly 1", len(got))
+	}
+	if !errors.Is(got[0], gst.ErrPipelineFatal) || !errors.Is(got[0], boom) {
+		t.Fatalf("reported %v, want a wrap of both gst.ErrPipelineFatal and the cause", got[0])
+	}
+
+	// The retry loop is provably dead, not merely resting: it never armed a
+	// backoff timer, so there is nothing for any number of ladder intervals to
+	// wake. The grace period is the same bounded negative wait expectNoBackoff
+	// documents — a machine that were still looping would arm its timer within
+	// microseconds of the STOPPED it should never have emitted.
+	if d := clk.delays(); len(d) != 0 {
+		t.Fatalf("backoff waits armed = %v, want none: a fatal must stop, not back off", d)
+	}
+	expectNoBackoff(t, clk, 100*time.Millisecond)
+	c := p.Counters()
+	if c.ReplaceSinks != 1 {
+		t.Fatalf("ReplaceSink called %d times, want exactly 1: the latch must not be retried", c.ReplaceSinks)
+	}
+	if c.Stops != 1 {
+		t.Fatalf("pipeline Stop called %d times, want 1: the self-stop must run the full shutdown", c.Stops)
+	}
+
+	// A self-stopped sender is still safely stoppable: WP-8 tears senders down
+	// unconditionally and must not be punished for the machine getting there
+	// first.
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop after the self-stop: %v", err)
+	}
+	if c := p.Counters(); c.ReplaceSinks != 1 {
+		t.Fatalf("ReplaceSink count moved to %d after STOPPED, want it flat at 1", c.ReplaceSinks)
+	}
+
+	// The log must not promise a retry that is not coming. "retrying in 0s"
+	// here would be the original defect reborn one line over. The guard is on
+	// the promise form "retrying in", not the bare word — the honest line
+	// deliberately says "stopping instead of retrying".
+	text := logs.text()
+	if !strings.Contains(text, boom.Error()) {
+		t.Fatalf("the log does not carry the device failure; it says:\n%s", text)
+	}
+	if strings.Contains(text, "retrying in") {
+		t.Fatalf("the log promises a retry after a fatal stop; it says:\n%s", text)
+	}
+}
+
+// TestPlainConnectFailureStillRetriesForeverOnTheStub is the regression guard
+// on the narrowing above: stopping is reserved for errors wrapping
+// gst.ErrPipelineFatal, and a plain connect refusal — M2L-X's re-accept
+// refusal window, a genuinely dead network — must still climb the ladder and
+// win in the end. Six failures walk 7, 7, 10, 15, 20, 30 seconds and the
+// seventh attempt connects. If someone widens the fatal check to "any repeated
+// error", this is the test that stops them silencing the commentary over a
+// network blip.
+func TestPlainConnectFailureStillRetriesForeverOnTheStub(t *testing.T) {
+	const failures = 6
+
+	want := []time.Duration{
+		7 * time.Second, 7 * time.Second, 10 * time.Second,
+		15 * time.Second, 20 * time.Second, 30 * time.Second,
+	}
+	if len(want) != failures {
+		t.Fatalf("test is inconsistent: %d delays for %d failures", len(want), failures)
+	}
+
+	p := gst.NewStubPipeline()
+	p.FailNextSinks(failures, errConnectRefused)
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	if err := s.Start(testOpts()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectState(t, s.States(), StateConnecting)
+
+	for i := 0; i < failures; i++ {
+		expectState(t, s.States(), StateBackoff)
+
+		tm := clk.next(t)
+		if tm.d != want[i] {
+			t.Fatalf("attempt %d waited %v, want %v", i, tm.d, want[i])
+		}
+		tm.fire()
+
+		expectState(t, s.States(), StateConnecting)
+	}
+	expectState(t, s.States(), StateConnected)
+
+	if c := p.Counters(); c.ReplaceSinks != failures+1 || c.SinksAttached != 1 {
+		t.Fatalf("counters = %+v, want %d ReplaceSinks of which exactly the last attached",
+			c, failures+1)
+	}
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	expectState(t, s.States(), StateStopped)
+	expectClosed(t, s.States())
+}
+
+// TestFatalWhileConnectedTerminatesAtTheNextReplaceSink covers the mid-match
+// shape of the same defect: the session is up and green when the capture chain
+// dies — the commentator's endpoint invalidated under a live connection. The
+// bus error knocks the machine out of CONNECTED exactly as a peer loss would,
+// and that exit is allowed to look like one: DRAINING, one first-rung BACKOFF,
+// CONNECTING. The distinction is made where it becomes knowable — the next
+// ReplaceSink, which returns the latched fatal — and the machine must stop
+// there rather than settle into the eternal amber loop.
+func TestFatalWhileConnectedTerminatesAtTheNextReplaceSink(t *testing.T) {
+	p := gst.NewStubPipeline()
+	clk := newFakeClock()
+	s := newSender(p, clk)
+
+	var (
+		mu   sync.Mutex
+		seen []error
+	)
+	opts := testOpts()
+	opts.OnConnectError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, err)
+	}
+
+	if err := s.Start(opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectStates(t, s.States(), StateConnecting, StateConnected)
+
+	// The capture chain dies: the real bus handler latches the fatal and
+	// delivers the same error asynchronously, so the stub is driven both ways
+	// in that order — latch first, then the wake-up on the Errors channel.
+	boom := errors.New("wasapi2: device invalidated mid-session")
+	p.MarkFatal(boom)
+	if !p.InjectError(boom) {
+		t.Fatalf("InjectError(%v) was dropped", boom)
+	}
+
+	expectStates(t, s.States(), StateDraining, StateBackoff)
+
+	tm := clk.next(t)
+	if tm.d != BackoffLadder[0] {
+		t.Fatalf("waited %v after the drop, want the first rung %v", tm.d, BackoffLadder[0])
+	}
+	tm.fire()
+
+	// The reconnect attempt finds the latch and the machine stops instead of
+	// announcing CONNECTED or re-entering BACKOFF.
+	expectStates(t, s.States(), StateConnecting, StateStopped)
+	expectClosed(t, s.States())
+
+	mu.Lock()
+	got := append([]error(nil), seen...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("OnConnectError called %d times, want exactly 1: the peer-loss exit from "+
+			"CONNECTED must not report, and the fatal must report once", len(got))
+	}
+	if !errors.Is(got[0], gst.ErrPipelineFatal) || !errors.Is(got[0], boom) {
+		t.Fatalf("reported %v, want a wrap of both gst.ErrPipelineFatal and the cause", got[0])
+	}
+
+	// One backoff for the drop out of CONNECTED, and none after the fatal was
+	// found: terminating at the ReplaceSink, not looping past it.
+	if d := clk.delays(); len(d) != 1 {
+		t.Fatalf("backoff waits armed = %v, want exactly the one that followed the drop", d)
+	}
+	c := p.Counters()
+	if c.ReplaceSinks != 2 {
+		t.Fatalf("ReplaceSink called %d times, want 2: the connect and the attempt that found the latch", c.ReplaceSinks)
+	}
+	if c.Stops != 1 {
+		t.Fatalf("pipeline Stop called %d times, want 1", c.Stops)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Stop, from everywhere
 // ---------------------------------------------------------------------------
 

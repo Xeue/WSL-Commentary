@@ -297,6 +297,113 @@ func TestRemoveSinkThenReplaceSinkReconnects(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The render-endpoint refusal and the pipeline-fatal latch (the loopback
+// defect's Gate A half — see device_id.go for the field failure).
+// ---------------------------------------------------------------------------
+
+// TestStartRefusesARenderEndpoint proves the refusal on the stub, which — via
+// the shared refuseRenderEndpoint helper — is also a statement about the real
+// twin. The fixture is the operator's actual playback endpoint id.
+func TestStartRefusesARenderEndpoint(t *testing.T) {
+	p := NewStubPipeline()
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: "{0.0.0.00000000}.{8678ce58-90c0-4827-8ff7-c9edd8d074ed}",
+	})
+	if err == nil {
+		t.Fatal("Start accepted a RENDER endpoint as the commentary input; the pipeline would " +
+			"preroll and then fail asynchronously with wasapi2's error 1551, which the sender " +
+			"misreads as a network failure and retries forever")
+	}
+	if !errors.Is(err, ErrNotACaptureDevice) {
+		t.Errorf("the refusal does not wrap ErrNotACaptureDevice: %v", err)
+	}
+	if p.State() != StubStateStopped {
+		t.Errorf("state after the refusal = %q, want %q", p.State(), StubStateStopped)
+	}
+}
+
+// TestStubDeviceListNamespacesAreContract pins the property the file headers
+// of gst_stub.go and return_stub.go now promise: every fake capture id is in
+// the capture namespace and every fake playback id is in the render
+// namespace, per the classifier both twins share. A stub device that failed
+// this would let a wiring bug — the headphone dropdown's value reaching
+// PipelineOpts.AudioDeviceID, or vice versa — pass at Gate A and surface in a
+// commentary booth.
+func TestStubDeviceListNamespacesAreContract(t *testing.T) {
+	for _, d := range defaultStubDevices {
+		if !IsCaptureEndpointID(d.ID) {
+			t.Errorf("defaultStubDevices %q: %s does not classify as a capture endpoint", d.Name, d.ID)
+		}
+		if IsRenderEndpointID(d.ID) {
+			t.Errorf("defaultStubDevices %q: %s classifies as a RENDER endpoint; the stub's own "+
+				"dropdown data would be refused by Start", d.Name, d.ID)
+		}
+	}
+	for _, d := range defaultStubOutputDevices {
+		if IsCaptureEndpointID(d.ID) {
+			t.Errorf("defaultStubOutputDevices %q: %s classifies as a CAPTURE endpoint", d.Name, d.ID)
+		}
+		if !IsRenderEndpointID(d.ID) {
+			t.Errorf("defaultStubOutputDevices %q: %s does not classify as a render endpoint, so a "+
+				"test feeding it to Start would not trip the refusal the real build applies", d.Name, d.ID)
+		}
+	}
+}
+
+// TestMarkFatalLatchesEveryReplaceSink models the contract documented on
+// Pipeline.ReplaceSink: a pipeline-fatal error latches for the life of the
+// pipeline, outranks the ordinary connection-failure ladder, and never
+// clears — recovery is Stop, New, Start.
+func TestMarkFatalLatchesEveryReplaceSink(t *testing.T) {
+	p := NewStubPipeline()
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sink := SinkOpts{Host: "m2lx.example", Port: 9001}
+	if err := p.ReplaceSink(sink); err != nil {
+		t.Fatalf("ReplaceSink before the fatal: %v", err)
+	}
+
+	boom := errors.New("gst: asrc: Internal data stream error")
+	p.MarkFatal(boom)
+
+	if f := p.Fatal(); !errors.Is(f, ErrPipelineFatal) || !errors.Is(f, boom) {
+		t.Fatalf("Fatal() = %v, want a wrap of both ErrPipelineFatal and the cause", f)
+	}
+
+	// The latch outranks the FailNextSinks ladder: a queued connection
+	// failure must not be what the caller sees, because "the network refused
+	// again" is exactly the misdiagnosis the sentinel exists to end.
+	other := errors.New("connection refused")
+	p.FailNextSinks(1, other)
+	for i := range 3 {
+		err := p.ReplaceSink(sink)
+		if !errors.Is(err, ErrPipelineFatal) {
+			t.Fatalf("ReplaceSink attempt %d after MarkFatal = %v, want errors.Is(_, ErrPipelineFatal)", i, err)
+		}
+		if errors.Is(err, other) {
+			t.Fatalf("ReplaceSink attempt %d returned the FailNextSinks error %v ahead of the latch", i, err)
+		}
+	}
+
+	// Only the first mark wins, as in the real markFatal: the first error is
+	// the one that explains the failure.
+	p.MarkFatal(errors.New("a later, less informative error"))
+	if f := p.Fatal(); !errors.Is(f, boom) {
+		t.Errorf("a second MarkFatal replaced the first: %v", f)
+	}
+
+	// Start, RemoveSink and ForceKeyUnit are untouched by the latch.
+	if err := p.RemoveSink(); err != nil {
+		t.Errorf("RemoveSink after MarkFatal: %v", err)
+	}
+	if err := p.ForceKeyUnit(); err != nil {
+		t.Errorf("ForceKeyUnit after MarkFatal: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The Windows environment-variable behaviour Init depends on.
 // ---------------------------------------------------------------------------
 
@@ -715,6 +822,212 @@ func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
 	}
 	if !strings.Contains(body, "width=1920,height=1080") {
 		t.Fatal("the slate branch no longer pins 1920x1080")
+	}
+}
+
+// TestListInputDevicesFiltersLoopbackAndRenderIDs guards the enumeration half
+// of the loopback defect.
+//
+// wasapi2's device provider republishes every RENDER endpoint as an
+// Audio/Source "loopback" device carrying wasapi2.device.loopback=true, so a
+// ListInputDevices that filters only on class + device.api offers playback
+// endpoints in the commentary input dropdown — measured: 11 of 25 entries,
+// and an operator selected one. The fix is two checks, and both must stay:
+// the loopback property (read through the propLoopback const) and the
+// endpoint-id namespace classifier in device_id.go.
+func TestListInputDevicesFiltersLoopbackAndRenderIDs(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "ListInputDevices")
+
+	if !strings.Contains(body, "propLoopback") {
+		t.Error("ListInputDevices no longer reads the wasapi2.device.loopback property; " +
+			"every playback endpoint's loopback republication is back in the input dropdown")
+	}
+	if !strings.Contains(body, "IsRenderEndpointID(") {
+		t.Error("ListInputDevices no longer refuses render-namespace endpoint ids; a playback " +
+			"endpoint that loses its loopback marker would be offered as a commentary input")
+	}
+	if !strings.Contains(body, "IsCaptureEndpointID(") {
+		t.Error("ListInputDevices no longer consults IsCaptureEndpointID; the warning for " +
+			"unrecognised id shapes — the asymmetry's other half — has been lost")
+	}
+}
+
+// TestLoopbackIsNeverSetInTheCgoSource pins the DELIBERATE NON-GOAL.
+//
+// The tempting one-line "fix" for a render endpoint in the input dropdown is
+// to set wasapi2src's loopback property to true so that opening the playback
+// endpoint succeeds. It would succeed — at putting the operator's own monitor
+// mix on air, as echo or feedback on a live feed. The property must be READ
+// during enumeration (to skip the republications) and never SET anywhere.
+func TestLoopbackIsNeverSetInTheCgoSource(t *testing.T) {
+	_, file := parseSource(t, cgoSourceFile)
+
+	// The const must exist with the exact provider key, or the enumeration
+	// read is silently checking nothing.
+	constOK := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range spec.Names {
+			if name.Name != "propLoopback" || i >= len(spec.Values) {
+				continue
+			}
+			if lit, ok := spec.Values[i].(*ast.BasicLit); ok && lit.Value == `"wasapi2.device.loopback"` {
+				constOK = true
+			}
+		}
+		return true
+	})
+	if !constOK {
+		t.Error(`gst_cgo.go has no const propLoopback = "wasapi2.device.loopback"`)
+	}
+
+	// No setter call anywhere in the file may name loopback, whether as a
+	// string literal or through the const.
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		callee := calleeName(call)
+		if !strings.Contains(callee, "Set") && callee != "UtilSetObjectArg" {
+			return true
+		}
+		for _, arg := range call.Args {
+			switch a := arg.(type) {
+			case *ast.BasicLit:
+				if a.Kind == token.STRING && strings.Contains(strings.ToLower(a.Value), "loopback") {
+					t.Errorf("%s is passed a loopback property name: the operator's monitor mix "+
+						"would go on air", callee)
+				}
+			case *ast.Ident:
+				if a.Name == "propLoopback" {
+					t.Errorf("%s is passed propLoopback: the property is read-only by design", callee)
+				}
+			}
+		}
+		return true
+	})
+}
+
+// calleeName returns the rightmost identifier of a call's function expression:
+// "SetObjectProperty" for el.SetObjectProperty(...), "UtilSetObjectArg" for
+// gogst.UtilSetObjectArg(...). "" if the shape is something else.
+func calleeName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	}
+	return ""
+}
+
+// TestStartRefusesRenderIDsAndRechecksFatal guards the two Start-side halves
+// of the loopback defect.
+//
+// The refusal must run before gst_parse_launch: wasapi2src accepts a render
+// id at construction and fails ASYNCHRONOUSLY, after Start has already
+// reported success, so anything later than the option checks is too late.
+//
+// The fatal re-check must sit between BlockSetState and `p.started = true`:
+// wasapi2 opens the endpoint on its own thread and posts failure on the bus,
+// so NULL→PLAYING can report success while onBusMessage has already latched a
+// pipeline-fatal error. ReplaceSink double-checks fatal before promising
+// success for exactly this reason; Start must mirror it or it reports a
+// running pipeline whose capture chain is already dead.
+func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+
+	refuse := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "refuseRenderEndpoint(opts.AudioDeviceID)")
+	})
+	parse := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "ParseLaunch(")
+	})
+	play := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "BlockSetState(gogst.StatePlaying")
+	})
+	fatal := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.fatalError()")
+	})
+	started := lastLineMatching(lines, func(s string) bool {
+		return s == "p.started = true"
+	})
+
+	if refuse < 0 {
+		t.Error("Start never calls refuseRenderEndpoint(opts.AudioDeviceID); a playback endpoint " +
+			"reaches wasapi2src and fails asynchronously as a fake network error")
+	}
+	if parse < 0 {
+		t.Fatal("Start never calls ParseLaunch")
+	}
+	if refuse >= 0 && refuse > parse {
+		t.Error("Start refuses a render endpoint only after building the pipeline; the refusal " +
+			"must be synchronous and up front")
+	}
+	if play < 0 || started < 0 {
+		t.Fatal("Start no longer has the BlockSetState(PLAYING) / p.started = true shape these " +
+			"guards expect; re-read them before restructuring")
+	}
+	if fatal < 0 || fatal < play || fatal > started {
+		t.Error("Start does not re-check p.fatalError() between BlockSetState and p.started = true; " +
+			"an asynchronous wasapi2 open failure lets Start report a running pipeline whose " +
+			"capture chain is already dead")
+	}
+}
+
+// TestStartLogsTheEndpointID guards the diagnosability of the asynchronous
+// failure. wasapi2src echoes the REQUESTED id verbatim in its error 1551
+// (proved by probe), so a log line carrying opts.AudioDeviceID immediately
+// before the property is set lets a field log match the failure to the
+// request instead of leaving the id to be argued about.
+func TestStartLogsTheEndpointID(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "cgoPipeline", "Start")
+
+	logged := false
+	for idx := strings.Index(body, "log.Printf("); idx >= 0; {
+		end := idx + 250
+		if end > len(body) {
+			end = len(body)
+		}
+		if strings.Contains(body[idx:end], "opts.AudioDeviceID") {
+			logged = true
+			break
+		}
+		next := strings.Index(body[idx+1:], "log.Printf(")
+		if next < 0 {
+			break
+		}
+		idx += 1 + next
+	}
+	if !logged {
+		t.Error("Start never logs opts.AudioDeviceID; wasapi2's asynchronous error 1551 quotes " +
+			"the requested id verbatim, and without this line the log cannot say what was requested")
+	}
+}
+
+// TestMarkFatalSiteWrapsErrPipelineFatal guards the sentinel. The bus
+// handler's fatal classification must wrap ErrPipelineFatal so that
+// internal/sender can errors.Is its way out of retrying a failure no
+// reconnect can fix, while the rendered text keeps the "pipeline-fatal"
+// substring older greps rely on.
+func TestMarkFatalSiteWrapsErrPipelineFatal(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+
+	if !strings.Contains(body, "p.markFatal(") {
+		t.Fatal("onBusMessage no longer marks non-sink errors as pipeline-fatal")
+	}
+	if !strings.Contains(body, "ErrPipelineFatal") {
+		t.Error("onBusMessage's markFatal site does not wrap ErrPipelineFatal; ReplaceSink's " +
+			"latched error is unmatchable with errors.Is and the sender goes back to retrying " +
+			"an unfixable failure as a network fault")
 	}
 }
 

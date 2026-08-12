@@ -256,6 +256,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -696,6 +697,15 @@ type App struct {
 	// without a GStreamer pipeline. Nil means the real one; see
 	// App.newReturnMonitor.
 	returnDial func() gst.ReturnMonitor
+
+	// senderDial builds the sender that drives a contribution pipeline. It is
+	// sender.New in the application and a fake in the tests — which is the only
+	// way to exercise the self-stop reaper in startSession at Gate A: the real
+	// sender stops itself only on gst.ErrPipelineFatal, a condition the stub
+	// pipeline reaches through a live reconnect cycle the test would otherwise
+	// have to choreograph in real time. Nil means the real one; see
+	// App.newSender.
+	senderDial func(gst.Pipeline) sender.Sender
 
 	// mixerDial builds the mixer write controller. It is mixer.NewController in
 	// the application and a fake in the tests, which is the only way to
@@ -1209,6 +1219,10 @@ func (a *App) startSession() error {
 		return fmt.Errorf("wslcomms: cannot start, the configuration is incomplete: %w", err)
 	}
 
+	if err := a.preflightAudioDevice(cfg.AudioDeviceID); err != nil {
+		return err
+	}
+
 	passphrase, err := a.srtPassphrase(cfg)
 	if err != nil {
 		return err
@@ -1219,7 +1233,7 @@ func (a *App) startSession() error {
 		return fmt.Errorf("wslcomms: creating the media pipeline: %w", err)
 	}
 
-	snd := sender.New(pipe)
+	snd := a.newSender(pipe)
 	opts := a.senderOpts(cfg, passphrase)
 
 	if err := snd.Start(opts); err != nil {
@@ -1247,6 +1261,44 @@ func (a *App) startSession() error {
 	}()
 	a.session = sess
 
+	// The reaper: clear a.session once this session's sender is finished, so
+	// that a sender which stopped ITSELF does not leave Start refusing with
+	// errAlreadySending forever. The sender stops itself on
+	// gst.ErrPipelineFatal — the capture chain is dead, no reconnect can carry
+	// media, and retrying would be the misdiagnosis that sentinel exists to end
+	// — and until this goroutine existed the only thing that ever cleared
+	// a.session was App.Stop, so a self-stopped session left the operator with
+	// a grey SENDING lamp, a button reading START, and a Start that refused
+	// because a session that had already died was still recorded as running.
+	//
+	// It keys on the forwarder's completion (sess.wg), because the forwarder
+	// ranges over snd.States() and the sender closes that channel as the last
+	// act of stopping — on the self-stop path exactly as on the operator-Stop
+	// path. It clears a.session ONLY if it still holds this same pointer:
+	// on the operator-Stop path App.Stop has already cleared it (and may even
+	// have installed a successor by the time the reaper gets the lock), and
+	// reaping a session it does not own would tear down someone else's.
+	//
+	// It is its OWN goroutine, deliberately NOT tracked by sess.wg. App.Stop
+	// holds sessMu across sess.wg.Wait() (see Stop), so a reaper counted in
+	// that WaitGroup — blocked on the sessMu that Stop holds — would deadlock
+	// every Stop. As its own goroutine the interleaving is safe in both
+	// directions: Stop waits only for the forwarder, and the reaper's lock
+	// acquisition simply queues behind Stop and then finds the pointer gone.
+	//
+	// One consequence is accepted rather than fixed: after a self-stop, an
+	// operator STOP that lands after the reaper returns errNotSending. That is
+	// tolerable — the states channel closed, so the frontend has already seen
+	// StateStopped and flipped the button back to START.
+	go func() {
+		sess.wg.Wait()
+		a.sessMu.Lock()
+		if a.session == sess {
+			a.session = nil
+		}
+		a.sessMu.Unlock()
+	}()
+
 	return nil
 }
 
@@ -1256,6 +1308,13 @@ func (a *App) startSession() error {
 // sender.Stop, so that a Start racing it cannot open a second pipeline on the
 // same WASAPI endpoint. By the time it returns, the pipeline is at NULL,
 // sender.StateStopped has been emitted and the forwarding goroutine has exited.
+//
+// A Stop that lands after the sender stopped ITSELF — gst.ErrPipelineFatal,
+// the capture chain dead — may find the session already reaped and return
+// errNotSending. That is accepted, not a defect: the frontend saw
+// StateStopped when the sender emitted it and the button already reads START,
+// so the click this Stop came from was pressed against a stale screen at
+// worst. See the reaper in startSession.
 func (a *App) Stop() error {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
@@ -1337,6 +1396,94 @@ func (a *App) GetStatusKeyCandidates() ([]m2lx.StatusKeyCandidate, error) {
 // The contribution session
 // ---------------------------------------------------------------------------
 
+// newSender builds the sender for one contribution session, through the
+// senderDial seam so the tests can substitute a fake. Nil means the real one.
+func (a *App) newSender(pipe gst.Pipeline) sender.Sender {
+	if a.senderDial != nil {
+		return a.senderDial(pipe)
+	}
+	return sender.New(pipe)
+}
+
+// preflightAudioDevice refuses, BEFORE a pipeline is built, a saved commentary
+// input id that is known not to work: a Windows RENDER (playback) endpoint, or
+// an id that no longer exists on this machine.
+//
+// # Why Start checks this at all
+//
+// Both bad ids used to fail twenty seconds too late and blame the wrong thing.
+// wasapi2src accepts any device id at Start, prerolls, and then fails
+// ASYNCHRONOUSLY — "Failed to open device {0.0.0.00000000}.{8678ce58-...}",
+// measured live — and the sender treated that bus error as a network failure
+// and retried forever, telling the operator "the commentary feed to
+// <host>:40005 is not connected and is retrying" about a fault that was
+// sitting in their own config.json. gst.ErrPipelineFatal now ends that retry
+// loop, but ending it is triage; this is prevention. The id is a string in
+// hand and both conditions are decidable RIGHT NOW, synchronously, with the
+// START button still under the operator's finger — which is worth twenty
+// minutes of confusion on a match day.
+//
+// The two refusals are deliberately different messages, because the operator's
+// next move differs: a playback endpoint means "you picked the wrong entry"
+// (the dropdown used to offer them; see internal/gst/device_id.go for the
+// wasapi2 loopback republication this cleans up after), while a vanished id
+// means "this machine no longer has that device" — Dante Virtual Soundcard and
+// NDI endpoints come and go with their sources, and a config.json copied from
+// another machine carries ids that were never here at all.
+//
+// # Why enumeration failure does NOT refuse
+//
+// Step (ii) is advisory: if ListInputDevices errors, or returns nothing, the
+// start proceeds and the hiccup goes to the log. The device monitor is a
+// GStreamer subsystem with failure modes of its own, and a monitor that could
+// veto Start would be a NEW way to be unable to go on air — with the saved
+// device possibly sitting there working the whole time. The namespace check
+// above it needs no enumeration and still fires; and a genuinely absent device
+// still fails exactly as it did before this function existed, loudly, through
+// the pipeline-fatal path. Refusal is reserved for POSITIVE knowledge.
+//
+// The presence test compares ids case-insensitively, matching the classifiers
+// in internal/gst/device_id.go: GUID casing is not stable across the APIs that
+// print these ids, and refusing a working device over casing would be this
+// function causing the outage it exists to prevent.
+func (a *App) preflightAudioDevice(id string) error {
+	if gst.IsRenderEndpointID(id) {
+		// Positively a playback endpoint. Refused, never opened, and never
+		// "made to work" via wasapi2's loopback mode — loopback would put the
+		// operator's own monitor mix on air (echo and feedback on a live feed).
+		return fmt.Errorf(
+			"wslcomms: cannot start: the saved commentary input %s is a Windows PLAYBACK endpoint, "+
+				"not a microphone — capture endpoints begin %s and this one begins %s. Choose a device "+
+				"from the Commentary input dropdown on the main screen and press START again.",
+			id, gst.CaptureEndpointPrefix, gst.RenderEndpointPrefix)
+	}
+
+	devices, err := a.ListInputDevices()
+	if err != nil {
+		log.Printf("wslcomms: could not enumerate audio inputs during the pre-flight check (%v); "+
+			"starting anyway — the device monitor must not become a new way to be unable to start", err)
+		return nil
+	}
+	if len(devices) == 0 {
+		log.Printf("wslcomms: the audio input enumeration returned no devices; starting anyway — " +
+			"an empty list is a device-monitor hiccup until proven otherwise")
+		return nil
+	}
+	for _, d := range devices {
+		if strings.EqualFold(d.ID, id) {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"wslcomms: cannot start: the saved commentary input %s is not present on this machine — "+
+			"%d inputs were found and none of them is that one. Dante Virtual Soundcard and NDI "+
+			"endpoints are created and destroyed as their sources come and go. Choose a device from "+
+			"the Commentary input dropdown on the main screen and press START again. (If this id was "+
+			"typed into the Settings screen's Commentary input device ID box, it belongs to another "+
+			"machine.)",
+		id, len(devices))
+}
+
 // senderOpts builds the options for one session from a configuration snapshot
 // and the passphrase already read from Credential Manager.
 //
@@ -1381,7 +1528,8 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 }
 
 // connectErrorReporter forwards the sender's connection failures to the
-// frontend's "error" event, rate-limited.
+// frontend's "error" event, rate-limited — except for the one failure that is
+// terminal, which bypasses the rate limit and says so.
 //
 // # What it is for
 //
@@ -1393,6 +1541,27 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 // subsequent gst.Pipeline.ReplaceSink fails immediately, and the operator has an
 // amber SENDING lamp and nothing else for the rest of the match. The lamp says
 // "connecting" when the truthful answer is "your audio device is gone".
+//
+// # The terminal branch: gst.ErrPipelineFatal
+//
+// That Dante-unplugged fault is no longer retried at all. internal/gst latches
+// a capture-chain death as gst.ErrPipelineFatal, and the sender STOPS on it —
+// it reports the error here once, emits StateStopped and closes its states
+// channel. So a report satisfying errors.Is(err, gst.ErrPipelineFatal) is not
+// one more failed attempt in an unbounded series; it is the session's last
+// word, and report treats it differently on every axis:
+//
+//   - the message says the session has STOPPED and what to do about it (check
+//     the commentary input device, press START), because the SENDING lamp is
+//     about to go grey and the operator needs the reason next to it;
+//   - it does NOT carry the SRT host and port. Naming the network target on a
+//     local device fault is the measured misdiagnosis this whole chain exists
+//     to end — "the commentary feed to <host>:40005 is not connected and is
+//     retrying", said forever, about a playback endpoint in config.json;
+//   - it bypasses the connectErrorRepeat suppression entirely, and touches
+//     none of its bookkeeping. A terminal message is by definition not a
+//     repeat: the sender stops after delivering it, so there is no series to
+//     suppress, and a fresh session gets a fresh reporter anyway.
 //
 // # Why it is rate-limited, and how
 //
@@ -1461,6 +1630,20 @@ func newConnectErrorReporter(emit func(error), host string, port int, now func()
 // is the one thing this exists to deliver.
 func (r *connectErrorReporter) report(err error) {
 	if err == nil {
+		return
+	}
+
+	if errors.Is(err, gst.ErrPipelineFatal) {
+		// Terminal. The sender is stopping over this — see the type comment's
+		// terminal-branch section for why it skips the rate limit, skips the
+		// bookkeeping, and does not name the SRT endpoint: the fault is the
+		// commentary input device or the capture chain on THIS machine, and
+		// prefixing it with host:port is the misdiagnosis being retired.
+		r.emit(fmt.Errorf(
+			"wslcomms: the commentary session has STOPPED and is not retrying: the commentary input "+
+				"device or its capture chain has failed, which is a fault on this machine, not the "+
+				"network — no reconnect can repair it. Check the commentary input device on the main "+
+				"screen, then press START to begin a new session: %w", err))
 		return
 	}
 

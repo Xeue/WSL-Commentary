@@ -107,6 +107,27 @@ func TestToNullForRetryClearsTheFakeSinks(t *testing.T) {
 	}
 }
 
+// TestListOutputDevicesRejectsCaptureIDs is the headphone dropdown's mirror of
+// ListInputDevices' namespace filter.
+//
+// Measured on the dev machine, the Audio/Sink endpoint-id set was a byte-exact
+// subset of Audio/Source — the loopback republication means the two dropdowns
+// can offer the same id string — so nothing structural stops a CAPTURE
+// endpoint appearing as headphones. wasapi2sink then falls back to the system
+// default playback device SILENTLY, and the commentator gets audio in the
+// wrong ears with nothing anywhere saying why. Only a POSITIVELY identified
+// capture id is skipped; unrecognised shapes stay offered, the same asymmetry
+// ListInputDevices applies in the other direction.
+func TestListOutputDevicesRejectsCaptureIDs(t *testing.T) {
+	fset, file := parseSource(t, returnCgoSourceFile)
+	body := funcBody(t, fset, file, "", "ListOutputDevices")
+
+	if !strings.Contains(body, "IsCaptureEndpointID(") {
+		t.Error("ListOutputDevices no longer skips capture-namespace endpoint ids; a microphone " +
+			"can be offered — and persisted — as the commentator's headphones")
+	}
+}
+
 // TestReturnTeardownDoesNotDetachTheBusSyncHandler is the return path's copy of
 // the guard gst_stub_test.go puts on the send path.
 //

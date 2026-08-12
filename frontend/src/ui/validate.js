@@ -16,8 +16,23 @@
 // exists to choose from. Start() will fail on its own if audioDeviceId is
 // still empty when pressed; that is internal/gst.PipelineOpts's job to
 // reject, not Settings'.
+//
+// Not required is not the same as not CHECKED: a pasted id that is positively
+// in the WRONG Windows endpoint namespace (a playback id in audioDeviceId, a
+// recording id in headphoneEndpointId) is refused at the field, with the
+// namespace rule in the message — see the two device-id checks below.
 
 import { CHANNEL_MODES } from '../monitor/channels.js';
+// The Windows endpoint-id namespace rule, mirrored from internal/gst/
+// device_id.go: capture ids begin {0.0.1.00000000}., render ids begin
+// {0.0.0.00000000}., and an id of unrecognised shape is NEITHER — accepted,
+// never refused. See the two device-id checks below.
+import {
+  isCaptureEndpointId,
+  isRenderEndpointId,
+  CAPTURE_ENDPOINT_PREFIX,
+  RENDER_ENDPOINT_PREFIX,
+} from './devices.js';
 
 const PBKEYLEN_VALUES = [0, 16, 32];
 
@@ -144,6 +159,38 @@ export function validateConfig(config) {
   // honest, and the feed is unaffected. Requiring it made the app unusable
   // until the operator guessed a value nothing in the M2L-X API will tell them
   // — the app now offers candidates after a START instead.
+
+  // audioDeviceId stays optional (see the file comment), but a value that is
+  // POSITIVELY a Windows RENDER (playback) endpoint id is refused at the
+  // field. This is the paste route into the defect the dropdown filter fixes:
+  // wasapi2 republishes every playback endpoint as a capture "loopback"
+  // device, an operator saved one, the pipeline prerolled and then failed
+  // ASYNCHRONOUSLY — and the sender blamed the SRT network and retried
+  // forever. An engineer pasting a GUID here before the hardware is patched in
+  // has only this message to tell the two namespaces apart.
+  //
+  // Unknown shapes and empty are ACCEPTED, deliberately — the asymmetric rule
+  // from internal/gst/device_id.go. Refusing an id merely because it fails to
+  // classify as capture would turn a future Windows id-shape change into a
+  // Settings screen that cannot be saved, twenty minutes before kick-off.
+  if (!isBlank(config.audioDeviceId) && isRenderEndpointId(config.audioDeviceId)) {
+    errors.audioDeviceId =
+      `This is a Windows PLAYBACK endpoint id — capture ids begin ${CAPTURE_ENDPOINT_PREFIX}, ` +
+      `render ids begin ${RENDER_ENDPOINT_PREFIX}. A playback device cannot be recorded from; ` +
+      'pick a device in the Commentary input dropdown on the main screen instead.';
+  }
+
+  // The same check, pointed the other way, for the SRT return's WASAPI
+  // endpoint (headphoneEndpointId): wasapi2sink plays through a RENDER
+  // endpoint, so a CAPTURE id pasted here is the mirror-image mistake.
+  // headphoneDeviceId is deliberately NOT checked — it is a browser
+  // mediaDeviceId, a different identifier space with no namespace to test.
+  if (!isBlank(config.headphoneEndpointId) && isCaptureEndpointId(config.headphoneEndpointId)) {
+    errors.headphoneEndpointId =
+      `This is a Windows CAPTURE (recording) endpoint id — render ids begin ` +
+      `${RENDER_ENDPOINT_PREFIX}, capture ids begin ${CAPTURE_ENDPOINT_PREFIX}. Headphones are a ` +
+      'playback device; take the id from App.ListOutputDevices, not the input list.';
+  }
 
   if (!isInt(config.returnMid) || !RETURN_MID_VALUES.includes(config.returnMid)) {
     errors.returnMid = 'Return must be one of the seven audio transceivers, mid 1 to 7.';

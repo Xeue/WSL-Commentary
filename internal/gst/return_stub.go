@@ -43,6 +43,13 @@ import (
 //
 // The first entry reproduces the real double space in the Dante Virtual
 // Soundcard display name, for the same reason defaultStubDevices does.
+//
+// Every ID being in the RENDER namespace ({0.0.0.00000000}.) is contract, the
+// mirror of defaultStubDevices being all-capture: these must fail
+// IsCaptureEndpointID and pass IsRenderEndpointID, so a Gate A test can prove
+// that wiring the headphone dropdown's value into PipelineOpts.AudioDeviceID
+// trips the render-endpoint refusal instead of silently "working" on stub
+// data the real build would reject. gst_stub_test.go asserts it.
 var defaultStubOutputDevices = []Device{
 	{
 		ID:   "{0.0.0.00000000}.{1e1c6f21-9f8e-4b6a-9a3d-1a6a37e0c2b1}",

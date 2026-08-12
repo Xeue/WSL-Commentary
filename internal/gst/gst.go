@@ -44,6 +44,28 @@
 // refusal window.
 package gst
 
+import "errors"
+
+// ErrPipelineFatal is wrapped by every error reporting a failure that
+// replacing the sink cannot repair — the capture or mux chain, not the SRT
+// link. It exists so that internal/sender can stop treating such a failure as
+// a connection problem: before this sentinel, a wasapi2 device that failed to
+// open asynchronously (the operator selecting a playback endpoint as the
+// commentary input) was retried as though the network were down, telling the
+// operator "the feed is not connected and is retrying" forever about a fault
+// no reconnect could ever fix.
+//
+// The condition LATCHES for the life of the pipeline: once one error wrapping
+// this sentinel has been returned or delivered, every subsequent ReplaceSink
+// on the same Pipeline returns it. Recovery is Stop, New, Start — nothing
+// less rebuilds the failed chain.
+//
+// The message text deliberately keeps the "pipeline-fatal" substring that the
+// pre-sentinel error carried, so anything still matching on the string —
+// field-log greps, BUILD-NOTES.md instructions — keeps matching. New code
+// must use errors.Is(err, ErrPipelineFatal) instead.
+var ErrPipelineFatal = errors.New("gst: pipeline-fatal")
+
 // Encoder settings fixed by specification section 5. The units differ between
 // the two encoders and the names here say which is which.
 const (
@@ -148,6 +170,15 @@ type Pipeline interface {
 	// succeeded and media is flowing; a non-nil error means it did not, and the
 	// caller — internal/sender — is responsible for backing off and trying
 	// again. Nothing upstream of srtq leaves PLAYING either way.
+	//
+	// One class of failure is not retryable, and ReplaceSink says so: an error
+	// satisfying errors.Is(err, ErrPipelineFatal) means the capture or mux
+	// chain itself has failed and no sink swap can carry media again. The
+	// condition latches for the life of the pipeline — every subsequent
+	// ReplaceSink returns it — and the only recovery is Stop, New, Start.
+	// Backing off and retrying such an error is the measured misdiagnosis this
+	// sentinel exists to end: a broken local device reported to the operator
+	// as a network that keeps refusing to connect.
 	ReplaceSink(opts SinkOpts) error
 
 	// RemoveSink tears the current sink out without installing another: block the

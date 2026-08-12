@@ -510,6 +510,20 @@ func missingElements() []string {
 // restricting the providers it uses. Devices from any other provider that might
 // end up in the bundle are discarded rather than offered, because Device.ID is
 // passed verbatim to wasapi2src and only wasapi2's IDs are meaningful there.
+//
+// # Audio/Source is not enough, and this function used to be wrong about it
+//
+// wasapi2's device provider republishes every RENDER (playback) endpoint as an
+// Audio/Source "loopback" device carrying wasapi2.device.loopback=true, so the
+// class check alone offered playback endpoints as commentary inputs — measured:
+// 11 of 25 entries on the dev machine, and an operator on another machine
+// selected one. The pipeline prerolled, wasapi2's rbuf failed ASYNCHRONOUSLY
+// with "Failed to open device {0.0.0.00000000}.{8678ce58-...}", and the sender
+// retried the SRT link forever over a local device fault. So two more filters
+// run below: the loopback property, and the endpoint-id namespace classifier
+// in device_id.go. Loopback devices are refused, never opened — setting
+// loopback=true to "make them work" would put the operator's own monitor mix
+// on air, which is the deliberate non-goal recorded in device_id.go.
 func ListInputDevices() ([]Device, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: ListInputDevices: Init has not been called")
@@ -544,6 +558,14 @@ func ListInputDevices() ([]Device, error) {
 	}
 
 	out := make([]Device, 0, len(devices))
+	// byID de-duplicates the offered list. With endpointID preferring
+	// device.actual-id, the "Default Audio Capture Device" pseudo entry
+	// resolves to the same endpoint id as the real device it currently points
+	// at, and offering both would let the operator persist two names for one
+	// endpoint. First entry with a real display name wins.
+	byID := make(map[string]int, len(devices))
+	audioSources := 0 // everything with the Audio/Source class, any provider
+	loopbacks := 0    // wasapi2 loopback republications of playback endpoints
 	for _, dev := range devices {
 		if dev == nil {
 			continue
@@ -555,6 +577,7 @@ func ListInputDevices() ([]Device, error) {
 		if !dev.HasClasses("Audio/Source") {
 			continue
 		}
+		audioSources++
 		props := dev.GetProperties()
 		if props == nil {
 			// gst_device_get_properties is nullable. Without properties the
@@ -565,6 +588,20 @@ func ListInputDevices() ([]Device, error) {
 			continue
 		}
 		if api := props.GetString("device.api"); api != "wasapi2" {
+			continue
+		}
+		// The loopback filter. GetBoolean fails unless the field exists AND is
+		// G_TYPE_BOOLEAN, which is how gstwasapi2device.c publishes it; if a
+		// future GStreamer changes the type this check silently passes and the
+		// namespace check below catches the device anyway, because a loopback
+		// republication always carries the render-namespace id of the playback
+		// endpoint it mirrors. Checked before endpointID so a device being
+		// skipped never costs the CreateElement fallback.
+		if loop, ok := props.GetBoolean(propLoopback); ok && loop {
+			loopbacks++
+			log.Printf("gst: ListInputDevices: skipping %q (%s): %s=true — it is wasapi2's loopback "+
+				"republication of a playback endpoint, and opening it would put the operator's own "+
+				"monitor mix on air", dev.GetDisplayName(), props.GetString("device.id"), propLoopback)
 			continue
 		}
 		id := endpointID(dev, props)
@@ -578,19 +615,64 @@ func ListInputDevices() ([]Device, error) {
 				dev.GetDisplayName(), structureFieldNames(props))
 			continue
 		}
-		out = append(out, Device{ID: id, Name: dev.GetDisplayName()})
+		// The namespace classifier, device_id.go. Only a POSITIVELY identified
+		// render id is refused; an unrecognised shape is offered with a warning,
+		// because refusing unknown shapes would turn a future Windows or
+		// GStreamer id-shape change into an empty dropdown at a facility.
+		if IsRenderEndpointID(id) {
+			log.Printf("gst: ListInputDevices: skipping %q (%s): its endpoint id is in the RENDER "+
+				"namespace (%s...) — a playback device that cannot be a commentary input",
+				dev.GetDisplayName(), id, RenderEndpointPrefix)
+			continue
+		}
+		if !IsCaptureEndpointID(id) {
+			log.Printf("gst: ListInputDevices: WARNING: %q (%s) has an endpoint id of unrecognised "+
+				"shape — offering it anyway (capture ids begin %s); if Start later fails to open it, "+
+				"this line is the diagnosis", dev.GetDisplayName(), id, CaptureEndpointPrefix)
+		}
+		name := dev.GetDisplayName()
+		if i, dup := byID[id]; dup {
+			// The kept name is captured BEFORE the empty-name upgrade below,
+			// or the log would quote the duplicate as having duplicated
+			// itself.
+			kept := out[i].Name
+			if out[i].Name == "" && name != "" {
+				out[i].Name = name
+			}
+			log.Printf("gst: ListInputDevices: %q duplicates the endpoint id of %q (%s); keeping the first",
+				name, kept, id)
+			continue
+		}
+		byID[id] = len(out)
+		out = append(out, Device{ID: id, Name: name})
 	}
+	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices; %d were WASAPI loopback "+
+		"republications of playback endpoints", len(out), audioSources, loopbacks)
 	return out, nil
 }
 
+// propLoopback is the GstStructure key under which wasapi2's device provider
+// marks an Audio/Source entry as its loopback republication of a RENDER
+// (playback) endpoint. ListInputDevices READS it to skip those entries; it is
+// never SET on wasapi2src, because loopback capture of the operator's own
+// monitor mix on a live commentary feed is the deliberate non-goal recorded in
+// device_id.go, and TestLoopbackIsNeverSetInTheCgoSource pins that.
+const propLoopback = "wasapi2.device.loopback"
+
 // endpointIDKeys are the GstStructure keys under which a wasapi2 device might
-// publish its IMMDevice endpoint ID, most likely first.
+// publish its IMMDevice endpoint ID, most preferred first.
 //
-// UNVERIFIED: gstwasapi2device.c is believed to publish it as "device.id", but
-// that has not been read against 1.28.5 on the target machine and no GStreamer
-// installation was available to check. The fallback below does not depend on
-// any of these names being right.
-var endpointIDKeys = []string{"device.id", "device.strid", "device.path"}
+// device.actual-id leads deliberately: the provider's two default-device
+// pseudo entries ("Default Audio Capture/Render Device") carry a DEVINTERFACE
+// class GUID as device.id but publish the REAL endpoint currently behind the
+// default as device.actual-id — preferring it resolves the pseudo entry to a
+// concrete endpoint that survives the default changing, and lets the de-dup
+// in ListInputDevices fold it onto the real entry it mirrors.
+//
+// UNVERIFIED: gstwasapi2device.c is believed to publish "device.id"; neither
+// that nor the others has been read against 1.28.5 on the target machine. The
+// fallback below does not depend on any of these names being right.
+var endpointIDKeys = []string{"device.actual-id", "device.id", "device.strid", "device.path"}
 
 // endpointID extracts the IMMDevice endpoint ID GUID for one device.
 //
@@ -610,6 +692,14 @@ func endpointID(dev gogst.Device, props *gogst.Structure) string {
 			}
 		}
 	}
+
+	// The fallback actually running means the provider's property keys have
+	// changed. Say so: at Gate B this line plus structureFieldNames in the
+	// caller's skip message is the whole diagnosis, and without it the only
+	// symptom is enumeration quietly costing an element instantiation per
+	// device.
+	log.Printf("gst: endpointID: %q publishes none of %v; falling back to gst_device_create_element",
+		dev.GetDisplayName(), endpointIDKeys)
 
 	el := dev.CreateElement("")
 	if el == nil {
@@ -1014,6 +1104,18 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if opts.AudioDeviceID == "" {
 		return errors.New("gst: PipelineOpts.AudioDeviceID is required")
 	}
+	// Refuse a RENDER (playback) endpoint here, synchronously, before anything
+	// is built. wasapi2src accepts such an id at construction and fails
+	// ASYNCHRONOUSLY — error 1551 on the bus, after Start has returned success —
+	// and the sender then misreads a local device fault as a network failure
+	// and retries the SRT link forever. The rule and its deliberate asymmetry
+	// (only a POSITIVE render identification refuses; unknown shapes pass) live
+	// in device_id.go, shared with the stub twin so the two cannot drift.
+	// NEVER "fix" this by setting wasapi2src's loopback property instead: that
+	// opens the operator's own monitor mix as the commentary source.
+	if err := refuseRenderEndpoint(opts.AudioDeviceID); err != nil {
+		return err
+	}
 	if opts.VideoBitrateKbps == 0 {
 		opts.VideoBitrateKbps = DefaultVideoBitrateKbps
 	}
@@ -1090,6 +1192,12 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if asrc == nil {
 		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioSrc))
 	}
+	// The id is logged VERBATIM immediately before it is handed to wasapi2src,
+	// because wasapi2src echoes the requested id verbatim in its asynchronous
+	// error 1551 (proved by probe — no substitution, no default fallback). With
+	// this line in the log, a "Failed to open device {...}" later is matched to
+	// what was actually requested rather than argued about.
+	log.Printf("gst: Start: wasapi2src capture endpoint id: %s", opts.AudioDeviceID)
 	if err := setStringProperty(asrc, "device", opts.AudioDeviceID); err != nil {
 		return abort(err)
 	}
@@ -1208,6 +1316,18 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		if busErr := p.drainStartupError(); busErr != nil {
 			err = fmt.Errorf("%w: %v", err, busErr)
 		}
+		return abort(err)
+	}
+
+	// BlockSetState reporting success is NOT proof the capture chain is
+	// healthy. wasapi2src opens its endpoint on its own thread and posts
+	// failure asynchronously — error 1551 for a device it cannot open — so
+	// NULL→PLAYING can return success while onBusMessage has already latched a
+	// pipeline-fatal error. Without this re-check Start reports a running
+	// pipeline whose capture chain is dead, and the caller connects a sink
+	// that will never carry media. ReplaceSink double-checks fatal before
+	// promising success for exactly the same reason; this mirrors it.
+	if err := p.fatalError(); err != nil {
 		return abort(err)
 	}
 
@@ -1551,8 +1671,15 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 			// Not the sink and not the queue in front of it: replacing the sink
 			// cannot repair this, so mark it and let ReplaceSink refuse rather
 			// than report a connection that carries no media.
-			p.markFatal(fmt.Errorf("gst: pipeline-fatal: %w "+
-				"(the capture or mux chain has failed; recover with Stop, New, Start)", err))
+			//
+			// The wrap puts ErrPipelineFatal — whose text is "gst:
+			// pipeline-fatal", so the rendered message is unchanged and
+			// anything still grepping for the substring keeps matching — at
+			// the head of the chain, which is what lets internal/sender use
+			// errors.Is to stop retrying a failure no reconnect can fix.
+			p.markFatal(fmt.Errorf("%w: %w "+
+				"(the capture or mux chain has failed; recover with Stop, New, Start)",
+				ErrPipelineFatal, err))
 		}
 		p.deliver(err)
 

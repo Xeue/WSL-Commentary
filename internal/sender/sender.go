@@ -19,9 +19,14 @@
 // never inside a pad probe or a bus callback. CONNECTING installs a fresh sink
 // and, on success, forces a key unit so the picture recovers at once.
 //
-// The application must reconnect indefinitely: on total network loss libsrt
-// declares the peer dead at about 5.27 s and exits, and M2L-X never recovers by
-// itself.
+// The application must reconnect indefinitely on anything a retry could fix:
+// on total network loss libsrt declares the peer dead at about 5.27 s and
+// exits, and M2L-X never recovers by itself. The one exception is a connect
+// failure wrapping gst.ErrPipelineFatal — the capture or mux chain is dead and
+// the condition latches, so every retry fails identically forever. The sender
+// stops instead: StateStopped is the documented recovery, Stop then New then
+// Start, being asked of the operator, where an eternal amber BACKOFF was a
+// local device fault blamed on the network.
 package sender
 
 import (
@@ -53,8 +58,10 @@ const (
 	// is amber.
 	StateBackoff State = "BACKOFF"
 
-	// StateStopped means the sender is not running, either because Start has not
-	// been called or because Stop has. The lamp is grey.
+	// StateStopped means the sender is not running: Start has not been called,
+	// Stop has, or a connection attempt returned an error wrapping
+	// gst.ErrPipelineFatal and the sender stopped itself, because only Stop,
+	// New, Start recovers a latched pipeline. The lamp is grey.
 	StateStopped State = "STOPPED"
 )
 
@@ -74,7 +81,11 @@ var BackoffLadder = []time.Duration{
 }
 
 // BackoffCap is the delay used for every attempt after the ladder is exhausted.
-// There is no attempt limit: the sender retries forever until Stop.
+// There is no attempt limit for retryable failures: the sender retries forever
+// until Stop. The single failure that is not retried at all — not capped, not
+// counted, stopped — is a ReplaceSink error wrapping gst.ErrPipelineFatal,
+// which latches for the life of the pipeline and so would fail identically on
+// every rung; see the loop in machine.go.
 const BackoffCap = 30 * time.Second
 
 // ErrAlreadyStarted is returned by Start on a Sender that is already running.
@@ -95,16 +106,24 @@ type Opts struct {
 	Sink gst.SinkOpts
 
 	// OnConnectError, if set, is called with the reason every failed connection
-	// attempt failed, immediately before the transition to StateBackoff.
+	// attempt failed — immediately before the transition to StateBackoff for a
+	// retryable failure, and exactly once, immediately before the sender stops
+	// itself, for an error wrapping gst.ErrPipelineFatal.
 	//
-	// Retrying forever is the requirement and this does not change it. What it
-	// changes is that the reason stops being discarded. The case that matters is
-	// a pipeline that has gone permanently fatal — the commentator's Dante
-	// endpoint unplugged, say, which errors wasapi2src and makes every subsequent
-	// ReplaceSink return the same failure immediately. Without this the operator
-	// sees an amber SENDING lamp and nothing else for the rest of the match,
-	// while the one lamp that could have said "your audio device is gone" says
-	// "connecting". WP-8 forwards it to the frontend's "error" event.
+	// Retrying forever remains the requirement for every failure a retry could
+	// fix, and this does not change it. What it changes is that the reason
+	// stops being discarded. The case that motivated it is a pipeline gone
+	// permanently fatal — the operator selecting a playback endpoint as the
+	// commentary input, or the commentator's Dante endpoint unplugged, either
+	// of which errors wasapi2src asynchronously and latches internal/gst's
+	// fatal state so that every subsequent ReplaceSink returns the same
+	// failure instantly. The sender stops on that error rather than backing
+	// off: this callback carries the real reason — WP-8 forwards it to the
+	// frontend's "error" event — and then the lamp goes grey STOPPED, which is
+	// the documented recovery (Stop, New, Start) being asked of the operator.
+	// Before either change the operator saw an amber SENDING lamp saying
+	// "connecting" for the rest of the match, while the one message that could
+	// have said "your audio device is gone" blamed the network instead.
 	//
 	// It is called on the state-machine goroutine, so it must not block and must
 	// not call back into the Sender. A nil value disables reporting.
@@ -119,7 +138,9 @@ type Sender interface {
 	// Start builds and plays the pipeline, then enters the state machine at
 	// StateConnecting. It returns as soon as the pipeline is playing; a
 	// connection failure is not an error from Start, it is a transition to
-	// StateBackoff, because the sender retries indefinitely.
+	// StateBackoff — the sender retries indefinitely — or, for an error
+	// wrapping gst.ErrPipelineFatal, a stop to StateStopped, because no
+	// reconnect can repair a latched pipeline.
 	//
 	// Start returns ErrAlreadyStarted if the sender is already running.
 	Start(opts Opts) error

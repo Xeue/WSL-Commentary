@@ -244,6 +244,21 @@ func ListOutputDevices() ([]Device, error) {
 				dev.GetDisplayName(), structureFieldNames(props))
 			continue
 		}
+		// The mirror of ListInputDevices' namespace check: a POSITIVELY
+		// identified CAPTURE endpoint has no business in the headphone
+		// dropdown. This is not hypothetical — measured on the dev machine,
+		// the Audio/Sink id set was a byte-exact subset of Audio/Source, so
+		// without this the two dropdowns can offer the same string and a
+		// microphone can be persisted as headphones. The asymmetry holds in
+		// this direction too: only a positive capture identification skips;
+		// an unrecognised shape is offered, because refusing unknown shapes
+		// would empty the dropdown on a future id-shape change.
+		if IsCaptureEndpointID(id) {
+			log.Printf("gst: ListOutputDevices: skipping %q (%s): its endpoint id is in the CAPTURE "+
+				"namespace (%s...) — a capture device cannot be the commentator's headphones",
+				dev.GetDisplayName(), id, CaptureEndpointPrefix)
+			continue
+		}
 		out = append(out, Device{ID: id, Name: dev.GetDisplayName()})
 	}
 	return out, nil

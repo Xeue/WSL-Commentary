@@ -13,6 +13,20 @@
 // It is owned by WP-3a along with the rest of this package, but WP-3b and WP-8
 // depend on it behaving exactly as documented, so changes to its semantics are a
 // contract change and must be reported, not made quietly.
+//
+// # What this stub does and does not model about the loopback defect
+//
+// The stub does NOT model wasapi2's loopback republication of playback
+// endpoints — ListInputDevices here returns capture devices only and there is
+// no fake loopback entry to filter. What it proves is the REFUSAL, not the
+// ENUMERATION filter: Start applies the identical render-endpoint refusal the
+// real twin does, through the shared refuseRenderEndpoint in device_id.go, so
+// a caller that would hand a playback endpoint to the real pipeline fails the
+// same way at Gate A. Correspondingly, the endpoint-id namespaces of the fake
+// device lists are CONTRACT: every defaultStubDevices id is in the capture
+// namespace ({0.0.1.00000000}.) and every defaultStubOutputDevices id (in
+// return_stub.go) is in the render namespace ({0.0.0.00000000}.), and
+// gst_stub_test.go asserts both against the classifier in device_id.go.
 
 package gst
 
@@ -46,6 +60,11 @@ const (
 // defaultStubDevices is the fake capture device list. The first entry reproduces
 // the real double space in the Dante Virtual Soundcard display name, because a
 // caller that mishandles it should fail at Gate A rather than at the facility.
+//
+// Every ID being in the CAPTURE namespace ({0.0.1.00000000}.) is contract, not
+// decoration: these must pass IsCaptureEndpointID so that a Gate A caller
+// wiring the dropdown to Start never trips the render-endpoint refusal on the
+// stub's own data. gst_stub_test.go asserts it.
 var defaultStubDevices = []Device{
 	{
 		ID:   "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
@@ -168,6 +187,12 @@ type StubPipeline struct {
 	sinkErr      error
 	sinkFailures int
 
+	// fatal models the real pipeline's latched pipeline-fatal state, set by
+	// MarkFatal and never cleared. Once set, every ReplaceSink returns it —
+	// ahead of the FailNextSinks ladder, exactly as the real implementation
+	// checks fatalError() before anything else that can fail.
+	fatal error
+
 	counters StubCounters
 }
 
@@ -221,6 +246,13 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	if opts.AudioDeviceID == "" {
 		return errors.New("gst: PipelineOpts.AudioDeviceID is required")
 	}
+	// The identical render-endpoint refusal the real twin applies, through the
+	// same shared helper, so the two builds cannot drift on either the rule or
+	// the wrapped ErrNotACaptureDevice sentinel. See device_id.go for the rule
+	// and its deliberate asymmetry.
+	if err := refuseRenderEndpoint(opts.AudioDeviceID); err != nil {
+		return err
+	}
 
 	if opts.VideoBitrateKbps == 0 {
 		opts.VideoBitrateKbps = DefaultVideoBitrateKbps
@@ -245,6 +277,13 @@ func (p *StubPipeline) ReplaceSink(opts SinkOpts) error {
 
 	if p.closed || p.state == StubStateStopped {
 		return errStubStopped
+	}
+	// The latch outranks the FailNextSinks ladder, mirroring the real
+	// implementation's fatalError() check on entry: once the (notional)
+	// capture or mux chain has failed, no reconnect can carry media, so every
+	// queued "connection failure" would be a lie about what is wrong.
+	if p.fatal != nil {
+		return p.fatal
 	}
 	if p.sinkFailures > 0 {
 		p.sinkFailures--
@@ -350,6 +389,42 @@ func (p *StubPipeline) InjectError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// MarkFatal models the real pipeline latching a pipeline-fatal error — a bus
+// error whose source is the capture or mux chain rather than the sink. It
+// wraps err in ErrPipelineFatal exactly as onBusMessage's markFatal site does,
+// keeping the same human-readable tail, so a Gate A test matching either the
+// sentinel or the "pipeline-fatal" substring is also a statement about the
+// real build.
+//
+// The latch behaves as the contract in gst.go documents: once marked, every
+// subsequent ReplaceSink returns the error — ahead of the FailNextSinks
+// ladder — and it NEVER clears; recovery is Stop, New, Start on a fresh
+// pipeline. Only the first mark wins, matching the real markFatal. Start,
+// RemoveSink and ForceKeyUnit are untouched, because the real fatal path
+// gates only ReplaceSink's promise of a working connection.
+//
+// Stub build only.
+func (p *StubPipeline) MarkFatal(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fatal != nil || err == nil {
+		return
+	}
+	p.fatal = fmt.Errorf("%w: %w "+
+		"(the capture or mux chain has failed; recover with Stop, New, Start)",
+		ErrPipelineFatal, err)
+}
+
+// Fatal returns the latched pipeline-fatal error, or nil. It is the stub's
+// fatalError.
+//
+// Stub build only.
+func (p *StubPipeline) Fatal() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fatal
 }
 
 // FailNextStart makes the next Start call return err instead of starting. Only

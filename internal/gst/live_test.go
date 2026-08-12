@@ -60,6 +60,7 @@ package gst
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1528,4 +1529,159 @@ func provokeGenuine(t *testing.T, h *harness) bool {
 	}
 	mark(t, "provokeGenuine: srtq:src last flow return is %s", h.p.srtqSrcPad.GetLastFlowReturn())
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// The loopback defect, verified against the real device provider.
+//
+// These two tests are the Gate C half of the fix in device_id.go: the source
+// guards prove the filtering code is present, the stub tests prove the refusal
+// semantics, and only a run against the real wasapi2 provider proves the
+// provider still behaves the way the fix assumes — republishing every RENDER
+// endpoint as an Audio/Source loopback device that must be filtered out.
+// ---------------------------------------------------------------------------
+
+// liveInit resolves the bundled GStreamer and calls Init, skipping rather than
+// failing on a machine that has no bundle. Shared by the device tests below,
+// which need nothing else from the harness — no M2L-X, no SRT peer, no slate.
+func liveInit(t *testing.T) {
+	t.Helper()
+	appDir, err := filepath.Abs(env("WSLCOMMS_LIVE_APP_DIR", defaultAppDir))
+	if err != nil {
+		t.Fatalf("resolving the app directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, "gst", "lib", "gstreamer-1.0")); err != nil {
+		t.Skipf("no bundled GStreamer under %s (run build\\bundle-gst.ps1): %v", appDir, err)
+	}
+	if err := Init(appDir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+}
+
+// TestLiveListInputDevicesOffersOnlyCaptureEndpoints proves the enumeration
+// filter against the real provider: every id offered classifies as capture,
+// and on a machine with Dante — whose DVS Transmit endpoints are what the
+// loopback republication multiplies (measured: 11 of 25 entries) — the offered
+// count is STRICTLY below the raw Audio/Source count, i.e. the filter removed
+// something real rather than matching nothing.
+func TestLiveListInputDevicesOffersOnlyCaptureEndpoints(t *testing.T) {
+	liveInit(t)
+
+	devices, err := ListInputDevices()
+	if err != nil {
+		t.Fatalf("ListInputDevices: %v", err)
+	}
+	if len(devices) == 0 {
+		t.Fatal("ListInputDevices offered nothing; either the machine has no capture endpoint " +
+			"or the filter is refusing everything")
+	}
+
+	hasDante := false
+	for _, d := range devices {
+		t.Logf("offered: %q  %s", d.Name, d.ID)
+		if IsRenderEndpointID(d.ID) {
+			t.Errorf("REGRESSION: %q (%s) is a RENDER endpoint offered as a commentary input — "+
+				"the operator's 'we had an output selected as an input' is possible again", d.Name, d.ID)
+		}
+		if !IsCaptureEndpointID(d.ID) {
+			t.Errorf("%q (%s) does not classify as a capture endpoint; either the provider's id "+
+				"shape changed (expected, warn-only in ListInputDevices, but this test wants to "+
+				"know) or the filter offered something it should not have", d.Name, d.ID)
+		}
+		if strings.Contains(d.Name, "Dante") || strings.Contains(d.Name, "DVS") {
+			hasDante = true
+		}
+	}
+
+	// The raw count: what the class + device.api filter alone would have
+	// offered, which is exactly what the defective ListInputDevices did.
+	monitor := gogst.NewDeviceMonitor()
+	if monitor == nil {
+		t.Fatal("gst_device_monitor_new returned nil")
+	}
+	monitor.AddFilter("Audio/Source", nil)
+	started := monitor.Start()
+	raw := 0
+	for _, dev := range monitor.GetDevices() {
+		if dev == nil || !dev.HasClasses("Audio/Source") {
+			continue
+		}
+		props := dev.GetProperties()
+		if props == nil || props.GetString("device.api") != "wasapi2" {
+			continue
+		}
+		raw++
+	}
+	if started {
+		monitor.Stop()
+	}
+	t.Logf("offered %d of %d raw wasapi2 Audio/Source devices", len(devices), raw)
+
+	if !hasDante {
+		t.Log("no Dante/DVS device present; skipping the strict-inequality assertion — " +
+			"a machine without DVS Transmit endpoints may legitimately have no loopback " +
+			"republication to filter")
+		return
+	}
+	if len(devices) >= raw {
+		t.Errorf("offered %d of %d raw Audio/Source devices on a machine with Dante: the loopback "+
+			"filter removed nothing, yet every DVS Transmit endpoint should have been republished "+
+			"as an Audio/Source loopback device and filtered out", len(devices), raw)
+	}
+}
+
+// TestLiveStartRefusesARenderEndpointUpFront proves the refusal against a real
+// render id — one taken from ListOutputDevices, so it is a genuine playback
+// endpoint on this machine, the exact class of id the operator selected. The
+// refusal must be synchronous and total: an error wrapping
+// ErrNotACaptureDevice from Start itself, with NO pipeline built, so no
+// asynchronous error-1551 bus message and no latched fatal.
+func TestLiveStartRefusesARenderEndpointUpFront(t *testing.T) {
+	liveInit(t)
+
+	outs, err := ListOutputDevices()
+	if err != nil {
+		t.Fatalf("ListOutputDevices: %v", err)
+	}
+	if len(outs) == 0 {
+		t.Skip("no playback endpoint on this machine; nothing to refuse")
+	}
+	renderID := outs[0].ID
+	if !IsRenderEndpointID(renderID) {
+		t.Fatalf("sanity: ListOutputDevices returned %q which does not classify as a render "+
+			"endpoint; the classifier and the provider disagree about namespaces", renderID)
+	}
+	mark(t, "Start with the render endpoint %s (%s) — expecting the up-front refusal",
+		renderID, outs[0].Name)
+
+	pipe, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cp, ok := pipe.(*cgoPipeline)
+	if !ok {
+		t.Fatalf("New returned a %T, not a *cgoPipeline", pipe)
+	}
+	defer func() { _ = pipe.Stop() }()
+
+	startErr := pipe.Start(PipelineOpts{SlatePath: "never-opened.png", AudioDeviceID: renderID})
+	if startErr == nil {
+		t.Fatal("Start accepted a render endpoint; wasapi2 will fail asynchronously with error " +
+			"1551 and the sender will retry the SRT link forever over a local device fault")
+	}
+	if !errors.Is(startErr, ErrNotACaptureDevice) {
+		t.Errorf("Start's refusal does not wrap ErrNotACaptureDevice: %v", startErr)
+	}
+
+	// The refusal ran before anything was built, so there must be no 1551 bus
+	// error and no latched fatal — the failure is synchronous, attributable
+	// and does not poison a pipeline that never existed.
+	if f := cp.fatalError(); f != nil {
+		t.Errorf("a fatal was latched by a Start that refused up front: %v", f)
+	}
+	select {
+	case e := <-pipe.Errors():
+		t.Errorf("a bus error arrived from a pipeline that was never built: %v", e)
+	default:
+	}
 }
