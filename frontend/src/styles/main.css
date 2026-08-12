@@ -288,6 +288,11 @@ input[type='range'] {
   color: #fecaca;
 }
 
+/* The message grows; the two buttons keep their size. */
+.error-banner > span {
+  flex: 1 1 auto;
+}
+
 .error-dismiss {
   background: transparent;
   border: none;
@@ -301,6 +306,67 @@ input[type='range'] {
 
 .error-dismiss:hover {
   background: rgba(255, 255, 255, 0.08);
+}
+
+/* The History button appears only when the log holds more than the banner is
+   already showing. Same visual family as the dismiss ✕, but bordered, because
+   it opens something rather than closing it. */
+.error-history-toggle {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--danger-border);
+  color: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.error-history-toggle:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* The history list: the banner's colours at a whisper, so it reads as part of
+   the same surface and cannot be mistaken for a second live error. */
+.error-history {
+  margin-top: 0.35rem;
+  padding: 0.5rem 1rem 0.6rem;
+  border-radius: var(--radius);
+  background: var(--panel);
+  border: 1px solid var(--danger-border);
+}
+
+.error-history-list {
+  margin: 0 0 0.5rem;
+  padding: 0;
+  list-style: none;
+  max-height: 9rem;
+  overflow-y: auto;
+}
+
+.error-history-list li {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  /* The row starts with an HH:MM:SS column; tabular digits keep it a column. */
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
+.error-history-clear {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+}
+
+.error-history-clear:hover {
+  background: var(--panel-alt);
+  color: var(--text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -594,37 +660,11 @@ input[type='range'] {
   flex: 1 1 340px;
 }
 
-/* ------------------------------------------------------------------ */
-/* What the selected picture actually is                                */
-/* ------------------------------------------------------------------ */
-
-/* Two lines, not a tooltip. The difference between the pictures — a soft tile
-   of a multiviewer already being received, against a real 15 Mbit/s stream and
-   one of M2L-X's four fan-out slots — is the whole basis on which the choice is
-   made, and it is not something you can judge by looking at a control. The
-   measured 489 ms figure below it is the RETURN AUDIO's, and says so; nobody
-   has measured the picture's, so no figure is printed for it. */
-.return-notes {
-  flex: 0 0 auto;
-  margin: 0 0 0.6rem;
-}
-
-.picture-note {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  line-height: 1.45;
-}
-
-.picture-status {
-  margin: 0.25rem 0 0;
-  font-size: 0.8rem;
-  color: var(--text);
-}
-
-.picture-status-bad {
-  color: var(--red);
-}
+/* .return-notes, .picture-note and .picture-status are gone with the paragraph
+   under the controls, which the operator removed — the same request that took
+   .control-hint above. The explanation of what each picture costs survives as
+   the segmented control's tooltips; the BACKOFF state that the status line
+   reported in red now raises the error banner instead (home.js, errorlog.js). */
 
 /* ------------------------------------------------------------------ */
 /* Start/stop + lamps                                                   */

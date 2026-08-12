@@ -1,25 +1,17 @@
 import { createLampRow } from './lamps.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
-// The headphone list is ALWAYS the browser's. Audio always comes from Kinesis
-// and is no longer switchable, so this is a constant now rather than a function
-// of a control — but it is still imported from the module that owns the two
-// identifier spaces, so that the WASAPI list and the browser list never come to
-// be described by two different sentences written in two different files.
-import { DEVICE_SOURCE_WEBRTC, LATENCY_NOTE } from './returnsource.js';
 import {
   PICTURE_SOURCES,
   PICTURE_SOURCE_SRT,
   DEFAULT_PICTURE_SOURCE,
   normalisePictureSource,
-  describePictureSource,
   derivePictureSourceEffects,
   describePictureShowing,
-  PICTURE_NOTE,
-  PICTURE_STATE_WORDS,
-  PICTURE_STATE_BACKOFF,
+  PICTURE_BACKOFF_ERROR,
   normalisePictureState,
 } from './picturesource.js';
+import { createErrorLog, createBackoffEpisode, describeEntry, formatErrorTime } from './errorlog.js';
 // The channel table comes from the monitor module because that is where it is
 // ENFORCED — it is the wiring of a ChannelSplitter to a ChannelMerger, and the
 // words here have to be the words for that wiring. It is pure data with no
@@ -97,7 +89,12 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   setRunning(running)                 flips the START/STOP button
  *   setBusy(busy)                       disables the button while a call is in flight
  *   setStatusUnavailable(unavailable)   shows/hides the transient banner (Status.Stale)
- *   showError(message) / clearError()   the dismissible error banner
+ *   showError(message) / clearError()   the dismissible error banner. Every
+ *                                       message is also kept in a history
+ *                                       (errorlog.js) with timestamps and
+ *                                       repeat counts, opened from the
+ *                                       banner's History button; dismissing
+ *                                       hides the banner, not the history
  *
  * handlers = {
  *   onSettings(), onMixer(), onStartStop(),
@@ -166,26 +163,100 @@ export function createHomeView(handlers) {
   }
 
   // --- error banner (dismissible; NOT the honest line) ----------------
+  //
+  // The banner shows the NEWEST error; the log behind it (./errorlog.js) keeps
+  // every one, so a second problem no longer destroys the evidence of the
+  // first. When there is more than one row, a History button appears and opens
+  // the list — timestamps, messages, repeat counts. Dismissing the banner
+  // keeps the history: dismissal means "I have seen this", not "unhappen it".
+  const errorLog = createErrorLog();
+  const backoffEpisode = createBackoffEpisode();
+  let bannerMessage = '';
+
   const errorBanner = document.createElement('div');
   errorBanner.className = 'error-banner';
   errorBanner.setAttribute('role', 'alert');
   errorBanner.hidden = true;
   const errorText = document.createElement('span');
+  const errorHistoryBtn = document.createElement('button');
+  errorHistoryBtn.type = 'button';
+  errorHistoryBtn.className = 'error-history-toggle';
+  errorHistoryBtn.hidden = true;
+  errorHistoryBtn.setAttribute('aria-expanded', 'false');
+  errorHistoryBtn.addEventListener('click', () => {
+    setErrorHistoryOpen(errorHistoryPanel.hidden);
+  });
   const errorDismiss = document.createElement('button');
   errorDismiss.type = 'button';
   errorDismiss.className = 'error-dismiss';
   errorDismiss.setAttribute('aria-label', 'Dismiss');
   errorDismiss.textContent = '✕';
   errorDismiss.addEventListener('click', () => clearError());
-  errorBanner.append(errorText, errorDismiss);
+  errorBanner.append(errorText, errorHistoryBtn, errorDismiss);
+
+  // The history list, drawn directly under the banner when opened.
+  const errorHistoryPanel = document.createElement('div');
+  errorHistoryPanel.className = 'error-history';
+  errorHistoryPanel.hidden = true;
+  const errorHistoryList = document.createElement('ul');
+  errorHistoryList.className = 'error-history-list';
+  const errorHistoryClear = document.createElement('button');
+  errorHistoryClear.type = 'button';
+  errorHistoryClear.className = 'error-history-clear';
+  errorHistoryClear.textContent = 'Clear history';
+  errorHistoryClear.addEventListener('click', () => {
+    errorLog.clear();
+    clearError();
+  });
+  errorHistoryPanel.append(errorHistoryList, errorHistoryClear);
+
+  function setErrorHistoryOpen(open) {
+    errorHistoryPanel.hidden = !open;
+    errorHistoryBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) renderErrorHistory();
+  }
+
+  function renderErrorHistory() {
+    // The History button exists whenever the log holds more than the line the
+    // banner is already showing — a second row, or the one row repeating.
+    const worthShowing = errorLog.size > 1 || (errorLog.entries[0]?.count ?? 0) > 1;
+    errorHistoryBtn.hidden = !worthShowing;
+    errorHistoryBtn.textContent = `History (${errorLog.size})`;
+    if (!worthShowing) setErrorHistoryOpen(false);
+
+    if (errorHistoryPanel.hidden) return;
+    errorHistoryList.textContent = '';
+    for (const entry of errorLog.entries) {
+      const li = document.createElement('li');
+      li.textContent = describeEntry(entry);
+      if (entry.count > 1) {
+        li.title = `first at ${formatErrorTime(entry.firstAt)}, ${entry.count} times in all`;
+      }
+      errorHistoryList.appendChild(li);
+    }
+  }
 
   function showError(message) {
-    errorText.textContent = message;
+    const entry = errorLog.record(message);
+    bannerMessage = entry.message;
+    errorText.textContent = entry.count > 1 ? `${entry.message} (×${entry.count})` : entry.message;
     errorBanner.hidden = false;
+    renderErrorHistory();
   }
   function clearError() {
     errorBanner.hidden = true;
     errorText.textContent = '';
+    bannerMessage = '';
+    setErrorHistoryOpen(false);
+    renderErrorHistory();
+  }
+  /**
+   * clearErrorIf takes the banner down only if it is still showing `message`.
+   * For errors that RESOLVE — the SRT picture coming back — where clearing
+   * unconditionally would eat whatever unrelated error arrived in between.
+   */
+  function clearErrorIf(message) {
+    if (bannerMessage === message) clearError();
   }
 
   // --- the picture area -------------------------------------------------
@@ -462,17 +533,15 @@ export function createHomeView(handlers) {
   sourceLabel.textContent = 'Picture';
   sourceGroup.append(sourceLabel, sourceSegmented.el);
 
-  // The note under the control: what the selected picture IS, what it costs,
-  // and — fixed, on both options — that the audio does not move.
-  const sourceNote = document.createElement('p');
-  sourceNote.className = 'picture-note';
-
-  // The native receiver's own status. Separate from the note because it is the
-  // only line on this screen that reports something happening rather than
-  // something configured, and it must not be mistaken for the WebRTC lamps.
-  const srtStatusLine = document.createElement('p');
-  srtStatusLine.className = 'picture-status';
-  srtStatusLine.hidden = true;
+  // THE NOTES UNDER THE CONTROLS ARE GONE, at the operator's request — the
+  // paragraph explaining the selected picture (describePictureSource +
+  // PICTURE_NOTE + LATENCY_NOTE) and the separate SRT status line under it.
+  // The words themselves are untouched in ./picturesource.js and
+  // ./returnsource.js, where Settings and the option tooltips still use them;
+  // what changed is that this screen no longer renders a paragraph of them.
+  // The one state that mattered from the status line — BACKOFF, the picture
+  // failing and retrying — now speaks through the error banner instead, once
+  // per episode; see setPictureState below and errorlog.js.
 
   const levelGroup = document.createElement('div');
   levelGroup.className = 'control-group control-group-level';
@@ -489,21 +558,19 @@ export function createHomeView(handlers) {
   levelSlider.addEventListener('input', () => handlers.onLevelChange(Number(levelSlider.value) / 100));
   levelGroup.append(levelLabel, levelSlider);
 
-  // The Headphones row is built by hand rather than through makeRow because its
-  // label says WHOSE device list is in it.
-  //
-  // It used to CHANGE, because the return-source control swapped the dropdown
-  // between the browser's mediaDeviceIds and Windows' WASAPI endpoint ids. That
-  // control is gone: audio always comes from Kinesis, so this is always the
-  // browser's list and always writes config.headphoneDeviceId. The label is
-  // still drawn because a dropdown of device names gives no clue which
-  // identifier space it belongs to, and the WASAPI field still exists on the
-  // Settings screen for the native return that is kept as a capability.
+  // The Headphones label is plain "Headphones/output", at the operator's
+  // request. It used to say whose identifier space the list came from — the
+  // browser's — which mattered when a control swapped the dropdown between
+  // the browser's list and Windows'. That control is gone — this is always
+  // the browser's list, always writing config.headphoneDeviceId — so the
+  // qualifier was engineering trivia on the operator's screen. The
+  // distinction itself still matters and still lives in ./returnsource.js and
+  // on the Settings screen's WASAPI field.
   const headphoneRow = document.createElement('div');
   headphoneRow.className = 'control-group';
   const headphoneLabel = document.createElement('label');
   headphoneLabel.htmlFor = 'headphone-select';
-  headphoneLabel.textContent = `Headphones — ${DEVICE_SOURCE_WEBRTC}`;
+  headphoneLabel.textContent = 'Headphones/output';
   headphoneRow.append(headphoneLabel, headphoneSelect);
 
   controls.append(
@@ -514,10 +581,6 @@ export function createHomeView(handlers) {
     sourceGroup,
     levelGroup,
   );
-
-  const returnNotes = document.createElement('div');
-  returnNotes.className = 'return-notes';
-  returnNotes.append(sourceNote, srtStatusLine);
 
   // --- start/stop + lamps -------------------------------------------------
   const actionRow = document.createElement('div');
@@ -542,10 +605,10 @@ export function createHomeView(handlers) {
   el.append(
     header,
     errorBanner,
+    errorHistoryPanel,
     pgmStage,
     audioEl,
     controls,
-    returnNotes,
     actionRow,
     statusUnavailableBanner,
   );
@@ -599,11 +662,16 @@ export function createHomeView(handlers) {
 
   /**
    * renderPicture draws what the SELECTION and the RECEIVER'S STATE mean: the
-   * badge over the tile, the segmented control, and the status line under it.
+   * badge over the tile and the segmented control.
    *
    * Both feed it, because neither alone says what is on screen: "SRT selected"
    * with the receiver in BACKOFF is a commentator watching the mosaic, and
    * saying "SRT" over the top of that would be a lie told in large letters.
+   *
+   * The status LINE it also used to draw is gone; BACKOFF — the only state on
+   * it that demanded attention — is raised through the error banner by
+   * setPictureState instead, and the badge over the tile already reports which
+   * picture is actually showing.
    *
    * IT DOES NOT DECIDE WHETHER THE MOSAIC IS SUPPRESSED, and it used to. That
    * is setPictureOverlaid's job and it answers a different question — is the
@@ -618,31 +686,6 @@ export function createHomeView(handlers) {
     pictureBadge.textContent = showing.text;
     pictureBadge.title = showing.detail;
     pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
-
-    sourceNote.textContent = [describePictureSource(effects.source), PICTURE_NOTE, LATENCY_NOTE].join(' ');
-
-    // The status line is drawn only while the SRT picture is being ASKED for.
-    // A status line for a receiver nobody wants running reads as a fault.
-    if (!effects.wantSRT || !currentPictureState) {
-      srtStatusLine.hidden = true;
-      srtStatusLine.textContent = '';
-      return;
-    }
-    // The wire value is lowercase — it is internal/gst's PictureState — and it
-    // is SHOUTED here, beside the uppercase lamp states, because a commentator
-    // reading this line at a glance is reading a status word and not a Go
-    // identifier. An unrecognised state still prints, with no gloss: a state
-    // this build does not know is shown as itself rather than swallowed.
-    const name = normalisePictureState(currentPictureState) || String(currentPictureState);
-    const words = PICTURE_STATE_WORDS[name];
-    srtStatusLine.textContent = `SRT picture: ${name.toUpperCase()}${words ? ` — ${words}` : ''}`;
-    // Only BACKOFF is called out. It is the one state that means something went
-    // wrong and is retrying; the others are normal parts of coming up.
-    //
-    // Compared against the CONSTANT, not against the shouted string above: the
-    // wire value is lowercase and `name.toUpperCase()` is display only.
-    srtStatusLine.classList.toggle('picture-status-bad', name === PICTURE_STATE_BACKOFF);
-    srtStatusLine.hidden = false;
   }
 
   /** setPictureSource selects which picture the application should try for. */
@@ -663,10 +706,24 @@ export function createHomeView(handlers) {
 
   /**
    * setPictureState records the native receiver's own state, one of the four
-   * strings on the "picture" event. Null hides the status line.
+   * strings on the "picture" event.
+   *
+   * It also feeds the backoff-episode tracker: the first failure of an
+   * unbroken failing run raises the error banner, the retry cycling inside
+   * that run stays silent, and recovery takes the banner down again — but only
+   * if the banner is still showing THIS message, because a different error
+   * arriving mid-episode must not be cleared by the picture getting better.
    */
   function setPictureState(state) {
     currentPictureState = state ? String(state) : null;
+    switch (backoffEpisode.track(normalisePictureState(currentPictureState))) {
+      case 'raise':
+        showError(PICTURE_BACKOFF_ERROR);
+        break;
+      case 'clear':
+        clearErrorIf(PICTURE_BACKOFF_ERROR);
+        break;
+    }
     renderPicture();
   }
 

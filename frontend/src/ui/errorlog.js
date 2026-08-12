@@ -25,6 +25,14 @@
  * produce alternating rows, because that is what happened.
  */
 
+// The picture-state spellings come from the module that OWNS them and asserts
+// them against internal/gst. Writing 'backoff' here as a string literal is the
+// two-tables bug ./returns.js exists to record.
+import {
+  PICTURE_STATE_BACKOFF,
+  PICTURE_STATE_CONNECTING,
+} from './picturesource.js';
+
 /**
  * ERROR_LOG_LIMIT caps the history. Fifty distinct errors is far beyond any
  * real session; the cap exists so that a pathological loop that composes a
@@ -129,14 +137,14 @@ export function createBackoffEpisode() {
      * unknown or gone).
      */
     track(state) {
-      if (state === 'backoff') {
+      if (state === PICTURE_STATE_BACKOFF) {
         if (inEpisode) return null;
         inEpisode = true;
         return 'raise';
       }
       // 'connecting' while failing is the retry in progress: the episode is
       // not over until the picture is showing or the receiver is stopped.
-      if (state === 'connecting') return null;
+      if (state === PICTURE_STATE_CONNECTING) return null;
       if (inEpisode) {
         inEpisode = false;
         return 'clear';

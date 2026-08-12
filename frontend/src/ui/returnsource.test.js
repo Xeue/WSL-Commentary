@@ -239,10 +239,12 @@ test('returnsource.js no longer claims the picture comes from WebRTC', () => {
     !/^export const CHANNEL_REBUILD_NOTE/m.test(src),
     'nor a warning about a control the GUI no longer has',
   );
-  // And home.js must take the replacement from the module that owns it. The
-  // two imports are checked by NAME, not by proximity: both modules export a
-  // PICTURE_NOTE now, and taking it from the wrong one would compile, build and
-  // print a sentence that is the opposite of the truth.
+  // home.js no longer renders the note AT ALL — the paragraph under the
+  // controls went at the operator's request — so the guard is now pure
+  // absence: no import of the sentence from either module, so the stale copy
+  // in returnsource.js (if it ever came back) would have no reader. The
+  // replacement sentence still has exactly one owner, picturesource.js, where
+  // the segmented control's tooltips and Settings take their words from.
   const home = ui('home.js');
   const importFrom = (module) => {
     const at = home.indexOf(`from './${module}.js'`);
@@ -255,8 +257,13 @@ test('returnsource.js no longer claims the picture comes from WebRTC', () => {
     'home.js must not import PICTURE_NOTE from returnsource.js',
   );
   assert.ok(
-    importFrom('picturesource').includes('PICTURE_NOTE'),
-    'home.js must import PICTURE_NOTE from picturesource.js',
+    !importFrom('picturesource').includes('PICTURE_NOTE'),
+    'home.js no longer renders the note; the paragraph was removed by the operator',
+  );
+  assert.match(
+    ui('picturesource.js'),
+    /^export const PICTURE_NOTE/m,
+    'picturesource.js still owns the sentence, for the tooltips and Settings',
   );
 });
 
@@ -725,21 +732,27 @@ test('exactly one function fills the Headphones dropdown, and it picks by path',
   );
 });
 
-test('the Headphones dropdown says it holds the BROWSER list, and never swaps', () => {
+test('the Headphones dropdown is plainly labelled, and never swaps lists', () => {
   // It used to swap between the browser's mediaDeviceIds and Windows' WASAPI
   // endpoint ids as the return-source control moved. That control is gone, so
-  // the list is always the browser's — but the label stays, because a dropdown
-  // of device names gives no clue which identifier space it belongs to and the
-  // WASAPI field still exists on the Settings screen.
+  // the list is always the browser's. The label used to SAY so — "Headphones —
+  // browser (enumerateDevices)" — and the operator removed the qualifier: it
+  // was engineering trivia on the screen of somebody about to commentate. The
+  // invariant it advertised is still enforced here: one list, never the WASAPI
+  // one, whose field lives on the Settings screen.
   const src = ui('home.js');
   assert.match(
     src,
-    /headphoneLabel\.textContent = `Headphones — \$\{DEVICE_SOURCE_WEBRTC\}`/,
-    'the label must name the browser list, from the module that owns both names',
+    /headphoneLabel\.textContent = 'Headphones\/output'/,
+    'the label is the plain "Headphones/output" the operator asked for',
   );
   assert.ok(
     !/DEVICE_SOURCE_SRT/.test(src),
     'home.js must never put the WASAPI list behind this dropdown again',
+  );
+  assert.ok(
+    !/DEVICE_SOURCE_WEBRTC/.test(src),
+    'the qualifier is gone entirely: no import left over to drift back in',
   );
 });
 

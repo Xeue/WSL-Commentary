@@ -95,6 +95,21 @@ export const PICTURE_STATE_WORDS = Object.freeze({
 });
 
 /**
+ * PICTURE_BACKOFF_ERROR is the banner raised when an SRT reconnect EPISODE
+ * begins — once per episode, not once per retry; see errorlog.js's
+ * createBackoffEpisode. It replaced an inline red status line under the
+ * controls, at the operator's request: reconnect failures now speak through
+ * the same banner as every other error.
+ *
+ * The second sentence is there because the first, alone, invites the wrong
+ * action: the fallback is automatic and the commentator has a picture the
+ * whole time. Nothing needs doing, and the message says so.
+ */
+export const PICTURE_BACKOFF_ERROR =
+  'SRT picture: the last attempt failed — retrying automatically. ' +
+  'You are watching the mosaic meanwhile.';
+
+/**
  * normalisePictureState folds a state from the wire to the spelling above.
  * Anything unrecognised comes back as the empty string, which every caller reads
  * as "not showing" — the safe direction, because the alternative is painting an
