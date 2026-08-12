@@ -97,12 +97,6 @@ foreach ($r in $required) {
     }
 }
 
-$pluginDir = Join-Path $DistDir 'gst\lib\gstreamer-1.0'
-$plugins = @(Get-ChildItem -LiteralPath $pluginDir -Filter '*.dll' -File -ErrorAction SilentlyContinue)
-if ($plugins.Count -ne 15) {
-    throw "Expected 15 GStreamer plugins in '$pluginDir', found $($plugins.Count). This is the incomplete-bundle failure: run build\bundle-gst.ps1 with the application closed."
-}
-
 # The manifest records whether the dependency closure was actually verified. A
 # bundle whose closure was never checked is one that fails at runtime on a
 # machine that is not this one - which is precisely the machine a portable build
@@ -111,7 +105,24 @@ $manifest = Get-Content -LiteralPath (Join-Path $DistDir 'gst\BUNDLE-MANIFEST.tx
 if ($manifest -notmatch 'Dependency check\s*:\s*PASSED') {
     throw "BUNDLE-MANIFEST.txt does not record a passing dependency check. Re-run build\bundle-gst.ps1 with objdump available; do not ship a bundle whose closure is unverified."
 }
-Write-Host "  staged folder is complete: 15 plugins, closure verified by bundle-gst.ps1."
+
+# The expected plugin count is not duplicated here: BUNDLE-MANIFEST.txt records
+# what the bundler staged, and bundle-gst.ps1 itself asserts the set equals its
+# closed allowlist. Packing checks the staged tree AGAINST the manifest, so a
+# bundler allowlist change (15 became 16 when the level plugin arrived for the
+# input meters) does not need a second edit here - a mismatch now means the
+# tree was modified after staging, which is the actual failure this check
+# exists to catch.
+$pluginDir = Join-Path $DistDir 'gst\lib\gstreamer-1.0'
+$plugins = @(Get-ChildItem -LiteralPath $pluginDir -Filter '*.dll' -File -ErrorAction SilentlyContinue)
+$manifestPlugins = ([regex]::Matches($manifest, '(?m)^Plugin\b')).Count
+if ($manifestPlugins -lt 1) {
+    throw "BUNDLE-MANIFEST.txt lists no plugins at all; the staged bundle is not one bundle-gst.ps1 produced."
+}
+if ($plugins.Count -ne $manifestPlugins) {
+    throw "The staged tree has $($plugins.Count) GStreamer plugins but BUNDLE-MANIFEST.txt records $manifestPlugins. Something changed the tree after staging - run build\bundle-gst.ps1 again with the application closed."
+}
+Write-Host ("  staged folder is complete: {0} plugins, closure verified by bundle-gst.ps1." -f $plugins.Count)
 Write-Host ''
 
 # --- 2. build the explicit file list -----------------------------------------

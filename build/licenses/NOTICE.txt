@@ -29,7 +29,11 @@ A. LGPL-2.1 COMPONENTS - shipped as DLLs, unmodified, dynamically linked
     Windows installers. Includes the core library and the following libraries
     and plugins only: coreelements, typefindfunctions, videoconvertscale,
     audioconvert, audioresample, imagefreeze, png, audioparsers,
-    videoparsersbad, wasapi2, mediafoundation, mpegtsmux, srt.
+    videoparsersbad, wasapi2, mediafoundation, mpegtsmux, mpegtsdemux, srt,
+    d3d11, level.
+    (mpegtsdemux was added for the SRT return monitor, d3d11 for the SRT
+    picture, and level for the input meters - each is recorded in
+    build\bundle-gst.ps1 beside the closed allowlist it extends.)
     The complete file list, with SHA-256 for every file, is in
     gst\BUNDLE-MANIFEST.txt in the program folder.
 

@@ -231,12 +231,13 @@ function Get-PluginEntries {
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
 
-        There have been exactly two additions since section 3 was written, and
-        both are stated here rather than slipped into the list, because that is
-        the rule this function exists to enforce on everyone else:
+        There have been exactly three additions since section 3 was written,
+        and all are stated here rather than slipped into the list, because that
+        is the rule this function exists to enforce on everyone else:
 
           mpegtsdemux   for the SRT return monitor.
           d3d11         for the SRT PICTURE. See its Why line below.
+          level         for the INPUT METERS, 2026-08-12. See its Why line.
 
         One plugin was CONSIDERED and deliberately NOT added:
 
@@ -300,6 +301,8 @@ function Get-PluginEntries {
             -Why 'tsdemux: the RETURN path''s demuxer. The commentator''s off-air monitor dials an M2L-X output as an SRT caller and gets MPEG-TS back, and this is the only element in the tree that can take the AAC out of it. Audio only - the H.265 video pad is fakesinked, not decoded.'
         New-BundleEntry -Kind Plugin -Names 'libgstsrt.dll' `
             -Why 'srtsink, mode=caller, auto-reconnect=false. The contribution path. Also srtsrc, mode=caller, for the return monitor and for the picture.'
+        New-BundleEntry -Kind Plugin -Names 'libgstlevel.dll' `
+            -Why 'level: the input meters. Sits in the capture chain and posts peak/RMS element messages, so the commentator sees the level of what is ACTUALLY being encoded and sent - not what the browser thinks the microphone is doing. gst-plugins-good, LGPL, 69 KB, no dependency that is not already in this bundle (verified by objdump 2026-08-12).'
         New-BundleEntry -Kind Plugin -Names 'libgstd3d11.dll' `
             -Why 'd3d11h265dec AND d3d11videosink: the commentator''s PICTURE. The programme feed arrives as H.265 1920x1080 50p on an M2L-X output and there is no other way to decode or show it here. mfh265dec is ABSENT on the target (the Windows HEVC extension is not installed and buying it from the Store is not a deployment step) and avdec_h265 is FFmpeg, which $ForbiddenPatterns refuses. d3d11h265dec is DXVA in the GPU driver, wrapped LGPL by gst-plugins-bad; measured on 2026-08-07 decoding 1178 frames in 25 s off port 40501, hardware=true, NV12 1920x1080 50/1. One plugin file supplies both the decoder and the sink, so this single entry is the whole picture path.' `
             -Fix 'If this file is missing, the machine has a partial GStreamer install: libgstd3d11.dll ships with gst-plugins-bad in every official build. Do NOT substitute libav.'
@@ -464,15 +467,17 @@ function Assert-ManifestSane {
     }
 
     # The plugin allowlist is closed and must equal specification section 3, plus
-    # the two deliberate additions since: mpegtsdemux, the return monitor's
-    # demuxer, and d3d11, the picture's HEVC decoder and video sink. Adding a
-    # plugin remains a specification change and this list is where it has to be
-    # made, not somewhere it can be drifted into - which is why this check exists
-    # at all and why it caught d3d11 on the first run of this change.
+    # the three deliberate additions since: mpegtsdemux, the return monitor's
+    # demuxer; d3d11, the picture's HEVC decoder and video sink; and level, the
+    # input meters' analyser. Adding a plugin remains a specification change and
+    # this list is where it has to be made, not somewhere it can be drifted into
+    # - which is why this check exists at all and why it caught d3d11 on the
+    # first run of this change.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
-        'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11'
+        'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11',
+        'level'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {
@@ -759,7 +764,7 @@ $entries += Get-RuntimeEntries
 Write-Host "Validating the file list ($($entries.Count) entries)..."
 Assert-ManifestSane -Entries $entries
 Write-Host "  file list OK: no wildcards, no forbidden names, no duplicate destinations,"
-Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, exactly."
+Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, d3d11 and level, exactly."
 Write-Host ''
 
 $srcBin = Join-Path $GstRoot 'bin'
