@@ -3,6 +3,12 @@ import { validateConfig } from './validate.js';
 import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
+// The instance-preset model: the diff for the confirm dialog, the whitelist
+// filter that mirrors Go's, and the machine-field LABELS for the permanent
+// note. Pure — presets.js cannot name a machine field's tag, by design, so
+// the tag/label pairing happens here, where the four fields already have
+// controls. See MACHINE_NOTE_TAGS below.
+import { diffPreset, describeIgnoredKeys, filterPresetFields, MACHINE_FIELD_LABELS } from './presets.js';
 // The channel table, from the module that enforces it in the Web Audio graph.
 // See the note beside the same import in home.js.
 import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
@@ -164,17 +170,324 @@ export function createSettingsView(handlers) {
   // had no way to correct it from the application at all. A field with no
   // control is a field nobody can fix.
 
+  // Each h2 opens a <section class="settings-group">: the SECTION is the grid,
+  // the form stays a column of sections so the h2 border-top still spans the
+  // full measure and still reads as the group separator it already is.
+  //
+  // Deliberately NOT a startGroup('Monitor') helper, and deliberately not a
+  // per-group closure. settings.test.js reads this file's TEXT: three tests
+  // match on the literal `addField(\n    '` — end of line, then exactly four
+  // spaces — and three more assert the source ORDER of the heading
+  // assignments. Wrapping the field calls in anything would re-indent them and
+  // break tests that are about SRT encryption, not about layout.
+  let currentGroup = form;
+
+  function openGroup(heading, modifier) {
+    const section = document.createElement('section');
+    section.className = modifier ? `settings-group ${modifier}` : 'settings-group';
+    section.appendChild(heading);
+    form.appendChild(section);
+    currentGroup = section;
+    return section;
+  }
+
   function addField(key, labelText, input, hint) {
     const { wrap, errorEl } = row(labelText, input.id, input, hint);
     fields[key] = { input, errorEl };
-    form.appendChild(wrap);
+    currentGroup.appendChild(wrap);
     return input;
+  }
+
+  // --- M2L-X instance (presets) -----------------------------------------
+  //
+  // FIRST group on the screen, above 'M2L-X connection', because it does not
+  // describe the form — it ACTS on it: applying a preset rewrites most of the
+  // fields below. main.css's .settings-group--presets card is the contract
+  // this hangs off.
+  //
+  // Availability follows the picture/return pattern: offered against the fake
+  // backend (the dev loop is how this UI is iterated on without a Wails
+  // build), and against a real build only when ALL SEVEN bindings exist —
+  // backend.presetsAvailable() says why a subset is worse than none.
+  const presetsSupported = backend.usingFakeBackend || backend.presetsAvailable();
+
+  /** The last config populate() drew, used as the diff baseline for Apply. */
+  let lastLoadedConfig = null;
+  /** ListPresets' summaries, keyed for the picker. */
+  let presetSummaries = [];
+  /** GetActivePreset's record, or null before the first refresh. */
+  let activePreset = null;
+  /** Mirrors app.js's sending state: Apply and Delete are gated on it. */
+  let sendingNow = false;
+
+  const presetsHeading = document.createElement('h2');
+  presetsHeading.textContent = 'M2L-X instance';
+  openGroup(presetsHeading, 'settings-group--presets');
+
+  const presetPicker = document.createElement('div');
+  presetPicker.className = 'preset-picker';
+  const presetSelect = document.createElement('select');
+  presetSelect.id = 'f-preset';
+  const presetSelectRow = row('Saved instance', 'f-preset', presetSelect);
+  presetPicker.appendChild(presetSelectRow.wrap);
+
+  function presetButton(label, className, onClick) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; // never submit: this form's submit is Save settings
+    btn.className = className;
+    btn.textContent = label;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  const presetActions = document.createElement('div');
+  presetActions.className = 'preset-actions';
+  const applyPresetBtn = presetButton('Apply', 'btn btn-primary btn-small', () => handleApplyPreset());
+  const savePresetBtn = presetButton('Save current as…', 'btn btn-ghost btn-small', () => handleSavePresetAs());
+  const renamePresetBtn = presetButton('Rename', 'btn btn-ghost btn-small', () => handleRenamePreset());
+  const deletePresetBtn = presetButton('Delete', 'btn btn-ghost btn-small', () => handleDeletePreset());
+  presetActions.append(applyPresetBtn, savePresetBtn, renamePresetBtn, deletePresetBtn);
+  presetPicker.appendChild(presetActions);
+  currentGroup.appendChild(presetPicker);
+
+  // Which Credential Manager scope is live, and which of its three
+  // credentials exist — GetPresetCredentialStatus's booleans, never a value.
+  const presetScopeLine = document.createElement('p');
+  presetScopeLine.className = 'field-hint preset-scope';
+  currentGroup.appendChild(presetScopeLine);
+
+  // THE ONE SENTENCE THIS CARD EXISTS TO MAKE UNMISSABLE, permanent and with
+  // the current values shown: the operator SEES that their hardware survived
+  // an apply, rather than being asked to trust that it did.
+  const presetNote = document.createElement('p');
+  presetNote.className = 'preset-note';
+  currentGroup.appendChild(presetNote);
+
+  // The four MACHINE tags, paired BY POSITION with presets.js's
+  // MACHINE_FIELD_LABELS. The tags are spelled HERE and not there on purpose:
+  // presets.js proves by its own source text that it cannot name a machine
+  // field, and this file already owns form controls for all four, so the
+  // pairing lives beside the fields it describes. settings.test.js asserts
+  // the two lists are the same length and that the note names every tag.
+  const MACHINE_NOTE_TAGS = ['audioDeviceId', 'headphoneDeviceId', 'headphoneEndpointId', 'slatePath'];
+
+  function renderPresetNote(config) {
+    const parts = MACHINE_NOTE_TAGS.map((tag, i) => {
+      const value = config ? config[tag] : '';
+      return `${MACHINE_FIELD_LABELS[i]}: ${value || '(not set)'}`;
+    });
+    presetNote.textContent =
+      "Never part of a preset — this PC's hardware and files stay put when an instance is " +
+      'applied: ' + parts.join(' · ');
+  }
+  renderPresetNote(null);
+
+  function selectedPresetSummary() {
+    return presetSummaries.find((p) => p.id === presetSelect.value) || null;
+  }
+
+  function renderPresetButtons() {
+    if (!presetsSupported) {
+      for (const btn of [applyPresetBtn, savePresetBtn, renamePresetBtn, deletePresetBtn]) {
+        btn.disabled = true;
+        btn.title = 'This build has no instance presets.';
+      }
+      presetSelect.disabled = true;
+      return;
+    }
+    const none = presetSummaries.length === 0;
+    presetSelect.disabled = none;
+    savePresetBtn.disabled = false;
+    savePresetBtn.title = 'Saves the last SAVED settings as a named instance. Save settings first if you have edited the form.';
+    renamePresetBtn.disabled = none;
+    renamePresetBtn.title = none ? 'No preset to rename.' : '';
+    // Apply and Delete are gated on the sending state, with the reason ON THE
+    // CONTROL: applying mid-match would leave the feed going to the previous
+    // instance with every lamp green, so Go refuses it — this mirror of that
+    // refusal is honesty, not the gate itself.
+    const sendingReason = 'Disabled while SENDING: stop the feed before changing instance.';
+    applyPresetBtn.disabled = none || sendingNow;
+    applyPresetBtn.title = sendingNow ? sendingReason : none ? 'No preset to apply.' : '';
+    deletePresetBtn.disabled = none || sendingNow;
+    deletePresetBtn.title = sendingNow ? sendingReason : none ? 'No preset to delete.' : '';
+  }
+
+  function renderPresetScopeLine(status) {
+    if (!presetsSupported) {
+      presetScopeLine.textContent =
+        'This build has no instance presets; the fields below still work as before.';
+      return;
+    }
+    const activeName =
+      activePreset && activePreset.id
+        ? `Active instance: ${
+            (presetSummaries.find((p) => p.id === activePreset.id) || { name: activePreset.id }).name
+          }.`
+        : 'No instance preset applied.';
+    if (!status) {
+      presetScopeLine.textContent = activeName;
+      return;
+    }
+    const scopeName = status.scope
+      ? `"${status.scope}"`
+      : "this machine's original entries";
+    const cred = (label, exists) => `${label} ${exists ? 'stored' : 'NOT stored'}`;
+    presetScopeLine.textContent =
+      `${activeName} Credentials scope: ${scopeName} — ` +
+      `${cred('M2L-X password', status.m2lx)} · ${cred('SRT passphrase', status.srt)} · ` +
+      `${cred('SRT return passphrase', status.srtreturn)}.`;
+  }
+
+  /**
+   * refreshPresets re-reads the picker, the active record and the credential
+   * status. Each failure degrades its own line rather than blanking the rest,
+   * for the same reason open() loads config and suggestions separately.
+   */
+  async function refreshPresets() {
+    if (!presetsSupported) {
+      renderPresetButtons();
+      renderPresetScopeLine(null);
+      return;
+    }
+    try {
+      const [list, active] = await Promise.all([backend.listPresets(), backend.getActivePreset()]);
+      presetSummaries = Array.isArray(list) ? list : [];
+      activePreset = active || null;
+      const previous = presetSelect.value;
+      presetSelect.textContent = '';
+      for (const p of presetSummaries) {
+        const o = document.createElement('option');
+        o.value = p.id;
+        o.textContent = p.name;
+        presetSelect.appendChild(o);
+      }
+      // Prefer the active preset; fall back to the previous selection, then
+      // the first. The picker showing the applied instance by default is what
+      // makes the Rename/Delete buttons act on the thing the operator sees.
+      if (activePreset && activePreset.id && presetSummaries.some((p) => p.id === activePreset.id)) {
+        presetSelect.value = activePreset.id;
+      } else if (previous && presetSummaries.some((p) => p.id === previous)) {
+        presetSelect.value = previous;
+      }
+    } catch (err) {
+      presetSummaries = [];
+      presetSelect.textContent = '';
+      setSaveMessage(`Could not list the saved instances: ${err.message}`, true);
+    }
+    let status = null;
+    try {
+      status = await backend.getPresetCredentialStatus();
+    } catch (err) {
+      console.error('wslcomms: could not read the credential status', err);
+    }
+    renderPresetButtons();
+    renderPresetScopeLine(status);
+  }
+
+  async function handleApplyPreset() {
+    const preset = selectedPresetSummary();
+    if (!preset || typeof handlers.onApplyPreset !== 'function') return;
+
+    // The confirm dialog: what will CHANGE, and what the file carries that a
+    // preset does not honour. Both computed here, before anything moves, so
+    // the operator confirms what will actually happen.
+    const changes = diffPreset(lastLoadedConfig, preset.fields);
+    const { ignored } = filterPresetFields(preset.fields);
+    const lines = changes.map((c) => `  ${c.label}: ${c.from} -> ${c.to}`);
+    const ignoredNote = describeIgnoredKeys(ignored);
+    const text =
+      `Apply the instance "${preset.name}"?\n\n` +
+      (lines.length ? `This changes:\n${lines.join('\n')}\n\n` : 'No field differs from the current settings.\n\n') +
+      (ignoredNote ? `${ignoredNote}\n\n` : '') +
+      'The monitor and the picture will reconnect to the new instance. ' +
+      'Your input and headphone devices are not part of a preset and stay as they are.';
+    if (!window.confirm(text)) return;
+
+    applyPresetBtn.disabled = true;
+    try {
+      // app.js owns the sequence — apply, adopt the RETURNED config, rebuild
+      // the monitors — and hands the merged config back for this form.
+      const merged = await handlers.onApplyPreset(preset.id);
+      if (merged) populate(merged);
+      setSaveMessage(`Applied "${preset.name}".`, false);
+    } catch (err) {
+      setSaveMessage(`Could not apply "${preset.name}": ${err.message}`, true);
+    } finally {
+      await refreshPresets();
+    }
+  }
+
+  async function handleSavePresetAs() {
+    // The NAME goes to Go; GO derives the id — the filename and the
+    // credential-target rules exist once, in internal/presets.DeriveID.
+    const name = window.prompt(
+      'Name this M2L-X instance (what is SAVED is the last saved settings — press Save settings first if you have edited the form):',
+    );
+    if (!name || !name.trim()) return;
+    try {
+      const saved = await backend.savePreset(name);
+      setSaveMessage(`Saved the current settings as "${saved.name}".`, false);
+    } catch (err) {
+      setSaveMessage(`Could not save the preset: ${err.message}`, true);
+    }
+    await refreshPresets();
+  }
+
+  async function handleRenamePreset() {
+    const preset = selectedPresetSummary();
+    if (!preset) return;
+    const name = window.prompt(`Rename "${preset.name}" to:`, preset.name);
+    if (!name || !name.trim() || name.trim() === preset.name) return;
+    try {
+      await backend.renamePreset(preset.id, name);
+      setSaveMessage(`Renamed to "${name.trim()}". Its stored passwords are unaffected.`, false);
+    } catch (err) {
+      setSaveMessage(`Could not rename: ${err.message}`, true);
+    }
+    await refreshPresets();
+  }
+
+  async function handleDeletePreset() {
+    const preset = selectedPresetSummary();
+    if (!preset) return;
+    if (!window.confirm(`Delete the instance preset "${preset.name}"? Its file is removed; the current settings do not change.`)) {
+      return;
+    }
+    // Credentials are a SECOND, separate question, and only asked when the
+    // preset owns a scope of its own: the legacy scope's entries are the
+    // machine's original passwords and Go refuses to delete them from here.
+    let alsoCredentials = false;
+    if (preset.credentialScope) {
+      alsoCredentials = window.confirm(
+        `Also delete the stored passwords for "${preset.name}" from Windows Credential Manager? ` +
+          'Choose Cancel to keep them (they are reused if you re-create the preset with the same name).',
+      );
+    }
+    try {
+      await backend.deletePreset(preset.id, alsoCredentials);
+      setSaveMessage(`Deleted "${preset.name}".`, false);
+    } catch (err) {
+      setSaveMessage(`Could not delete: ${err.message}`, true);
+    }
+    await refreshPresets();
+  }
+
+  /**
+   * setSending mirrors the sender state into this screen's gates: Apply and
+   * Delete are disabled, with the reason on the control, while the feed is
+   * up. app.js calls this from the same place it drives the SENDING lamp, so
+   * the two can never disagree. The gate itself is Go's — ApplyPreset refuses
+   * while a session runs — this is the honest rendering of it.
+   */
+  function setSending(sending) {
+    sendingNow = sending === true;
+    renderPresetButtons();
   }
 
   // --- connection -------------------------------------------------------
   const connectionHeading = document.createElement('h2');
   connectionHeading.textContent = 'M2L-X connection';
-  form.appendChild(connectionHeading);
+  openGroup(connectionHeading);
 
   // The primary input: the address bar of the M2L-X GUI the operator is
   // already looking at. Both the host and the event ID are in it, and the
@@ -197,7 +510,7 @@ export function createSettingsView(handlers) {
   liveURLNote.className = 'field-hint field-note';
   liveURLNote.hidden = true;
   liveURLRow.wrap.insertBefore(liveURLNote, liveURLRow.errorEl);
-  form.appendChild(liveURLRow.wrap);
+  currentGroup.appendChild(liveURLRow.wrap);
 
   addField('m2lxHost', 'M2L-X host', textInput('f-m2lxHost'), 'Bare host, e.g. "m2lx.example.com" — no scheme.');
   addField('alias', 'Alias', textInput('f-alias'), 'The sign-in alias. Note: not "username".');
@@ -210,7 +523,7 @@ export function createSettingsView(handlers) {
   m2lxPasswordBadge.className = 'secret-badge';
   m2lxPasswordRow.wrap.insertBefore(m2lxPasswordBadge, m2lxPasswordRow.errorEl);
   fields.m2lxPassword = { input: m2lxPasswordInput, errorEl: m2lxPasswordRow.errorEl };
-  form.appendChild(m2lxPasswordRow.wrap);
+  currentGroup.appendChild(m2lxPasswordRow.wrap);
 
   addField(
     'eventId',
@@ -234,7 +547,7 @@ export function createSettingsView(handlers) {
   // --- SRT output ---------------------------------------------------------
   const srtHeading = document.createElement('h2');
   srtHeading.textContent = 'SRT output';
-  form.appendChild(srtHeading);
+  openGroup(srtHeading);
 
   // Optional and clearly secondary: on every instance seen so far the SRT
   // listener answers on the same name as the REST API, and the operator should
@@ -266,19 +579,19 @@ export function createSettingsView(handlers) {
   srtPassphraseBadge.className = 'secret-badge';
   srtPassphraseRow.wrap.insertBefore(srtPassphraseBadge, srtPassphraseRow.errorEl);
   fields.srtPassphrase = { input: srtPassphraseInput, errorEl: srtPassphraseRow.errorEl };
-  form.appendChild(srtPassphraseRow.wrap);
+  currentGroup.appendChild(srtPassphraseRow.wrap);
 
   const secretsHint = document.createElement('p');
   secretsHint.className = 'field-hint secrets-hint';
   secretsHint.textContent =
     'Passwords are write-only: this app never reads them back. "set" only means this field was ' +
     'saved successfully during the current run of the app.';
-  form.appendChild(secretsHint);
+  currentGroup.appendChild(secretsHint);
 
   // --- status ---------------------------------------------------------
   const statusHeading = document.createElement('h2');
   statusHeading.textContent = 'Status';
-  form.appendChild(statusHeading);
+  openGroup(statusHeading);
   addField(
     'statusKey',
     'Status key — optional',
@@ -300,7 +613,7 @@ export function createSettingsView(handlers) {
   const suggestionsList = document.createElement('div');
   suggestionsList.className = 'suggestion-list';
   suggestions.appendChild(suggestionsList);
-  form.appendChild(suggestions);
+  currentGroup.appendChild(suggestions);
 
   /**
    * renderSuggestions draws the candidate list. Each entry states what it
@@ -369,7 +682,7 @@ export function createSettingsView(handlers) {
   // --- devices ---------------------------------------------------------
   const devicesHeading = document.createElement('h2');
   devicesHeading.textContent = 'Devices';
-  form.appendChild(devicesHeading);
+  openGroup(devicesHeading, 'settings-group--devices');
   addField(
     'audioDeviceId',
     'Commentary input device ID',
@@ -399,7 +712,7 @@ export function createSettingsView(handlers) {
   // --- monitor / return ---------------------------------------------------
   const monitorHeading = document.createElement('h2');
   monitorHeading.textContent = 'Monitor';
-  form.appendChild(monitorHeading);
+  openGroup(monitorHeading);
   // All seven audio tracks, from the one shared table in ./returns.js — the
   // same object the main screen's dropdown iterates, not a copy of it. The
   // monitor subscribes to every track regardless; this only picks which one is
@@ -426,6 +739,16 @@ export function createSettingsView(handlers) {
       CHANNEL_MODES.map((m) => ({ value: m.value, label: m.label })),
     ),
     CHANNEL_MODES.map((m) => `${m.label}: ${m.hint}`).join(' '),
+  );
+  // Beside the bus and channel controls it trims, NOT below the encryption
+  // heading it used to sit under: this is a monitor-wide gain, and a field that
+  // renders among the encryption controls reads as one of them — under the
+  // grid, literally on the same row as the key length and the passphrase.
+  addField(
+    'returnGainDb',
+    'Return gain (dB)',
+    numberInput('f-returnGainDb', 0.1),
+    'Default 18 dB — the measured offset between the SRT-ingested level and the KVS monitor level.',
   );
   // The return SOURCE — WebRTC or the native SRT path — has NO control here on
   // purpose. It decides what the commentator can hear right now, and a
@@ -503,7 +826,7 @@ export function createSettingsView(handlers) {
   // makes the monitor work would change the key the feed goes out with.
   const returnEncryptionHeading = document.createElement('h3');
   returnEncryptionHeading.textContent = 'SRT return encryption';
-  form.appendChild(returnEncryptionHeading);
+  currentGroup.appendChild(returnEncryptionHeading);
 
   addField(
     'srtReturnPBKeyLen',
@@ -536,18 +859,11 @@ export function createSettingsView(handlers) {
     input: srtReturnPassphraseInput,
     errorEl: srtReturnPassphraseRow.errorEl,
   };
-  form.appendChild(srtReturnPassphraseRow.wrap);
-
-  addField(
-    'returnGainDb',
-    'Return gain (dB)',
-    numberInput('f-returnGainDb', 0.1),
-    'Default 18 dB — the measured offset between the SRT-ingested level and the KVS monitor level.',
-  );
+  currentGroup.appendChild(srtReturnPassphraseRow.wrap);
 
   const tileHeading = document.createElement('h3');
   tileHeading.textContent = 'Monitor tile (position within the 2240x1440 mosaic)';
-  form.appendChild(tileHeading);
+  currentGroup.appendChild(tileHeading);
   const tileGrid = document.createElement('div');
   tileGrid.className = 'tile-grid';
   const tileX = numberInput('f-tileX');
@@ -564,12 +880,12 @@ export function createSettingsView(handlers) {
     fields[key] = { input, errorEl };
     tileGrid.appendChild(wrap);
   }
-  form.appendChild(tileGrid);
+  currentGroup.appendChild(tileGrid);
 
   // --- slate ---------------------------------------------------------
   const slateHeading = document.createElement('h2');
   slateHeading.textContent = 'Slate';
-  form.appendChild(slateHeading);
+  openGroup(slateHeading);
   addField('slatePath', 'Slate image path', textInput('f-slatePath'), 'Defaults to the bundled slate.png.');
 
   // --- actions ---------------------------------------------------------
@@ -589,7 +905,15 @@ export function createSettingsView(handlers) {
   cancelBtn.textContent = 'Cancel';
   cancelBtn.addEventListener('click', () => leaveSettings());
   actions.append(saveBtn, cancelBtn);
-  form.append(saveMessage, actions);
+
+  // The action bar STAYS ON SCREEN. It used to sit at the foot of ~3,500px of
+  // form: displayErrors() focuses the first bad field and the operator then had
+  // to go and find Save. Buttons first, message beside them, so the primary
+  // action does not move when the message is long.
+  const footer = document.createElement('div');
+  footer.className = 'settings-footer';
+  footer.append(actions, saveMessage);
+  form.appendChild(footer);
 
   el.append(header, form);
 
@@ -655,6 +979,12 @@ export function createSettingsView(handlers) {
   // --- populate / collect --------------------------------------------
 
   function populate(config) {
+    // The diff baseline for Apply, and the values the machine-fields note
+    // shows. Recorded BEFORE the form gets a chance to be edited: the confirm
+    // dialog compares a preset against what is SAVED, not against keystrokes
+    // that were never saved.
+    lastLoadedConfig = config;
+    renderPresetNote(config);
     fields.m2lxHost.input.value = config.m2lxHost || '';
     fields.alias.input.value = config.alias || '';
     fields.eventId.input.value = config.eventId || '';
@@ -840,7 +1170,12 @@ export function createSettingsView(handlers) {
     } catch (err) {
       console.error('wslcomms: could not fetch statusKey suggestions', err);
     }
+
+    // And the instance picker, separately again and last: a preset listing
+    // failure must not stop the operator editing the fields it would have
+    // filled in.
+    await refreshPresets();
   }
 
-  return { el, open };
+  return { el, open, setSending };
 }

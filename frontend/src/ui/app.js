@@ -99,6 +99,10 @@ export function mountApp(root) {
   const settings = createSettingsView({
     onBack: showHome,
     onSaved: onConfigSaved,
+    // The instance-preset apply. Settings owns the confirm dialog; this file
+    // owns the sequence — because the sequence has to reach the monitor, the
+    // mixer host and the picture, none of which Settings can see.
+    onApplyPreset: applyPresetAndRefresh,
   });
 
   const home = createHomeView({
@@ -338,6 +342,12 @@ export function mountApp(root) {
   function renderSenderLamp() {
     home.lamps.SENDING.update(deriveSenderLamp(currentSenderState));
     home.setRunning(!!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED);
+    // The Settings screen's preset gate tracks the SAME derivation of the same
+    // state home.setRunning does, from the same place, so the Apply button and
+    // the START/STOP button can never disagree about whether a session is up.
+    // The gate itself is Go's — ApplyPreset refuses while sending — this is
+    // the honest rendering of it on the control.
+    settings.setSending(!!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED);
     // The honest line used to be updated from here as well, so that its claim
     // and the lamp could never disagree about whether anything was being sent.
     // It is no longer rendered — see the header of home.js — and the SENDING
@@ -370,6 +380,15 @@ export function mountApp(root) {
     console.error('wslcomms: backend error event', message);
     home.showError(String(message));
   });
+
+  // The input meters beside the picture: the SEND pipeline's own peak/RMS
+  // measurement of what is being encoded and sent, at most 20 frames a second.
+  // Pure forwarding — the scale, zones and peak-hold all live in ui/meters.js
+  // and the painting in home.js — and no session-state bookkeeping here: the
+  // Go side ends every session with an all-silence zero-frame, which is what
+  // dims the meters, so this wire never has to know whether a session is
+  // running.
+  backend.onLevels((frame) => home.setLevels(frame));
 
   // The native PICTURE receiver's own state. This is what drives the fallback:
   // the moment it stops SHOWING, the overlay is hidden and the mosaic
@@ -834,6 +853,108 @@ export function mountApp(root) {
       // in-flight guard and the fallback to WebRTC if the restart fails.
       .applyOption({ what: 'saved return settings', save: async () => {} })
       .then((result) => afterReturnOperation(result));
+  }
+
+  // --- applying an instance preset ------------------------------------------
+
+  /**
+   * applyPresetAndRefresh is the whole apply sequence: Go merges and returns,
+   * this page ADOPTS the returned config, and then every connection that was
+   * built from the old instance is rebuilt — unconditionally.
+   *
+   * ============ currentConfig = THE RETURNED CONFIG, NEVER A LOCAL MERGE =====
+   *
+   * The assignment below is a correctness contract. This file re-writes the
+   * WHOLE currentConfig on the next dropdown change (persistConfig), so any
+   * version of this that kept the old object — or rebuilt it locally by
+   * spreading preset fields over it — would have the stale cache clobber the
+   * preset on the very next control the operator touched. Go's ApplyPreset
+   * returns the merged document for exactly this reason, and presets.test.js
+   * reads this function's source to prove the assignment is still here and
+   * that no field is spread by hand.
+   *
+   * ============ EVERYTHING THAT IS A MONITOR IS RESTARTED ====================
+   *
+   * Not "only when the port changed": the credential SCOPE changed with the
+   * preset, so the return passphrase and the KVS sign-in are different even
+   * when every numeric field is the same.
+   *
+   *   - the mixer drawer is closed (and with it disarmed on the Go side by
+   *     ApplyPreset itself): an open arm window pointed at a different desk
+   *     is a write gate nobody can see;
+   *   - onConfigSaved reuses the whole Settings-save pathway — tile, mid,
+   *     channel, gain, dropdowns, a running SRT audio return;
+   *   - the KVS monitor is torn down and REBUILT, which onConfigSaved does
+   *     not do: setUpMonitor is otherwise called exactly once, at init, and
+   *     the peer connection holds credentials fetched for the OLD event —
+   *     without this the commentator keeps hearing the previous event until
+   *     the connection happens to drop;
+   *   - the picture, if selected, is stopped and started: StartPicture reads
+   *     the config and the SRT-return passphrase ONCE, at start.
+   *
+   * The several seconds of black picture and silence this costs are
+   * affordable only because ApplyPreset refuses while SENDING — the refusal
+   * gate is load-bearing, not a courtesy.
+   */
+  async function applyPresetAndRefresh(id) {
+    const merged = await backend.applyPreset(id);
+    currentConfig = merged;
+
+    mixerHost.close();
+    onConfigSaved(merged);
+
+    // The KVS monitor rebuild. Stop is best-effort — a monitor that never
+    // started still needs the new one built over it.
+    safeMonitorCall((m) => m.stop());
+    monitor = null;
+    setUpMonitor(merged);
+
+    // The picture, only if it is the selected source: stop-then-start against
+    // the new instance. "Not running" rejections are the normal case when the
+    // receiver was in backoff and are not worth a banner.
+    if (currentPictureSource === PICTURE_SOURCE_SRT && pictureBindingsPresent) {
+      try {
+        await backend.stopPicture();
+      } catch {
+        /* nothing was running; the start below is still wanted */
+      }
+      try {
+        await backend.startPicture();
+        currentPictureState = await backend.getPictureState();
+      } catch (err) {
+        currentPictureState = null;
+        home.showError(
+          `The picture did not restart on the new instance: ${err?.message || err}. ` +
+            'You are watching the multiviewer mosaic; your audio is unaffected.',
+        );
+      }
+      renderPicture();
+    }
+
+    // Missing credentials, surfaced in the banner NOW rather than as a grey
+    // lamp later: a scope that was never written to on this machine looks
+    // exactly like a wrong password unless somebody says which it is. Only
+    // the credentials this configuration actually needs are named.
+    try {
+      const status = await backend.getPresetCredentialStatus();
+      const missing = [];
+      if (!status.m2lx) missing.push('the M2L-X password');
+      if (!status.srt && merged.pbkeylen) missing.push('the SRT passphrase');
+      if (!status.srtreturn && merged.srtReturnPBKeyLen) missing.push('the SRT return passphrase');
+      if (missing.length > 0) {
+        home.showError(
+          `This instance has no stored ${missing.join(' or ')} on this PC yet — enter ` +
+            `${missing.length === 1 ? 'it' : 'them'} on the Settings screen before starting.`,
+        );
+      }
+    } catch (err) {
+      console.error('wslcomms: could not check the credential status after the apply', err);
+    }
+
+    // Ignored keys from a hand-edited preset arrive on the "error" event from
+    // Go and reach the banner through the onError wiring above; nothing to do
+    // here, and this function must never inspect preset fields itself.
+    return merged;
   }
 
   // --- monitor -------------------------------------------------------------

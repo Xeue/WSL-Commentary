@@ -45,6 +45,11 @@
 // `setDevices(list)` and `setDeviceError(message|null)`. It is never created
 // when a real Wails runtime is detected.
 
+// The preset whitelist's JS mirror, used ONLY by the fake backend below so a
+// dev session drops the same non-instance keys a real ApplyPreset would.
+// presets.js imports nothing, so this cannot cycle.
+import { filterPresetFields } from './presets.js';
+
 // Event names emitted Go -> JS, mirroring app.go's EventStatus / EventSender
 // / EventError constants exactly. These strings are the contract; they must
 // match app.go.
@@ -60,6 +65,15 @@ export const EVENT_STATUS_KEYS = 'statusKeyCandidates';
 // EventReturn: the native SRT return monitor's state, mirroring app.go's
 // EventReturn constant exactly. The payload is a gst.ReturnState string.
 export const EVENT_RETURN = 'return';
+
+// EventLevels: the send pipeline's own measurement of the commentary audio,
+// mirroring app.go's EventLevels constant exactly. The payload is
+// {peak: number[], rms: number[]} — one entry per channel, dBFS, silence
+// clamped to -100 (never -Infinity; it does not survive JSON). It arrives at
+// most 20 times a second while a session is running, plus one final
+// all-silence frame when the session stops, so a meter driven from it falls
+// to nothing rather than freezing at the last level.
+export const EVENT_LEVELS = 'levels';
 
 // Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT / KeySRTReturn
 // constants exactly. Passed to setSecret().
@@ -257,6 +271,61 @@ function clearFakeSenderTimers() {
   fakeSenderTimers = [];
 }
 
+// --- fake input levels -----------------------------------------------------
+//
+// The same deterministic waveform internal/gst's stub twin emits (gst_stub.go
+// via levels.go's stubLevelsAt): a triangle from -40 up to -6 dBFS and back
+// over six seconds at 20 frames a second, right channel a quarter-period
+// behind the left, RMS 8 dB under the peak. Mirrored by value rather than
+// imported from anywhere because there is nowhere to import it from — the Go
+// stub is the other side of the boundary — and matching it means a dev session
+// in the browser and a Gate A session in the app show the same moving meters.
+// The final all-silence frame on stop mirrors app.go's zero-frame: -100 dBFS
+// per channel, the clamped floor, so the meters fall rather than freeze.
+const FAKE_LEVELS_LOW_DB = -40;
+const FAKE_LEVELS_HIGH_DB = -6;
+const FAKE_LEVELS_PERIOD = 120; // 50 ms steps: a six-second sweep
+const FAKE_LEVELS_RIGHT_OFFSET = FAKE_LEVELS_PERIOD / 4;
+const FAKE_LEVELS_RMS_BELOW_PEAK_DB = 8;
+const FAKE_LEVELS_SILENCE_DB = -100;
+
+let fakeLevelsInterval = null;
+let fakeLevelsStep = 0;
+
+function fakeLevelAt(step, channel) {
+  const phase = (step + channel * FAKE_LEVELS_RIGHT_OFFSET) % FAKE_LEVELS_PERIOD;
+  const half = FAKE_LEVELS_PERIOD / 2;
+  const span = FAKE_LEVELS_HIGH_DB - FAKE_LEVELS_LOW_DB;
+  if (phase < half) return FAKE_LEVELS_LOW_DB + (span * phase) / half;
+  return FAKE_LEVELS_HIGH_DB - (span * (phase - half)) / half;
+}
+
+function startFakeLevels() {
+  if (fakeLevelsInterval) return;
+  fakeLevelsStep = 0;
+  fakeLevelsInterval = setInterval(() => {
+    const peak = [fakeLevelAt(fakeLevelsStep, 0), fakeLevelAt(fakeLevelsStep, 1)];
+    fakeEmit(EVENT_LEVELS, {
+      peak,
+      rms: peak.map((p) => Math.max(FAKE_LEVELS_SILENCE_DB, p - FAKE_LEVELS_RMS_BELOW_PEAK_DB)),
+    });
+    fakeLevelsStep += 1;
+  }, 50);
+}
+
+function stopFakeLevels() {
+  if (fakeLevelsInterval) {
+    clearInterval(fakeLevelsInterval);
+    fakeLevelsInterval = null;
+  }
+  // The zero-frame, exactly as app.go emits one when the session ends: the
+  // meters must fall to silence, not freeze at the last level.
+  fakeEmit(EVENT_LEVELS, {
+    peak: [FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB],
+    rms: [FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB],
+  });
+}
+
 // fakeStart simulates the shape of a real session start: CONNECTING now,
 // CONNECTED after the spec's measured ~1.1 s input lock (section 4), then the
 // switcher_status echoing "starting" and "streaming" a little afterwards —
@@ -267,6 +336,11 @@ function fakeStart() {
   }
   fakeSenderRunning = true;
   clearFakeSenderTimers();
+  // Levels begin with the session, not with the connection: the real pipeline
+  // is capturing and encoding from Start onwards — the sink comes later — and
+  // the level element measures upstream of the sink, so the meters move even
+  // while the SRT caller is still dialling. The fake keeps that property.
+  startFakeLevels();
   fakeEmit(EVENT_SENDER, SENDER_STATE.CONNECTING);
   fakeSenderTimers.push(
     setTimeout(() => {
@@ -288,6 +362,7 @@ function fakeStop() {
   }
   fakeSenderRunning = false;
   clearFakeSenderTimers();
+  stopFakeLevels();
   fakeEmit(EVENT_SENDER, SENDER_STATE.STOPPED);
   fakeEmit(EVENT_STATUS, makeFakeStatus({ streamState: STREAM_STATE.STOPPED, healthy: false }));
   return Promise.resolve();
@@ -416,6 +491,15 @@ export function onSender(cb) {
 /** Subscribes to the "error" event, a human-readable string. Returns an unsubscribe function. */
 export function onError(cb) {
   return subscribe(EVENT_ERROR, cb);
+}
+
+/**
+ * Subscribes to the "levels" event: {peak: number[], rms: number[]}, dBFS per
+ * channel, at most 20 frames a second while a session runs, one all-silence
+ * frame ([-100, ...]) when it stops. Returns an unsubscribe function.
+ */
+export function onLevels(cb) {
+  return subscribe(EVENT_LEVELS, cb);
 }
 
 /**
@@ -1058,4 +1142,240 @@ export async function getMixerGolden() {
 export async function setMixerGolden(snapshot) {
   requireWails();
   return callGo('SetMixerGolden', snapshot);
+}
+
+// ---------------------------------------------------------------------------
+// The M2L-X instance presets
+// ---------------------------------------------------------------------------
+//
+// Seven bindings, mirroring app_presets.go. A preset is one M2L-X deployment's
+// coordinates, applied onto the live config as a MERGE on the Go side; the
+// whitelist that keeps device ids out of it lives in internal/presets and is
+// mirrored (for the fake and the confirm dialog) in ./presets.js.
+//
+// # applyPreset RETURNS THE MERGED CONFIG, and the caller must ASSIGN it
+//
+// `currentConfig = await backend.applyPreset(id)` is a correctness contract,
+// not a style choice: app.js re-writes the WHOLE currentConfig on the next
+// dropdown change, so an apply that did not replace the page's cache would be
+// clobbered by the very next control the operator touched — the stale cache
+// winning over the preset that was just applied, deterministically.
+//
+// # The preset NAME goes to Go; GO derives the id
+//
+// The id is a filename under %APPDATA% and a Credential Manager target
+// segment, and the sanitiser that makes it safe exists exactly once, in
+// internal/presets.DeriveID. Nothing on this side slugifies (the fake's
+// stand-in below is the fake BEING Go, not a second implementation shipped to
+// production).
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const PRESET_METHODS = Object.freeze({
+  list: 'ListPresets',
+  save: 'SavePreset',
+  apply: 'ApplyPreset',
+  rename: 'RenamePreset',
+  delete: 'DeletePreset',
+  active: 'GetActivePreset',
+  credentials: 'GetPresetCredentialStatus',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const PRESET_METHOD_NAMES = Object.freeze(Object.values(PRESET_METHODS));
+
+/**
+ * presetsAvailable reports whether this build has the instance presets at all.
+ *
+ * It requires ALL SEVEN, for the reason srtReturnAvailable and
+ * pictureAvailable spell out at length (backend.js's return section): every
+ * one of these is called on a path that has already assumed availability —
+ * getActivePreset() straight after applyPreset(), getPresetCredentialStatus()
+ * to render the scope line — and deciding on a subset turns a missing binding
+ * into a throw on the line AFTER an apply has already half-happened.
+ */
+export function presetsAvailable() {
+  return PRESET_METHOD_NAMES.every(hasBinding);
+}
+
+// --- the fake preset store ---------------------------------------------------
+//
+// In-memory, mirroring the Go behaviour closely enough that the Settings
+// group is exercisable under `npm run dev`: the whitelist filter (through
+// presets.js, the same module the real UI uses), the merge, the migration
+// rule for the first preset's credential scope, and the refusal to apply
+// while the fake sender is running — because that refusal is the safety story
+// and a fake that waved it through would let the bug be written and then not
+// reproduce.
+
+let fakePresets = []; // [{id, name, credentialScope, savedAt, fields}]
+let fakeActivePreset = { id: '', credentialScope: '', appliedAt: '' };
+
+/**
+ * fakeDeriveId is the fake standing in for Go's DeriveID — NOT a second
+ * production slugifier. It exists only so `npm run dev` can mint plausible
+ * ids; the real path sends the NAME to Go and Go answers.
+ */
+function fakeDeriveId(name) {
+  const id = String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!id || id.length > 48) {
+    throw new Error(`presets: ${JSON.stringify(name)} cannot name a preset (fake)`);
+  }
+  return id;
+}
+
+function fakePresetSummaries() {
+  return fakePresets
+    .slice()
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    .map((p) => JSON.parse(JSON.stringify(p)));
+}
+
+/** Lists every saved preset: {id, name, credentialScope, savedAt, fields}[]. */
+export async function listPresets() {
+  if (hasWails()) return callGoBound(PRESET_METHODS.list);
+  return fakePresetSummaries();
+}
+
+/**
+ * Saves the CURRENT SAVED configuration as a preset named `name`, returns its
+ * summary, and points the active record at it. Unsaved form edits are not in
+ * it — SavePreset extracts from what SaveConfig last persisted.
+ */
+export async function savePreset(name) {
+  if (hasWails()) return callGoBound(PRESET_METHODS.save, name);
+
+  const id = fakeDeriveId(name);
+  const existing = fakePresets.find((p) => p.id === id);
+  if (existing && existing.name.toLowerCase() !== String(name).trim().toLowerCase()) {
+    throw new Error(
+      `presets: the name ${JSON.stringify(name)} would collide with the existing preset ` +
+        `${JSON.stringify(existing.name)} (fake)`,
+    );
+  }
+  // The migration rule, mirrored: the FIRST preset on a machine that has never
+  // had one keeps the legacy scope "" so nothing has to be retyped.
+  const migration = fakePresets.length === 0 && !fakeActivePreset.id;
+  const scope = existing ? existing.credentialScope : migration ? '' : id;
+  const { kept } = filterPresetFields(JSON.parse(JSON.stringify(fakeConfig)));
+  const preset = {
+    id,
+    name: String(name).trim(),
+    credentialScope: scope,
+    savedAt: new Date().toISOString(),
+    fields: kept,
+  };
+  fakePresets = fakePresets.filter((p) => p.id !== id).concat(preset);
+  fakeActivePreset = { id, credentialScope: scope, appliedAt: preset.savedAt };
+  return JSON.parse(JSON.stringify(preset));
+}
+
+/**
+ * Applies a preset onto the live config and RETURNS THE MERGED CONFIG — see
+ * the section header: the caller must assign it over its whole cached config.
+ *
+ * The fake refuses while the fake sender is running, exactly as Go does,
+ * because the refusal is load-bearing: a mid-match apply leaves the feed going
+ * to the previous instance with every lamp green.
+ */
+export async function applyPreset(id) {
+  if (hasWails()) return callGoBound(PRESET_METHODS.apply, id);
+
+  if (fakeSenderRunning) {
+    throw new Error(
+      'wslcomms: a preset cannot be applied while the feed is SENDING — press STOP first (fake)',
+    );
+  }
+  const preset = fakePresets.find((p) => p.id === id);
+  if (!preset) throw new Error(`presets: no preset ${JSON.stringify(id)} (fake)`);
+
+  const { kept, ignored } = filterPresetFields(preset.fields);
+  const merged = JSON.parse(JSON.stringify(fakeConfig));
+  for (const [key, value] of Object.entries(kept)) {
+    if (key === 'monitorTile' && value && typeof value === 'object') {
+      // Field-by-field, as Go's unmarshal-onto-live-struct merge does: a
+      // partial tile in a hand-edited file updates only the fields it names.
+      merged.monitorTile = { ...merged.monitorTile, ...value };
+    } else {
+      merged[key] = JSON.parse(JSON.stringify(value));
+    }
+  }
+  fakeConfig = merged;
+  fakeActivePreset = {
+    id: preset.id,
+    credentialScope: preset.credentialScope,
+    appliedAt: new Date().toISOString(),
+  };
+  if (ignored.length > 0) {
+    // The banner surfacing, exactly as Go emits it on the "error" event.
+    fakeEmit(
+      EVENT_ERROR,
+      `wslcomms: preset "${preset.name}" carried keys that are not part of a preset and were ` +
+        `ignored: ${ignored.join(', ')} (fake)`,
+    );
+  }
+  return JSON.parse(JSON.stringify(merged));
+}
+
+/** Renames a preset. The id and the credential scope never change with it. */
+export async function renamePreset(id, name) {
+  if (hasWails()) return callGoBound(PRESET_METHODS.rename, id, name);
+  const preset = fakePresets.find((p) => p.id === id);
+  if (!preset) throw new Error(`presets: no preset ${JSON.stringify(id)} (fake)`);
+  const trimmed = String(name).trim();
+  if (!trimmed) throw new Error('presets: a preset needs a name (fake)');
+  preset.name = trimmed;
+}
+
+/**
+ * Deletes a preset, refusing the ACTIVE one and refusing to delete the legacy
+ * scope's credentials — both refusals mirrored from Go so the dev loop shows
+ * the same behaviour the operator gets.
+ */
+export async function deletePreset(id, alsoDeleteCredentials) {
+  if (hasWails()) return callGoBound(PRESET_METHODS.delete, id, alsoDeleteCredentials === true);
+  const preset = fakePresets.find((p) => p.id === id);
+  if (!preset) throw new Error(`presets: no preset ${JSON.stringify(id)} (fake)`);
+  if (fakeActivePreset.id === id) {
+    throw new Error('wslcomms: this preset is the ACTIVE one — apply another preset first (fake)');
+  }
+  if (alsoDeleteCredentials && preset.credentialScope === '') {
+    throw new Error(
+      "wslcomms: this preset uses the machine's original Credential Manager entries; they are " +
+        'not deleted with it (fake)',
+    );
+  }
+  fakePresets = fakePresets.filter((p) => p.id !== id);
+}
+
+/**
+ * Returns {id, credentialScope, appliedAt}: which preset this PC is pointed
+ * at. The zero record (empty id) means none — the legacy vault entries.
+ */
+export async function getActivePreset() {
+  if (hasWails()) return callGoBound(PRESET_METHODS.active);
+  return { ...fakeActivePreset };
+}
+
+/**
+ * Returns {scope, m2lx, srt, srtreturn}: whether each credential EXISTS for
+ * the active scope. Booleans, never values — this is the one recorded
+ * exception to "no secret crosses the boundary outbound", and it exists
+ * because after applying a preset the operator has to know whether to type
+ * the passwords, and the "set this session" badge cannot answer for a scope
+ * never written to in this run.
+ *
+ * The fake answers from its session-write flags, which is as much as a
+ * browser tab can honestly claim to know.
+ */
+export async function getPresetCredentialStatus() {
+  if (hasWails()) return callGoBound(PRESET_METHODS.credentials);
+  return {
+    scope: fakeActivePreset.credentialScope,
+    m2lx: !!secretSetThisSession[SECRET_KEY_M2LX],
+    srt: !!secretSetThisSession[SECRET_KEY_SRT],
+    srtreturn: !!secretSetThisSession[SECRET_KEY_SRT_RETURN],
+  };
 }

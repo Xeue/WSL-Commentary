@@ -747,3 +747,114 @@ test('the default picture latency is 120 everywhere it is written down', () => {
   const go = read(repoRoot, 'internal', 'config', 'config.go');
   assert.match(go, /DefaultPictureLatencyMs = 120/);
 });
+
+// ---------------------------------------------------------------------------
+// The M2L-X instance group (presets)
+// ---------------------------------------------------------------------------
+//
+// The pure model has its own file (presets.test.js). What is asserted HERE is
+// the Settings form's half of the contract: where the group sits, that the
+// sending gate reaches its buttons, that the machine-fields note names all
+// four fields, and — the one that guards the whole feature's data path — that
+// collectConfig() did not grow a preset key, because saveConfig REPLACES the
+// stored document and a key with no Go field is discarded silently
+// (pictureSource is the standing example of that trap).
+
+test('the instance group is the FIRST group, above M2L-X connection', () => {
+  const js = ui('settings.js');
+  const presets = js.indexOf("presetsHeading.textContent = 'M2L-X instance'");
+  const connection = js.indexOf("connectionHeading.textContent = 'M2L-X connection'");
+  assert.ok(presets > 0, 'the Settings form must have the M2L-X instance group');
+  assert.ok(connection > 0);
+  assert.ok(
+    presets < connection,
+    'the instance picker ACTS on the form — applying rewrites most fields below — so it comes first',
+  );
+  // And it opens through the same group machinery as every other heading,
+  // with the card modifier main.css's presets contract hangs off.
+  assert.match(js, /openGroup\(presetsHeading, 'settings-group--presets'\)/);
+});
+
+test('Apply and Delete are gated on the sending state, with the reason on the control', () => {
+  // The gate itself is Go's — ApplyPreset refuses while a session runs. This
+  // is the honest rendering of it: a button that would only ever fail must
+  // say why it is disabled, not throw when pressed.
+  const js = ui('settings.js');
+  const setSending = js.slice(js.indexOf('function setSending(sending)'), js.indexOf('\n  }', js.indexOf('function setSending(sending)')));
+  assert.ok(setSending.length > 0, 'settings.js must expose setSending');
+  assert.match(setSending, /sendingNow = sending === true/);
+  assert.match(setSending, /renderPresetButtons\(\)/);
+
+  const buttons = js.slice(js.indexOf('function renderPresetButtons()'), js.indexOf('function renderPresetScopeLine'));
+  assert.match(buttons, /applyPresetBtn\.disabled = none \|\| sendingNow/);
+  assert.match(buttons, /deletePresetBtn\.disabled = none \|\| sendingNow/);
+  assert.match(buttons, /Disabled while SENDING/, 'the reason must be on the control, not in a log');
+
+  // And the view object hands setSending out for app.js to drive from the
+  // same place as the SENDING lamp.
+  assert.match(js, /return \{ el, open, setSending \};/);
+  assert.match(
+    ui('app.js'),
+    /settings\.setSending\(!!currentSenderState && currentSenderState !== backend\.SENDER_STATE\.STOPPED\)/,
+    'app.js must drive the gate from renderSenderLamp, the same derivation the lamp uses',
+  );
+});
+
+test('the permanent note names all four MACHINE fields with their current values', () => {
+  // The whole feature's safety story is "your microphone and headphones are
+  // not in here", and showing the current values is how the operator SEES
+  // that they survived an apply. The tags are paired BY POSITION with
+  // presets.js's MACHINE_FIELD_LABELS — presets.js itself may not spell them.
+  const js = ui('settings.js');
+  const tags = js.slice(js.indexOf('const MACHINE_NOTE_TAGS'), js.indexOf(';', js.indexOf('const MACHINE_NOTE_TAGS')));
+  for (const tag of ['audioDeviceId', 'headphoneDeviceId', 'headphoneEndpointId', 'slatePath']) {
+    assert.ok(tags.includes(`'${tag}'`), `the note's tag list must include ${tag}`);
+  }
+  assert.match(js, /renderPresetNote\(config\)/, 'populate must refresh the note with the loaded values');
+  assert.match(js, /Never part of a preset/, 'the note must be a statement, not a hint');
+});
+
+test('collectConfig still restates every config.Config json tag and no preset key', () => {
+  const js = ui('settings.js');
+  const collect = js.slice(js.indexOf('function collectConfig()'), js.indexOf('function clearAllErrors()'));
+  assert.ok(collect.length > 0);
+
+  const struct = read(repoRoot, 'internal', 'config', 'config.go').match(/type Config struct \{[\s\S]*?\n\}/);
+  assert.ok(struct);
+  const tags = [...struct[0].matchAll(/json:"([^"]+)"/g)]
+    .map((m) => m[1])
+    // The Tile's nested x/y/w/h tags live under monitorTile and are restated
+    // as monitorTile.{x,y,w,h}; the top-level key is what collectConfig owns.
+    .filter((tag) => !['x', 'y', 'w', 'h'].includes(tag));
+  for (const tag of tags) {
+    // headphoneEndpointId is restated through the DEVICE_KEY_SRT constant —
+    // the one shared spelling of the SRT headphone key (returnsource.js) —
+    // so the literal tag does not appear in collectConfig's body.
+    const restated =
+      collect.includes(tag) || (tag === 'headphoneEndpointId' && collect.includes('DEVICE_KEY_SRT'));
+    assert.ok(
+      restated,
+      `collectConfig no longer restates "${tag}": saveConfig REPLACES the whole document, so a ` +
+        'field this form does not restate is a field this form DELETES',
+    );
+  }
+  assert.ok(
+    !/preset/i.test(collect),
+    'collectConfig has grown a preset key; it has no Go field on Config and would be silently ' +
+      'discarded on every save — the pictureSource trap again',
+  );
+});
+
+test('the apply confirm is built from the pure model, before anything moves', () => {
+  const js = ui('settings.js');
+  const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
+  assert.match(handler, /diffPreset\(lastLoadedConfig, preset\.fields\)/, 'the dialog must diff against the SAVED config');
+  assert.match(handler, /filterPresetFields\(preset\.fields\)/, 'and name the keys the apply will ignore');
+  assert.match(handler, /window\.confirm\(/, 'apply must be confirmed; it rewrites most of the form');
+  assert.match(
+    handler,
+    /await handlers\.onApplyPreset\(preset\.id\)/,
+    'the sequence itself belongs to app.js, which can reach the monitor and the picture',
+  );
+  assert.match(handler, /populate\(merged\)/, 'the form must redraw from the RETURNED config, the authority');
+});

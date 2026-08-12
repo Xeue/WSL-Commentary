@@ -282,6 +282,14 @@ const (
 	nameVideoScale = "vscale" // videoscale, so a slate that is not 1920x1080 still starts
 )
 
+// levelStructureName is the name of the GstStructure a level element posts in
+// its GST_MESSAGE_ELEMENT bus messages ("level", fixed by gst-plugins-good).
+// onBusMessage matches on the STRUCTURE name rather than on the element name,
+// because the structure name is the documented contract and survives the
+// element being renamed; element messages carrying any other structure pass
+// through the handler untouched.
+const levelStructureName = "level"
+
 // Package-level GStreamer initialisation state. Init is idempotent because
 // gst_init is not: calling it twice is harmless in current GStreamer but the
 // environment variables it depends on must be set before the first call and
@@ -333,6 +341,7 @@ var requiredElements = []struct{ factory, plugin string }{
 	{"h264parse", "videoparsersbad"},
 	{"aacparse", "audioparsers"},
 	{"wasapi2src", "wasapi2"},
+	{"level", "level"},
 	{"mfaacenc", "mediafoundation"},
 	{"mpegtsmux", "mpegtsmux"},
 	{"srtsink", "srt"},
@@ -1069,6 +1078,16 @@ type cgoPipeline struct {
 	// Written by ReplaceSink under mu, read by onBusMessage without any lock.
 	route atomic.Pointer[sinkErrRoute]
 
+	// onLevels is PipelineOpts.OnLevels, or nil when the caller wants no
+	// metering. It is an atomic pointer for the same reason route is: the
+	// reader is onBusMessage on a GStreamer streaming thread, which must not
+	// take p.mu, and the writer is Start — which holds p.mu across the state
+	// change that first makes level messages possible, so a plain field would
+	// be a write racing the very messages it enables. It is written once,
+	// before the pipeline is built, and never cleared: busSilenced already
+	// stops delivery at teardown.
+	onLevels atomic.Pointer[func(Levels)]
+
 	// busSilenced makes onBusMessage return immediately once the pipeline is
 	// being torn down. It exists because the bus sync handler is NEVER
 	// detached; see teardownLocked.
@@ -1125,6 +1144,17 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if opts.VideoBitrateKbps < 0 || opts.AudioBitrateBps < 0 {
 		return fmt.Errorf("gst: negative bitrate: video %d kbps, audio %d bps",
 			opts.VideoBitrateKbps, opts.AudioBitrateBps)
+	}
+
+	// The levels callback is published BEFORE anything GStreamer is built. The
+	// level element starts posting the moment the pipeline reaches PLAYING,
+	// which happens further down while p.mu is still held — so onBusMessage,
+	// on a streaming thread that must not take p.mu, may read this field while
+	// Start is still executing. Storing it first, through an atomic, is what
+	// makes that read safe; see the field comment.
+	if opts.OnLevels != nil {
+		cb := opts.OnLevels
+		p.onLevels.Store(&cb)
 	}
 
 	encoderName, err := selectH264Encoder()
@@ -1414,9 +1444,29 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 		" ! video/x-h264,stream-format=byte-stream,alignment=au" +
 		" ! queue name=vq max-size-time=1000000000 ! " + nameMux + ".\n" +
 
+		// The level element sits AFTER audioconvert/audioresample and their
+		// capsfilter, IMMEDIATELY BEFORE the encoder, and that placement is the
+		// point: it measures the exact S16LE 48 kHz stereo signal that enters
+		// mfaacenc, so the input meters show what is ACTUALLY being encoded and
+		// sent — wrong device, dead Dante endpoint, muted desk send and all.
+		// Measuring upstream of the resample (or worse, in the browser) would
+		// keep a meter moving while the on-air signal was silence, which is a
+		// reassurance the operator must never be given. interval=50000000 is
+		// 50 ms in nanoseconds — twenty element messages a second, which the
+		// app throttles rather than trusts — and post-messages defaults to
+		// true so it is not set here. The element passes buffers through
+		// untouched; it adds measurement, not latency.
+		//
+		// alevel is a literal rather than an entry in the element-name const
+		// block, deliberately: those consts exist because GetByName is called
+		// with them, and nothing ever looks the level element up — its output
+		// arrives as bus messages matched on the STRUCTURE name. The literal
+		// is also what lets the Gate A source guard
+		// (TestPipelineDescriptionMetersWhatIsEncoded) assert the exact text.
 		"wasapi2src name=" + nameAudioSrc +
 		" ! audioconvert ! audioresample" +
 		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
+		" ! level name=alevel interval=50000000" +
 		" ! mfaacenc bitrate=" + strconv.Itoa(audioBitrateBps) +
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "."
@@ -1700,9 +1750,68 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		// behind Go's log mutex during an outage would add latency to the
 		// capture chain at the one moment it must not have any.
 		p.deliverWarning(fmt.Sprintf("gst: warning: %s: %v (%s)", source, gerr, debug))
+
+	case gogst.MessageElement:
+		// The level element's measurement reports. Matched on the STRUCTURE
+		// name — the documented contract for level messages — and element
+		// messages carrying any other structure fall through untouched, which
+		// matters because other elements in this pipeline are free to post
+		// their own. Everything here runs on the posting streaming thread, so
+		// the whole path is: read two fields, convert, hand to a callback that
+		// the contract in gst.go requires not to block. No locks, no logging.
+		f := p.onLevels.Load()
+		if f == nil || *f == nil {
+			break
+		}
+		s := msg.GetStructure()
+		if s == nil || s.GetName() != levelStructureName {
+			break
+		}
+		if levels, ok := levelsFromStructure(s); ok {
+			(*f)(levels)
+		}
 	}
 
 	return gogst.BusDrop
+}
+
+// levelsFromStructure reads the "peak" and "rms" fields of a level element
+// message structure into a clamped gst.Levels.
+//
+// Each field is a GValueArray of G_TYPE_DOUBLE, one entry per channel — the
+// level element has posted exactly that shape since gst-plugins-good kept the
+// deprecated GValueArray for message compatibility, and go-glib v0.0.2
+// registers a marshaler for it (gobject/valuearray.go), so Structure.GetValue
+// delivers a gobject.ValueArray, which is a named []any of float64s. The type
+// switch below also accepts a plain []any, in case a future go-glib flattens
+// the alias; anything else — a go-gst that starts returning InvalidValue for
+// boxed types, a level element that switched to GstValueArray — makes this
+// return ok=false and the meters simply stay empty, which is the correct
+// degradation for a display: silent absence, never a crash on a streaming
+// thread and never invented numbers.
+//
+// It runs on a streaming thread: no locks, no logging, allocation limited to
+// the two output slices.
+func levelsFromStructure(s *gogst.Structure) (Levels, bool) {
+	peak := levelListToDB(anyList(s.GetValue("peak")))
+	rms := levelListToDB(anyList(s.GetValue("rms")))
+	if peak == nil || rms == nil {
+		return Levels{}, false
+	}
+	return Levels{PeakDB: peak, RMSDB: rms}, true
+}
+
+// anyList unwraps the two list shapes go-glib may hand back for a GValueArray
+// field. A nil return means the field was absent or of an unexpected type.
+func anyList(v any) []any {
+	switch l := v.(type) {
+	case gobject.ValueArray:
+		return []any(l)
+	case []any:
+		return l
+	default:
+		return nil
+	}
 }
 
 // isSinkSourced reports whether a bus message source name belongs to the sink

@@ -113,7 +113,11 @@ func newTestApp(t *testing.T) (*App, *fakeStore) {
 
 	a := NewApp(t.TempDir(), nil)
 	store := newFakeStore()
-	a.store = store
+	// Wrapped by the same scope decorator NewApp installs around the real
+	// store, not installed raw: the decorator is part of the credential path
+	// under test — a bare fake would pass keys through unscoped and every
+	// preset-scope test would be testing nothing.
+	a.store = scopedStore{inner: store, scope: a.credentialScope}
 
 	// The real exitProcess ends the process, which under `go test` is the test
 	// binary and every other test in it. Every App a test builds gets a no-op
@@ -824,6 +828,15 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // sit and when to get out of the way, and they are on this surface precisely
 // because there is no other way for the page to say it. They are listed fourth
 // so that group stays legible too.
+//
+// The seven preset methods are the next group, added with the M2L-X instance
+// presets and documented in the same header. Four are read-only or rename a
+// display string; SavePreset writes files under %APPDATA% only; ApplyPreset is
+// the one that changes the running configuration and it refuses outright while
+// a session is sending. GetPresetCredentialStatus is the recorded, deliberate
+// exception to "no secret crosses this boundary outbound": it reports whether
+// a credential EXISTS for the active preset scope — booleans, never values —
+// and app_presets.go carries the whole argument beside the type.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -855,6 +868,14 @@ func assertBoundSurface(t *testing.T) {
 		"GetPictureState":   true,
 		"SetPictureRect":    true,
 		"SetPictureVisible": true,
+
+		"ListPresets":               true,
+		"SavePreset":                true,
+		"ApplyPreset":               true,
+		"RenamePreset":              true,
+		"DeletePreset":              true,
+		"GetActivePreset":           true,
+		"GetPresetCredentialStatus": true,
 	}
 
 	got := exportedMethodsOfApp()
@@ -3015,5 +3036,126 @@ func TestShutdownTimeoutJustificationNamesEveryStopItBounds(t *testing.T) {
 	if shutdownTimeout < senderWorstCase {
 		t.Errorf("shutdownTimeout = %s, below the sender's own bounded worst case of %s",
 			shutdownTimeout, senderWorstCase)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The input meters' "levels" events
+// ---------------------------------------------------------------------------
+
+// isSilentLevels reports whether a payload is the session-end zero-frame:
+// every channel at the silence floor. An empty payload is NOT silent for this
+// test's purposes — it is malformed, and the assertions below should see it.
+func isSilentLevels(p levelsPayload) bool {
+	if len(p.Peak) == 0 {
+		return false
+	}
+	for _, v := range p.Peak {
+		if v > levelsSilenceDB {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSessionEmitsLevelsAndAZeroFrameOnStop(t *testing.T) {
+	// The whole path at Gate A: the stub pipeline's synthetic ticker calls
+	// PipelineOpts.OnLevels (wired by senderOpts), the App-side forwarder
+	// throttles and queues "levels" events on the pump, and the session's end
+	// queues one final all-silence frame so the meters fall rather than
+	// freeze. The real build swaps only the producer.
+	a, _ := newTestApp(t)
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	var live *levelsPayload
+	waitFor(t, 5*time.Second, "a live levels frame to reach the frontend queue", func() bool {
+		for _, e := range drainPump(a) {
+			if e.name != EventLevels {
+				continue
+			}
+			p, ok := e.data.(levelsPayload)
+			if !ok {
+				t.Fatalf("a %q event carried a %T, want levelsPayload", EventLevels, e.data)
+			}
+			if !isSilentLevels(p) {
+				pp := p
+				live = &pp
+			}
+		}
+		return live != nil
+	})
+
+	if len(live.Peak) != 2 || len(live.RMS) != 2 {
+		t.Fatalf("live frame has %d peak / %d rms channels, want 2 of each (the pipeline pins stereo)",
+			len(live.Peak), len(live.RMS))
+	}
+	for i := range live.Peak {
+		if live.Peak[i] < levelsSilenceDB || live.Peak[i] > 0 {
+			t.Errorf("channel %d peak = %v dBFS, outside [%d, 0]", i, live.Peak[i], levelsSilenceDB)
+		}
+		if live.RMS[i] > live.Peak[i] {
+			t.Errorf("channel %d rms %v is above its peak %v", i, live.RMS[i], live.Peak[i])
+		}
+	}
+
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	// The zero-frame is already queued by the time Stop returns: the sender
+	// stops the pipeline (which joins the stub's ticker) BEFORE closing its
+	// states channel, the forwarder goroutine sends the zero-frame after the
+	// channel closes and before its wg.Done, and Stop waits on that WaitGroup.
+	// So the LAST levels event in the queue is deterministically the silence.
+	var last *levelsPayload
+	for _, e := range drainPump(a) {
+		if e.name != EventLevels {
+			continue
+		}
+		if p, ok := e.data.(levelsPayload); ok {
+			pp := p
+			last = &pp
+		}
+	}
+	if last == nil {
+		t.Fatal("no levels event was queued during Stop; the zero-frame never arrived and " +
+			"the meters would freeze at the last live level")
+	}
+	if !isSilentLevels(*last) {
+		t.Fatalf("the final levels frame after Stop is %+v, want every channel at %v dBFS: "+
+			"a meter frozen at the last level reads as a live one", *last, float64(levelsSilenceDB))
+	}
+}
+
+func TestLevelsForwarderThrottlesToTheMinInterval(t *testing.T) {
+	// The producer runs at 20 Hz and the pump drops OLDEST under pressure, so
+	// without this throttle a stalled renderer turns the meter bursty and
+	// purges other events from the shared queue. The clock is injected, so no
+	// sleeps: four calls inside one 50 ms window must forward exactly two —
+	// the first, and the one landing exactly on the interval boundary.
+	a, _ := newTestApp(t)
+
+	clock := time.Unix(1_700_000_000, 0)
+	fwd := a.levelsForwarder(func() time.Time { return clock })
+	frame := gst.Levels{PeakDB: []float64{-10, -12}, RMSDB: []float64{-18, -20}}
+
+	fwd(frame) // forwarded: the first frame
+	fwd(frame) // dropped: same instant
+	clock = clock.Add(49 * time.Millisecond)
+	fwd(frame) // dropped: inside the floor
+	clock = clock.Add(1 * time.Millisecond)
+	fwd(frame) // forwarded: exactly levelsMinInterval after the first
+
+	count := 0
+	for _, e := range drainPump(a) {
+		if e.name == EventLevels {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("the forwarder queued %d levels events for four calls in one interval window, want 2", count)
 	}
 }

@@ -51,12 +51,29 @@
 //	SetPictureRect(x,y,w,h,ratio)       error              caller: WP-5b
 //	SetPictureVisible(visible)          error              caller: WP-5b
 //
+// and the seven added for the M2L-X INSTANCE PRESETS, which live in
+// app_presets.go — the TWENTIETH to TWENTY-SIXTH, recorded in CONTRACT.md's
+// bound-surface table with the same deliberateness as the rest:
+//
+//	ListPresets()                       []presets.Summary       caller: WP-5b
+//	SavePreset(name)                    presets.Summary         caller: WP-5b
+//	ApplyPreset(id)                     *config.Config          caller: WP-5b
+//	RenamePreset(id, name)              error                   caller: WP-5b
+//	DeletePreset(id, alsoCreds)         error                   caller: WP-5b
+//	GetActivePreset()                   presets.ActiveRecord    caller: WP-5b
+//	GetPresetCredentialStatus()         PresetCredentialStatus  caller: WP-5b
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
 // and not merely by habit. There is deliberately no getter for a secret — a
 // secret goes into Credential Manager and never comes back out across this
-// boundary.
+// boundary. GetPresetCredentialStatus is the one recorded, deliberate
+// narrowing of that rule: it reports whether a credential EXISTS for the
+// active preset scope — three booleans, never a value — because after applying
+// a preset the operator has to know whether to type the passwords, and the
+// frontend's "set this session" badge is a lie for a scope never written to in
+// this run. The reasoning lives with the type in app_presets.go.
 //
 // GetStatusKeyCandidates is the EIGHTH, added after the surface was declared
 // frozen, and it is called out here rather than slipped in: with no statusKey
@@ -108,6 +125,7 @@
 //	"return"              a gst.ReturnState
 //	"error"               a string
 //	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
+//	"levels"              a levelsPayload {peak:[...], rms:[...]} — the input meters
 //
 // The "error" event carries first-run configuration problems, gst.Init failures,
 // sign-in failures, and — rate-limited, because the sender retries forever — the
@@ -269,6 +287,7 @@ import (
 	"wslcomms/internal/kvs"
 	"wslcomms/internal/m2lx"
 	"wslcomms/internal/mixer"
+	"wslcomms/internal/presets"
 	"wslcomms/internal/secrets"
 	"wslcomms/internal/sender"
 )
@@ -300,6 +319,15 @@ const (
 	// It is emitted only while a discovery is running, and never causes anything
 	// to be saved — see App.GetStatusKeyCandidates.
 	EventStatusKeys = "statusKeyCandidates"
+
+	// EventLevels carries a levelsPayload: the send pipeline's own peak/RMS
+	// measurement of the commentary audio, per channel in dBFS, behind the
+	// input meters beside the big picture. Emitted only while a session is
+	// running — throttled to at most one per levelsMinInterval, because a
+	// meter must degrade to SLOWER under pressure, never to bursty — plus one
+	// final all-silence frame when the session ends, so the meters fall to
+	// nothing rather than freezing at the last level and reading as live.
+	EventLevels = "levels"
 )
 
 const (
@@ -454,7 +482,29 @@ const (
 	// genuinely new message is still visible next to it. It is a judgement, not a
 	// measurement, and it is stated as one.
 	connectErrorRepeat = 5 * time.Minute
+
+	// levelsMinInterval is the App-side floor between two "levels" events: at
+	// most twenty a second, matching the level element's own 50 ms interval.
+	//
+	// The producer already runs at that rate, so on a healthy day this drops
+	// nothing. It exists for the unhealthy day: the pump discards OLDEST under
+	// pressure, which is the right policy for edge-triggered state events but
+	// the wrong shape for a meter — a meter that falls behind must degrade to
+	// SLOWER, not to bursts of stale frames arriving together and painting a
+	// jerky history of two seconds ago. Throttling at the producer keeps the
+	// queue shallow so the frame that does arrive is recent. It also protects
+	// every other event in the shared pump: at 20 Hz an unthrottled producer
+	// could purge the 64-slot queue of sender transitions in three seconds of
+	// renderer stall.
+	levelsMinInterval = 50 * time.Millisecond
 )
+
+// levelsSilenceDB is the all-channels-silent level, in dBFS, of the zero-frame
+// emitted when a session ends. It mirrors internal/gst's documented clamp
+// floor — Levels values are clamped to -100, matching the mixer drawer's own
+// digital-silence reading — so the falling meter lands on the same number the
+// live meter uses for silence.
+const levelsSilenceDB = -100
 
 // signInBackoff is the delay ladder between sign-in attempts, followed by
 // signInBackoffCap repeated forever until the app shuts down.
@@ -527,9 +577,18 @@ type App struct {
 	// events decouples both event producers from the renderer.
 	events *eventPump
 
-	// store is Windows Credential Manager. It is stateless and needs no
-	// shutdown.
+	// store is Windows Credential Manager, wrapped by app_presets.go's
+	// scopedStore so that every read and write resolves through the ACTIVE
+	// credential scope. It is stateless and needs no shutdown.
 	store secrets.Store
+
+	// credScope is the active credential scope: "" until an instance preset
+	// with a scope of its own is applied, and then that preset's scope. It is
+	// an atomic rather than a field under cfgMu because signInLoop reads the
+	// M2L-X password on the control-plane goroutine while ctlMu is held, and
+	// the lock order below says ctlMu is never held with cfgMu — a lock-free
+	// read has no ordering to violate. Accessors in app_presets.go.
+	credScope atomic.Pointer[string]
 
 	// cfgMu guards cfg, which is the in-memory copy of config.json.
 	cfgMu sync.Mutex
@@ -775,18 +834,25 @@ type session struct {
 // field comment for why a failure there is carried rather than fatal.
 func NewApp(appDir string, gstInitErr error) *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{
+	a := &App{
 		appDir:      appDir,
 		gstInitErr:  gstInitErr,
 		rootCtx:     ctx,
 		rootCancel:  cancel,
 		events:      newEventPump(),
-		store:       secrets.New(),
 		lastSender:  sender.StateStopped,
 		lastReturn:  gst.ReturnStateStopped,
 		lastPicture: gst.PictureStateStopped,
 		exitProcess: forceExit,
 	}
+	// Credential Manager is reached ONLY through the scope decorator, installed
+	// once, here — never at the call sites. That is what keeps the four
+	// credential read sites (two of them in WP-P's and WP-R's files) untouched
+	// by the instance-preset feature: they keep passing the three bare keys,
+	// and the decorator resolves each through the active scope. See
+	// app_presets.go for the whole argument.
+	a.store = scopedStore{inner: secrets.New(), scope: a.credentialScope}
+	return a
 }
 
 // startup is the Wails OnStartup callback. It captures the context that the
@@ -822,6 +888,24 @@ func (a *App) startup(ctx context.Context) {
 	if a.gstInitErr != nil {
 		a.emitError(a.gstInitErr)
 	}
+
+	// The active-preset record decides WHICH Credential Manager entries the
+	// control plane signs in with, so it must be read BEFORE startControlPlane
+	// — the sign-in loop reads the M2L-X password immediately, and a scope set
+	// late means the first sign-in of every launch consults the wrong vault
+	// entry. A corrupt record is reported rather than silently absorbed,
+	// because "no password stored" and "the wrong password target was
+	// consulted" look identical on the lamps; the fallback itself is the empty
+	// scope — the machine's original entries — which is the recoverable wrong
+	// answer, never a guess at another instance's.
+	rec, _, err := presets.LoadActive()
+	if err != nil {
+		a.emitError(fmt.Errorf(
+			"wslcomms: the active-preset record could not be read (%v) — no preset is treated as applied "+
+				"and the machine's original stored passwords are in use. Apply a preset from the Settings "+
+				"screen to repair the record", err))
+	}
+	a.setCredentialScope(rec.CredentialScope)
 
 	a.startControlPlane()
 }
@@ -1258,6 +1342,17 @@ func (a *App) startSession() error {
 	go func() {
 		defer sess.wg.Done()
 		a.forwardSenderStates(snd.States())
+		// The session is over — the sender closed its states channel, on the
+		// operator-Stop path and the self-stop path alike — so the meters get
+		// one final all-silence frame. Without it they freeze at the last
+		// level the pipeline reported, and a frozen meter reads as a live one.
+		// It is sent from here, before wg.Done runs, so that by the time
+		// App.Stop returns (it waits on sess.wg) the zero-frame is already
+		// queued behind the StateStopped that preceded it. It bypasses the
+		// levels throttle deliberately: the throttle drops frames on the
+		// assumption another is 50 ms behind, and this is the frame after
+		// which nothing follows.
+		a.events.send(EventLevels, silentLevelsPayload())
 	}()
 	a.session = sess
 
@@ -1512,6 +1607,12 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// explicitly not exposed to the user (specification section 2), so
 			// config.Config carries no field for them and nothing here should
 			// invent one.
+
+			// The input meters. The pipeline's level element measures what is
+			// actually encoded and sent and calls this on a streaming thread
+			// (gst.PipelineOpts.OnLevels: MUST NOT BLOCK) — the forwarder is a
+			// throttle in front of the non-blocking event pump, so it cannot.
+			OnLevels: a.levelsForwarder(nil),
 		},
 		Sink: gst.SinkOpts{
 			Host:       srtHost,
@@ -2081,6 +2182,64 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (a *App) forwardStatus(statuses <-chan m2lx.Status) {
 	for status := range statuses {
 		a.events.send(EventStatus, status)
+	}
+}
+
+// levelsPayload is the "levels" event's wire shape: peak and RMS per channel,
+// dBFS, silence at levelsSilenceDB. The lower-case JSON keys are the contract
+// with frontend/src/ui/backend.js — gst.Levels is not sent directly because
+// its exported Go field names would cross the boundary as PeakDB/RMSDB and tie
+// the frontend to this package's internal naming.
+type levelsPayload struct {
+	Peak []float64 `json:"peak"`
+	RMS  []float64 `json:"rms"`
+}
+
+// silentLevelsPayload is the zero-frame emitted once when a session ends:
+// every channel at the silence floor, so the meters fall to nothing instead of
+// freezing at the last reported level. A frozen meter reads as a live one,
+// which is the direction the status display must never be wrong in — the same
+// reasoning that makes the lamps prefer grey over stale green.
+func silentLevelsPayload() levelsPayload {
+	return levelsPayload{
+		Peak: []float64{levelsSilenceDB, levelsSilenceDB},
+		RMS:  []float64{levelsSilenceDB, levelsSilenceDB},
+	}
+}
+
+// levelsForwarder returns the OnLevels callback for one session: it forwards
+// each frame to the "levels" event, dropping frames that arrive within
+// levelsMinInterval of the last one forwarded.
+//
+// It is called on internal/gst's bus goroutine — a real GStreamer streaming
+// thread at Gate B — so it must not block and must not take any App lock:
+// the whole body is one CAS loop and a non-blocking pump send. The throttle
+// state is per-forwarder rather than per-App because two sessions never
+// overlap (sessMu) and a fresh session deserves a fresh meter, not a 50 ms
+// debt inherited from the last one.
+//
+// now supplies the clock; nil means time.Now, which is what the application
+// passes. It is a parameter so the throttle is testable without real sleeps.
+func (a *App) levelsForwarder(now func() time.Time) func(gst.Levels) {
+	if now == nil {
+		now = time.Now
+	}
+	var last atomic.Int64 // UnixNano of the last frame forwarded; 0 = none yet
+	return func(l gst.Levels) {
+		t := now().UnixNano()
+		for {
+			prev := last.Load()
+			if prev != 0 && t-prev < int64(levelsMinInterval) {
+				// Too soon. Dropping HERE, before the queue, is the point:
+				// the pump drops oldest, and a meter must degrade to slower,
+				// not to bursty. See levelsMinInterval.
+				return
+			}
+			if last.CompareAndSwap(prev, t) {
+				break
+			}
+		}
+		a.events.send(EventLevels, levelsPayload{Peak: l.PeakDB, RMS: l.RMSDB})
 	}
 }
 

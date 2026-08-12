@@ -16,6 +16,18 @@ import {
   normalisePictureState,
 } from './picturesource.js';
 import { createErrorLog, createBackoffEpisode, describeEntry, formatErrorTime } from './errorlog.js';
+// The input meters' maths and state: the mixer's own -60..0 scale and
+// -18/-6 zone boundaries (imported there, not copied — two meter scales that
+// disagree is the two-tables bug), plus the peak-hold. This file only builds
+// the bars and paints what meters.js computes; meters.test.js is where the
+// behaviour is proved.
+import {
+  meterZones,
+  zoneFills,
+  dbToFraction,
+  isSilentFrame,
+  createPeakHold,
+} from './meters.js';
 // The channel table comes from the monitor module because that is where it is
 // ENFORCED — it is the wiring of a ChannelSplitter to a ChannelMerger, and the
 // words here have to be the words for that wiring. It is pure data with no
@@ -89,6 +101,9 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *                                       over the tile. The ONLY thing that may
  *                                       suppress the mosaic; see the function.
  *   measurePictureRect()                the reserved box, in CSS pixels
+ *   setLevels(frame)                    paints the input meters from one
+ *                                       "levels" frame {peak:[], rms:[]}; an
+ *                                       all-silence frame (or null) dims them
  *   setLevel(fraction)                  positions the level slider, 0..1
  *   setRunning(running)                 flips the START/STOP button
  *   setBusy(busy)                       disables the button while a call is in flight
@@ -297,7 +312,66 @@ export function createHomeView(handlers) {
   pictureBadge.className = 'picture-badge';
   pgmTile.appendChild(pictureBadge);
 
-  pgmStage.appendChild(pgmTile);
+  // --- the input meters, at the right edge of the picture area -------------
+  //
+  // A slim vertical stereo pair fed from the SEND pipeline's "levels" event:
+  // the level of what is ACTUALLY being encoded and sent, which is the one
+  // meter that goes quiet when the wrong device is selected.
+  //
+  // ============= OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING =================
+  //
+  // The native SRT overlay is an OPAQUE CHILD WINDOW painted over exactly the
+  // tile's rectangle — measurePictureRect measures .pgm-tile and nothing else —
+  // and no z-index in this page reaches above it. Anything drawn inside that
+  // rectangle is invisible for as long as the overlay is up, which is exactly
+  // when a commentator is mid-match and most needs to see their input. So the
+  // meters live in .pgm-stage BESIDE the tile: visible over both pictures,
+  // never under either, and the measured rectangle is untouched.
+  //
+  // The bar is the RMS — the loudness a listener would report — and the thin
+  // marker riding above it is the peak-hold, ~1.5 s of the highest recent
+  // peak. Zone segments are fixed slices of the scale (green to -18, amber to
+  // -6, red above, from meters.js via the mixer's own constants) and only the
+  // fill inside each moves, for the reason mixer.css documents: a gradient on
+  // a moving fill drags its colour stops with the level.
+  const metersEl = document.createElement('div');
+  metersEl.className = 'input-meters input-meters-idle';
+  metersEl.title =
+    'Commentary input level, measured on the encoded feed itself. Green to -18 dBFS, amber to -6, red above.';
+  const meterChannels = ['L', 'R'].map((name) => {
+    const channel = document.createElement('div');
+    channel.className = 'input-meter';
+    const bar = document.createElement('div');
+    bar.className = 'input-meter-bar';
+    // Bottom-first zones drawn bottom-up: the bar is a column-reverse flex, so
+    // the first (green) segment sits at the bottom without this file doing
+    // coordinate arithmetic.
+    const fills = meterZones().map(({ zone, from, to }) => {
+      const seg = document.createElement('div');
+      seg.className = `input-meter-seg input-meter-seg--${zone}`;
+      // The segment's share of the bar comes from the dB boundaries, so the
+      // paint cannot drift from the scale it claims to show — the same
+      // derive-don't-restate rule as the mixer's meterStageWidths.
+      seg.style.flexBasis = `${((to - from) * 100).toFixed(1)}%`;
+      const fill = document.createElement('div');
+      fill.className = `input-meter-fill input-meter-fill--${zone}`;
+      seg.appendChild(fill);
+      bar.appendChild(seg);
+      return fill;
+    });
+    const peakMark = document.createElement('div');
+    peakMark.className = 'input-meter-peak';
+    peakMark.hidden = true;
+    bar.appendChild(peakMark);
+    const label = document.createElement('span');
+    label.className = 'input-meter-label';
+    label.textContent = name;
+    channel.append(bar, label);
+    metersEl.appendChild(channel);
+    return { fills, peakMark };
+  });
+
+  pgmStage.append(pgmTile, metersEl);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -806,6 +880,57 @@ export function createHomeView(handlers) {
   // any config has loaded.
   renderPicture();
 
+  // Peak-hold state for the input meters. One instance for the view's life:
+  // the session-end zero-frame resets it below, so a new session starts with
+  // no ghost of the old one's peaks.
+  const inputPeakHold = createPeakHold();
+
+  /**
+   * setLevels paints the input meters from one "levels" frame
+   * ({peak: number[], rms: number[]}, dBFS per channel).
+   *
+   * Called on every event, ~20 Hz — no rAF loop, deliberately: at that rate
+   * the event IS the frame clock, and the peak-hold ticks with it, so a
+   * stopped session (which stops the events after its zero-frame) also stops
+   * all meter work rather than leaving a timer painting nothing.
+   *
+   * The bar is the RMS; the marker is the held peak. An all-silence frame —
+   * the zero-frame app.go emits when the session ends — or a null/malformed
+   * one dims the whole assembly and resets the hold: empty and dimmed, no
+   * text clutter, because "no session" is not a level and must not look like
+   * one.
+   */
+  function setLevels(frame) {
+    const silent = isSilentFrame(frame);
+    metersEl.classList.toggle('input-meters-idle', silent);
+    if (silent) {
+      inputPeakHold.reset();
+      for (const ch of meterChannels) {
+        ch.fills.forEach((fill) => {
+          fill.style.height = '0%';
+        });
+        ch.peakMark.hidden = true;
+      }
+      return;
+    }
+
+    const peaks = Array.isArray(frame.peak) ? frame.peak : [];
+    const rms = Array.isArray(frame.rms) ? frame.rms : [];
+    const marks = inputPeakHold.update(peaks);
+    meterChannels.forEach((ch, i) => {
+      const fills = zoneFills(rms[i]);
+      ch.fills.forEach((fill, z) => {
+        // Rounded to 0.1% for the same reason the mixer's meterPercent
+        // rounds: a 20 Hz update must not rewrite the style attribute with a
+        // seventeen-digit float.
+        fill.style.height = `${(Math.round(fills[z] * 1000) / 10).toFixed(1)}%`;
+      });
+      const frac = dbToFraction(marks[i]);
+      ch.peakMark.hidden = !(frac > 0);
+      ch.peakMark.style.bottom = `${(Math.round(frac * 1000) / 10).toFixed(1)}%`;
+    });
+  }
+
   function setLevel(fraction) {
     levelSlider.value = String(Math.round(Math.max(0, Math.min(1, fraction)) * 100));
   }
@@ -844,6 +969,7 @@ export function createHomeView(handlers) {
     setPictureState,
     setPictureOverlaid,
     measurePictureRect,
+    setLevels,
     setLevel,
     setRunning,
     setBusy,

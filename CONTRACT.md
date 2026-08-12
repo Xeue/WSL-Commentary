@@ -75,6 +75,7 @@ these are the ones that change what a package may assume:
 | `app_picture.go` | **WP-P** | the SRT picture's bound surface, the native overlay, the `picture` event |
 | `app_return.go` | **WP-R** | the SRT audio return's bound surface and the `return` event |
 | `app_mixer.go` | **WP-8** | the mixer drawer's bound surface: snapshot, arm/disarm, send, golden |
+| `app_presets.go`, `internal/presets/`, `frontend/src/ui/presets.js` (and their tests) | **WP-PRESETS** | the M2L-X instance presets: whitelist, file store, credential-scope decorator, bound surface, picker model |
 | `internal/config/` | **WP-1** | `%APPDATA%\WSLComms\config.json`, spec §9 |
 | `internal/secrets/` | **WP-1** | Windows Credential Manager: `WSLComms/m2lx`, `WSLComms/srt`, `WSLComms/srtreturn` |
 | `internal/m2lx/` | **WP-2** | sign-in, token refresh, status WebSocket, the snapshot/delta document, 4 s debounce, 15 s staleness |
@@ -185,6 +186,32 @@ out with.
 `ErrNotFound` is a normal first-run condition, not a failure. Secrets never enter `config.json`, a
 log line, a GStreamer URI, or the Wails boundary in the outbound direction — there is deliberately
 no getter.
+
+**Amended for the M2L-X instance presets (approved under rules 2 and 3):** the three logical keys
+can be **scoped** to a preset — `ScopedKey("wembley", KeyM2LX)` → key `"wembley/m2lx"` → target
+`WSLComms/wembley/m2lx`. The **empty scope resolves to the three legacy targets byte-for-byte**
+(`TestTargetNames` is unchanged), the `Store` interface is untouched (the key carries the scope),
+and the scope charset is exactly what `internal/presets.DeriveID` can produce, so a scope can never
+collide with a legacy target (`TestScopedTargetsDoNotCollide` pins the adversarial `"srt"/m2lx`
+pair). Secrets are never copied between scopes. The one recorded narrowing of "no getter":
+`App.GetPresetCredentialStatus` reports whether a credential **exists** for the active scope —
+three booleans, never a value — because after applying a preset the operator must know whether to
+type the passwords, and the frontend's session-only badge cannot answer for a scope never written
+to in this run. The reasoning lives beside the type in `app_presets.go`.
+
+### `internal/presets` — WP-PRESETS
+One M2L-X deployment's coordinates as a file under `%APPDATA%\WSLComms\presets\<id>.json`, applied
+onto the live config as a **merge**. The load-bearing mechanism is a **whitelist**
+(`InstanceFields`, 14 tags) plus apply-by-`json.Unmarshal`-onto-the-live-struct — the same
+primitive `config.Load` uses — so a preset is *physically incapable* of writing a field it does not
+carry, and `Extract`/`Filter` make sure it never carries a MACHINE field (`audioDeviceId`,
+`headphoneDeviceId`, `headphoneEndpointId`, `slatePath`) or a UI field (`returnSource`,
+`returnChannel`). A reflection test fails by name on any unclassified `config.Config` field.
+`DeriveID` is the security-sensitive function — the id is both a filename and a Credential Manager
+scope segment — and its rejection table (traversal, separators, colons, Windows reserved device
+names, length) is not optional. `active.json` (which preset this PC points at, and its credential
+scope) is MACHINE state: never inside a preset body, never a `config.Config` field. Gate A: the
+package imports `internal/config` and nothing from `internal/gst`.
 
 ### `internal/m2lx` — WP-2
 `Client` (`SignIn`/`Refresh`/`Token`/`KVSInfo`/`KVSToken`) and `Watcher` (`Watch`, `RawSnapshot`).
@@ -357,10 +384,27 @@ disconnect, stall the status WebSocket, empty the audio array, and lie about `st
 | `ArmMixer()` / `DisarmMixer()` | `MixerArmState` / `error` | WP-M4 |
 | `SendMixerCommands(cmds)` | `error` | WP-M4 |
 | `GetMixerGolden()` / `SetMixerGolden(s)` | `*mixer.Snapshot` / `error` | WP-M4 |
+| `ListPresets()` | `[]presets.Summary` | WP-5b |
+| `SavePreset(name)` | `presets.Summary` | WP-5b |
+| `ApplyPreset(id)` | `*config.Config` | WP-5b |
+| `RenamePreset(id, name)` | `error` | WP-5b |
+| `DeletePreset(id, alsoDeleteCredentials)` | `error` | WP-5b |
+| `GetActivePreset()` | `presets.ActiveRecord` | WP-5b |
+| `GetPresetCredentialStatus()` | `PresetCredentialStatus` | WP-5b |
+
+The seven preset methods live in `app_presets.go`. `ApplyPreset` **returns the merged config and
+the page assigns it over its whole cache** — that return type is a correctness contract (the next
+dropdown change re-writes the whole `currentConfig`, so an apply that returned only an error would
+be clobbered by the stale cache). It **refuses while a session is SENDING**, in Go, and that
+refusal is load-bearing: it is what makes the unconditional monitor/picture rebuild on apply
+affordable. `GetPresetCredentialStatus` is the recorded exception to "no getter" — existence
+booleans, never a value; see the `internal/secrets` amendment above.
 
 Events emitted Go → JS: **`status`** (an `m2lx.Status`), **`sender`** (a `sender.State`),
 **`return`** (a `gst.ReturnState`), **`picture`** (a `gst.PictureState`),
-**`statusKeyCandidates`** (a `[]m2lx.StatusKeyCandidate`), **`error`** (a string).
+**`statusKeyCandidates`** (a `[]m2lx.StatusKeyCandidate`), **`error`** (a string),
+**`levels`** (the input meters: `{peak, rms []float64}` in dBFS, ≤20/s while a
+session runs, one all-`-100` zero-frame on stop).
 
 **There is no `mixer` event, and that is deliberate.** It is not known whether a routing or mute
 change is pushed as a whole-node state at `"/"` or as a subtree delta, so a pushed "latest known"

@@ -116,12 +116,22 @@ button {
   padding: 0 1.25rem 1rem;
 }
 
-/* Settings is a form and reads badly at 3840px wide, so it keeps the measure
-   and the scrollbar. The home view does NOT: the picture is the point, and a
-   1100px cap on a 3840px window was throwing away two thirds of it. */
+/* Settings is a form, and a form reads badly at 3840px. But the pair of caps
+   that used to be here capped it TWICE: a 640px column pinned to the LEFT of an
+   1100px box, so a 2560px window spent ~1,900px on nothing while the form ran
+   ~3,500px deep. The measure now belongs to the COLUMN, not to the form — the
+   groups below split the width into 18rem tracks — so this cap only has to stop
+   a fifth column appearing and cutting the hint prose to ribbons. */
 .view-settings {
-  max-width: 1100px;
-  overflow-y: auto;
+  max-width: 1500px;
+  /* The FORM scrolls, not the view: "‹ Back" above and the action bar below
+     both have to stay put. Same arrangement as the mixer drawer, which pins its
+     chrome flex: 0 0 auto and gives ONE inner region the scrollbar. */
+  overflow: hidden;
+}
+
+.view-settings .topbar {
+  flex: 0 0 auto;
 }
 
 /* auto, not hidden: when everything fits there is no scrollbar, and when the
@@ -785,11 +795,76 @@ input[type='range'] {
 /* ------------------------------------------------------------------ */
 
 .settings-form {
+  /* Still a column: the h2 border-top is the group separator and has to span
+     the full measure. The GROUPS are the grids. */
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
-  max-width: 640px;
-  padding: 0.5rem 0 2.5rem;
+  padding: 0.5rem 0 0;
+  /* The scroll container. min-height: 0 is what lets a flex child shrink below
+     its content instead of pushing the footer off the bottom. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* displayErrors() focuses the first bad field. Without this the browser may
+     scroll it flush to the bottom edge, underneath the sticky footer, and the
+     operator gets a focus ring on a field they cannot read. */
+  scroll-padding-bottom: 6rem;
+}
+
+/* One group = one grid.
+ *
+ * auto-fill, NOT auto-fit. auto-fit collapses the empty tracks, so the Status
+ * group's single "cam7" box would stretch to 1460px while the four-field groups
+ * showed 350px boxes — the columns would stop being columns. auto-fill keeps a
+ * field the same width in every group, and the track COUNT follows the dragged
+ * window continuously, so there is no breakpoint to flicker at and none to
+ * re-tune when a field is added.
+ *
+ * At the .view's 40px padding and this 1.25rem gap: 800px window (the Wails
+ * minimum) 2 columns, 1024px (the default) 3, 1280px 4, and 4 from there up
+ * because the 1500px view cap holds it. A fifth column would cut a hint to
+ * ~28 characters a line. */
+.settings-group {
+  --settings-track: 18rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--settings-track), 1fr));
+  align-items: start;
+  gap: 0.9rem 1.25rem;
+}
+
+/* A grid item's default min-width is auto — its CONTENT width — so one long
+   <select> option or one unbreakable hint word would push a track past its
+   share and shove the last column off the edge. .control-group carries this on
+   the home screen for the same reason. */
+.settings-group > * {
+  min-width: 0;
+}
+
+/* Headings, prose and composite controls own the whole row.
+ *
+ * `1 / -1` and NEVER `span N`: a span wider than the track count does not clamp
+ * to it, it ADDS implicit columns, which would silently turn the 800px window
+ * into a two-column grid of 380px tracks. */
+.settings-group > h2,
+.settings-group > h3,
+.settings-group > .suggestions,
+.settings-group > .secrets-hint,
+.settings-group > .tile-grid,
+.settings-group > .preset-picker,
+.settings-group > .preset-scope,
+.settings-group > .preset-note {
+  grid-column: 1 / -1;
+}
+
+/* A full endpoint id — {0.0.1.00000000}.{d6ca5cf3-b02c-47dc-b237-0ab704e62a5e},
+   55 characters — is about 432px of Segoe UI at 16px. 27rem is that. The three
+   Devices fields then land on one row from 1440px, two-plus-one at 1024px and
+   stacked at 800px, and the field this application's worst configuration bug is
+   entered through is never a box you scroll sideways inside. Per-group track
+   minimums are the right lever throughout — one line each. */
+.settings-group--devices {
+  --settings-track: 27rem;
 }
 
 .settings-form h2 {
@@ -799,7 +874,12 @@ input[type='range'] {
   border-top: 1px solid var(--border);
 }
 
-.settings-form h2:first-of-type {
+/* THE SECTION-WRAPPER TRAP. This was `.settings-form h2:first-of-type`, which
+   was correct while all six h2s were siblings. Inside one section each, EVERY
+   h2 is :first-of-type among its own siblings — and all six group separators
+   would disappear at once, silently, leaving one undifferentiated 26-field
+   form. */
+.settings-form > .settings-group:first-of-type h2 {
   margin-top: 0.3rem;
   padding-top: 0;
   border-top: none;
@@ -823,6 +903,32 @@ input[type='range'] {
   color: var(--text-muted);
 }
 
+/* THE FIELDS THAT NEED THE WHOLE ROW.
+ *
+ *   f-liveUrl          a URL, and the primary paste target on the screen
+ *   f-srtReturnPort    a ~450-character hint naming four M2L-X outputs
+ *   f-pictureLatencyMs a ~430-character hint naming the 300ms floor M2L-X sets
+ *   f-slatePath        a filesystem path
+ *
+ * Selected by ID rather than by a class settings.js adds, because three tests
+ * in settings.test.js read that file by literal text and byte offset —
+ * js.indexOf("addField(\n    'srtReturnPort',") — so those calls must keep their
+ * exact text and their exact four-space indentation. settingslayout.test.js
+ * asserts every id named here is still created over there, which is what keeps
+ * this coupling from drifting in silence.
+ *
+ * The three Devices fields are NOT here: they get room from their group's
+ * 27rem track instead, so three of them share a row rather than taking three.
+ *
+ * :has() is already load-bearing in this stylesheet — the segmented controls
+ * depend on it — so this adds no new requirement of WebView2. */
+.field:has(> #f-liveUrl),
+.field:has(> #f-srtReturnPort),
+.field:has(> #f-pictureLatencyMs),
+.field:has(> #f-slatePath) {
+  grid-column: 1 / -1;
+}
+
 .field-hint {
   margin: 0;
   font-size: 0.8rem;
@@ -841,6 +947,29 @@ input[type='range'] {
   color: var(--green);
 }
 
+/* Prose gets a measure of its own. Two of these hints are ~450 characters and
+   both are load-bearing — settings.test.js calls one of them "THE MOST
+   IMPORTANT STRING ON THIS SCREEN" — so on a full-width field they must not run
+   to 200-character lines nobody reaches the end of. In a 350px track this never
+   binds and the hint wraps as it always did. */
+.settings-form .field-hint,
+.settings-form .field-error,
+.settings-form .field-note {
+  max-width: 68ch;
+}
+
+/* A full-row field is full-row for its HINT or for a long value, never so that
+   a five-digit port number can be typed into a 1460px box. */
+.settings-group input[type='number'] {
+  max-width: 12rem;
+}
+
+.settings-group input[type='text'],
+.settings-group input[type='password'],
+.settings-group select {
+  max-width: 44rem;
+}
+
 /* statusKey suggestions. Deliberately not styled as a call to action: each one
    is evidence the operator judges, and the app must not look confident about
    which node is theirs. */
@@ -849,6 +978,8 @@ input[type='range'] {
   flex-direction: column;
   gap: 0.5rem;
   margin: -0.2rem 0 0.3rem;
+  /* Evidence the operator reads and judges, not a control. */
+  max-width: 62rem;
 }
 
 .suggestion-list {
@@ -904,14 +1035,100 @@ input[type='range'] {
   margin-top: -0.3rem;
 }
 
+/* Four pixel counts, not four columns of the form. A max track keeps them the
+   size of the numbers they hold instead of stretching each to a quarter of
+   1460px. */
 .tile-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(80px, 1fr));
+  grid-template-columns: repeat(4, minmax(5rem, 9rem));
+  justify-content: start;
   gap: 0.75rem;
 }
 
+/* THE INSTANCE PICKER. A card, not a field group, because it does not describe
+   the form — it ACTS on it: applying a preset rewrites most of the fields
+   below. First on the screen, and the only bordered block on it.
+
+   Deliberately NOT sticky. A sticky header plus the sticky footer would spend a
+   third of the 620px minimum window (main.go:78) on furniture, and the form is
+   about two screenfuls now rather than four. */
+.settings-group--presets {
+  padding: 0.9rem 1.1rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.settings-form > .settings-group--presets h2 {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* Select and buttons on one line, buttons wrapping under it on a narrow
+   window. Same idiom as .controls / .control-group on the home screen. */
+.preset-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.6rem 1.25rem;
+}
+
+.preset-picker > .field {
+  flex: 1 1 22rem;
+  min-width: 0;
+}
+
+.preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+}
+
+/* Which Credential Manager scope this instance's passwords live under. */
+.preset-scope {
+  margin: 0;
+}
+
+/* THE ONE SENTENCE THIS CARD EXISTS TO MAKE UNMISSABLE: an instance carries the
+   M2L-X coordinates and nothing else. The commentary input and the headphones
+   are this PC's hardware and are never in a preset — a device id from another
+   machine is exactly the phantom-endpoint failure already under investigation.
+   Amber because it is a caution, not a fault. */
+.preset-note {
+  margin: 0;
+  color: var(--amber);
+}
+
+/* OPAQUE, never an rgba. mixer.css:407-421 records what happens otherwise:
+   "A sticky element with a translucent background is not a header, it is a
+   window" — the form scrolls visibly through it. */
+.settings-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 0.75rem;
+  margin-top: 0.6rem;
+  padding: 0.75rem 0 0.9rem;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+.settings-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
 .save-message {
-  margin: 0.25rem 0 0;
+  margin: 0;
+  flex: 1 1 22rem;
+  min-width: 0;
   padding: 0.6rem 0.9rem;
   border-radius: 8px;
   font-size: 0.9rem;
@@ -927,12 +1144,6 @@ input[type='range'] {
   background: var(--danger-bg);
   border: 1px solid var(--danger-border);
   color: #fecaca;
-}
-
-.settings-actions {
-  display: flex;
-  gap: 0.75rem;
-  margin-top: 0.5rem;
 }
 
 /* ------------------------------------------------------------------ */
@@ -964,7 +1175,7 @@ input[type='range'] {
   }
 
   .tile-grid {
-    grid-template-columns: repeat(2, minmax(80px, 1fr));
+    grid-template-columns: repeat(2, minmax(5rem, 9rem));
   }
 }
 
@@ -981,4 +1192,123 @@ input[type='range'] {
   .pgm-stage {
     margin: 0.4rem 0;
   }
+
+  /* Shrink the furniture first, same principle as the START button above: a
+     half-height window must not spend 70 of its 620 pixels on the action bar. */
+  .settings-footer {
+    padding: 0.4rem 0 0.5rem;
+  }
+}
+
+/* ==================================================================== */
+/* INPUT METERS (appended block — see the note below before moving it)  */
+/*                                                                      */
+/* The stereo input meters beside the picture: home.js builds them in   */
+/* .pgm-stage as a SIBLING of .pgm-tile, because the native SRT overlay */
+/* covers exactly the tile's rectangle and anything inside it is        */
+/* invisible under the native picture. Zone segment sizes (70/20/10 of  */
+/* the -60..0 dBFS scale) are set inline by home.js from ui/meters.js,  */
+/* which imports the mixer's own boundaries — the CSS here carries only */
+/* paint, never thresholds, so the two cannot disagree.                 */
+/*                                                                      */
+/* This block was added AT THE END of the file on purpose: another      */
+/* change was editing the middle of this stylesheet at the same time.   */
+/* It depends on nothing above except the :root colour variables.       */
+/* ==================================================================== */
+
+.input-meters {
+  /* Stretch to the stage's height rather than the tile's: the tile's height
+     is computed from its own aspect ratio and CSS cannot cheaply follow it,
+     and a meter slightly taller than the picture costs nothing while a
+     JS-driven height would be one more thing to keep in step on resize. */
+  align-self: stretch;
+  display: flex;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 2px 0;
+}
+
+.input-meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-height: 0;
+}
+
+/* column-reverse puts the FIRST segment (green, the bottom of the scale) at
+   the bottom of the bar, so home.js appends zones bottom-first with no
+   coordinate arithmetic. position:relative anchors the peak-hold marker. */
+.input-meter-bar {
+  position: relative;
+  display: flex;
+  flex-direction: column-reverse;
+  flex: 1 1 auto;
+  width: 10px;
+  min-height: 0;
+  background: #10151b; /* the mixer meter's trough colour, same instrument */
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+/* Fixed slices of the scale; only the fill inside each moves. The hairline
+   between segments makes the -18 and -6 boundaries readable as POSITIONS
+   even with the bar dark — same rule as mixer.css's .mx-meter-seg. */
+.input-meter-seg {
+  position: relative;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.input-meter-seg + .input-meter-seg {
+  box-shadow: inset 0 -1px 0 #0a0e12;
+}
+
+/* Fills rise from the bottom of their segment; height is set inline by
+   home.js from meters.js's zoneFills. */
+.input-meter-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0;
+}
+
+.input-meter-fill--green {
+  background: var(--green);
+}
+
+.input-meter-fill--amber {
+  background: var(--amber);
+}
+
+.input-meter-fill--red {
+  background: var(--red);
+}
+
+/* The peak-hold marker: a thin line at the held peak's position, riding the
+   whole bar rather than one segment. bottom is set inline by home.js. */
+.input-meter-peak {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  margin-bottom: -1px;
+  background: #e8edf2;
+  pointer-events: none;
+}
+
+.input-meter-label {
+  flex: 0 0 auto;
+  font-size: 0.65rem;
+  line-height: 1;
+  color: #6b7683;
+  user-select: none;
+}
+
+/* No session: empty and dimmed, no text clutter. The bars stay in the layout
+   so the picture does not move when a session starts — the same
+   nothing-moves-on-fallback rule the two pictures follow. */
+.input-meters-idle {
+  opacity: 0.35;
 }

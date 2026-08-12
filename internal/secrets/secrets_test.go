@@ -3,6 +3,7 @@ package secrets
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/danieljoos/wincred"
@@ -149,6 +150,149 @@ func TestTheTwoSRTPassphrasesAreSeparateCredentials(t *testing.T) {
 	if send == ret {
 		t.Fatalf("both SRT passphrases resolve to the Credential Manager target %q; "+
 			"setting one would overwrite the other", send)
+	}
+}
+
+// --- Scoped keys: the instance-preset extension. Pure logic, no vault. ---
+
+func TestTargetFor_ScopedKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"wembley/m2lx", "WSLComms/wembley/m2lx"},
+		{"wembley/srt", "WSLComms/wembley/srt"},
+		{"wembley/srtreturn", "WSLComms/wembley/srtreturn"},
+		{"twickenham-2/m2lx", "WSLComms/twickenham-2/m2lx"},
+	}
+	for _, tt := range tests {
+		got, err := targetFor(tt.key)
+		if err != nil {
+			t.Errorf("targetFor(%q) error = %v", tt.key, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("targetFor(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestTargetFor_EmptyScopeIsLegacy(t *testing.T) {
+	// The migration guarantee: ScopedKey with the empty scope returns the bare
+	// key, and the bare key resolves to the ORIGINAL target — so a machine that
+	// never applies a preset never notices any of this exists.
+	for _, tt := range []struct {
+		base string
+		want string
+	}{
+		{KeyM2LX, TargetM2LX},
+		{KeySRT, TargetSRT},
+		{KeySRTReturn, TargetSRTReturn},
+	} {
+		key, err := ScopedKey("", tt.base)
+		if err != nil {
+			t.Fatalf("ScopedKey(\"\", %q) error = %v", tt.base, err)
+		}
+		if key != tt.base {
+			t.Errorf("ScopedKey(\"\", %q) = %q, want the base unchanged", tt.base, key)
+		}
+		target, err := targetFor(key)
+		if err != nil {
+			t.Fatalf("targetFor(%q) error = %v", key, err)
+		}
+		if target != tt.want {
+			t.Errorf("the empty scope must resolve to the legacy target: got %q, want %q", target, tt.want)
+		}
+	}
+}
+
+func TestTargetFor_RejectsBadScope(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{"a scope containing a slash — the last-slash split leaves it invalid", "a/b/m2lx"},
+		{"an empty scope segment", "/m2lx"},
+		{"whitespace in the scope", "wem bley/m2lx"},
+		{"uppercase in the scope", "WEMBLEY/m2lx"},
+		{"a base that is not one of the three keys", "wembley/nonsense"},
+		{"an empty base", "wembley/"},
+		{"a scope longer than DeriveID can produce", strings.Repeat("a", 49) + "/m2lx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := targetFor(tt.key); err == nil {
+				t.Fatalf("targetFor(%q) = %q, want an error", tt.key, got)
+			} else if !errors.Is(err, ErrUnknownKey) {
+				t.Errorf("targetFor(%q) error = %v, want ErrUnknownKey", tt.key, err)
+			}
+		})
+	}
+}
+
+func TestScopedKey_RejectsWhatTargetForWould(t *testing.T) {
+	// ScopedKey is the constructor; it must refuse everything targetFor
+	// refuses, so a bad scope fails where it is BUILT rather than where it is
+	// first used — which may be the control-plane goroutine mid-match.
+	for _, tt := range []struct{ scope, base string }{
+		{"a/b", KeyM2LX},
+		{"WEMBLEY", KeyM2LX},
+		{"wem bley", KeyM2LX},
+		{strings.Repeat("a", 49), KeyM2LX},
+		{"wembley", "nonsense"},
+		{"wembley", ""},
+	} {
+		if got, err := ScopedKey(tt.scope, tt.base); err == nil {
+			t.Errorf("ScopedKey(%q, %q) = %q, want an error", tt.scope, tt.base, got)
+		}
+	}
+}
+
+// TestScopedTargetsDoNotCollide is the test that matters most here: two
+// presets — or a preset and a legacy entry — sharing one Credential Manager
+// target means entering one instance's password overwrites another's, which is
+// the same class of failure the third credential (KeySRTReturn) was created to
+// remove.
+func TestScopedTargetsDoNotCollide(t *testing.T) {
+	// The adversarial pair: a preset NAMED "srt" must not land its M2L-X
+	// password on the legacy send-passphrase target.
+	key, err := ScopedKey("srt", KeyM2LX)
+	if err != nil {
+		t.Fatalf("ScopedKey(\"srt\", KeyM2LX) error = %v", err)
+	}
+	target, err := targetFor(key)
+	if err != nil {
+		t.Fatalf("targetFor(%q) error = %v", key, err)
+	}
+	if target == TargetSRT {
+		t.Fatalf("scope %q + base %q produced the LEGACY target %q; entering that preset's "+
+			"password would overwrite the machine's send passphrase", "srt", KeyM2LX, TargetSRT)
+	}
+
+	// Exhaustively: every scoped and legacy target across two scopes and the
+	// three bases is distinct from every other.
+	seen := map[string]string{
+		TargetM2LX:      "legacy m2lx",
+		TargetSRT:       "legacy srt",
+		TargetSRTReturn: "legacy srtreturn",
+	}
+	for _, scope := range []string{"srt", "m2lx", "srtreturn", "wembley"} {
+		for _, base := range []string{KeyM2LX, KeySRT, KeySRTReturn} {
+			k, err := ScopedKey(scope, base)
+			if err != nil {
+				t.Fatalf("ScopedKey(%q, %q) error = %v", scope, base, err)
+			}
+			tgt, err := targetFor(k)
+			if err != nil {
+				t.Fatalf("targetFor(%q) error = %v", k, err)
+			}
+			who := scope + "/" + base
+			if prev, dup := seen[tgt]; dup {
+				t.Errorf("credential target %q is shared by %s and %s; one password would overwrite the other",
+					tgt, prev, who)
+			}
+			seen[tgt] = who
+		}
 	}
 }
 

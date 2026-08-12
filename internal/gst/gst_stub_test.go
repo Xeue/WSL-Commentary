@@ -9,10 +9,13 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"math"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestListInputDevicesReturnsFakes(t *testing.T) {
@@ -1059,5 +1062,305 @@ func TestInitPointsEveryPluginPathAtTheBundle(t *testing.T) {
 		if !strings.Contains(body, name) {
 			t.Errorf("doInit never sets %s; a machine-wide GStreamer install can outrank the bundle", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The input meters: the stub's synthetic levels, the shared pure helpers in
+// levels.go, and the source guards on the real build's level element.
+// ---------------------------------------------------------------------------
+
+// stubCaptureID is a capture-namespace endpoint id that passes the
+// render-endpoint refusal, for tests that are not about that refusal.
+const stubCaptureID = "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}"
+
+func TestStubEmitsLevelsWhileStarted(t *testing.T) {
+	frames := make(chan Levels, 128)
+	p := NewStubPipeline()
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		// Non-blocking capture, as the contract requires of the callback: the
+		// stub's ticker goroutine must never wait on this test.
+		OnLevels: func(l Levels) {
+			select {
+			case frames <- l:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop()
+
+	deadline := time.After(3 * time.Second)
+	var got []Levels
+	for len(got) < 4 {
+		select {
+		case l := <-frames:
+			got = append(got, l)
+		case <-deadline:
+			t.Fatalf("only %d level frames arrived in 3s at a 50ms interval; want at least 4", len(got))
+		}
+	}
+
+	for i, l := range got {
+		if len(l.PeakDB) != levelStubChannels || len(l.RMSDB) != levelStubChannels {
+			t.Fatalf("frame %d has %d peak / %d rms channels, want %d of each: the real "+
+				"pipeline pins channels=2 and the fakes must match it",
+				i, len(l.PeakDB), len(l.RMSDB), levelStubChannels)
+		}
+		for ch := range l.PeakDB {
+			peak, rms := l.PeakDB[ch], l.RMSDB[ch]
+			if peak < levelSilenceDB || peak > 0 {
+				t.Errorf("frame %d channel %d peak = %v dBFS, outside [%d, 0]", i, ch, peak, levelSilenceDB)
+			}
+			if rms < levelSilenceDB || rms > 0 {
+				t.Errorf("frame %d channel %d rms = %v dBFS, outside [%d, 0]", i, ch, rms, levelSilenceDB)
+			}
+			if rms > peak {
+				t.Errorf("frame %d channel %d rms %v is above its peak %v; no real signal does that",
+					i, ch, rms, peak)
+			}
+		}
+	}
+}
+
+func TestStubLevelsStopWhenThePipelineStops(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	p := NewStubPipeline()
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		OnLevels: func(Levels) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for count() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("OnLevels never fired while the pipeline was started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Stop JOINS the ticker goroutine, so the count is final the moment Stop
+	// returns — a callback delivered after this line is the join being lost.
+	after := count()
+	time.Sleep(150 * time.Millisecond) // three ticker intervals of silence
+	if got := count(); got != after {
+		t.Fatalf("OnLevels fired %d more time(s) after Stop returned; the ticker was "+
+			"signalled but not joined", got-after)
+	}
+}
+
+func TestStubStartWithNilOnLevelsIsSafe(t *testing.T) {
+	// nil OnLevels means no metering and no goroutine: the documented default.
+	// This is the "does not panic and does not wedge Stop" case.
+	p := NewStubPipeline()
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: stubCaptureID}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+}
+
+func TestClampLevelDB(t *testing.T) {
+	tests := []struct {
+		name string
+		in   float64
+		want float64
+	}{
+		{"negative infinity is the silence floor", math.Inf(-1), levelSilenceDB},
+		{"NaN is the silence floor", math.NaN(), levelSilenceDB},
+		{"below the floor clamps up", -144, levelSilenceDB},
+		{"the floor itself passes", levelSilenceDB, levelSilenceDB},
+		{"an ordinary level passes", -20.5, -20.5},
+		{"zero passes", 0, 0},
+		{"positive infinity clamps to full scale", math.Inf(1), 0},
+		{"above full scale passes as measured", 1.2, 1.2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampLevelDB(tt.in); got != tt.want {
+				t.Fatalf("clampLevelDB(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLevelListToDB(t *testing.T) {
+	if got := levelListToDB(nil); got != nil {
+		t.Fatalf("levelListToDB(nil) = %v, want nil", got)
+	}
+	if got := levelListToDB([]any{}); got != nil {
+		t.Fatalf("levelListToDB(empty) = %v, want nil", got)
+	}
+
+	got := levelListToDB([]any{-3.5, float32(-10), math.Inf(-1), "not a number"})
+	want := []float64{-3.5, -10, levelSilenceDB, levelSilenceDB}
+	if len(got) != len(want) {
+		t.Fatalf("levelListToDB kept %d entries, want %d: the channel count must survive "+
+			"bad elements or the left bar becomes the right bar", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestStubLevelWaveIsDeterministicAndInRange(t *testing.T) {
+	// The exact endpoints: the wave starts at the bottom of its range and
+	// reaches the top half a period later.
+	if got := stubLevelAt(0, 0); got != stubLevelLowDB {
+		t.Fatalf("stubLevelAt(0, 0) = %v, want %v", got, float64(stubLevelLowDB))
+	}
+	if got := stubLevelAt(stubLevelPeriod/2, 0); got != stubLevelHighDB {
+		t.Fatalf("stubLevelAt(period/2, 0) = %v, want %v", got, float64(stubLevelHighDB))
+	}
+	// The right channel is the left channel a quarter period later, which is
+	// what makes the two bars visibly independent at Gate A.
+	if l, r := stubLevelAt(stubLevelRightOffset, 0), stubLevelAt(0, 1); l != r {
+		t.Fatalf("channel offset broken: left at step %d = %v, right at step 0 = %v",
+			stubLevelRightOffset, l, r)
+	}
+	for step := 0; step < 3*stubLevelPeriod; step++ {
+		l := stubLevelsAt(step)
+		for ch := range l.PeakDB {
+			if l.PeakDB[ch] < stubLevelLowDB || l.PeakDB[ch] > stubLevelHighDB {
+				t.Fatalf("step %d channel %d peak %v escapes [%d, %d]",
+					step, ch, l.PeakDB[ch], stubLevelLowDB, stubLevelHighDB)
+			}
+			if want := l.PeakDB[ch] - stubLevelRMSBelowPeakDB; l.RMSDB[ch] != clampLevelDB(want) {
+				t.Fatalf("step %d channel %d rms = %v, want peak-%d = %v",
+					step, ch, l.RMSDB[ch], stubLevelRMSBelowPeakDB, want)
+			}
+		}
+	}
+}
+
+func TestSilentLevelsIsAllChannelsAtTheFloor(t *testing.T) {
+	l := silentLevels()
+	if len(l.PeakDB) != levelStubChannels || len(l.RMSDB) != levelStubChannels {
+		t.Fatalf("silentLevels has %d/%d channels, want %d", len(l.PeakDB), len(l.RMSDB), levelStubChannels)
+	}
+	for ch := range l.PeakDB {
+		if l.PeakDB[ch] != levelSilenceDB || l.RMSDB[ch] != levelSilenceDB {
+			t.Fatalf("channel %d = %v/%v, want %d/%d",
+				ch, l.PeakDB[ch], l.RMSDB[ch], levelSilenceDB, levelSilenceDB)
+		}
+	}
+}
+
+// TestPipelineDescriptionMetersWhatIsEncoded guards the level element's
+// PLACEMENT, which is the whole point of the input meters: after audioconvert,
+// audioresample and the S16LE/48k capsfilter, immediately before mfaacenc, so
+// what the meter shows is what is actually encoded and sent. A level element
+// moved upstream of the resample — or removed — would keep the meters moving
+// (or silent) in ways that no longer describe the on-air signal, and nothing
+// at Gate A would notice: the stub emits synthetic levels either way.
+func TestPipelineDescriptionMetersWhatIsEncoded(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "pipelineDescription")
+
+	level := strings.Index(body, "level name=alevel")
+	if level < 0 {
+		t.Fatal("the audio branch has no level element named alevel; the input meters have " +
+			"nothing to measure and the levels event will never fire on a real build")
+	}
+	resample := strings.Index(body, "audioconvert ! audioresample")
+	enc := strings.Index(body, "mfaacenc bitrate=")
+	if resample < 0 || enc < 0 {
+		t.Fatal("the audio branch has been restructured; re-derive this guard from the new shape")
+	}
+	if !(resample < level && level < enc) {
+		t.Error("the level element must sit AFTER audioresample and BEFORE mfaacenc: it exists " +
+			"to measure the exact signal that enters the encoder, not the endpoint's raw format")
+	}
+	if !strings.Contains(body, "interval=50000000") {
+		t.Error("the level interval is no longer 50 ms (50000000 ns); the app-side throttle and " +
+			"the UI's no-rAF rendering are both sized against 20 frames a second")
+	}
+}
+
+// TestBusHandlerForwardsLevelMessages guards the real build's receive half:
+// onBusMessage must handle GST_MESSAGE_ELEMENT, match the structure NAMED
+// "level" (through levelStructureName — the structure name is the documented
+// contract; the element name is not), and hand the reading to the OnLevels
+// callback through the atomic. It runs on a streaming thread, so the
+// level-reading helper is held to the same no-logging rule
+// TestBusHandlerDoesNotLogOnTheStreamingThread pins for the handler itself.
+func TestBusHandlerForwardsLevelMessages(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+
+	for _, want := range []string{
+		"gogst.MessageElement",
+		"levelStructureName",
+		"levelsFromStructure(",
+		"p.onLevels.Load()",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("onBusMessage no longer contains %q; the real build would post level "+
+				"messages that nothing reads and the meters would sit empty at Gate B only", want)
+		}
+	}
+
+	helper := funcBody(t, fset, file, "", "levelsFromStructure")
+	if strings.Contains(helper, "log.") {
+		t.Error("levelsFromStructure calls into the log package on a GStreamer streaming thread; " +
+			"see TestBusHandlerDoesNotLogOnTheStreamingThread for why that is forbidden")
+	}
+}
+
+// TestStartPublishesOnLevelsBeforeBuildingThePipeline guards an ordering that
+// is easy to lose in a refactor: the level element starts posting the moment
+// the pipeline reaches PLAYING, which happens inside Start while p.mu is held,
+// and onBusMessage reads p.onLevels without taking p.mu — so the callback must
+// be published (through the atomic) BEFORE gst_parse_launch ever runs, or the
+// first frames of every session race the store.
+func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+
+	store := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.onLevels.Store(")
+	})
+	parse := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "gogst.ParseLaunch(")
+	})
+	if store < 0 {
+		t.Fatal("Start never stores PipelineOpts.OnLevels; the real build would drop every level message")
+	}
+	if parse < 0 {
+		t.Fatal("Start no longer calls gogst.ParseLaunch; re-derive this guard from the new shape")
+	}
+	if store > parse {
+		t.Error("Start stores OnLevels after building the pipeline; level messages posted " +
+			"during startup race the store on a streaming thread")
 	}
 }

@@ -111,7 +111,7 @@ cd frontend
 node --test "src/monitor/*.test.js" "src/ui/*.test.js" "src/ui/mixer/*.test.js"
 ```
 
-**612 tests, all passing, 2026-08-07.** The three globs are the KVS monitor
+**693 tests, all passing, 2026-08-12.** The three globs are the KVS monitor
 (WP-5a), the shell (WP-5b) and the mixer drawer (WP-M4); running them
 separately is fine and is what the per-package sections below assume.
 
@@ -154,7 +154,7 @@ go test -race -tags 'dev gststub' ./... -count=5
 | `internal/kvs` | Working, and verified against the live endpoints. |
 | `internal/mixer` | Working. Read path parses a live `switcher_status` frame; write path is arm-gated. **Do not point its write path at the live instance.** |
 | `cmd/mockm2lx` | Working. REST, status WebSocket, a real SRT listener, and fault injection. |
-| Frontend | 612 tests. Also runs in a browser against an in-memory fake backend (§3.2). |
+| Frontend | 693 tests. Also runs in a browser against an in-memory fake backend (§3.2). |
 | `main.go`, `app.go`, `app_picture.go`, `app_return.go`, `app_mixer.go` | Working and covered, and exercised on air. |
 | `wslcomms.exe` | **Built**, in `build\bin\`, and in use by the operator. Do not launch it (§4). |
 

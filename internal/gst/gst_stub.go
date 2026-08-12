@@ -27,6 +27,21 @@
 // namespace ({0.0.1.00000000}.) and every defaultStubOutputDevices id (in
 // return_stub.go) is in the render namespace ({0.0.0.00000000}.), and
 // gst_stub_test.go asserts both against the classifier in device_id.go.
+//
+// # What this stub models about the input meters
+//
+// While started with PipelineOpts.OnLevels set, the stub emits SYNTHETIC
+// levels on a 50 ms ticker — the real level element's interval — as a
+// deterministic triangle wave, -40 up to -6 dBFS and back over six seconds,
+// with the right channel a quarter-period behind the left (levels.go,
+// stubLevelsAt). That is enough for the whole UI path — event pump, throttle,
+// meters — to be developed and watched moving at Gate A. What it does NOT
+// model: any relationship to real audio (there is none to measure), the bus
+// threading of the real build (the ticker is an ordinary goroutine, where the
+// real callback arrives on a GStreamer streaming thread), message loss under
+// load, or per-channel differences beyond the fixed phase offset. The ticker
+// stops at Stop, before the error channel closes, and a nil OnLevels starts no
+// goroutine at all.
 
 package gst
 
@@ -34,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // errStubStopped is returned by methods called on a stopped pipeline.
@@ -193,6 +209,16 @@ type StubPipeline struct {
 	// checks fatalError() before anything else that can fail.
 	fatal error
 
+	// levelStop ends the synthetic-levels ticker goroutine, and levelDone is
+	// closed by that goroutine as it exits so Stop can JOIN it rather than
+	// merely signal it. The join matters: without it a Stop-then-assert test
+	// could observe one more OnLevels callback delivered after Stop returned,
+	// which the real build cannot do either — busSilenced is checked on the
+	// posting thread before the callback runs. Both are nil when Start was
+	// given no OnLevels.
+	levelStop chan struct{}
+	levelDone chan struct{}
+
 	counters StubCounters
 }
 
@@ -263,6 +289,39 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 
 	p.opts = opts
 	p.state = StubStateRunning
+
+	// The synthetic input meters. Only when the caller asked for metering:
+	// nil OnLevels means no goroutine, exactly as the real build installs no
+	// callback. The goroutine owns nothing but its own step counter and the
+	// two channels, so it never takes p.mu — which is what lets Stop join it
+	// without holding the lock, and what makes a callback that (wrongly)
+	// blocks unable to deadlock anything except the Stop that must wait for
+	// it, mirroring the real contract's "MUST NOT BLOCK".
+	if opts.OnLevels != nil {
+		cb := opts.OnLevels
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		p.levelStop = stop
+		p.levelDone = done
+		go func() {
+			defer close(done)
+			// The real level element's interval: 50 ms, twenty frames a
+			// second, so the app-side throttle and the UI see Gate A traffic
+			// with the same shape Gate B will produce.
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			step := 0
+			for {
+				select {
+				case <-stop:
+					return
+				case <-ticker.C:
+					cb(stubLevelsAt(step))
+					step++
+				}
+			}
+		}()
+	}
 	return nil
 }
 
@@ -354,7 +413,24 @@ func (p *StubPipeline) Errors() <-chan error {
 
 // Stop moves the pipeline to StubStateStopped and closes the error channel. It
 // is idempotent.
+//
+// The levels ticker is stopped AND JOINED first, outside the lock. The join is
+// what guarantees no OnLevels callback is delivered after Stop returns — a
+// promise the real build keeps through busSilenced — and it happens without
+// p.mu held because the ticker goroutine calls application code (the callback)
+// and nothing that calls application code may run under a lock the application
+// can reach. Concurrent Stops are safe: the first takes the channels, the rest
+// find nil.
 func (p *StubPipeline) Stop() error {
+	p.mu.Lock()
+	stop, done := p.levelStop, p.levelDone
+	p.levelStop, p.levelDone = nil, nil
+	p.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

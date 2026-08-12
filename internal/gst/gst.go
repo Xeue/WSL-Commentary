@@ -35,7 +35,8 @@
 //	    low-latency=true cabac=true
 //	  ! h264parse config-interval=-1 ! queue ! mux.
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true
-//	  ! audioconvert ! audioresample ! mfaacenc bitrate=128000
+//	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
+//	  ! mfaacenc bitrate=128000
 //	  ! aacparse ! queue ! mux.
 //
 // srtsink's own auto-reconnect is set to false and must stay false: on a write
@@ -117,6 +118,43 @@ type PipelineOpts struct {
 	// AudioBitrateBps is mfaacenc's bitrate in bits per second. Zero means
 	// DefaultAudioBitrateBps.
 	AudioBitrateBps int
+
+	// OnLevels, if set, is called with the audio level of the commentary being
+	// sent — peak and RMS per channel, in dBFS — roughly twenty times a second
+	// (the level element's 50 ms interval). It is what feeds the input meters
+	// beside the big picture, and it measures the signal at the one point that
+	// answers the operator's actual question: after audioconvert and
+	// audioresample, immediately upstream of the AAC encoder, so what the meter
+	// shows is what is ACTUALLY being encoded and sent. A meter fed from the
+	// browser's idea of the microphone would keep moving while the wrong device
+	// was selected, which is a reassurance nobody should be given.
+	//
+	// It is called ON THE BUS/STREAMING GOROUTINE and MUST NOT BLOCK: in the
+	// real build the caller is a GStreamer streaming thread inside
+	// gst_element_post_message, and a callback that waits there stalls the
+	// capture chain the way the file comment in gst_cgo.go forbids at length.
+	// Hand the value to a queue or an atomic and return.
+	//
+	// Values are clamped to the -100 dBFS floor before delivery — the level
+	// element reports -inf for digital silence, and -inf neither survives JSON
+	// nor draws on a meter. Nil means no metering; nothing else changes.
+	OnLevels func(Levels)
+}
+
+// Levels is one audio level report from the send pipeline: what the level
+// element measured over its last 50 ms window, immediately upstream of the AAC
+// encoder.
+//
+// PeakDB and RMSDB carry one entry per channel — [left, right] for the
+// specification's stereo pipeline — in dBFS, 0 being digital full scale.
+// Silence is -100, never -inf: the producer clamps (see clampLevelDB), because
+// -inf does not survive JSON and a meter has a floor anyway.
+type Levels struct {
+	// PeakDB is the per-channel peak over the measurement window, dBFS.
+	PeakDB []float64
+	// RMSDB is the per-channel RMS over the same window, dBFS. Always at or
+	// below the peak for any real signal.
+	RMSDB []float64
 }
 
 // SinkOpts configures the srtsink alone. It is separate from PipelineOpts
