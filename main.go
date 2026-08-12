@@ -42,11 +42,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 
+	"wslcomms/internal/applog"
 	"wslcomms/internal/gst"
 )
 
@@ -103,6 +105,33 @@ const (
 )
 
 func main() {
+	// The log file comes first — before anything can log. A release build is
+	// -H windowsgui: it has no console, so without this every log.Printf in the
+	// application is composed and then discarded. That is not hypothetical; an
+	// SRT return failure on a remote machine was undiagnosable for exactly this
+	// reason, with the diagnosis being written to a stderr that did not exist.
+	//
+	// A failure to open the file is logged (to stderr, which is all there is at
+	// that point) and otherwise ignored: no machine loses the application over
+	// a log file.
+	stamp := time.Now().UTC().Format("20060102-150405")
+	if logDir, err := applog.DefaultDir(); err != nil {
+		log.Printf("wslcomms: no log directory available (%v); logging to stderr only", err)
+	} else if sink, err := applog.Open(logDir, stamp); err != nil {
+		log.Printf("wslcomms: could not open a log file (%v); logging to stderr only", err)
+	} else {
+		defer sink.Close()
+
+		// GStreamer's own debug goes to a sibling file. Set-if-unset, and it
+		// must happen here — before gst.Init below — because gst_init reads
+		// these variables exactly once. srt* at INFO is what turns "the return
+		// isn't working" into a file that says why.
+		applog.SetGStreamerDebugDefaults(applog.GStreamerLogPath(logDir, stamp))
+
+		exe, _ := os.Executable()
+		log.Printf("wslcomms: started; exe=%q pid=%d; logging to %q", exe, os.Getpid(), sink.Path)
+	}
+
 	setWebView2Arguments()
 
 	dir, err := appDir()
