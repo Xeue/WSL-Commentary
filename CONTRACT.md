@@ -72,6 +72,7 @@ these are the ones that change what a package may assume:
 | `assets/slate.png` | **WP-0** | 1920x1080 slate fed to `filesrc ! pngdec ! imagefreeze` |
 | `CONTRACT.md` | **WP-0** | this file |
 | `main.go`, `main_nocgo.go`, `app.go`, `exit_windows.go` | **WP-8** | Wails bindings, wire-up, events, lifecycle, the hard-exit path |
+| `app_remote.go` (and `app_remote_test.go`) | **WP-8 — added 2026-08-12** | the App-side of the LAN bridge: the hand-written allowlist that implements `remote.Dispatcher` (method → capability → host-only), the audit log, mixer arm-ownership routing, the five host-only remote-admin bound methods, and the listener's startup/teardown wiring. The transport it drives is `internal/remote` (WP-REMOTE). |
 | `app_picture.go` | **WP-P** | the SRT picture's bound surface, the native overlay, the `picture` event |
 | `app_return.go` | **WP-R** | the SRT audio return's bound surface and the `return` event |
 | `app_mixer.go` | **WP-8** | the mixer drawer's bound surface: snapshot, arm/disarm, send, golden |
@@ -85,6 +86,7 @@ these are the ones that change what a package may assume:
 | `internal/sender/` | **WP-3b** | spec §6 in full: timestamp pinning, reconnect state machine, backoff ladder |
 | `internal/kvs/` | **WP-4** | M2L-X → Cognito credential chain |
 | `internal/mixer/` | **WP-M0…M3** | bus model, `switcher_status` parse, golden/compare, `switcher_controller` client |
+| `internal/remote/` (incl. `shim.js`) | **WP-REMOTE — added 2026-08-12** | the App-agnostic authenticated LAN control bridge: TLS transport, PBKDF2 auth, session fan-out, the `//go:embed` frontend shim. Pairs with `app_remote.go` (root, WP-8), which implements `remote.Dispatcher`. |
 | `frontend/src/monitor/` | **WP-5a** | KVS viewer, 8 transceivers, mosaic crop, bus + channel selection, Web Audio return, `setSinkId` |
 | `frontend/src/ui/`, `frontend/src/styles/`, `frontend/index.html`, `frontend/src/main.js` | **WP-5b** | controls, lamps, Settings view, picture source |
 | `frontend/src/ui/mixer/` | **WP-M4** | the drawer: `contract.js`, `model.js`, `drawer.js`, the demo harness |
@@ -356,41 +358,130 @@ anything under `internal/`; the production path is GStreamer's `srtsink` over li
 Most of WP-7's value is fault injection: drop the session, hold the listener socket open after a
 disconnect, stall the status WebSocket, empty the audio array, and lie about `stream_state`.
 
+### `internal/remote` — WP-REMOTE (added 2026-08-12, rule 3)
+
+The authenticated LAN control bridge. **App-agnostic on purpose:** it imports nothing from the root
+package or `internal/gst`, so the whole package builds and unit-tests at Gate A with
+`CGO_ENABLED=0` against a fake dispatcher. The one seam is:
+
+```
+type Dispatcher interface {
+    Call(ctx, ClientInfo, method string, args []json.RawMessage) (any, error)
+    Methods(ClientInfo) []string
+}
+```
+
+`app_remote.go` (root, WP-8) implements it as a **hand-written allowlist switch** — never a
+reflective loop, so a method newly bound to `*App` does NOT become remotely callable by default.
+`ClientInfo{ID, Name, Caps, RemoteAddr}` is the only thing about a caller the dispatcher sees.
+
+Public surface consumed by the root package: `Server`/`NewServer(Options)`,
+`(*Server).Start() (addr, error)` / `.Broadcast(name, data)` / `.Clients()` / `.Close(ctx)` /
+`.Fingerprint()`; `Options{Enabled, Bind, Port, Dispatcher, Auth, Assets fs.FS, CertDir, Events,
+Logf}`; `NewAuthenticator([]Client)`; `Settings` + `LoadSettings`/`DefaultSettings`/`SettingsPath`/
+`RemoteDir` and its `Save`/`Validate`/`Add`/`SetPassword`/`SetCaps`/`DeleteClient` methods;
+`Capability` (`CapView`/`CapOperate`/`CapMixer`) with `Allows(granted, required)` implementing tier
+inclusion (mixer⊇operate⊇view); `EnsureCertificate(dir, bindIP) (cert, fp, err)`.
+
+Contract points that are load-bearing rather than detail:
+
+- **Off and loopback by default.** `DefaultSettings()` is `enabled:false, bind:"127.0.0.1",
+  port:8443`; a missing `remote.json` yields exactly that, so doing nothing is the safe posture.
+  `Start()` binds nothing when disabled; `Settings.Validate` **refuses a non-loopback bind with no
+  clients** and refuses a bind that is not a literal IP.
+- **TLS is mandatory, not optional.** Over plain HTTP a LAN page is not a secure context
+  (`navigator.mediaDevices`/`setSinkId` vanish) and `GetKVSCredentials` would cross the LAN in clear.
+  A self-signed ECDSA P-256 cert is generated into `%APPDATA%\WSLComms\remote\`, SANs cover the bind
+  IP + loopback + `localhost` + hostname, and its SHA-256 fingerprint is `(*Server).Fingerprint()`.
+- **`remote.json` is deliberately NOT in `config.json`.** `settings.js collectConfig()` rewrites the
+  whole config document from a page cache and drops any field it does not restate; a listener bind
+  address must not be reachable by that mechanism. Passwords are PBKDF2-HMAC-SHA256 (stdlib
+  `crypto/pbkdf2`, confirmed present under `go 1.25.0`) + `crypto/rand` salt, never readable back.
+- **Auth closes the exact hole Wails' devserver leaves open.** The upgrade requires an
+  `HttpOnly/Secure/SameSite=Strict` session cookie AND a **strict same-origin** check (Origin
+  host:port must equal Host; a missing Origin is refused). Per-source-IP lockout, constant-time
+  compare, and a fixed minimum login delay. Sessions are in-memory and all revoked on `Close`.
+- **The hello frame's `methods` list is authoritative** — the shim installs exactly those functions
+  on `window.go.main.App`, so **host-only methods degrade by OMISSION**, not by a refusal the
+  frontend must be taught. `SetPictureRect`/`SetPictureVisible`/`StartPicture`/`StopPicture`/
+  `StartReturn`/`StopReturn` are host-only: absent from `Methods()` and refused by `Call` at every
+  capability (enforced in `app_remote.go`; the package's fake dispatcher mirrors it).
+- **The fan-out never blocks a producer.** Each session has a bounded, drop-oldest event queue with
+  a per-connection monotonic `seq` (mirroring `app.go`'s `eventPump`); results ride a separate queue
+  that cannot overflow under the in-flight cap. A client that will not drain is dropped by the write
+  deadline, never allowed to stall `Broadcast`. Disconnect cancels every in-flight call's context.
+- **The shim (`shim.js`, `//go:embed`) is the entire frontend side and needs zero `backend.js`
+  changes.** It is a classic script injected before the deferred module bundle, installs
+  `window.go`/`window.runtime` (queuing calls until the socket opens), prunes to `methods` on hello,
+  and sets `window.__wslcommsRemote = {client, caps}`. It is DOM-optional so a headless test can
+  drive its transport; the shim's node test is left to WP-5b's `remotewiring.test.js`.
+- **`Start()` must complete-before `Fingerprint()`/`Close()` (usage contract, noted 2026-08-12 by
+  WP-8).** `Server.Start` writes `fp`/`httpSrv`/`ln`/`addr` without a lock, on the assumption the
+  caller does not read them concurrently. Because the design starts the listener on a goroutine (so
+  startup never blocks on the ECDSA keygen), `app.go` establishes that ordering by publishing the
+  `*Server` pointer to its atomic field ONLY AFTER `Start` returns: a reader that Loads a non-nil
+  pointer has a happens-before edge to `Start`'s writes, and a reader that Loads nil correctly sees
+  "not running yet". A future direct, concurrent caller of `Start`+`Fingerprint` would need the same
+  discipline or an internal lock in the Server.
+
 ---
 
 ## The Wails surface — the frontend's entire view of Go
 
 **Wails binds every exported method of `*App`, so this list IS the contract.** Declared across
-`app.go`, `app_picture.go`, `app_return.go` and `app_mixer.go`.
+`app.go`, `app_picture.go`, `app_return.go`, `app_mixer.go` and `app_remote.go`.
 
-| Bound method | Returns | Caller |
-|---|---|---|
-| `ListInputDevices()` | `[]gst.Device` | WP-5b |
-| `ListOutputDevices()` | `[]gst.Device` | WP-5b |
-| `GetConfig()` | `*config.Config` | WP-5b |
-| `SaveConfig(c)` | `error` | WP-5b |
-| `SetSecret(key, value)` | `error` | WP-5b |
-| `Start()` / `Stop()` | `error` | WP-5b |
-| `GetKVSCredentials()` | `kvs.Credentials` | WP-5a |
-| `GetStatusKeyCandidates()` | `[]m2lx.StatusKeyCandidate` | WP-5b |
-| `StartPicture()` / `StopPicture()` | `error` | WP-5b |
-| `GetPictureState()` | `gst.PictureState` | WP-5b |
-| `SetPictureRect(x,y,w,h,ratio)` | `error` | WP-5b |
-| `SetPictureVisible(visible)` | `error` | WP-5b |
-| `IsSRTReturnSelected()` | `bool` | WP-5b |
-| `StartReturn()` / `StopReturn()` | `error` | WP-5b |
-| `GetReturnState()` | `gst.ReturnState` | WP-5b |
-| `GetMixerSnapshot()` | `mixer.Snapshot` | WP-M4 |
-| `ArmMixer()` / `DisarmMixer()` | `MixerArmState` / `error` | WP-M4 |
-| `SendMixerCommands(cmds)` | `error` | WP-M4 |
-| `GetMixerGolden()` / `SetMixerGolden(s)` | `*mixer.Snapshot` / `error` | WP-M4 |
-| `ListPresets()` | `[]presets.Summary` | WP-5b |
-| `SavePreset(name)` | `presets.Summary` | WP-5b |
-| `ApplyPreset(id)` | `*config.Config` | WP-5b |
-| `RenamePreset(id, name)` | `error` | WP-5b |
-| `DeletePreset(id, alsoDeleteCredentials)` | `error` | WP-5b |
-| `GetActivePreset()` | `presets.ActiveRecord` | WP-5b |
-| `GetPresetCredentialStatus()` | `PresetCredentialStatus` | WP-5b |
+The **Remote** column is added 2026-08-12: the LAN bridge exposes a HAND-WRITTEN allowlist
+(`remoteAllowlist` in `app_remote.go`), never a reflective dispatch, so a method's remote
+reachability is a decision recorded here and drift-guarded by `TestRemoteAllowlistCoversEveryBoundMethod`
+(every exported `*App` method must be classified). The column reads *capability* / `host-only`:
+**view** ⊂ **operate** ⊂ **mixer**; a **host-only** method is refused for every remote client at
+every capability AND omitted from the hello frame, so it degrades by omission on the remote page.
+
+| Bound method | Returns | Caller | Remote |
+|---|---|---|---|
+| `ListInputDevices()` | `[]gst.Device` | WP-5b | view |
+| `ListOutputDevices()` | `[]gst.Device` | WP-5b | view |
+| `GetConfig()` | `*config.Config` | WP-5b | view |
+| `SaveConfig(c)` | `error` | WP-5b | operate |
+| `SetSecret(key, value)` | `error` | WP-5b | operate |
+| `Start()` / `Stop()` | `error` | WP-5b | operate |
+| `GetKVSCredentials()` | `kvs.Credentials` | WP-5a | view |
+| `GetStatusKeyCandidates()` | `[]m2lx.StatusKeyCandidate` | WP-5b | view |
+| `StartPicture()` / `StopPicture()` | `error` | WP-5b | **host-only** |
+| `GetPictureState()` | `gst.PictureState` | WP-5b | view |
+| `SetPictureRect(x,y,w,h,ratio)` | `error` | WP-5b | **host-only** |
+| `SetPictureVisible(visible)` | `error` | WP-5b | **host-only** |
+| `IsSRTReturnSelected()` | `bool` | WP-5b | view |
+| `StartReturn()` / `StopReturn()` | `error` | WP-5b | **host-only** |
+| `GetReturnState()` | `gst.ReturnState` | WP-5b | view |
+| `GetMixerSnapshot()` | `mixer.Snapshot` | WP-M4 | view |
+| `ArmMixer()` | `MixerArmState` | WP-M4 | operate |
+| `DisarmMixer()` | `error` | WP-M4 | view |
+| `SendMixerCommands(cmds)` | `error` | WP-M4 | mixer + arm-owner |
+| `GetMixerGolden()` | `*mixer.Snapshot` | WP-M4 | view |
+| `SetMixerGolden(s)` | `error` | WP-M4 | mixer |
+| `ListPresets()` | `[]presets.Summary` | WP-5b | view |
+| `SavePreset(name)` | `presets.Summary` | WP-5b | operate |
+| `ApplyPreset(id)` | `*config.Config` | WP-5b | operate |
+| `RenamePreset(id, name)` | `error` | WP-5b | operate |
+| `DeletePreset(id, alsoDeleteCredentials)` | `error` | WP-5b | operate |
+| `GetActivePreset()` | `presets.ActiveRecord` | WP-5b | view |
+| `GetPresetCredentialStatus()` | `PresetCredentialStatus` | WP-5b | view |
+| `GetRemoteState()` | `RemoteState` | WP-5b | **host-only** |
+| `SetRemoteListener(enabled, bind, port)` | `error` | WP-5b | **host-only** |
+| `AddRemoteClient(name, caps)` | `error` | WP-5b | **host-only** |
+| `SetRemoteClientPassword(name, password)` | `error` | WP-5b | **host-only** |
+| `DeleteRemoteClient(name)` | `error` | WP-5b | **host-only** |
+
+The five remote-access methods live in `app_remote.go` and are ALL host-only: they change WHO may
+connect and on WHAT address, so a remote client must never reach them — the remote dispatcher
+refuses every one at every capability. They are on the bound surface solely so the LOCAL Settings
+screen can configure the listener. `GetRemoteState` reports a *has-password* boolean per client,
+never a hash — the second and last recorded narrowing of "no secret crosses this boundary
+outbound", after `GetPresetCredentialStatus`. `SendMixerCommands` additionally requires the caller
+to be the seat that armed (`mixArmedBy`); a write from any other seat is refused with
+`mixer.ErrDisarmed`, so one operator's arm cannot authorise another's write to the live desk.
 
 The seven preset methods live in `app_presets.go`. `ApplyPreset` **returns the merged config and
 the page assigns it over its whole cache** — that return type is a correctness contract (the next
@@ -404,7 +495,16 @@ Events emitted Go → JS: **`status`** (an `m2lx.Status`), **`sender`** (a `send
 **`return`** (a `gst.ReturnState`), **`picture`** (a `gst.PictureState`),
 **`statusKeyCandidates`** (a `[]m2lx.StatusKeyCandidate`), **`error`** (a string),
 **`levels`** (the input meters: `{peak, rms []float64}` in dBFS, ≤20/s while a
-session runs, one all-`-100` zero-frame on stop).
+session runs, one all-`-100` zero-frame on stop), and — added 2026-08-12 with the LAN bridge —
+**`config`** (`{config: *config.Config, origin: string}`, emitted from `SaveConfig` after the write
+so a SECOND controller can refresh; `origin` is the id of the seat that saved, so a page ignores the
+echo of its own save) and **`remote`** (`[]{name, addr}`, the currently-connected remote seats, for
+the home-screen indicator that lets the operator at the desk see that someone else has a seat).
+
+**Every event ALSO reaches the LAN bridge.** `app.go`'s event pump tees each event to
+`remote.Server.Broadcast` at the single `wailsruntime.EventsEmit` tap point, so a remote seat sees
+exactly the stream the local page sees. The bridge is App-agnostic; it learns the event names from
+`Options.Events` (`remoteEventNames()`), not from any hard-coded list.
 
 **There is no `mixer` event, and that is deliberate.** It is not known whether a routing or mute
 change is pushed as a whole-node state at `"/"` or as a subtree delta, so a pushed "latest known"
@@ -417,6 +517,21 @@ delta-fed subscription can replace the polling.
 Headphone enumeration and selection for the **WebRTC** return are JavaScript-side only
 (`enumerateDevices` + `setSinkId`). `ListOutputDevices` is the **WASAPI** list, for the SRT return
 only. The two identifier spaces are not interchangeable — see `internal/config`.
+
+**`backend.js`'s JS-side mirror of the LAN bridge (added 2026-08-12, WP-5b).** The remote transport
+stays entirely behind the shim — `backend.js` contains no `fetch(` and no `WebSocket`
+(`remotewiring.test.js` guards both) — but it gained the ordinary Go-facing wrappers the shell needs:
+the event names `EVENT_CONFIG`/`EVENT_REMOTE` with `onConfig`/`onRemote` subscribers (mirroring
+`onStatus`/`onLevels`); `isRemoteClient()`, which reads the `window.__wslcommsRemote` the shim
+publishes; and the five host-only remote-admin wrappers `getRemoteState`/`setRemoteListener`/
+`addRemoteClient`/`setRemoteClientPassword`/`deleteRemoteClient`, each with an in-memory fake for
+`npm run dev` and an availability probe `remoteAvailable()` (all-or-nothing, like
+`presetsAvailable`/`pictureAvailable`). The Settings "Remote access" group drives those five and is
+hidden when `isRemoteClient()`; `app.js` subscribes to `onConfig` (ignoring the echo of its own save
+by comparing `origin` against `local-webview2`/`window.__wslcommsRemote.client`), wires `onRemote` to
+a home-screen seat indicator, and gates the destructive `beforeunload` `stopReturn()`/`stopPicture()`
+on `!isRemoteClient()`. The `local-webview2` id is a string contract mirrored from `app_remote.go`'s
+`localClientID`.
 
 ---
 

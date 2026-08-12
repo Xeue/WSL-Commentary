@@ -332,7 +332,20 @@ func checkMixerNodeIsWhole(raw []byte) error {
 // forgets to do, so an operator who arms and walks away ends with a shut gate.
 //
 // Arming again extends the window rather than stacking one.
+//
+// The bound ArmMixer arms as the LOCAL WebView2 seat; a remote seat arms as its
+// own connection id through armMixerFrom (app_remote.go). Whichever seat armed
+// is the only one SendMixerCommands will accept a write from — see mixArmedBy
+// and sendMixerCommandsFrom — so two controllers cannot cross-authorise a write
+// to the live clean feed.
 func (a *App) ArmMixer() (MixerArmState, error) {
+	return a.armMixerFrom(localClientID)
+}
+
+// armMixerFrom is ArmMixer's body, recording WHICH seat armed so the write gate
+// can enforce arm-ownership. clientID is localClientID for the local window and
+// the connecting seat's id for a remote one.
+func (a *App) armMixerFrom(clientID string) (MixerArmState, error) {
 	if a.closing.Load() {
 		return MixerArmState{}, errShuttingDown
 	}
@@ -366,6 +379,13 @@ func (a *App) ArmMixer() (MixerArmState, error) {
 		a.mixCtl = ctl
 	}
 
+	// Record the arming seat under the same lock as the controller it authorises.
+	// A second arm from a DIFFERENT seat takes ownership — the window is shared
+	// (one controller, one desk), so the last arm wins and the drift is bounded by
+	// mixer.ArmWindow; the point of ownership is that a write needs the seat that
+	// armed most recently, not that arming is exclusive.
+	a.mixArmedBy = clientID
+
 	until := a.mixCtl.Arm(mixer.ArmWindow)
 	return MixerArmState{
 		Armed:         true,
@@ -396,6 +416,11 @@ func (a *App) closeMixerController() error {
 	a.mixMu.Lock()
 	ctl := a.mixCtl
 	a.mixCtl = nil
+	// Clear the arming seat along with the controller: once the socket is gone
+	// there is nothing to own, and the next arm re-establishes ownership from
+	// scratch. Leaving a stale owner would let a disarmed-then-rearmed window be
+	// judged against a seat that no longer holds it.
+	a.mixArmedBy = ""
 	a.mixMu.Unlock()
 
 	if ctl == nil {
@@ -479,6 +504,22 @@ func mixerHost(raw string) (string, error) {
 // deliberate write from the drawer's Apply path, so an empty one is a bug in
 // the caller and should say so rather than resolve as though it had written.
 func (a *App) SendMixerCommands(cmds []MixerCommand) error {
+	return a.sendMixerCommandsFrom(localClientID, cmds)
+}
+
+// sendMixerCommandsFrom is SendMixerCommands' body, carrying the id of the
+// calling seat so arm-OWNERSHIP can be enforced: the write is refused unless the
+// caller is the seat that armed. The bound SendMixerCommands passes
+// localClientID; a remote seat's id is passed by the dispatcher (app_remote.go).
+//
+// EVERY refusal carries mixer.ErrDisarmed — not armed, disarmed since, window
+// expired, or armed by ANOTHER seat all read as the same sentinel — so a caller
+// deciding whether a write landed has one condition to test, and a foreign-seat
+// refusal cannot be mistaken for success. That the refusal is ErrDisarmed and
+// not a new sentinel is deliberate: the whole write gate is "is there an open
+// window I own", and a seat that does not own the window is, for its purposes,
+// disarmed.
+func (a *App) sendMixerCommandsFrom(clientID string, cmds []MixerCommand) error {
 	if len(cmds) == 0 {
 		return errors.New("wslcomms: SendMixerCommands: no commands supplied")
 	}
@@ -490,6 +531,7 @@ func (a *App) SendMixerCommands(cmds []MixerCommand) error {
 
 	a.mixMu.Lock()
 	ctl := a.mixCtl
+	owner := a.mixArmedBy
 	a.mixMu.Unlock()
 
 	if ctl == nil {
@@ -497,6 +539,15 @@ func (a *App) SendMixerCommands(cmds []MixerCommand) error {
 		// as a distinct "no controller" error so that every refusal of a write
 		// carries the same sentinel, whichever of the two gates shut first.
 		return fmt.Errorf("%w: press Arm in the mixer drawer before making changes", mixer.ErrDisarmed)
+	}
+	if owner != clientID {
+		// Armed by a DIFFERENT seat. This is the arm-ownership gate: with two
+		// controllers, one operator's arm must not authorise the other's write to
+		// the live clean feed. Same sentinel, so a write refused for lack of
+		// ownership is indistinguishable from a write refused for lack of an arm —
+		// both mean "you do not currently hold the gate".
+		return fmt.Errorf("%w: the mixer was armed by another seat; press Arm here before making changes",
+			mixer.ErrDisarmed)
 	}
 
 	ctx, cancel := context.WithTimeout(a.rootCtx, mixerSendTimeout)

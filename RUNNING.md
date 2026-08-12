@@ -111,9 +111,12 @@ cd frontend
 node --test "src/monitor/*.test.js" "src/ui/*.test.js" "src/ui/mixer/*.test.js"
 ```
 
-**693 tests, all passing, 2026-08-12.** The three globs are the KVS monitor
+**700 tests, all passing, 2026-08-12.** The three globs are the KVS monitor
 (WP-5a), the shell (WP-5b) and the mixer drawer (WP-M4); running them
-separately is fine and is what the per-package sections below assume.
+separately is fine and is what the per-package sections below assume. The last
+six are `src/ui/remotewiring.test.js`, which drives `internal/remote/shim.js`
+against a fake WebSocket (§10) and is why the `src/ui` glob now reaches a file
+outside `frontend/`.
 
 `src/ui/` covers the pure modules the shell cannot get subtly wrong without
 somebody noticing on air: `tile.js`, which rescales `config.monitorTile` from
@@ -154,7 +157,7 @@ go test -race -tags 'dev gststub' ./... -count=5
 | `internal/kvs` | Working, and verified against the live endpoints. |
 | `internal/mixer` | Working. Read path parses a live `switcher_status` frame; write path is arm-gated. **Do not point its write path at the live instance.** |
 | `cmd/mockm2lx` | Working. REST, status WebSocket, a real SRT listener, and fault injection. |
-| Frontend | 693 tests. Also runs in a browser against an in-memory fake backend (§3.2). |
+| Frontend | 700 tests. Also runs in a browser against an in-memory fake backend (§3.2). |
 | `main.go`, `app.go`, `app_picture.go`, `app_return.go`, `app_mixer.go` | Working and covered, and exercised on air. |
 | `wslcomms.exe` | **Built**, in `build\bin\`, and in use by the operator. Do not launch it (§4). |
 
@@ -222,7 +225,13 @@ npm ci
 npm run build      # writes frontend/dist, which main.go go:embeds
 ```
 
-`frontend/dist` is committed, so you only need this if you change the frontend.
+`frontend/dist` is **gitignored** (`.gitignore` excludes `frontend/dist/`, and
+`git ls-files frontend` returns nothing under `dist/`), so a fresh checkout has
+no bundle at all — you must run this once before `wails build`, and again
+whenever you change the frontend. An earlier revision of this note claimed the
+directory was committed; it never was. The same `frontend/dist` is what the LAN
+remote bridge serves (§10), so the remote page is byte-identical to the local
+one only after a rebuild.
 
 The mixer drawer has its own harness that does not need the app or the backend:
 open `frontend/src/ui/mixer/demo.html`, which drives `drawer.js` from
@@ -706,3 +715,50 @@ the tests that would settle each is spec v3 §14; this is the working summary.
   it back is a change to `home.js` alone. The fact underneath it has not
   changed and is not going to: **there is no reliable in-app proof that
   commentary is on air.** Do not build a lamp that claims otherwise.
+
+---
+
+## 10. Remote access — the LAN bridge
+
+A second person can drive this application from a browser on the same network,
+over an authenticated TLS bridge built into `wslcomms` (`internal/remote`, plus
+`app_remote.go`). It is **OFF by default and bound to loopback by default**, and
+turning it on is a real change to the attack surface of a machine that is on
+air — read [`docs/remote-access.md`](docs/remote-access.md) in full before
+enabling it at a venue. The short version:
+
+- **Enable it on the local Settings screen**, in the "Remote access" group (the
+  last group on the form). Set a bind address, a port (default 8443), add at
+  least one client, and set that client a password. The group is HIDDEN on a
+  remote browser — the five admin methods are host-only and pruned there — so
+  the listener can only ever be configured from the machine itself.
+- **Loopback is the default and the safe posture.** `127.0.0.1` is reachable
+  only from the same PC. A non-loopback bind (`0.0.0.0` or the machine's LAN IP)
+  is REFUSED until at least one client exists: an address nobody can
+  authenticate to is not a convenience, it is unauthenticated attack surface.
+- **TLS is mandatory, not optional.** The listener generates a self-signed
+  certificate on first enable; the Settings screen prints its SHA-256
+  fingerprint. In the remote browser you will click through a certificate
+  warning once — check the fingerprint against the one Settings shows. TLS is
+  load-bearing: over plain HTTP a LAN page is not a secure context, so the
+  headphone picker (`navigator.mediaDevices`) and `setSinkId` are gone, and
+  `GetKVSCredentials` would put live AWS credentials on the wire in clear.
+- **The SRT picture CANNOT be remoted, ever.** It is a native child window
+  painted by the commentary PC's GPU, outside the DOM. A remote seat gets the
+  WebRTC multiviewer mosaic and an honest message; audio is unaffected. If a
+  remote person must SEE the programme picture at full quality, the answer is
+  console mirroring (Sunshine/Moonlight) — **not plain RDP**, which substitutes
+  its own audio endpoints and graphics stack and breaks the app.
+- **A remote browser is a SECOND CONTROLLER, not a viewer.** It can press STOP,
+  arm and write the mixer (if granted `mixer`), and save config. The home
+  screen shows a persistent indicator naming the connected remote seats so the
+  operator at the desk can see that someone else has a seat. Capability tiers
+  (`view` ⊂ `operate` ⊂ `mixer`, mixer off by default) and mixer arm-ownership
+  bound the damage a remote seat can do.
+- **Driving the shim in a test:** `frontend/src/ui/remotewiring.test.js` runs
+  `internal/remote/shim.js` against a fake WebSocket, with no browser and no
+  running listener. It proves the zero-frontend-change claim: a call queued
+  before the socket opens resolves after it, and a hello frame that omits the
+  picture/return methods prunes them so `pictureAvailable()`/`srtReturnAvailable()`
+  go false — degradation by omission, exactly as the local build handles a
+  missing binding.

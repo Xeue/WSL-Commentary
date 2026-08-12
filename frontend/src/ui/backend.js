@@ -75,6 +75,23 @@ export const EVENT_RETURN = 'return';
 // to nothing rather than freezing at the last level.
 export const EVENT_LEVELS = 'levels';
 
+// EventConfig: the freshly-saved configuration and the id of the seat that
+// saved it, mirroring app_remote.go's EventConfig ("config") exactly. The
+// payload is {config: Config, origin: string}. It is emitted after ANY seat's
+// SaveConfig — the local WebView2 or a remote browser on the LAN bridge — so a
+// SECOND controller can refresh its cache instead of clobbering the other
+// page's edits on the next whole-object save. `origin` is the saving seat's id,
+// which is how a page tells its own echo (ignore it) from somebody else's save
+// (adopt it); see app.js. String contract, mirrored from app_remote.go.
+export const EVENT_CONFIG = 'config';
+
+// EventRemote: the remote seats connected right now, mirroring app_remote.go's
+// EventRemote ("remote") exactly. The payload is an array of {name, addr}, or an
+// empty array when nobody is connected. It drives the home-screen indicator that
+// lets the operator at the desk SEE that someone else has a seat — without it, a
+// remote operator pressing STOP is indistinguishable from a crash.
+export const EVENT_REMOTE = 'remote';
+
 // Secret keys, mirroring internal/secrets' KeyM2LX / KeySRT / KeySRTReturn
 // constants exactly. Passed to setSecret().
 //
@@ -391,6 +408,27 @@ function installFakeConsoleHandle() {
 /** True once, at load time, if this session is running against the fakes. */
 export const usingFakeBackend = !hasWails();
 
+/**
+ * isRemoteClient reports whether this page is a REMOTE browser reaching the app
+ * over the LAN bridge, rather than the local WebView2 window (or a `npm run dev`
+ * tab).
+ *
+ * The transport shim (internal/remote/shim.js) sets window.__wslcommsRemote the
+ * moment it loads — from its very first line, before the hello frame arrives —
+ * and the local WebView2 and a plain browser tab never do. So the presence of
+ * that object IS the signal, and it is readable from the first paint.
+ *
+ * app.js uses it for two safety decisions: to make the picture-unavailable
+ * message honest (the SRT picture is a host GPU surface that cannot cross the
+ * network, not a missing build feature), and to SKIP the destructive
+ * beforeunload stopReturn()/stopPicture() calls — a closing remote tab must not
+ * be able to kill the commentator's audio or picture. It is deliberately NOT a
+ * transport call: it reads a global the shim already published.
+ */
+export function isRemoteClient() {
+  return typeof window !== 'undefined' && window.__wslcommsRemote != null;
+}
+
 if (usingFakeBackend) {
   installFakeConsoleHandle();
   console.info(
@@ -500,6 +538,26 @@ export function onError(cb) {
  */
 export function onLevels(cb) {
   return subscribe(EVENT_LEVELS, cb);
+}
+
+/**
+ * Subscribes to the "config" event: {config, origin}. Emitted after ANY seat's
+ * SaveConfig so a second controller can refresh; `origin` is the saving seat's
+ * id, which lets a page ignore the echo of its own save. Returns an unsubscribe
+ * function. Mirrors onStatus/onLevels; the transport is the shim's, not this
+ * module's.
+ */
+export function onConfig(cb) {
+  return subscribe(EVENT_CONFIG, cb);
+}
+
+/**
+ * Subscribes to the "remote" event: an array of {name, addr} of the connected
+ * remote seats, for the home-screen indicator. An empty array means nobody is
+ * connected. Returns an unsubscribe function.
+ */
+export function onRemote(cb) {
+  return subscribe(EVENT_REMOTE, cb);
 }
 
 /**
@@ -1378,4 +1436,150 @@ export async function getPresetCredentialStatus() {
     srt: !!secretSetThisSession[SECRET_KEY_SRT],
     srtreturn: !!secretSetThisSession[SECRET_KEY_SRT_RETURN],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Remote access administration
+// ---------------------------------------------------------------------------
+//
+// Five bindings, mirroring app_remote.go's host-only remote-admin surface: the
+// LAN bridge's enable/bind/port, the named client records, and their write-only
+// passwords. They configure internal/remote's listener, which is default-OFF
+// and default-loopback.
+//
+// ===================== THESE ARE HOST-ONLY, AND THAT SHAPES THIS ============
+//
+// On the Go side all five are HostOnly: the remote dispatcher refuses every one
+// at every capability, and the hello frame OMITS them, so on a remote browser
+// window.go.main.App does not carry them at all — a listener that could be
+// reconfigured by one of its own remote clients is one that whoever first gets
+// in can widen to the world. So these exist for the LOCAL Settings screen only,
+// which is why settings.js hides the whole "Remote access" group when
+// isRemoteClient(), and why the calls below go through callGoBound: against a
+// remote client (or an older host build without the bindings) they are simply
+// absent, and BindingMissingError is the honest report of that.
+//
+// remoteAvailable() decides whether the Settings group offers itself against a
+// real build, all-or-nothing for the reason presetsAvailable/pictureAvailable
+// spell out: a build with GetRemoteState but not SetRemoteListener would draw
+// the panel and then fail the moment Apply was pressed. Against the fake backend
+// the group is offered and driven by the in-memory store below, so the dev loop
+// can exercise it without a Wails build.
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const REMOTE_METHODS = Object.freeze({
+  state: 'GetRemoteState',
+  setListener: 'SetRemoteListener',
+  addClient: 'AddRemoteClient',
+  setPassword: 'SetRemoteClientPassword',
+  deleteClient: 'DeleteRemoteClient',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const REMOTE_METHOD_NAMES = Object.freeze(Object.values(REMOTE_METHODS));
+
+/**
+ * remoteAvailable reports whether this build has the remote-access administration
+ * bindings at all. False against a remote client (they are pruned host-only) and
+ * against an older host build without them; the Settings group uses it to say why
+ * rather than offering controls that always fail.
+ */
+export function remoteAvailable() {
+  return REMOTE_METHOD_NAMES.every(hasBinding);
+}
+
+// The fake remote-access store: default-OFF, default-loopback, mirroring
+// internal/remote's own defaults so a `npm run dev` session shows the same
+// starting posture the real Settings screen does. Passwords are never stored,
+// only a "hasPassword" flag, exactly as the real GetRemoteState reports them.
+let fakeRemote = { enabled: false, bind: '127.0.0.1', port: 8443, clients: [] };
+
+/** fakeRemoteState mirrors app_remote.go's RemoteState shape for the dev loop. */
+function fakeRemoteState() {
+  return {
+    enabled: fakeRemote.enabled,
+    bind: fakeRemote.bind,
+    port: fakeRemote.port,
+    // The fake never binds a real socket, so it is never "running" and has no
+    // certificate to fingerprint — an honest answer, not an invented one.
+    running: false,
+    address: '',
+    url: `https://${fakeRemote.bind}:${fakeRemote.port}`,
+    fingerprint: '',
+    clients: fakeRemote.clients.map((c) => ({
+      name: c.name,
+      caps: c.caps.slice(),
+      hasPassword: c.hasPassword,
+    })),
+    connected: [],
+  };
+}
+
+/**
+ * Reads the remote-access configuration and live status for the Settings screen:
+ * {enabled, bind, port, running, address, url, fingerprint, clients[], connected[]}.
+ * clients[] carries a hasPassword boolean, never a hash.
+ */
+export async function getRemoteState() {
+  if (hasWails()) return callGoBound(REMOTE_METHODS.state);
+  return fakeRemoteState();
+}
+
+/**
+ * Enables or disables the listener and sets where it binds, then (on the Go side)
+ * validates and restarts it. Validation is Go's: a bind that is not a literal IP,
+ * or a non-loopback bind with no clients, is refused with its reason.
+ */
+export async function setRemoteListener(enabled, bind, port) {
+  if (hasWails()) {
+    return callGoBound(REMOTE_METHODS.setListener, enabled === true, String(bind), Number(port));
+  }
+  fakeRemote.enabled = enabled === true;
+  fakeRemote.bind = String(bind).trim();
+  fakeRemote.port = Number(port);
+}
+
+/**
+ * Adds a named client with the given capabilities (a subset of "view",
+ * "operate", "mixer") and NO password — one is set separately with
+ * setRemoteClientPassword before the client can log in, mirroring the "set / not
+ * set" secret-badge convention.
+ */
+export async function addRemoteClient(name, caps) {
+  if (hasWails()) return callGoBound(REMOTE_METHODS.addClient, name, caps);
+  const trimmed = String(name).trim();
+  if (!trimmed) throw new Error('remote: client name must not be empty (fake)');
+  if (fakeRemote.clients.some((c) => c.name === trimmed)) {
+    throw new Error(`remote: client "${trimmed}" already exists (fake)`);
+  }
+  fakeRemote.clients.push({
+    name: trimmed,
+    caps: Array.isArray(caps) ? caps.slice() : [],
+    hasPassword: false,
+  });
+}
+
+/**
+ * Sets or replaces a client's password. Write-only: the plaintext is hashed on
+ * the Go side and never readable back, so all the Settings badge can ever show is
+ * "set". The fake records only the boolean.
+ */
+export async function setRemoteClientPassword(name, password) {
+  if (hasWails()) return callGoBound(REMOTE_METHODS.setPassword, name, password);
+  const client = fakeRemote.clients.find((c) => c.name === name);
+  if (!client) throw new Error(`remote: no client named "${name}" (fake)`);
+  client.hasPassword = String(password).length > 0;
+}
+
+/**
+ * Deletes a client and (on the Go side) restarts the listener, which revokes
+ * that client's live sessions along with everyone else's.
+ */
+export async function deleteRemoteClient(name) {
+  if (hasWails()) return callGoBound(REMOTE_METHODS.deleteClient, name);
+  const before = fakeRemote.clients.length;
+  fakeRemote.clients = fakeRemote.clients.filter((c) => c.name !== name);
+  if (fakeRemote.clients.length === before) {
+    throw new Error(`remote: no client named "${name}" (fake)`);
+  }
 }

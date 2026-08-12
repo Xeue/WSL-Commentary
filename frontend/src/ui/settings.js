@@ -871,6 +871,133 @@ export function createSettingsView(handlers) {
   openGroup(slateHeading);
   addField('slatePath', 'Slate image path', textInput('f-slatePath'), 'Blank = the bundled slate.png.');
 
+  // --- remote access -----------------------------------------------------
+  //
+  // THE LAST GROUP, and deliberately NOT part of the config document. The
+  // listener's enable/bind/port and its client records live in a Go-owned file
+  // (internal/remote), NOT config.json, because collectConfig() rewrites the
+  // whole config from this page's cache and a field it does not restate is
+  // deleted — and "a network listener's bind address can be changed by a stale
+  // page cache" is not an acceptable failure mode for a machine that is on air.
+  //
+  // So these controls are registered in NEITHER the shared `fields` map NOR the
+  // hidden-field set: they do not travel through populate()/collectConfig() at
+  // all. They persist through the host-only bound methods
+  // (getRemoteState/setRemoteListener/add/setPassword/delete), each of which the
+  // Go side validates and applies immediately.
+  //
+  // The WHOLE GROUP IS HIDDEN ON A REMOTE CLIENT. These methods are host-only —
+  // pruned from a remote browser's window.go.main.App — so a remote seat could
+  // not drive them anyway, but a listener that one of its own clients could
+  // reconfigure is one that whoever first gets in could widen to the world.
+  // Hiding the group is the visible half of that refusal.
+  const isRemoteView = backend.isRemoteClient();
+  const remoteSupported = backend.usingFakeBackend || backend.remoteAvailable();
+
+  const remoteHeading = document.createElement('h2');
+  remoteHeading.textContent = 'Remote access';
+  const remoteGroup = openGroup(remoteHeading, 'settings-group--remote');
+  remoteGroup.hidden = isRemoteView;
+
+  const remoteEnabledInput = document.createElement('input');
+  remoteEnabledInput.type = 'checkbox';
+  remoteEnabledInput.id = 'f-remoteEnabled';
+  const remoteEnabledRow = row(
+    'Enable remote access',
+    'f-remoteEnabled',
+    remoteEnabledInput,
+    'Off by default. When on, a browser on the LAN can sign in over TLS and control this app.',
+  );
+  currentGroup.appendChild(remoteEnabledRow.wrap);
+
+  const remoteBindInput = textInput('f-remoteBind');
+  const remoteBindRow = row(
+    'Bind address',
+    'f-remoteBind',
+    remoteBindInput,
+    "127.0.0.1 = this PC only, the safe default. A LAN address (0.0.0.0 or this machine's IP) is " +
+      'refused until at least one client exists — an address nobody can authenticate to is just ' +
+      'attack surface.',
+  );
+  currentGroup.appendChild(remoteBindRow.wrap);
+
+  const remotePortInput = numberInput('f-remotePort');
+  const remotePortRow = row('Port', 'f-remotePort', remotePortInput, 'Default 8443.');
+  currentGroup.appendChild(remotePortRow.wrap);
+
+  // Read-only facts to copy into the remote browser: the URL to visit and the
+  // certificate fingerprint to check against the browser's warning. Selectable,
+  // monospaced; see .remote-readout in main.css.
+  const remoteUrlLine = document.createElement('p');
+  remoteUrlLine.className = 'remote-readout';
+  currentGroup.appendChild(remoteUrlLine);
+  const remoteFingerprintLine = document.createElement('p');
+  remoteFingerprintLine.className = 'remote-readout';
+  currentGroup.appendChild(remoteFingerprintLine);
+
+  const remoteApplyBtn = presetButton('Apply listener settings', 'btn btn-primary btn-small', () =>
+    handleRemoteListener(),
+  );
+  currentGroup.appendChild(remoteApplyBtn);
+
+  // --- the client list ---
+  const remoteClientsHeading = document.createElement('h3');
+  remoteClientsHeading.textContent = 'Clients';
+  currentGroup.appendChild(remoteClientsHeading);
+
+  const remoteClientList = document.createElement('div');
+  remoteClientList.className = 'remote-clients';
+  currentGroup.appendChild(remoteClientList);
+
+  // The three capability tiers, spelled with the SAME string values as
+  // internal/remote's Capability constants ("view" ⊂ "operate" ⊂ "mixer"). They
+  // are chosen when a client is ADDED; there is no bound method to change a
+  // client's capabilities after the fact (delete and re-add to change them), so
+  // an existing client's tier is displayed, not editable, in its row above.
+  const REMOTE_CAP_OPTIONS = [
+    { value: 'view', label: 'View — watch only' },
+    { value: 'operate', label: 'Operate — start/stop and settings' },
+    { value: 'mixer', label: 'Mixer — write to the live desk' },
+  ];
+
+  const remoteAdd = document.createElement('div');
+  remoteAdd.className = 'remote-add';
+  const remoteNewName = textInput('f-remoteNewClient');
+  remoteNewName.placeholder = 'New client name';
+  remoteNewName.autocomplete = 'off';
+  const remoteCapsBox = document.createElement('div');
+  remoteCapsBox.className = 'remote-caps';
+  const remoteCapBoxes = REMOTE_CAP_OPTIONS.map((opt) => {
+    const label = document.createElement('label');
+    label.className = 'remote-cap';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = opt.value;
+    if (opt.value === 'view') input.checked = true; // view is the sane default floor
+    const text = document.createElement('span');
+    text.textContent = opt.label;
+    label.append(input, text);
+    remoteCapsBox.appendChild(label);
+    return { value: opt.value, input };
+  });
+  const remoteAddBtn = presetButton('Add client', 'btn btn-ghost btn-small', () =>
+    handleAddRemoteClient(),
+  );
+  remoteAdd.append(remoteNewName, remoteCapsBox, remoteAddBtn);
+  currentGroup.appendChild(remoteAdd);
+
+  // Everything the group can drive, for the one-shot disable when the build has
+  // no remote-access bindings at all.
+  const remoteControls = [
+    remoteEnabledInput,
+    remoteBindInput,
+    remotePortInput,
+    remoteApplyBtn,
+    remoteNewName,
+    remoteAddBtn,
+    ...remoteCapBoxes.map((c) => c.input),
+  ];
+
   // --- actions ---------------------------------------------------------
   const saveMessage = document.createElement('p');
   saveMessage.className = 'save-message';
@@ -1150,6 +1277,160 @@ export function createSettingsView(handlers) {
     }
   }
 
+  // --- remote access handlers -------------------------------------------
+
+  /**
+   * renderRemoteState paints the listener controls and the client list from
+   * GetRemoteState. The password badge reuses the "set / not set" convention the
+   * secret fields use — hasPassword is a boolean the Go side reports, never a
+   * hash — and existing clients show their capabilities read-only, because there
+   * is no bound method to change them.
+   */
+  function renderRemoteState(state) {
+    const s = state || {};
+    remoteEnabledInput.checked = s.enabled === true;
+    remoteBindInput.value = s.bind || '127.0.0.1';
+    remotePortInput.value = String(s.port || 8443);
+    remoteUrlLine.textContent = s.url ? `Address for the remote browser: ${s.url}` : '';
+    if (s.running && s.fingerprint) {
+      remoteFingerprintLine.textContent =
+        `Certificate SHA-256 (check this against the browser's warning): ${s.fingerprint}`;
+    } else if (s.enabled) {
+      remoteFingerprintLine.textContent =
+        'Listener not running — press Apply to start it; the certificate fingerprint appears here ' +
+        'once it binds.';
+    } else {
+      remoteFingerprintLine.textContent = 'Listener is off.';
+    }
+    renderRemoteClientList(Array.isArray(s.clients) ? s.clients : []);
+  }
+
+  function renderRemoteClientList(clients) {
+    remoteClientList.textContent = '';
+    if (clients.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'remote-empty';
+      empty.textContent =
+        'No clients yet. A remote (non-loopback) bind address needs at least one client with a ' +
+        'password before the listener will start.';
+      remoteClientList.appendChild(empty);
+      return;
+    }
+    for (const c of clients) {
+      const rowEl = document.createElement('div');
+      rowEl.className = 'remote-client';
+      const name = document.createElement('span');
+      name.className = 'remote-client-name';
+      name.textContent = c.name;
+      const caps = document.createElement('span');
+      caps.className = 'remote-client-caps';
+      caps.textContent = c.caps && c.caps.length ? c.caps.join(' · ') : 'no capabilities';
+      const badge = document.createElement('span');
+      badge.className = 'secret-badge';
+      const hasPassword = c.hasPassword === true;
+      badge.textContent = hasPassword ? 'password set' : 'no password';
+      badge.classList.toggle('secret-badge-set', hasPassword);
+      const setPwBtn = presetButton('Set password', 'btn btn-ghost btn-small', () =>
+        handleSetRemotePassword(c.name),
+      );
+      const deleteBtn = presetButton('Delete', 'btn btn-ghost btn-small', () =>
+        handleDeleteRemoteClient(c.name),
+      );
+      rowEl.append(name, caps, badge, setPwBtn, deleteBtn);
+      remoteClientList.appendChild(rowEl);
+    }
+  }
+
+  /**
+   * refreshRemote reads the remote-access state and renders it. It is a no-op on
+   * a remote client (the group is hidden and the host-only methods are not even
+   * bound there), and degrades to a single note against a build that has no
+   * remote-access bindings — the same all-or-nothing availability rule the
+   * presets and picture controls use.
+   */
+  async function refreshRemote() {
+    if (isRemoteView) return;
+    if (!remoteSupported) {
+      for (const control of remoteControls) control.disabled = true;
+      remoteUrlLine.textContent = '';
+      remoteFingerprintLine.textContent = 'This build has no remote access.';
+      remoteClientList.textContent = '';
+      return;
+    }
+    try {
+      renderRemoteState(await backend.getRemoteState());
+    } catch (err) {
+      setSaveMessage(`Could not read the remote-access settings: ${err.message}`, true);
+    }
+  }
+
+  async function handleRemoteListener() {
+    remoteApplyBtn.disabled = true;
+    try {
+      await backend.setRemoteListener(
+        remoteEnabledInput.checked,
+        remoteBindInput.value.trim(),
+        Number(remotePortInput.value),
+      );
+      setSaveMessage('Remote-access settings applied.', false);
+    } catch (err) {
+      setSaveMessage(`Could not apply the remote-access settings: ${err.message}`, true);
+    } finally {
+      remoteApplyBtn.disabled = false;
+      await refreshRemote();
+    }
+  }
+
+  async function handleAddRemoteClient() {
+    const name = remoteNewName.value.trim();
+    if (!name) {
+      setSaveMessage('Enter a name for the new client.', true);
+      return;
+    }
+    const caps = remoteCapBoxes.filter((c) => c.input.checked).map((c) => c.value);
+    try {
+      await backend.addRemoteClient(name, caps);
+      remoteNewName.value = '';
+      for (const c of remoteCapBoxes) c.input.checked = c.value === 'view';
+      setSaveMessage(`Added "${name}". Set a password before it can sign in.`, false);
+    } catch (err) {
+      setSaveMessage(`Could not add the client: ${err.message}`, true);
+    }
+    await refreshRemote();
+  }
+
+  async function handleSetRemotePassword(name) {
+    // Write-only: a password goes in and never comes back, exactly like the
+    // three Credential Manager secrets. window.prompt is enough — the badge, not
+    // a value, is all the form can ever show afterwards.
+    const pw = window.prompt(`Set a password for remote client "${name}":`);
+    if (pw === null) return; // cancelled
+    if (!pw) {
+      setSaveMessage('A remote client password must not be empty.', true);
+      return;
+    }
+    try {
+      await backend.setRemoteClientPassword(name, pw);
+      setSaveMessage(`Password set for "${name}".`, false);
+    } catch (err) {
+      setSaveMessage(`Could not set the password: ${err.message}`, true);
+    }
+    await refreshRemote();
+  }
+
+  async function handleDeleteRemoteClient(name) {
+    if (!window.confirm(`Delete remote client "${name}"? Any session it currently holds is ended.`)) {
+      return;
+    }
+    try {
+      await backend.deleteRemoteClient(name);
+      setSaveMessage(`Deleted "${name}".`, false);
+    } catch (err) {
+      setSaveMessage(`Could not delete "${name}": ${err.message}`, true);
+    }
+    await refreshRemote();
+  }
+
   async function open() {
     saveBtn.disabled = true;
     renderSuggestions([]);
@@ -1175,6 +1456,11 @@ export function createSettingsView(handlers) {
     // failure must not stop the operator editing the fields it would have
     // filled in.
     await refreshPresets();
+
+    // The remote-access group, last and separately again for the same reason: a
+    // failure to read it must not blank the rest of the screen. A no-op on a
+    // remote client (the group is hidden there).
+    await refreshRemote();
   }
 
   return { el, open, setSending };

@@ -149,7 +149,20 @@ export function createHomeView(handlers) {
   devBadge.className = 'dev-badge';
   devBadge.textContent = 'DEV — fake backend';
   devBadge.hidden = true;
-  titleWrap.append(title, devBadge);
+
+  // WHO ELSE HAS A SEAT. A small persistent indicator of the remote clients
+  // connected to the LAN bridge right now, by name. It is hidden when there are
+  // none — the normal case — so it costs no attention until it has something to
+  // say, and it says exactly one thing: that a person other than the operator at
+  // this desk can drive the application. Without it, a remote operator pressing
+  // STOP is indistinguishable from a crash.
+  //
+  // This file knows nothing about the backend — see the header — so it only
+  // exposes setRemoteClients(); app.js wires it to the "remote" event.
+  const remoteIndicator = document.createElement('span');
+  remoteIndicator.className = 'remote-indicator';
+  remoteIndicator.hidden = true;
+  titleWrap.append(title, devBadge, remoteIndicator);
   // The two header controls. Mixer sits beside Settings because that is where
   // the operator asked for it: it used to be a section INSIDE Settings, which
   // meant reaching the clean-feed matrix through a configuration form.
@@ -179,6 +192,32 @@ export function createHomeView(handlers) {
 
   function setDevBadge(visible) {
     devBadge.hidden = !visible;
+  }
+
+  /**
+   * setRemoteClients shows the connected remote seats by name, or hides the
+   * indicator entirely when there are none. It takes the "remote" event payload
+   * shape — an array of {name, addr} — and shows only the names, because the
+   * operator's question is WHO, not from where; the address is kept in the title
+   * attribute for the rare moment it is wanted. A malformed or empty payload
+   * reads as "nobody", which is the safe default: the indicator over-hiding is a
+   * missing reassurance, never a false one.
+   */
+  function setRemoteClients(clients) {
+    const list = Array.isArray(clients) ? clients : [];
+    if (list.length === 0) {
+      remoteIndicator.hidden = true;
+      remoteIndicator.textContent = '';
+      remoteIndicator.removeAttribute('title');
+      return;
+    }
+    const names = list.map((c) => (c && c.name ? String(c.name) : '?'));
+    remoteIndicator.textContent =
+      list.length === 1 ? `Remote seat: ${names[0]}` : `Remote seats: ${names.join(', ')}`;
+    remoteIndicator.title = list
+      .map((c) => `${c && c.name ? c.name : '?'}${c && c.addr ? ` (${c.addr})` : ''}`)
+      .join('\n');
+    remoteIndicator.hidden = false;
   }
 
   // --- error banner (dismissible; NOT the honest line) ----------------
@@ -959,6 +998,7 @@ export function createHomeView(handlers) {
     pictureEl: pgmTile,
     lamps,
     setDevBadge,
+    setRemoteClients,
     setTile,
     setInputDevices,
     setHeadphoneDevices,

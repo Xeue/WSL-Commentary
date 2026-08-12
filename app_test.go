@@ -837,6 +837,16 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // exception to "no secret crosses this boundary outbound": it reports whether
 // a credential EXISTS for the active preset scope — booleans, never values —
 // and app_presets.go carries the whole argument beside the type.
+//
+// The five remote-access methods are the last group, added with the LAN control
+// bridge and documented in app_remote.go. They are ALL host-only — the remote
+// dispatcher refuses every one of them at every capability — because they change
+// WHO may connect and on WHAT address, and a listener reconfigurable by its own
+// remote clients could be widened to the world by whoever first gets in. They
+// are on this bound surface solely so the LOCAL Settings screen can drive them.
+// GetRemoteState reports the has-password flag but never a hash, keeping the "no
+// secret crosses this boundary outbound" rule that GetPresetCredentialStatus is
+// the only other narrowing of.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -876,6 +886,12 @@ func assertBoundSurface(t *testing.T) {
 		"DeletePreset":              true,
 		"GetActivePreset":           true,
 		"GetPresetCredentialStatus": true,
+
+		"GetRemoteState":          true,
+		"SetRemoteListener":       true,
+		"AddRemoteClient":         true,
+		"SetRemoteClientPassword": true,
+		"DeleteRemoteClient":      true,
 	}
 
 	got := exportedMethodsOfApp()

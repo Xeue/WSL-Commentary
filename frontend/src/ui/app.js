@@ -53,6 +53,26 @@ import { createMonitor } from '../monitor/monitor.js';
 //
 // Owner: WP-5b.
 
+// LOCAL_CLIENT_ID mirrors app_remote.go's localClientID: the fixed id the Go
+// side stamps on the "config" event for a save made by the LOCAL WebView2 seat
+// (which does not go through the remote dispatcher). It is a string contract,
+// spelled the same on both sides; a page uses it to recognise the echo of its
+// own save. A remote page instead knows its own id from the shim
+// (window.__wslcommsRemote.client), so ownClientId prefers that when present.
+const LOCAL_CLIENT_ID = 'local-webview2';
+
+/**
+ * ownClientId returns the id the "config" event carries as `origin` when THIS
+ * page is the one that saved. For a remote browser that is the connection id the
+ * shim recorded on the hello frame; for the local window it is LOCAL_CLIENT_ID.
+ * The comparison against it is the whole mechanism that stops a page reacting to
+ * the echo of its own save.
+ */
+function ownClientId() {
+  const remote = typeof window !== 'undefined' ? window.__wslcommsRemote : null;
+  return (remote && remote.client) || LOCAL_CLIENT_ID;
+}
+
 /** Mounts the whole application into root (the #app div from index.html). */
 export function mountApp(root) {
   let currentConfig = null;
@@ -405,6 +425,74 @@ export function mountApp(root) {
   // not, which is worth a console line and nothing on screen.
   backend.onReturn((state) => {
     console.info('wslcomms: the native SRT audio return reported', String(state));
+  });
+
+  // --- a SECOND controller's save --------------------------------------------
+  //
+  // config is written as a WHOLE OBJECT from a per-page cache (persistConfig
+  // below, and settings.js's collectConfig), and App.SaveConfig applies it
+  // verbatim with no field-level merge. With two controllers — the local
+  // WebView2 and a remote browser on the LAN bridge — one page's save would
+  // otherwise clobber the other's edits until something forced a reload. The
+  // "config" event closes that to one round trip: after ANY seat saves, every
+  // OTHER seat adopts the result.
+  //
+  // It is emitted to this page too on its OWN saves; those are ignored by
+  // origin, because this page has already applied its own change through the
+  // ordinary save path and re-applying would be at best redundant and at worst —
+  // for a remote operator mid-edit — a Settings screen yanked out from under
+  // them (onConfigSaved ends in showHome()). So this handler deliberately does
+  // NOT call onConfigSaved(): it re-applies only the live-safe parts and leaves
+  // the current view exactly where it is.
+  backend.onConfig((payload) => {
+    if (!payload || !payload.config) return;
+    // Our own save, echoed back. We already applied it locally; do nothing —
+    // and above all do not showHome() on a page that may be mid-edit.
+    if (payload.origin === ownClientId()) return;
+    applyRemoteConfig(payload.config);
+  });
+
+  /**
+   * applyRemoteConfig adopts a config another controller saved and re-applies
+   * only the parts that are safe to change under a page that did not ask for it:
+   * the monitor tile, the return bus/channel/gain, the headphone selection and
+   * the input dropdown. It is onConfigSaved's live-safe subset, on purpose:
+   *
+   *   - NO showHome() — the whole reason this is not onConfigSaved(). A remote
+   *     operator editing Settings must not be ejected because somebody at the
+   *     desk pressed Save.
+   *   - NO picture-source or return-source switch. Neither is a Settings field,
+   *     and flipping what this operator is watching or hearing from another
+   *     page's save is exactly the silent side effect the source controls were
+   *     split apart to prevent.
+   *   - NO SRT-return rebuild. The audio path is fixed at Kinesis in this build
+   *     (currentReturnSource is always webrtc), so there is nothing to rebuild;
+   *     re-dialling it for a remote save would only risk a glitch for no gain.
+   */
+  function applyRemoteConfig(config) {
+    currentConfig = config;
+    home.setTile(config.monitorTile);
+    home.setReturnMid(config.returnMid);
+    home.setInputDevices(currentInputDevices, config.audioDeviceId);
+    const channel = normaliseChannelMode(config.returnChannel);
+    home.setReturnChannel(channel);
+    renderHeadphoneList();
+    safeMonitorCall((m) => {
+      m.setReturnMid(config.returnMid);
+      m.setChannelMode(channel);
+      m.setGainDb(config.returnGainDb);
+      const sink = selectedHeadphoneId();
+      if (sink && currentReturnSource !== RETURN_SOURCE_SRT) m.setSinkId(sink);
+    });
+  }
+
+  // The connected remote seats, straight to the home-screen indicator. The
+  // local WebView2 is never in this list (it does not connect to the listener),
+  // so the indicator shows only OTHER seats — which is the question the operator
+  // at the desk is asking: is someone else driving this? home.js knows nothing
+  // about the backend; app.js is the wire, as everywhere else.
+  backend.onRemote((clients) => {
+    home.setRemoteClients(Array.isArray(clients) ? clients : []);
   });
 
   // --- start / stop --------------------------------------------------------
@@ -1032,17 +1120,37 @@ export function mountApp(root) {
   }
 
   window.addEventListener('beforeunload', () => {
+    // The monitor is this page's own Web Audio graph and WebRTC connection, so
+    // stopping it on unload is always correct — for the local window AND a
+    // remote tab, each of which owns its own monitor.
     safeMonitorCall((m) => m.stop());
+
+    // ===================== A REMOTE TAB MUST NOT DO THIS =======================
+    //
+    // stopReturn() and stopPicture() reach the HOST's native SRT return and
+    // picture — the commentator's audio and the operator's picture. On the local
+    // window that is the right cleanup on unload. On a REMOTE tab it would be a
+    // closing browser somewhere on the LAN silencing the commentator and blacking
+    // the operator's picture, which is the single highest-consequence hazard in
+    // the whole remote-access plan.
+    //
+    // The shim already neutralises it by omission — StopReturn/StopPicture are
+    // host-only and are simply not installed on a remote client, so these calls
+    // land in backend.js as a handled BindingMissingError — but the guard makes
+    // the intent explicit rather than emergent, so a future change to the shim's
+    // method list cannot quietly re-arm it.
+    if (backend.isRemoteClient()) return;
+
     // An SRT caller left dialled in holds one of M2L-X's four fan-out slots
     // after this window is gone. Best-effort — beforeunload cannot await — and
     // app.go's teardown stops it as well; this is the earlier of the two, not
     // the only one.
     //
-    // UNCONDITIONAL, not "only if the selected path is SRT". StopReturn rejects
-    // when nothing was running and that rejection is free, whereas the case this
-    // covers is not hypothetical: it is precisely a page whose belief about
-    // what is running has come apart from the Go side that leaves a monitor
-    // behind, and that is the page least able to tell.
+    // UNCONDITIONAL (on the local window), not "only if the selected path is
+    // SRT". StopReturn rejects when nothing was running and that rejection is
+    // free, whereas the case this covers is not hypothetical: it is precisely a
+    // page whose belief about what is running has come apart from the Go side
+    // that leaves a monitor behind, and that is the page least able to tell.
     //
     // It does not go through returnPath, and does not need to: stopping can only
     // ever take audio away. The machine owns the two directions that can make
@@ -1087,12 +1195,22 @@ export function mountApp(root) {
     // is a real possibility while the native side lands, and an option that
     // always fails when pressed is worse than one that says why it cannot be.
     pictureBindingsPresent = backend.usingFakeBackend || backend.pictureAvailable();
+    // The reason the SRT option is unavailable is DIFFERENT on a remote client,
+    // and the difference matters. On the local build a missing option means the
+    // native bindings are absent — a build problem. On a remote browser the
+    // option is absent because it is host-only and pruned, and the true reason is
+    // physics, not a build: the picture is a native window painted by the
+    // commentary PC's GPU and cannot travel over the network. Saying "this build
+    // has no native SRT picture" to a remote operator would send an engineer
+    // hunting a build fault that is not there.
+    const pictureUnavailableReason = backend.isRemoteClient()
+      ? "The SRT picture is drawn by the commentary PC's graphics card and cannot be sent " +
+        'over the network. You are watching the multiviewer mosaic; audio is unaffected.'
+      : 'This build has no native SRT picture. You are watching the multiviewer mosaic; ' +
+        'your audio is unaffected either way.';
     home.setPictureAvailable(
       pictureBindingsPresent,
-      pictureBindingsPresent
-        ? ''
-        : 'This build has no native SRT picture. You are watching the multiviewer mosaic; ' +
-            'your audio is unaffected either way.',
+      pictureBindingsPresent ? '' : pictureUnavailableReason,
     );
 
     // ================= THE AUDIO PATH IS NOW FIXED AT KINESIS =================

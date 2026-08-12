@@ -1317,3 +1317,118 @@ input[type='range'] {
 .input-meters-idle {
   opacity: 0.35;
 }
+
+/* ==================================================================== */
+/* REMOTE ACCESS (appended block — see the note below before moving it) */
+/*                                                                      */
+/* The LAN bridge's two operator-facing pieces: the home-screen         */
+/* indicator that names the remote seats connected right now            */
+/* (home.js setRemoteClients), and the Settings "Remote access" group   */
+/* (settings.js). Both draw only from the :root token set, so this      */
+/* block depends on nothing above except the colour variables and can   */
+/* sit at the end of the file — added here on purpose, alongside the    */
+/* input-meters block, so a change editing the middle of this           */
+/* stylesheet does not collide with it.                                 */
+/* ==================================================================== */
+
+/* The connected-seats indicator in the home header, beside the title. It reads
+   as an active, benign notice — amber, like the DEV badge — because "someone
+   else has a seat" is a state the operator must notice but is not a fault. It is
+   hidden by home.js (the `hidden` attribute) whenever nobody is connected. */
+.remote-indicator {
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--amber);
+  background: var(--panel);
+  color: var(--amber);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22rem;
+}
+
+/* The Settings "Remote access" group. It uses the shared .settings-group grid
+   like every other group; these rules style only the pieces that are unique to
+   it — the read-only URL/fingerprint lines and the client list. */
+
+/* The URL and certificate-fingerprint lines are read-only facts to copy into a
+   remote browser, so they are monospaced and selectable, muted like a hint. */
+.remote-readout {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  word-break: break-all;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* The client list spans the whole group width: each row is a self-contained
+   card so a client's name, capabilities, password badge and actions read as one
+   unit rather than flowing into the grid's device-width columns. */
+.remote-clients {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.remote-client {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-alt);
+}
+
+.remote-client-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.remote-client-caps {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+/* The add-a-client row and the capability checkboxes for it. Laid out inline so
+   the name box, the three capability boxes and the Add button sit on one line on
+   a wide window and wrap gracefully on a narrow one. */
+.remote-add {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.remote-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  align-items: center;
+}
+
+.remote-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+/* The empty-state line when no clients are configured: a non-loopback listener
+   with no clients is refused, so this is also the instruction for how to make a
+   LAN address legal. Muted, not alarming. */
+.remote-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}

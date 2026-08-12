@@ -288,6 +288,7 @@ import (
 	"wslcomms/internal/m2lx"
 	"wslcomms/internal/mixer"
 	"wslcomms/internal/presets"
+	"wslcomms/internal/remote"
 	"wslcomms/internal/secrets"
 	"wslcomms/internal/sender"
 )
@@ -399,9 +400,15 @@ const (
 	// Stop is prompt for the same reasons StopReturn's is; the overlay window's
 	// Close posts a quit to its own message thread and waits gst's
 	// overlayCloseBudget, two seconds, before abandoning that thread and saying
-	// so. pictureStopBudget is four seconds, which is that pair with room, and it
-	// is why shutdownTimeout is twenty-four and not twenty.
-	shutdownTimeout = 24 * time.Second
+	// so. pictureStopBudget is four seconds, which is that pair with room.
+	//
+	// The remote listener adds one more second (remoteStopBudget, in
+	// app_remote.go): closing a TLS http.Server and its session goroutines is
+	// prompt — no cgo, no device, only sockets and goroutines selecting on a
+	// cancelled context — so a second is generous, and it takes the total to
+	// twenty-five. Unlike the media stops it cannot wedge, so it is a term in the
+	// sum rather than a wait expected to be cut off.
+	shutdownTimeout = 25 * time.Second
 
 	// senderStopBudget bounds step 2, a.Stop. Fifteen seconds is the sender's own
 	// bounded worst case; see above.
@@ -653,6 +660,15 @@ type App struct {
 	// down by DisarmMixer — never on application start.
 	mixCtl mixer.Controller
 
+	// mixArmedBy records WHICH seat opened the current arm window, guarded by
+	// mixMu alongside mixCtl. It is the arm-OWNERSHIP gate: a SendMixerCommands
+	// from any other seat is refused with mixer.ErrDisarmed, so with two
+	// controllers one operator's arm cannot silently authorise the other's write
+	// to the live clean feed. The local WebView2 seat arms as localClientID; a
+	// remote seat arms as its per-connection id. Empty when nothing is armed;
+	// cleared by closeMixerController. See app_mixer.go and app_remote.go.
+	mixArmedBy string
+
 	// retMu guards ret: the SRT return monitor.
 	//
 	// It is held for the whole of StartReturn and StopReturn, so that a
@@ -772,6 +788,24 @@ type App struct {
 	// means the real one; see App.dialMixerController.
 	mixerDial func(host, token string) (mixer.Controller, error)
 
+	// The LAN control bridge (internal/remote). The listener is off by default
+	// and bound to loopback by default; startup builds and starts it on a
+	// goroutine, guarded on the remote.json enabled flag, and teardown closes it
+	// with its own bounded budget. It is App-agnostic — it reaches back into the
+	// application only through the remoteDispatcher allowlist in app_remote.go.
+	//
+	// remoteMu serializes building and replacing the server (startup and every
+	// remote-admin method). The pointer itself is an atomic so the event-pump tee
+	// (broadcastRemote) and the connected-client poll can read it lock-free, on
+	// goroutines that must not take remoteMu. remoteRunCancel ends the current
+	// generation's client-indicator poll on a restart or teardown; remoteWG holds
+	// the per-generation goroutines so teardown can join them within its budget
+	// rather than through rootWG (whose join must not race a restart's Add).
+	remoteMu        sync.Mutex
+	remote          atomic.Pointer[remote.Server]
+	remoteRunCancel context.CancelFunc
+	remoteWG        sync.WaitGroup
+
 	// closing is raised by teardown before it stops anything, so that a bound
 	// method already running on a Wails message-handler goroutine cannot build a
 	// new session or control plane behind it. See step 0 of the shutdown order
@@ -852,6 +886,13 @@ func NewApp(appDir string, gstInitErr error) *App {
 	// and the decorator resolves each through the active scope. See
 	// app_presets.go for the whole argument.
 	a.store = scopedStore{inner: secrets.New(), scope: a.credentialScope}
+
+	// Install the event-pump tee so every event the local renderer receives also
+	// reaches every connected remote seat. It is set here, before the pump's
+	// consumer goroutine can exist (that starts in domReady), and reads the
+	// remote server pointer lazily on each call, so it is safe even though the
+	// server is not built until startup.
+	a.events.tee = a.broadcastRemote
 	return a
 }
 
@@ -908,6 +949,16 @@ func (a *App) startup(ctx context.Context) {
 	a.setCredentialScope(rec.CredentialScope)
 
 	a.startControlPlane()
+
+	// The LAN control bridge, LAST, and on a goroutine of its own inside
+	// startRemote. It reads its OWN settings file (remote.json, never config.json)
+	// so nothing above had to load it, and it is off by default — a machine that
+	// has never enabled remote access binds no socket. startup must not block
+	// (Wails runs it on the main thread before the window shows), and standing up
+	// a TLS listener means an ECDSA keygen on first enable and a socket bind; both
+	// happen on the goroutine startRemote spawns, and any failure is reported on
+	// the error event rather than being allowed to delay the window appearing.
+	a.startRemote()
 }
 
 // domReady is the Wails OnDomReady callback, called once the embedded page has
@@ -1093,6 +1144,14 @@ func (a *App) teardownOrdered() int {
 
 	step("the mixer write path", mixerCloseBudget, a.closeMixerController)
 
+	// The remote listener BEFORE the control plane: closing it cancels every
+	// in-flight remote call's context, so a remote GetMixerSnapshot or
+	// SendMixerCommands cannot still be reaching for the m2lx client or the mixer
+	// socket the next steps are about to close. It cannot wedge — no cgo, no
+	// device — so its bound is a formality, but it carries one so a stray
+	// http.Server can never be the process that will not exit.
+	step("the remote listener", remoteStopBudget, a.stopRemote)
+
 	step("the status watcher and the token refresh", controlPlaneStopBudget, func() error {
 		a.ctlMu.Lock()
 		defer a.ctlMu.Unlock()
@@ -1200,6 +1259,20 @@ func (a *App) GetConfig() (*config.Config, error) {
 // control plane, because otherwise a first run would need the operator to save
 // their settings and then restart the application before anything signed in.
 func (a *App) SaveConfig(c *config.Config) error {
+	return a.saveConfigFrom(localClientID, c)
+}
+
+// saveConfigFrom is SaveConfig's body, carrying the id of the seat that saved.
+//
+// The bound SaveConfig passes localClientID; the remote dispatcher passes the
+// connecting seat's id (app_remote.go). After the write it emits EventConfig
+// carrying the saved config AND that id, so every OTHER seat can refresh its
+// cached config while the seat that saved ignores the echo of its own write.
+// Without it, two controllers writing config — a whole-object write from each
+// page's cache — clobber one another indefinitely; with it the stale window is
+// one round trip. The event carries no secret: config.Save never writes one and
+// config.Config has no secret field.
+func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 	if c == nil {
 		return errors.New("wslcomms: SaveConfig: no configuration supplied")
 	}
@@ -1216,7 +1289,17 @@ func (a *App) SaveConfig(c *config.Config) error {
 	if controlPlaneChanged(previous, &saved) {
 		a.startControlPlane()
 	}
+
+	a.events.send(EventConfig, configEvent{Config: &saved, Origin: originClientID})
 	return nil
+}
+
+// configEvent is the EventConfig payload: the freshly-saved configuration and
+// the id of the seat that saved it. A page compares Origin against its own id
+// and refreshes only on somebody else's save; see app_remote.go's EventConfig.
+type configEvent struct {
+	Config *config.Config `json:"config"`
+	Origin string         `json:"origin"`
 }
 
 // SetSecret writes one of the three Credential Manager secrets from the
@@ -2307,6 +2390,17 @@ type eventPump struct {
 	// would split the queue between them, so each event would reach the page
 	// once but the ordering between them would no longer hold.
 	startOnce sync.Once
+
+	// tee, if set, receives every event the pump delivers to the local renderer,
+	// so the SAME stream reaches every connected remote seat. It is the single
+	// tap point the remote bridge hooks: called once per delivered event, from
+	// the pump's one consumer goroutine, right after wailsruntime.EventsEmit — so
+	// a remote client sees exactly the events the local page sees, including the
+	// drops (a client that fell behind detects its own gap through the frame seq,
+	// see internal/remote/session.go). It must not block; broadcastRemote fans out
+	// through per-session drop-oldest queues and returns immediately. Nil until
+	// NewApp installs App.broadcastRemote, and harmless when nil.
+	tee func(name string, data any)
 }
 
 // newEventPump creates a pump. It does not start the emitting goroutine; that
@@ -2334,6 +2428,13 @@ func (p *eventPump) start(rootCtx, wailsCtx context.Context, wg *sync.WaitGroup)
 					return
 				case e := <-p.ch:
 					wailsruntime.EventsEmit(wailsCtx, e.name, e.data)
+					// TEE: the same event, to every connected remote seat. This is
+					// the one tap point — after the local emit, so remote sees what
+					// local sees and no event is broadcast that the pump dropped
+					// before reaching here. tee never blocks; see the field comment.
+					if p.tee != nil {
+						p.tee(e.name, e.data)
+					}
 				}
 			}
 		}()
