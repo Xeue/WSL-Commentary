@@ -246,6 +246,14 @@ const secretSetThisSession = {
 let fakeDevices = FAKE_DEVICES.slice();
 let fakeDeviceError = null;
 
+// FAKE_EVENTS is what a `npm run dev` session lists through listEvents(). ONE
+// event by default, shaped exactly like the Go m2lx.Event ({id, name, status}),
+// so the dev loop shows the OPERATOR'S DEFAULT — a lone event is auto-selected,
+// with no picker (see ui/events.js). Reassign it from the devtools console
+// (window.__wslcommsFake.setEvents) to exercise the empty-instance and
+// multiple-event paths without a Wails build.
+let fakeEvents = [{ id: 'dl9-5p5ah0bd-empd', name: 'MatchT', status: 'Running' }];
+
 const fakeListeners = new Map(); // event name -> Set<callback>
 
 function fakeOn(event, cb) {
@@ -397,6 +405,11 @@ function installFakeConsoleHandle() {
     setDeviceError: (message) => {
       fakeDeviceError = message || null;
     },
+    // Drive the event auto-select / picker: [] for an empty instance (the URL
+    // falls back in), one for the auto-select path, several for the picker.
+    setEvents: (list) => {
+      fakeEvents = Array.isArray(list) ? list : [];
+    },
   };
 }
 
@@ -502,6 +515,46 @@ export async function getKVSCredentials() {
     sessionToken: 'fake-session-token',
     expiry: new Date(Date.now() + 3600_000).toISOString(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The M2L-X events list
+// ---------------------------------------------------------------------------
+//
+// One binding, App.ListEvents, mirroring the concrete (*client).ListEvents: a
+// GET /api/events/overview through the already-signed-in client, returning
+// [{id, name, status}] sorted by name with id-less entries dropped (all on the
+// Go side).
+//
+// It is the mechanism behind "you should not have to know your event id". With
+// a signed-in client the app can enumerate the instance's events and, when
+// there is exactly one, choose it without asking; when there are several, offer
+// a picker (ui/events.js owns that rule). The pasted live-operation URL is still
+// the source when the app CANNOT list — not signed in, no host, or an older
+// build without this binding — which is why it goes through callGoBound: against
+// such a build the caller gets a BindingMissingError it treats the same as an
+// empty list, and settings.js wraps the whole call in try/catch so a failure
+// leaves today's URL-derived behaviour untouched rather than breaking the
+// screen.
+
+/** ListEvents' bound method name. One place, so a rename is one edit. */
+const EVENTS_METHOD = 'ListEvents';
+
+/**
+ * Lists the M2L-X instance's events: [{id, name, status}]. An empty instance is
+ * an empty array and NOT an error — "no events" is a state the caller renders,
+ * falling back to the URL-derived id. A non-array answer (or a build without the
+ * binding, via BindingMissingError out of callGoBound) is the caller's cue to
+ * do the same.
+ *
+ * @returns {Promise<Array<{id: string, name: string, status: string}>>}
+ */
+export async function listEvents() {
+  if (hasWails()) {
+    const got = await callGoBound(EVENTS_METHOD);
+    return Array.isArray(got) ? got : [];
+  }
+  return fakeEvents.map((e) => ({ ...e }));
 }
 
 // subscribe wires cb to event, using the real Wails runtime's EventsOn/

@@ -27,6 +27,7 @@
 //	Start() / Stop()            error                      caller: WP-5b
 //	GetKVSCredentials()         kvs.Credentials            caller: WP-5a
 //	GetStatusKeyCandidates()    []m2lx.StatusKeyCandidate  caller: WP-5b
+//	ListEvents()                []m2lx.Event               caller: WP-5b
 //
 // and the six added for the mixer drawer, which live in app_mixer.go:
 //
@@ -81,6 +82,14 @@
 // endpoint will name the node (specification open question 5). The alternative
 // to this method was leaving the operator to guess, which is what they were
 // doing. It is read-only and returns a suggestion the operator must confirm.
+//
+// ListEvents is a later, deliberate widening of the same kind, recorded here
+// rather than slipped in. It is read-only — GET /api/events/overview on the
+// already-signed-in client — and it exists so an operator need never know their
+// event id: the frontend auto-selects the sole event and offers a picker only
+// when there is a real choice, superseding the id an operator used to recover by
+// pasting a live-operation URL. Like GetStatusKeyCandidates it acts on nothing;
+// it hands the frontend a list to render.
 //
 // The six mixer methods are the NINTH to FOURTEENTH, and the count was kept
 // down on purpose: they are the smallest set that lets the drawer read state,
@@ -1547,6 +1556,53 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 	ctx, cancel := context.WithTimeout(a.rootCtx, kvsFetchTimeout)
 	defer cancel()
 	return kvs.Fetch(ctx, client, cfg.EventID)
+}
+
+// ListEvents lists the events on the configured M2L-X instance, so the frontend
+// need never ask an operator to know their event id. It is the mechanism behind
+// the operator's "by default for the event to be auto selected when there is
+// only 1": with the list in hand the frontend auto-selects the sole event and
+// offers a picker only when there is a genuine choice. The event id is otherwise
+// derived from a pasted live-operation URL; this supersedes that whenever the
+// app can talk to the instance.
+//
+// It mirrors GetKVSCredentials' guards exactly, because the failure it is most
+// likely to hit is the same one — a client that exists but is not signed in —
+// and the operator is owed the same specific message rather than a bare
+// ErrNotSignedIn bubbling up from the m2lx package:
+//
+//   - no client at all means m2lxHost is not configured; say so and name the
+//     Settings field, since nothing downstream can be tried until it is set.
+//   - a client with no bearer token means sign-in has not succeeded (wrong
+//     alias, wrong password, or the instance unreachable at start-up); point at
+//     the alias and the password in Credential Manager under secrets.TargetM2LX,
+//     the same place GetKVSCredentials points, because it is the same fix.
+//
+// The call is bounded by kvsFetchTimeout off a.rootCtx — the events overview is
+// one small GET, well inside the budget already sized for the whole KVS chain,
+// so it reuses that constant rather than introducing a second one that would
+// have to be kept in step with it.
+func (a *App) ListEvents() ([]m2lx.Event, error) {
+	a.ctlMu.Lock()
+	client := a.client
+	a.ctlMu.Unlock()
+
+	if client == nil {
+		return nil, errors.New(
+			"wslcomms: cannot list events: m2lxHost is not configured — set it on the Settings screen")
+	}
+
+	cfg := a.snapshotConfig()
+	if client.Token() == "" {
+		return nil, fmt.Errorf(
+			"wslcomms: cannot list events: not signed in to M2L-X at %q yet — "+
+				"check the alias and the password stored in Windows Credential Manager under %q",
+			cfg.M2LXHost, secrets.TargetM2LX)
+	}
+
+	ctx, cancel := context.WithTimeout(a.rootCtx, kvsFetchTimeout)
+	defer cancel()
+	return client.ListEvents(ctx)
 }
 
 // GetStatusKeyCandidates returns the switcher_status nodes that were seen to

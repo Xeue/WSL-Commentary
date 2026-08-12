@@ -135,6 +135,10 @@ export function mountApp(root) {
     onReturnChannelChange: onReturnChannelChange,
     onPictureSourceChange: onPictureSourceChange,
     onLevelChange: onLevelChange,
+    // Switching instance from the header indicator. It reuses the SAME apply
+    // sequence the Settings preset UI does — no second apply path — see
+    // onHomePresetChange.
+    onPresetChange: onHomePresetChange,
   });
 
   // The drawer mounts at the TOP LEVEL, not inside home.el.
@@ -450,6 +454,11 @@ export function mountApp(root) {
     // and above all do not showHome() on a page that may be mid-edit.
     if (payload.origin === ownClientId()) return;
     applyRemoteConfig(payload.config);
+    // Another seat's save may have applied a different instance — the Settings
+    // screen or a remote client can change the active preset — so refresh the
+    // header indicator from the authority rather than trusting the config event
+    // to carry preset state (it does not).
+    refreshHomePresets();
   });
 
   /**
@@ -1042,7 +1051,52 @@ export function mountApp(root) {
     // Ignored keys from a hand-edited preset arrive on the "error" event from
     // Go and reach the banner through the onError wiring above; nothing to do
     // here, and this function must never inspect preset fields itself.
+
+    // The header indicator follows the apply, so switching from Settings and
+    // switching from the header both leave the same at-a-glance state behind.
+    await refreshHomePresets();
     return merged;
+  }
+
+  /**
+   * onHomePresetChange applies the instance chosen from the HEADER indicator. It
+   * reuses applyPresetAndRefresh — the exact sequence the Settings preset UI
+   * runs through onApplyPreset — rather than writing a second apply path: there
+   * is one place that calls backend.applyPreset, adopts the returned config and
+   * rebuilds the monitor and picture, and this is a second caller of it, not a
+   * second copy of it.
+   *
+   * The header selector is disabled while SENDING (home.setRunning gates it), so
+   * a refused-mid-send apply should not arrive here; the catch is the honest
+   * fallback if it does, and refreshHomePresets in the finally snaps the
+   * indicator back to whatever is ACTUALLY active when the apply did not land.
+   */
+  async function onHomePresetChange(id) {
+    try {
+      await applyPresetAndRefresh(id);
+    } catch (err) {
+      home.showError(`Could not switch instance: ${err?.message || err}`);
+      await refreshHomePresets();
+    }
+  }
+
+  /**
+   * refreshHomePresets reads the saved instances and the active one and pushes
+   * them to the header indicator. Called on startup, after any apply, and when a
+   * "config" event says another seat changed things. It degrades quietly: a
+   * build without the preset bindings (or a failure to read them) just leaves
+   * the indicator as it was — the header must never show an error over a status
+   * ornament.
+   */
+  async function refreshHomePresets() {
+    if (!(backend.usingFakeBackend || backend.presetsAvailable())) return;
+    try {
+      const [list, active] = await Promise.all([backend.listPresets(), backend.getActivePreset()]);
+      home.setPresets(Array.isArray(list) ? list : []);
+      home.setActivePreset(active && active.id ? active.id : '');
+    } catch (err) {
+      console.info('wslcomms: could not refresh the header preset indicator', err?.message || err);
+    }
   }
 
   // --- monitor -------------------------------------------------------------
@@ -1185,6 +1239,11 @@ export function mountApp(root) {
     home.setReturnMid(currentConfig.returnMid || 2);
     home.setReturnChannel(normaliseChannelMode(currentConfig.returnChannel));
     home.setLevel(1);
+
+    // The header preset indicator, at startup: which instance is running, shown
+    // at a glance. Fire-and-forget — it must not delay putting the commentator
+    // on air — and it degrades quietly against a build without the presets.
+    refreshHomePresets();
 
     // Whether the SRT PICTURE can be offered at all.
     //

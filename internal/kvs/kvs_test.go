@@ -54,6 +54,10 @@ func (c *testClient) Refresh(ctx context.Context) error                        {
 func (c *testClient) Token() string                                            { return "" }
 func (c *testClient) Close() error                                             { return nil }
 
+// ListEvents satisfies m2lx.Client. Fetch never lists events, so it is not
+// exercised here.
+func (c *testClient) ListEvents(ctx context.Context) ([]m2lx.Event, error) { return nil, nil }
+
 func (c *testClient) KVSInfo(ctx context.Context, eventID string) (m2lx.KVSInfo, error) {
 	body, status, err := getJSON(ctx, c.baseURL+"/api/live_operation/kvs/webrtc_info/"+eventID)
 	if err != nil {

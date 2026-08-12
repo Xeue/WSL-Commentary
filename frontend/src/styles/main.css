@@ -1432,3 +1432,43 @@ input[type='range'] {
   font-size: 0.82rem;
   color: var(--text-muted);
 }
+
+/* ==================================================================== */
+/* The home-header active-preset indicator (home.js setPresets /         */
+/* setActivePreset). A marked block appended at the end so it does not   */
+/* collide with the middle of this stylesheet, the same convention the   */
+/* remote-indicator block above follows. It sits in .topbar-actions      */
+/* beside Mixer/Settings and reads as a QUIET status control, not a       */
+/* primary action — a muted label and a compact select on the shared     */
+/* token set. home.js hides the whole block (the `hidden` attribute)     */
+/* until at least one instance is saved, and disables the select while   */
+/* SENDING (ApplyPreset is refused server-side mid-send).                */
+/* ==================================================================== */
+.preset-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 0 0 auto;
+}
+
+.preset-indicator-label {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  letter-spacing: 0.02em;
+}
+
+.preset-indicator select {
+  min-height: 44px;
+  max-width: 12rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.preset-indicator select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

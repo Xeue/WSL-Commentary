@@ -71,6 +71,10 @@ func (f *fakeClientToken) KVSToken(ctx context.Context, eventID string) (KVSToke
 	return KVSToken{}, nil
 }
 
+// ListEvents satisfies Client. The watcher never lists events, so it is not
+// exercised here.
+func (f *fakeClientToken) ListEvents(ctx context.Context) ([]Event, error) { return nil, nil }
+
 // Close satisfies the Client interface. fakeClientToken starts no
 // goroutine of its own, so there is nothing to cancel or wait for.
 func (f *fakeClientToken) Close() error { return nil }

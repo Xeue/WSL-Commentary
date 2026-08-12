@@ -105,7 +105,14 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *                                       "levels" frame {peak:[], rms:[]}; an
  *                                       all-silence frame (or null) dims them
  *   setLevel(fraction)                  positions the level slider, 0..1
- *   setRunning(running)                 flips the START/STOP button
+ *   setPresets(list)                    fills the header preset indicator with
+ *                                       the saved instances; hides it when there
+ *                                       are none
+ *   setActivePreset(id)                 marks which instance is running, at a
+ *                                       glance, in the header indicator
+ *   setRunning(running)                 flips the START/STOP button, and gates
+ *                                       the preset selector (switching is
+ *                                       refused server-side while SENDING)
  *   setBusy(busy)                       disables the button while a call is in flight
  *   setStatusUnavailable(unavailable)   shows/hides the transient banner (Status.Stale)
  *   showError(message) / clearError()   the dismissible error banner. Every
@@ -119,7 +126,7 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
- *   onLevelChange(fraction),
+ *   onLevelChange(fraction), onPresetChange(id),
  * }
  *
  * ===================== THE PICTURE AREA IS NOW A RESERVATION ================
@@ -176,6 +183,34 @@ export function createHomeView(handlers) {
   // name the forbidden symbols here even in a comment.
   const headerBtns = document.createElement('div');
   headerBtns.className = 'topbar-actions';
+
+  // WHICH M2L-X INSTANCE IS RUNNING, at a glance. The operator asked to see the
+  // active preset on the main page without opening Settings. It is a <select> so
+  // the instance can also be SWITCHED from here — but switching is refused
+  // server-side while a session is SENDING (ApplyPreset would otherwise leave
+  // the feed going to the PREVIOUS instance with every lamp green), so the
+  // control is disabled with that reason on it while running (see setRunning).
+  //
+  // Quiet by design: the whole indicator is hidden until there is at least one
+  // saved instance, and when none is applied it shows a disabled "none" rather
+  // than an empty box. This file knows nothing about the backend — it exposes
+  // setPresets / setActivePreset and raises onPresetChange; app.js wires it to
+  // the SAME apply flow the Settings preset UI uses.
+  const presetIndicator = document.createElement('div');
+  presetIndicator.className = 'preset-indicator';
+  presetIndicator.hidden = true;
+  const presetIndicatorLabel = document.createElement('span');
+  presetIndicatorLabel.className = 'preset-indicator-label';
+  presetIndicatorLabel.textContent = 'Preset:';
+  const presetIndicatorSelect = document.createElement('select');
+  presetIndicatorSelect.id = 'home-preset-select';
+  presetIndicatorSelect.addEventListener('change', () => {
+    // The empty "none" option is disabled and unselectable, so a change always
+    // carries a real preset id — but guard anyway rather than apply "".
+    if (presetIndicatorSelect.value) handlers.onPresetChange(presetIndicatorSelect.value);
+  });
+  presetIndicator.append(presetIndicatorLabel, presetIndicatorSelect);
+
   const mixerBtn = document.createElement('button');
   mixerBtn.type = 'button';
   mixerBtn.className = 'btn btn-ghost';
@@ -187,11 +222,74 @@ export function createHomeView(handlers) {
   settingsBtn.className = 'btn btn-ghost';
   settingsBtn.textContent = 'Settings';
   settingsBtn.addEventListener('click', () => handlers.onSettings());
-  headerBtns.append(mixerBtn, settingsBtn);
+  headerBtns.append(presetIndicator, mixerBtn, settingsBtn);
   header.append(titleWrap, headerBtns);
 
   function setDevBadge(visible) {
     devBadge.hidden = !visible;
+  }
+
+  // --- the active-preset indicator's state ------------------------------
+  //
+  // presetList is ListPresets' summaries; activePresetId is GetActivePreset's
+  // id ('' means none applied); sendingNow mirrors the START/STOP state so the
+  // selector can be gated the same way the Settings Apply button is.
+  let presetList = [];
+  let activePresetId = '';
+  let presetSendingNow = false;
+
+  /**
+   * renderPresetIndicator draws the header indicator from the three pieces of
+   * state. It hides the whole control when there are no saved instances (quiet
+   * until it has something to say), shows a disabled "none" when nothing is
+   * applied, and disables switching — with the reason on the control — while a
+   * session is running.
+   */
+  function renderPresetIndicator() {
+    if (presetList.length === 0) {
+      presetIndicator.hidden = true;
+      return;
+    }
+    presetIndicator.hidden = false;
+    presetIndicatorSelect.textContent = '';
+    // A "none" option ONLY when nothing is applied: it lets the control show the
+    // no-preset state honestly without offering "none" as a thing to switch TO.
+    if (!activePresetId) {
+      const none = document.createElement('option');
+      none.value = '';
+      none.textContent = 'none';
+      none.disabled = true;
+      presetIndicatorSelect.appendChild(none);
+    }
+    for (const p of presetList) {
+      const o = document.createElement('option');
+      o.value = p.id;
+      o.textContent = p.name;
+      presetIndicatorSelect.appendChild(o);
+    }
+    presetIndicatorSelect.value = activePresetId || '';
+    // Gated on the sending state, with the reason ON THE CONTROL: ApplyPreset is
+    // refused server-side while a session runs, so a switch that would only ever
+    // fail must say why it is disabled rather than throw when pressed.
+    presetIndicatorSelect.disabled = presetSendingNow;
+    presetIndicatorSelect.title = presetSendingNow
+      ? 'Disabled while SENDING: stop the feed before switching instance.'
+      : 'The M2L-X instance this seat is pointed at. Switching reconnects to the chosen instance.';
+  }
+
+  /** setPresets fills the indicator with the saved instances (id-bearing only). */
+  function setPresets(list) {
+    presetList = Array.isArray(list) ? list.filter((p) => p && p.id) : [];
+    renderPresetIndicator();
+  }
+
+  /**
+   * setActivePreset marks which instance is running. Accepts the id string (what
+   * app.js passes from GetActivePreset), tolerating the whole record for safety.
+   */
+  function setActivePreset(id) {
+    activePresetId = typeof id === 'string' ? id : (id && id.id) || '';
+    renderPresetIndicator();
   }
 
   /**
@@ -979,6 +1077,11 @@ export function createHomeView(handlers) {
     startStopBtn.classList.toggle('btn-stop', running);
     startStopBtn.classList.toggle('btn-primary', !running);
     startStopBtn.setAttribute('aria-pressed', String(running));
+    // The preset selector is gated on the SAME running state as the button: the
+    // server refuses ApplyPreset while SENDING, so switching instance from the
+    // header must be disabled with the reason on it rather than left to fail.
+    presetSendingNow = running === true;
+    renderPresetIndicator();
   }
 
   function setBusy(busy) {
@@ -1011,6 +1114,8 @@ export function createHomeView(handlers) {
     measurePictureRect,
     setLevels,
     setLevel,
+    setPresets,
+    setActivePreset,
     setRunning,
     setBusy,
     setStatusUnavailable,

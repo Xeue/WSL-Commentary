@@ -170,6 +170,7 @@ var remoteAllowlist = map[string]methodPolicy{
 	"GetConfig":                 {cap: remote.CapView},
 	"GetKVSCredentials":         {cap: remote.CapView},
 	"GetStatusKeyCandidates":    {cap: remote.CapView},
+	"ListEvents":                {cap: remote.CapView},
 	"GetMixerSnapshot":          {cap: remote.CapView},
 	"GetMixerGolden":            {cap: remote.CapView},
 	"GetPictureState":           {cap: remote.CapView},
@@ -310,6 +311,8 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetKVSCredentials()
 	case "GetStatusKeyCandidates":
 		return a.GetStatusKeyCandidates()
+	case "ListEvents":
+		return a.ListEvents()
 	case "GetMixerSnapshot":
 		return a.GetMixerSnapshot()
 	case "GetMixerGolden":

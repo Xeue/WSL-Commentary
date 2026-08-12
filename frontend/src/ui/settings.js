@@ -9,6 +9,11 @@ import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
 // the tag/label pairing happens here, where the four fields already have
 // controls. See MACHINE_NOTE_TAGS below.
 import { diffPreset, describeIgnoredKeys, filterPresetFields, MACHINE_FIELD_LABELS } from './presets.js';
+// The pure event auto-select / picker rule. It decides, from the instance's
+// event list and the URL-derived id, whether to auto-select a lone event or
+// offer a picker; this file turns that answer into the hidden field, a note or a
+// <select>. Pure and DOM-free — see events.js and events.test.js.
+import { chooseEvent } from './events.js';
 // The channel table, from the module that enforces it in the Web Audio graph.
 // See the note beside the same import in home.js.
 import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
@@ -552,6 +557,100 @@ export function createSettingsView(handlers) {
     liveURLNote.hidden = !(host || event);
     liveURLNote.textContent = `Host "${host}", event "${event}".`;
   };
+
+  // --- the event auto-select / picker -----------------------------------
+  //
+  // When the app can LIST the instance's events (a signed-in client against a
+  // reachable instance), the event id no longer has to come from the pasted
+  // URL: a lone event is auto-selected for the operator, and several are offered
+  // as a picker. Both write the SAME hidden eventId field the URL path writes,
+  // so collectConfig, validation and the preset diff are untouched — this only
+  // changes where the value comes FROM. When the app cannot list (not signed in,
+  // no host, an older build, any error), neither the picker nor the note shows
+  // and the URL-derived behaviour above stands exactly as it was.
+  //
+  // The rule itself is in events.js (pure, tested); this is the wiring.
+  const eventSelect = document.createElement('select');
+  eventSelect.id = 'f-eventSelect';
+  const eventSelectRow = row(
+    'Event',
+    'f-eventSelect',
+    eventSelect,
+    'This instance is running more than one event — choose which one this seat controls.',
+  );
+  eventSelectRow.wrap.hidden = true;
+  currentGroup.appendChild(eventSelectRow.wrap);
+
+  // The auto-selected line, shown INSTEAD of the picker when there is exactly
+  // one event: the operator sees the event was chosen for them rather than
+  // wondering why there is no control.
+  const eventNote = document.createElement('p');
+  eventNote.className = 'field-hint event-note';
+  eventNote.hidden = true;
+  currentGroup.appendChild(eventNote);
+
+  // Writing the hidden field is the whole point: the picker is just another
+  // source for the value collectConfig already reads out of fields.eventId.
+  eventSelect.addEventListener('change', () => {
+    fields.eventId.input.value = eventSelect.value;
+    showDerived();
+  });
+
+  /**
+   * renderEventChoice applies chooseEvent's decision to the DOM: the picker for
+   * a genuine choice, the note for a lone auto-selected event, and neither when
+   * there is nothing to improve on (the URL-derived id then stands untouched).
+   */
+  function renderEventChoice(choice, events) {
+    if (choice.needsPicker) {
+      eventSelect.textContent = '';
+      for (const e of events) {
+        const o = document.createElement('option');
+        o.value = e.id;
+        // Name and status, because an operator choosing between several events
+        // tells the live one from the rest by its status.
+        o.textContent = e.status ? `${e.name} (${e.status})` : e.name;
+        eventSelect.appendChild(o);
+      }
+      eventSelect.value = choice.selectedId;
+      fields.eventId.input.value = choice.selectedId;
+      eventSelectRow.wrap.hidden = false;
+      eventNote.hidden = true;
+      showDerived();
+      return;
+    }
+    eventSelectRow.wrap.hidden = true;
+    if (choice.autoSelected) {
+      fields.eventId.input.value = choice.selectedId;
+      eventNote.textContent = `Event "${choice.selectedName}" (auto-selected).`;
+      eventNote.hidden = false;
+      showDerived();
+      return;
+    }
+    // 0 events: leave the URL-derived id and its line exactly as they were.
+    eventNote.hidden = true;
+  }
+
+  /**
+   * refreshEvents asks the backend for the instance's events and applies the
+   * pure rule. It swallows every failure to the console: not signed in, no host,
+   * an older build without the binding, a network error — none of these may
+   * break the screen, and all of them mean "fall back to the URL-derived id".
+   */
+  async function refreshEvents() {
+    try {
+      const events = await backend.listEvents();
+      const usable = Array.isArray(events) ? events.filter((e) => e && e.id) : [];
+      renderEventChoice(chooseEvent(usable, fields.eventId.input.value), usable);
+    } catch (err) {
+      eventSelectRow.wrap.hidden = true;
+      eventNote.hidden = true;
+      console.info(
+        'wslcomms: could not list events; the URL-derived event id stands',
+        err?.message || err,
+      );
+    }
+  }
 
   // --- SRT output ---------------------------------------------------------
   const srtHeading = document.createElement('h2');
@@ -1451,6 +1550,12 @@ export function createSettingsView(handlers) {
     } catch (err) {
       console.error('wslcomms: could not fetch statusKey suggestions', err);
     }
+
+    // The instance's events, after the config load so the URL-derived id is in
+    // place as the fallback and the picker's default. Its own try/catch inside —
+    // an instance the app cannot enumerate must leave the URL-derived behaviour
+    // untouched, never blank the screen.
+    await refreshEvents();
 
     // And the instance picker, separately again and last: a preset listing
     // failure must not stop the operator editing the fields it would have

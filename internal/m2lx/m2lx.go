@@ -250,6 +250,14 @@ type Client interface {
 	// KVSToken fetches the Cognito identity and token for an event.
 	KVSToken(ctx context.Context, eventID string) (KVSToken, error)
 
+	// ListEvents lists the instance's events (GET /api/events/overview) using
+	// the held bearer token. It returns ErrNotSignedIn if SignIn has not
+	// succeeded, and an empty slice — not an error — for an empty instance, so
+	// "no events" is a state the caller renders rather than a failure it must
+	// distinguish from a network fault. The concrete implementation lives in
+	// events.go; it drops id-less entries and sorts by name.
+	ListEvents(ctx context.Context) ([]Event, error)
+
 	// Close cancels the background token-refresh goroutine started by
 	// SignIn, if one was ever started, and blocks until it has actually
 	// exited. Idempotent and safe to call concurrently with itself and

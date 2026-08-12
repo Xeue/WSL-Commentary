@@ -859,6 +859,7 @@ func assertBoundSurface(t *testing.T) {
 		"Stop":                   true,
 		"GetKVSCredentials":      true,
 		"GetStatusKeyCandidates": true,
+		"ListEvents":             true,
 
 		"GetMixerSnapshot":  true,
 		"ArmMixer":          true,
@@ -956,6 +957,64 @@ func TestGetKVSCredentialsWhenNotSignedIn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), secrets.TargetM2LX) {
 		t.Fatalf("error %q does not name the Credential Manager target holding the password", err)
+	}
+}
+
+// TestListEventsReturnsTheClientsEvents is the happy path: a signed-in client
+// with events yields exactly them, so the frontend can auto-select the sole
+// event or offer a picker.
+func TestListEventsReturnsTheClientsEvents(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	want := []m2lx.Event{
+		{ID: "e1", Name: "Alpha", Status: "Running"},
+		{ID: "e2", Name: "Bravo", Status: "Idle"},
+	}
+	a.ctlMu.Lock()
+	a.client = stubClient{token: "tok", fakeEvents: want}
+	a.ctlMu.Unlock()
+
+	got, err := a.ListEvents()
+	if err != nil {
+		t.Fatalf("ListEvents() error = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListEvents() = %v, want %v", got, want)
+	}
+}
+
+// TestListEventsWhenNotSignedIn proves the not-signed-in guard fires BEFORE the
+// client is called: with a token-less client the operator is pointed at the
+// alias and the password, the same fix GetKVSCredentials names, rather than a
+// bare ErrNotSignedIn bubbling up.
+func TestListEventsWhenNotSignedIn(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	a.ctlMu.Lock()
+	a.client = stubClient{token: ""}
+	a.ctlMu.Unlock()
+
+	_, err := a.ListEvents()
+	if err == nil {
+		t.Fatal("ListEvents() succeeded while not signed in")
+	}
+	if !strings.Contains(err.Error(), secrets.TargetM2LX) {
+		t.Fatalf("error %q does not name the Credential Manager target holding the password", err)
+	}
+}
+
+// TestListEventsWithoutAControlPlane proves the no-client guard: with no
+// configured m2lxHost there is no client to call, and the error must name the
+// Settings field the operator has to fill in.
+func TestListEventsWithoutAControlPlane(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	_, err := a.ListEvents()
+	if err == nil {
+		t.Fatal("ListEvents() succeeded with no client; want an error naming the missing setting")
+	}
+	if !strings.Contains(err.Error(), "m2lxHost") {
+		t.Fatalf("error %q does not name the field the operator must fill in", err)
 	}
 }
 
@@ -2566,14 +2625,26 @@ func exportedMethodsOfApp() map[string]bool {
 }
 
 // stubClient is an m2lx.Client that makes no network call. GetKVSCredentials
-// only needs Token() to decide whether it is worth trying the chain.
+// only needs Token() to decide whether it is worth trying the chain, and
+// App.ListEvents needs a canned event list (or error) to return once it has
+// passed its own client/token guards — so fakeEvents and fakeEventsErr are
+// settable and drive the App.ListEvents tests directly.
 type stubClient struct {
 	token string
+
+	fakeEvents    []m2lx.Event
+	fakeEventsErr error
 }
 
 func (c stubClient) SignIn(context.Context, string, string) error { return nil }
 func (c stubClient) Refresh(context.Context) error                { return nil }
 func (c stubClient) Token() string                                { return c.token }
+
+// ListEvents returns the canned events (or error) the test configured, so that
+// App.ListEvents can be exercised without a live instance.
+func (c stubClient) ListEvents(context.Context) ([]m2lx.Event, error) {
+	return c.fakeEvents, c.fakeEventsErr
+}
 
 func (c stubClient) KVSInfo(context.Context, string) (m2lx.KVSInfo, error) {
 	return m2lx.KVSInfo{}, errors.New("stubClient: KVSInfo is not implemented")
