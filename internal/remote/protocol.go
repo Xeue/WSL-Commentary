@@ -136,16 +136,14 @@ type EventFrame struct {
 // and the SRT return, which own the host's GPU child window and headphones) are
 // simply absent from this list, so on a remote client they do not exist to be
 // called — the degradation is by omission, not by a refusal the frontend would
-// have to be taught to expect. Caps is informational for the client's own UI
-// (e.g. hiding controls it may not use); the server never trusts the client to
-// enforce it and re-checks every call in the dispatcher regardless.
+// have to be taught to expect. There are no capabilities: the listener is
+// unauthenticated, so every connection sees the same method list.
 type HelloFrame struct {
 	T string `json:"t"`
-	// Client is the authenticated client-record name this connection belongs to.
+	// Client is this connection's per-connection id. It is what the shim
+	// publishes as window.__wslcommsRemote.client so the frontend can recognise
+	// the echo of its OWN SaveConfig (whose EventConfig origin is this same id).
 	Client string `json:"client"`
-	// Caps are the capabilities granted to this client (view/operate/mixer),
-	// for the client's own UI. Not a security boundary.
-	Caps []string `json:"caps"`
 	// Methods is the authoritative allowlist the shim installs on
 	// window.go.main.App. Absence is how a method ceases to exist for a client.
 	Methods []string `json:"methods"`

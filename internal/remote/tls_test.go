@@ -110,8 +110,8 @@ func TestEnsureCertificate_ValidityIsBounded(t *testing.T) {
 // TestFingerprint_MatchesServedLeaf ties the number Settings would print to the
 // leaf a client actually receives on the wire, over the running server.
 func TestFingerprint_MatchesServedLeaf(t *testing.T) {
-	h := newHarness(t, nil)
-	conn, err := tls.Dial("tcp", h.addr, &tls.Config{InsecureSkipVerify: true})
+	h := newHarness(t)
+	conn, err := tls.Dial("tcp", h.httpsAddr, &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatalf("tls.Dial: %v", err)
 	}

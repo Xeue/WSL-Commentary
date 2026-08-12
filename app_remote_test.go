@@ -42,23 +42,13 @@ import (
 // the classification is a decision, made once, visible in review — not a default
 // that a reader has to reverse-engineer from the dispatch switch.
 func TestRemoteAllowlistCoversEveryBoundMethod(t *testing.T) {
-	knownCap := map[remote.Capability]bool{
-		remote.CapView:    true,
-		remote.CapOperate: true,
-		remote.CapMixer:   true,
-	}
-
-	// Forward: every exported method is classified.
+	// Forward: every exported method is classified. With no capability tiers the
+	// classification is binary — a method is host-only or it is not — so being
+	// present in the table is the whole requirement.
 	for name := range exportedMethodsOfApp() {
-		pol, ok := remoteAllowlist[name]
-		if !ok {
-			t.Errorf("*App exports %q but it is NOT in remoteAllowlist. Classify it: give it a "+
-				"capability (view/operate/mixer) and decide whether it is host-only, so a new binding "+
-				"cannot default into being remotely callable.", name)
-			continue
-		}
-		if !knownCap[pol.cap] {
-			t.Errorf("method %q has capability %q, which is not one of view/operate/mixer", name, pol.cap)
+		if _, ok := remoteAllowlist[name]; !ok {
+			t.Errorf("*App exports %q but it is NOT in remoteAllowlist. Classify it: decide whether it "+
+				"is host-only, so a new binding cannot default into being remotely callable.", name)
 		}
 	}
 
@@ -73,7 +63,8 @@ func TestRemoteAllowlistCoversEveryBoundMethod(t *testing.T) {
 }
 
 // TestRemoteHostOnlySet pins exactly which methods are host-only, so neither the
-// native-surface six nor the admin five can silently gain OR lose that status.
+// native-surface six nor the two remote-admin methods can silently gain OR lose
+// that status. The per-client admin methods are gone — there are no clients.
 func TestRemoteHostOnlySet(t *testing.T) {
 	want := map[string]bool{
 		// the native picture / SRT-return surface
@@ -82,8 +73,6 @@ func TestRemoteHostOnlySet(t *testing.T) {
 		"StartReturn": true, "StopReturn": true,
 		// remote administration (local Settings screen only)
 		"GetRemoteState": true, "SetRemoteListener": true,
-		"AddRemoteClient": true, "SetRemoteClientPassword": true,
-		"DeleteRemoteClient": true,
 	}
 	got := map[string]bool{}
 	for name, pol := range remoteAllowlist {
@@ -105,7 +94,7 @@ func TestRemoteHostOnlySet(t *testing.T) {
 func TestRemoteCallRefusesUnknownMethod(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
-	client := remote.ClientInfo{ID: "c1", Name: "op", Caps: []string{string(remote.CapMixer)}}
+	client := remote.ClientInfo{ID: "c1", RemoteAddr: "192.0.2.9:5000"}
 
 	_, err := a.remoteCall(context.Background(), client, "NoSuchMethod", nil)
 	if err == nil || !strings.Contains(err.Error(), "unknown") {
@@ -113,84 +102,61 @@ func TestRemoteCallRefusesUnknownMethod(t *testing.T) {
 	}
 }
 
-// TestRemoteHostOnlyRefusedAtEveryCapability is the design's test 5 at the App
-// layer: a host-only method is refused for every capability set INCLUDING the
-// highest, and is absent from the hello methods list a client at that capability
-// would receive.
-func TestRemoteHostOnlyRefusedAtEveryCapability(t *testing.T) {
+// TestRemoteHostOnlyRefused is the design's host-only test at the App layer: a
+// host-only method is refused for every connection and is absent from the hello
+// methods list. With no capabilities, "every connection" is a single case.
+func TestRemoteHostOnlyRefused(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
 
-	capSets := [][]string{
-		nil,
-		{string(remote.CapView)},
-		{string(remote.CapOperate)},
-		{string(remote.CapMixer)},
-	}
+	client := remote.ClientInfo{ID: "c1", RemoteAddr: "192.0.2.9:5000"}
+	installed := set(a.remoteMethods(client))
 
 	for name, pol := range remoteAllowlist {
 		if !pol.hostOnly {
 			continue
 		}
-		for _, caps := range capSets {
-			client := remote.ClientInfo{ID: "c1", Name: "op", Caps: caps}
-
-			// Absent from the methods list.
-			for _, m := range a.remoteMethods(client) {
-				if m == name {
-					t.Errorf("host-only %q appeared in remoteMethods for caps %v", name, caps)
-				}
-			}
-			// Refused by Call.
-			_, err := a.remoteCall(context.Background(), client, name, nil)
-			if err == nil || !strings.Contains(err.Error(), "host-only") {
-				t.Errorf("remoteCall(%q) at caps %v error = %v, want a host-only refusal", name, caps, err)
-			}
+		// Absent from the methods list.
+		if installed[name] {
+			t.Errorf("host-only %q appeared in remoteMethods", name)
+		}
+		// Refused by Call.
+		_, err := a.remoteCall(context.Background(), client, name, nil)
+		if err == nil || !strings.Contains(err.Error(), "host-only") {
+			t.Errorf("remoteCall(%q) error = %v, want a host-only refusal", name, err)
 		}
 	}
 }
 
-// TestRemoteMethodsFollowTheCapabilityTiers checks the authoritative hello list:
-// a view client sees the reads but not the writes, operate sees the operate
-// writes but not the mixer write, mixer sees them all. DisarmMixer is view, so
-// every authenticated client sees it — shutting a gate is always safe.
-func TestRemoteMethodsFollowTheCapabilityTiers(t *testing.T) {
+// TestRemoteMethodsAreEveryNonHostOnlyMethod checks the authoritative hello list:
+// with no capability tiers, every connection sees EVERY allowlisted method that
+// is not host-only, and no host-only method ever appears.
+func TestRemoteMethodsAreEveryNonHostOnlyMethod(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
 
-	viewer := set(a.remoteMethods(remote.ClientInfo{Caps: []string{string(remote.CapView)}}))
-	operator := set(a.remoteMethods(remote.ClientInfo{Caps: []string{string(remote.CapOperate)}}))
-	mixerC := set(a.remoteMethods(remote.ClientInfo{Caps: []string{string(remote.CapMixer)}}))
+	got := set(a.remoteMethods(remote.ClientInfo{ID: "c1", RemoteAddr: "192.0.2.9:5000"}))
 
-	// view: reads yes, writes no.
-	mustHave(t, "view", viewer, "GetConfig", "ListPresets", "GetActivePreset", "DisarmMixer")
-	mustLack(t, "view", viewer, "Start", "SaveConfig", "SendMixerCommands", "SetMixerGolden")
-
-	// operate: operate writes yes, mixer write no.
-	mustHave(t, "operate", operator, "Start", "Stop", "SaveConfig", "SetSecret", "ArmMixer", "ApplyPreset")
-	mustLack(t, "operate", operator, "SendMixerCommands", "SetMixerGolden")
-
-	// mixer: the write path too.
-	mustHave(t, "mixer", mixerC, "SendMixerCommands", "SetMixerGolden", "Start", "GetConfig")
-
-	// Host-only never appears at any tier.
-	mustLack(t, "mixer", mixerC, "StartPicture", "StopReturn", "SetRemoteListener")
-}
-
-// TestRemoteCapabilityGateRefusesUnderTier proves the gate is enforced by Call,
-// not merely reflected in the methods list: a view client naming an operate
-// method on the wire is refused with a capability error, before the method runs.
-func TestRemoteCapabilityGateRefusesUnderTier(t *testing.T) {
-	a, _ := newTestApp(t)
-	silencePump(a)
-	view := remote.ClientInfo{ID: "c1", Name: "v", Caps: []string{string(remote.CapView)}}
-
-	for _, m := range []string{"Start", "SaveConfig", "SendMixerCommands"} {
-		_, err := a.remoteCall(context.Background(), view, m, nil)
-		if err == nil || !strings.Contains(err.Error(), "requires capability") {
-			t.Errorf("remoteCall(%q) as view error = %v, want a capability refusal", m, err)
+	// Every non-host-only allowlisted method is present; every host-only one is
+	// absent. This is derived from the table itself so it cannot drift from it.
+	for name, pol := range remoteAllowlist {
+		if pol.hostOnly {
+			if got[name] {
+				t.Errorf("host-only %q must not appear in remoteMethods", name)
+			}
+			continue
+		}
+		if !got[name] {
+			t.Errorf("non-host-only %q is missing from remoteMethods", name)
 		}
 	}
+
+	// Spot-check the reads, the writes and the arm-gated write are all there —
+	// every connection can reach them now.
+	mustHave(t, "open", got, "GetConfig", "ListPresets", "DisarmMixer",
+		"Start", "SaveConfig", "SetSecret", "ArmMixer", "SendMixerCommands", "SetMixerGolden")
+	// Host-only never appears.
+	mustLack(t, "open", got, "StartPicture", "StopReturn", "GetRemoteState", "SetRemoteListener")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +198,9 @@ func TestArmOwnershipRefusesAForeignSeat(t *testing.T) {
 // TestArmOwnershipLocalArmRefusesRemoteWrite closes the exact two-controller case
 // the feature exists for: the LOCAL operator arms (through the bound ArmMixer),
 // and a REMOTE seat's SendMixerCommands — arriving through the dispatcher with
-// its own connection id — is refused with mixer.ErrDisarmed even though it holds
-// the mixer capability.
+// its own connection id — is refused with mixer.ErrDisarmed. Arm-ownership is
+// about WHICH seat holds the open window, not authentication, so it survives the
+// move to the unauthenticated listener unchanged.
 func TestArmOwnershipLocalArmRefusesRemoteWrite(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
@@ -244,8 +211,8 @@ func TestArmOwnershipLocalArmRefusesRemoteWrite(t *testing.T) {
 		t.Fatalf("ArmMixer() error = %v", err)
 	}
 
-	// Remote mixer-capable seat writes through the dispatcher.
-	remoteClient := remote.ClientInfo{ID: "remote-1", Name: "producer", Caps: []string{string(remote.CapMixer)}}
+	// A remote seat writes through the dispatcher with its own connection id.
+	remoteClient := remote.ClientInfo{ID: "remote-1", RemoteAddr: "192.0.2.9:5000"}
 	args := mustArgs(t, []MixerCommand{routingCommandJSON(t, "cam22-1", "master")})
 	_, err := a.remoteCall(context.Background(), remoteClient, "SendMixerCommands", args)
 	if !errors.Is(err, mixer.ErrDisarmed) {
@@ -302,20 +269,15 @@ func TestTeardownStopsTheRemoteListenerWithinBudget(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
 
-	// A listener enabled on loopback, ephemeral port (0 — accepted by Start; the
-	// operator-facing >=1 floor lives in Settings.Validate, which this bypasses on
-	// purpose so the test does not fight for a fixed port). One client so the
-	// store is non-empty and realistic.
+	// A listener enabled on loopback, ephemeral ports (0 — accepted by Start and
+	// used here so the test does not fight for the fixed 80/443 or their
+	// fallbacks). There are no clients to configure; the listener is
+	// unauthenticated.
 	s := remote.DefaultSettings()
 	s.Enabled = true
 	s.Bind = "127.0.0.1"
-	s.Port = 0
-	if err := s.AddClient("op", []string{string(remote.CapView)}); err != nil {
-		t.Fatalf("AddClient: %v", err)
-	}
-	if err := s.SetClientPassword("op", "pw"); err != nil {
-		t.Fatalf("SetClientPassword: %v", err)
-	}
+	s.HTTPPort = 0
+	s.HTTPSPort = 0
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save remote.json: %v", err)
 	}
@@ -340,22 +302,39 @@ func TestTeardownStopsTheRemoteListenerWithinBudget(t *testing.T) {
 	}
 }
 
-// TestStartRemoteDisabledBindsNothing is the safe-posture check at the App layer:
-// with the default (missing remote.json → disabled), startRemote builds a server
-// but Start binds nothing, so there is no listener and no goroutine to reap.
+// TestStartRemoteDisabledBindsNothing is the off-switch check at the App layer:
+// an operator who has turned remote access OFF (enabled=false in remote.json)
+// gets no listener. The listener is ON by default now, so this test must write
+// the disabled state explicitly rather than rely on a missing file.
 func TestStartRemoteDisabledBindsNothing(t *testing.T) {
-	a, _ := newTestApp(t)
+	a, _ := newTestApp(t) // newTestApp already writes a disabled remote.json
+
 	silencePump(a)
 
 	a.startRemote()
 
-	// Give the start goroutine a moment; a disabled server returns addr "" and
+	// Give the start goroutine a moment; a disabled server binds nothing and
 	// never sets a fingerprint.
 	if pollUntil(300*time.Millisecond, func() bool {
 		srv := a.remote.Load()
 		return srv != nil && srv.Fingerprint() != ""
 	}) {
-		t.Fatal("a listener bound with remote access disabled; the default posture must bind nothing")
+		t.Fatal("a listener bound with remote access disabled; OFF must bind nothing")
+	}
+}
+
+// disableRemoteListenerForTest writes a remote.json that turns the LAN listener
+// OFF, under the APPDATA the caller has already redirected. The listener is now
+// ON by default and binds 0.0.0.0:80/443 (falling back to 8080/8443), so a test
+// that calls startup() or startRemote() without this would try to open a REAL
+// LAN listener — a firewall prompt and a resource leak. Tests that WANT a
+// listener save their own enabled settings after newTestApp has run.
+func disableRemoteListenerForTest(t *testing.T) {
+	t.Helper()
+	s := remote.DefaultSettings()
+	s.Enabled = false
+	if err := s.Save(); err != nil {
+		t.Fatalf("disabling the remote listener for the test: %v", err)
 	}
 }
 

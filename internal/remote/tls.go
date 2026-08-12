@@ -51,27 +51,75 @@ func certPaths(dir string) (certPath, keyPath string) {
 // generates and persists a fresh one, returning the certificate ready for a
 // tls.Config together with its SHA-256 fingerprint for display.
 //
-// It regenerates when there is no stored cert, when the stored cert cannot be
-// parsed, when it has expired, or — the case that matters operationally — when
-// the operator has changed the bind address and the stored cert's SANs no longer
-// cover the new IP. A cert that does not name the address the browser dialled
-// produces a name-mismatch error on top of the self-signed warning, which is a
-// second, more alarming click-through; regenerating keeps it to the one
-// unavoidable "unknown issuer" prompt the fingerprint display exists to answer.
+// Because the listener binds 0.0.0.0 and remote browsers reach it by whatever
+// LAN IP the commentary PC answers on, the cert must name EVERY such address or
+// the browser adds a name-mismatch error on top of the unavoidable self-signed
+// warning — a second, more alarming click-through. So the SANs are the union of
+// every non-loopback interface IP (net.InterfaceAddrs), loopback (v4 and v6),
+// "localhost", the hostname, and — when a specific non-wildcard bind is
+// configured — that bind IP too. bindIP may be "0.0.0.0" (the default), in which
+// case it contributes nothing and the interface IPs carry the cert.
+//
+// It regenerates when there is no stored cert, when it cannot be parsed, when it
+// has expired, or — the case that matters operationally — when the machine's set
+// of interface IPs has GROWN and the stored cert no longer covers an address a
+// client could now dial. It does NOT regenerate merely because an interface
+// disappeared: a cert that names an address nothing answers on is harmless.
 func EnsureCertificate(dir, bindIP string) (tls.Certificate, string, error) {
+	want := certIPs(bindIP)
 	certPath, keyPath := certPaths(dir)
-	if cert, fp, ok := loadIfUsable(certPath, keyPath, bindIP); ok {
+	if cert, fp, ok := loadIfUsable(certPath, keyPath, want); ok {
 		return cert, fp, nil
 	}
-	return generateAndPersist(dir, bindIP)
+	return generateAndPersist(dir, want)
+}
+
+// certIPs is the set of IP addresses the served certificate must name: every
+// non-loopback interface IP, both loopbacks, and the configured bind when it is
+// a specific (non-wildcard) address. Duplicates are removed; a machine's own IPs
+// naturally overlap loopback only if it is oddly configured, and dedupeIPs
+// tolerates it.
+func certIPs(bindIP string) []net.IP {
+	ips := interfaceIPs()
+	ips = append(ips, net.IPv4(127, 0, 0, 1), net.IPv6loopback)
+	if ip := net.ParseIP(strings.TrimSpace(bindIP)); ip != nil && !ip.IsUnspecified() {
+		ips = append(ips, ip)
+	}
+	return dedupeIPs(ips)
+}
+
+// interfaceIPs returns every non-loopback, non-wildcard IP currently assigned to
+// a network interface — the LAN addresses a remote browser might dial. A failure
+// to enumerate is not fatal: the caller still has the loopbacks, and a cert that
+// covers fewer addresses only costs an extra browser warning, never correctness.
+func interfaceIPs() []net.IP {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []net.IP
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
 }
 
 // loadIfUsable tries to load an existing cert/key pair and reports whether it is
-// usable for bindIP right now. Any reason it is not — missing, unparseable,
-// expired, or not covering bindIP — returns ok=false so the caller regenerates,
-// rather than an error: a stale cert is a normal condition to recover from, not
-// a failure to report.
-func loadIfUsable(certPath, keyPath, bindIP string) (tls.Certificate, string, bool) {
+// usable right now: parseable, unexpired, and covering every IP in want. Any
+// reason it is not returns ok=false so the caller regenerates, rather than an
+// error — a stale cert is a normal condition to recover from, not a failure to
+// report.
+func loadIfUsable(certPath, keyPath string, want []net.IP) (tls.Certificate, string, bool) {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
 		return tls.Certificate{}, "", false
@@ -92,8 +140,10 @@ func loadIfUsable(certPath, keyPath, bindIP string) (tls.Certificate, string, bo
 	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
 		return tls.Certificate{}, "", false
 	}
-	if !certCoversIP(leaf, bindIP) {
-		return tls.Certificate{}, "", false
+	for _, ip := range want {
+		if !certCoversIP(leaf, ip.String()) {
+			return tls.Certificate{}, "", false
+		}
 	}
 	cert.Leaf = leaf
 	return cert, fingerprintDER(cert.Certificate[0]), true
@@ -117,17 +167,18 @@ func certCoversIP(leaf *x509.Certificate, ip string) bool {
 }
 
 // generateAndPersist mints a fresh ECDSA P-256 self-signed certificate covering
-// bindIP, loopback and the machine's hostname, writes it atomically alongside
-// remote.json, and returns it with its fingerprint.
+// the given IP set, "localhost" and the machine's hostname, writes it atomically
+// alongside remote.json, and returns it with its fingerprint.
 //
 // P-256 rather than RSA is chosen because the keygen is near-instant — this runs
 // on first enable, off the Wails main thread, and must not be a perceptible
 // stall — and because a modern browser accepts it without complaint once the
 // issuer is trusted.
-func generateAndPersist(dir, bindIP string) (tls.Certificate, string, error) {
-	ip := net.ParseIP(bindIP)
-	if ip == nil {
-		return tls.Certificate{}, "", fmt.Errorf("remote: bind %q is not a literal IP", bindIP)
+func generateAndPersist(dir string, ips []net.IP) (tls.Certificate, string, error) {
+	if len(ips) == 0 {
+		// Should not happen — certIPs always adds the loopbacks — but a cert with
+		// no IP SANs would be useless, so refuse rather than mint one.
+		return tls.Certificate{}, "", fmt.Errorf("remote: no IP addresses to put in the certificate")
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -140,11 +191,10 @@ func generateAndPersist(dir, bindIP string) (tls.Certificate, string, error) {
 		return tls.Certificate{}, "", fmt.Errorf("remote: generating serial: %w", err)
 	}
 
-	// SANs. The bind IP is what a remote browser dials; loopback (both v4 and
-	// v6) is what the local operator and a developer reach; localhost and the
-	// hostname are the names either might type instead of an address. Duplicates
-	// (a loopback bind) are harmless and de-duplicated by set membership below.
-	ips := dedupeIPs([]net.IP{ip, net.IPv4(127, 0, 0, 1), net.IPv6loopback})
+	// SANs. The caller has already assembled the IP set — every LAN interface IP
+	// a remote browser might dial, plus both loopbacks and any specific bind;
+	// "localhost" and the hostname are the names either the operator or a
+	// developer might type instead of an address.
 	dns := []string{"localhost"}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		dns = append(dns, h)

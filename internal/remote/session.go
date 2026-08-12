@@ -123,8 +123,7 @@ func (s *session) writeHello() error {
 	methods := s.dispatcher.Methods(s.info)
 	hello := HelloFrame{
 		T:       FrameHello,
-		Client:  s.info.Name,
-		Caps:    s.info.Caps,
+		Client:  s.info.ID,
 		Methods: methods,
 		Events:  s.events,
 	}
@@ -171,7 +170,7 @@ func (s *session) readPump() {
 		if err != nil {
 			// A peer that cannot speak the protocol is disconnected rather than
 			// guessed at; see errProtocol.
-			s.logf("remote: %s from %s: %v", s.info.Name, s.info.RemoteAddr, err)
+			s.logf("remote: seat %s from %s: %v", s.info.ID, s.info.RemoteAddr, err)
 			return
 		}
 		s.startCall(call)

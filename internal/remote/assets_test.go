@@ -58,8 +58,8 @@ func TestInjectShim_NoMarkerReturnsOriginalAndError(t *testing.T) {
 }
 
 func TestAssetServer_GETSlashIsInjectedIndex(t *testing.T) {
-	h := newHarness(t, nil)
-	resp, err := h.httpClient().Get("https://" + h.addr + "/")
+	h := newHarness(t)
+	resp, err := h.httpClient().Get("https://" + h.httpsAddr + "/")
 	if err != nil {
 		t.Fatalf("GET /: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestAssetServer_GETSlashIsInjectedIndex(t *testing.T) {
 }
 
 func TestAssetServer_StaticPassthroughIsByteIdentical(t *testing.T) {
-	h := newHarness(t, nil)
-	resp, err := h.httpClient().Get("https://" + h.addr + "/assets/index-B3qX8jaX.js")
+	h := newHarness(t)
+	resp, err := h.httpClient().Get("https://" + h.httpsAddr + "/assets/index-B3qX8jaX.js")
 	if err != nil {
 		t.Fatalf("GET asset: %v", err)
 	}
@@ -90,8 +90,8 @@ func TestAssetServer_StaticPassthroughIsByteIdentical(t *testing.T) {
 }
 
 func TestAssetServer_ShimServedFromEmbedWithNoStore(t *testing.T) {
-	h := newHarness(t, nil)
-	resp, err := h.httpClient().Get("https://" + h.addr + shimPath)
+	h := newHarness(t)
+	resp, err := h.httpClient().Get("https://" + h.httpsAddr + shimPath)
 	if err != nil {
 		t.Fatalf("GET shim: %v", err)
 	}

@@ -721,40 +721,46 @@ the tests that would settle each is spec v3 §14; this is the working summary.
 ## 10. Remote access — the LAN bridge
 
 A second person can drive this application from a browser on the same network,
-over an authenticated TLS bridge built into `wslcomms` (`internal/remote`, plus
-`app_remote.go`). It is **OFF by default and bound to loopback by default**, and
-turning it on is a real change to the attack surface of a machine that is on
-air — read [`docs/remote-access.md`](docs/remote-access.md) in full before
-enabling it at a venue. The short version:
+over a TLS-and-plain-HTTP bridge built into `wslcomms` (`internal/remote`, plus
+`app_remote.go`). By the owner's explicit, repeated, final decision it is
+**ON by default, bound to ALL interfaces (`0.0.0.0`), and UNAUTHENTICATED** — no
+login, no client accounts, no origin/CSRF check. It is meant for a secure remote
+facility on a **dedicated private network**, where the network is the access
+control. Read [`docs/remote-access.md`](docs/remote-access.md) in full before
+deploying it anywhere that is not that. The short version:
 
-- **Enable it on the local Settings screen**, in the "Remote access" group (the
-  last group on the form). Set a bind address, a port (default 8443), add at
-  least one client, and set that client a password. The group is HIDDEN on a
-  remote browser — the five admin methods are host-only and pruned there — so
-  the listener can only ever be configured from the machine itself.
-- **Loopback is the default and the safe posture.** `127.0.0.1` is reachable
-  only from the same PC. A non-loopback bind (`0.0.0.0` or the machine's LAN IP)
-  is REFUSED until at least one client exists: an address nobody can
-  authenticate to is not a convenience, it is unauthenticated attack surface.
-- **TLS is mandatory, not optional.** The listener generates a self-signed
-  certificate on first enable; the Settings screen prints its SHA-256
-  fingerprint. In the remote browser you will click through a certificate
-  warning once — check the fingerprint against the one Settings shows. TLS is
-  load-bearing: over plain HTTP a LAN page is not a secure context, so the
-  headphone picker (`navigator.mediaDevices`) and `setSinkId` are gone, and
-  `GetKVSCredentials` would put live AWS credentials on the wire in clear.
+- **Doing nothing leaves it listening.** A missing `remote.json` yields
+  `{enabled:true, bind:"0.0.0.0", httpPort:80, httpsPort:443}`, so a fresh
+  machine on the facility network answers out of the box. Its state lives in
+  `%APPDATA%\WSLComms\remote\remote.json`, deliberately NOT `config.json`.
+- **Both HTTP and HTTPS are served, with a Windows fallback.** The well-known
+  ports are preferred so an operator can type a bare host; each has an automatic
+  fallback when `http.sys` holds it — **80 → 8080**, **443 → 8443**. Prefer the
+  `https://` URL: over plain HTTP a LAN page is not a secure context (the
+  headphone picker `navigator.mediaDevices` and `setSinkId` are gone), and plain
+  HTTP carries everything — including the live AWS session credentials from
+  `GetKVSCredentials` — in clear.
+- **There is no login and no client management.** Navigate to the URL, accept
+  the self-signed certificate once, and the frontend loads and connects — that
+  is the whole handshake. The local Settings screen's "Remote access" group is
+  **status-only**: it shows whether the listener is on and which HTTP/HTTPS ports
+  it bound on, and nothing else. `GetRemoteState`/`SetRemoteListener` are
+  host-only and pruned on a remote browser, so the listener can only ever be
+  reconfigured from the machine itself.
 - **The SRT picture CANNOT be remoted, ever.** It is a native child window
   painted by the commentary PC's GPU, outside the DOM. A remote seat gets the
   WebRTC multiviewer mosaic and an honest message; audio is unaffected. If a
   remote person must SEE the programme picture at full quality, the answer is
   console mirroring (Sunshine/Moonlight) — **not plain RDP**, which substitutes
   its own audio endpoints and graphics stack and breaks the app.
-- **A remote browser is a SECOND CONTROLLER, not a viewer.** It can press STOP,
-  arm and write the mixer (if granted `mixer`), and save config. The home
-  screen shows a persistent indicator naming the connected remote seats so the
-  operator at the desk can see that someone else has a seat. Capability tiers
-  (`view` ⊂ `operate` ⊂ `mixer`, mixer off by default) and mixer arm-ownership
-  bound the damage a remote seat can do.
+- **A remote browser is a SECOND CONTROLLER, not a viewer.** With no
+  authentication, anyone who can reach the ports has full control — press STOP,
+  arm and write the mixer, save config, set passphrases, read the AWS
+  credentials. The home screen shows a persistent indicator naming the connected
+  remote seats (by source IP, the only identity there is) so the operator at the
+  desk can see that someone else has a seat. A hand-written allowlist bounds
+  WHICH methods are reachable, and mixer arm-ownership still requires the writing
+  seat to be the one that armed — but neither is authentication.
 - **Driving the shim in a test:** `frontend/src/ui/remotewiring.test.js` runs
   `internal/remote/shim.js` against a fake WebSocket, with no browser and no
   running listener. It proves the zero-frontend-change claim: a call queued

@@ -110,6 +110,12 @@ func validConfig() *config.Config {
 func newTestApp(t *testing.T) (*App, *fakeStore) {
 	t.Helper()
 	t.Setenv("APPDATA", t.TempDir())
+	// The LAN listener is ON by default and would bind 0.0.0.0:80/443 (or the
+	// 8080/8443 fallback) the moment a test calls startup()/startRemote() — a real
+	// listener and a firewall prompt mid-test. Turn it OFF for the redirected
+	// %APPDATA%; the handful of tests that WANT a listener save their own enabled
+	// settings after this.
+	disableRemoteListenerForTest(t)
 
 	a := NewApp(t.TempDir(), nil)
 	store := newFakeStore()
@@ -511,6 +517,7 @@ func TestStartupEmitsNothingUntilDomReady(t *testing.T) {
 	// with no listeners and is lost — and the events startup produces are the
 	// first-run ones that matter most.
 	t.Setenv("APPDATA", t.TempDir())
+	disableRemoteListenerForTest(t) // startup() calls startRemote; keep it off real ports
 
 	a := NewApp(t.TempDir(), errors.New("GStreamer bundle is missing libsrt"))
 	a.store = newFakeStore()
@@ -544,6 +551,7 @@ func TestStartupWithNoM2LXHostBuildsNoControlPlane(t *testing.T) {
 	// First run: nothing is configured. This must not be treated as an error and
 	// must not open a socket to a host that does not exist.
 	t.Setenv("APPDATA", t.TempDir())
+	disableRemoteListenerForTest(t) // startup() calls startRemote; keep it off real ports
 
 	a := NewApp(t.TempDir(), nil)
 	a.store = newFakeStore()
@@ -838,15 +846,18 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // a credential EXISTS for the active preset scope — booleans, never values —
 // and app_presets.go carries the whole argument beside the type.
 //
-// The five remote-access methods are the last group, added with the LAN control
-// bridge and documented in app_remote.go. They are ALL host-only — the remote
-// dispatcher refuses every one of them at every capability — because they change
-// WHO may connect and on WHAT address, and a listener reconfigurable by its own
-// remote clients could be widened to the world by whoever first gets in. They
-// are on this bound surface solely so the LOCAL Settings screen can drive them.
-// GetRemoteState reports the has-password flag but never a hash, keeping the "no
-// secret crosses this boundary outbound" rule that GetPresetCredentialStatus is
-// the only other narrowing of.
+// The two remote-access methods are the last group, added with the LAN control
+// bridge and documented in app_remote.go. They are BOTH host-only — the remote
+// dispatcher refuses them from every connection — because they change WHETHER
+// the listener runs and on WHAT address and ports, and a listener reconfigurable
+// by its own remote connections could be turned off or moved by whoever first
+// gets in. They are on this bound surface solely so the LOCAL Settings screen
+// can drive them. (There used to be three more — AddRemoteClient,
+// SetRemoteClientPassword, DeleteRemoteClient — but the listener is now
+// unauthenticated by the owner's decision, so there are no client accounts to
+// manage; see app_remote.go and docs/remote-access.md.) GetRemoteState carries
+// no secret, keeping the "no secret crosses this boundary outbound" rule that
+// GetPresetCredentialStatus is the only recorded narrowing of.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -888,11 +899,8 @@ func assertBoundSurface(t *testing.T) {
 		"GetActivePreset":           true,
 		"GetPresetCredentialStatus": true,
 
-		"GetRemoteState":          true,
-		"SetRemoteListener":       true,
-		"AddRemoteClient":         true,
-		"SetRemoteClientPassword": true,
-		"DeleteRemoteClient":      true,
+		"GetRemoteState":    true,
+		"SetRemoteListener": true,
 	}
 
 	got := exportedMethodsOfApp()

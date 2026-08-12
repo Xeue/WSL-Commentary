@@ -24,6 +24,14 @@
  * condition this frontend already handles, not by a server refusal it would
  * have to be taught to expect.
  *
+ * WHY THERE IS NO LOGIN
+ *
+ * The listener is UNAUTHENTICATED by the owner's explicit decision — it runs on
+ * a dedicated private facility network, and the network is the access control
+ * (see docs/remote-access.md). So this shim connects straight to the WebSocket
+ * with no login step, no cookie and no credentials, and derives ws:// vs wss://
+ * from the page's own protocol so it works identically over HTTP and HTTPS.
+ *
  * WHY IT TOLERATES A MISSING DOM
  *
  * Every document/overlay access is guarded. The transport core — queue a call
@@ -35,7 +43,6 @@
   'use strict';
 
   var WS_PATH = '/__wslremote/ws';
-  var LOGIN_PATH = '/__wslremote/login';
 
   var win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this);
   // hasDoc gates every overlay/DOM access. When false — a headless test harness
@@ -65,7 +72,9 @@
   // window.__wslcommsRemote is how the frontend (app.js) knows it is a remote
   // client rather than the local WebView2 — see isRemoteClient(). It exists
   // from the first line so a check that runs before hello still reads "remote".
-  win.__wslcommsRemote = { client: null, caps: [] };
+  // `client` is filled in on hello with this connection's id, which the frontend
+  // uses to recognise the echo of its own SaveConfig.
+  win.__wslcommsRemote = { client: null };
 
   // --- window.go.main.App --------------------------------------------------
   //
@@ -261,14 +270,11 @@
     // In-flight calls cannot be answered on a dead socket; reject them so the
     // frontend's promises settle instead of hanging forever.
     rejectAllPending('remote: connection lost');
-    if (!everConnected) {
-      // Never got a hello: most likely we are not authenticated. Offer login.
-      showLogin(null);
-      return;
-    }
     if (wasConnected) {
       showReconnecting();
     }
+    // There is no login to offer — the listener is unauthenticated — so a close
+    // before or after a hello is the same case: back off and reconnect.
     scheduleReconnect();
   }
 
@@ -299,7 +305,7 @@
 
   function onHello(msg) {
     everConnected = true;
-    win.__wslcommsRemote = { client: msg.client || null, caps: msg.caps || [] };
+    win.__wslcommsRemote = { client: msg.client || null };
     installMethods(msg.methods || []);
     lastSeq = 0;
     hideOverlay();
@@ -332,55 +338,7 @@
     emit(msg.name, msg.data);
   }
 
-  // --- login + overlay (all DOM access guarded) ----------------------------
-
-  function login(user, password) {
-    return fetch(LOGIN_PATH, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ user: user, password: password }),
-    }).then(function (resp) {
-      if (!resp.ok) throw new Error('invalid credentials');
-      return resp.json();
-    });
-  }
-
-  function showLogin(errText) {
-    if (!docReady()) return;
-    var ov = ensureOverlay();
-    ov.innerHTML = '';
-    var box = el('div', 'wslremote-box');
-    box.appendChild(el('h1', null, 'WSL Commentary — remote sign in'));
-    if (errText) box.appendChild(el('p', 'wslremote-err', errText));
-    var u = input('text', 'Client name');
-    var p = input('password', 'Password');
-    box.appendChild(u);
-    box.appendChild(p);
-    var btn = el('button', null, 'Sign in');
-    box.appendChild(btn);
-    ov.appendChild(box);
-    show(ov);
-
-    function submit() {
-      btn.disabled = true;
-      login(u.value, p.value)
-        .then(function () {
-          hideOverlay();
-          everConnected = false;
-          reconnectDelay = 1000;
-          connect();
-        })
-        .catch(function (e) {
-          btn.disabled = false;
-          showLogin((e && e.message) || 'sign in failed');
-        });
-    }
-    btn.onclick = submit;
-    p.onkeydown = function (e) {
-      if (e.key === 'Enter') submit();
-    };
-  }
+  // --- reconnect overlay (all DOM access guarded) --------------------------
 
   function showReconnecting() {
     if (!docReady()) return;
@@ -423,20 +381,10 @@
     var e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
-    if (tag === 'button') e.setAttribute('style', 'margin-top:12px;padding:8px 16px;cursor:pointer;');
     if (tag === 'h1') e.setAttribute('style', 'font-size:18px;margin:0 0 12px;');
-    if (cls === 'wslremote-err') e.setAttribute('style', 'color:#e0708a;margin:0 0 8px;');
     if (cls === 'wslremote-box')
       e.setAttribute('style', 'display:flex;flex-direction:column;min-width:280px;padding:24px;background:#161a20;border-radius:8px;');
     return e;
-  }
-
-  function input(type, placeholder) {
-    var i = document.createElement('input');
-    i.type = type;
-    i.placeholder = placeholder;
-    i.setAttribute('style', 'margin:4px 0;padding:8px;background:#0e1116;color:#e6e8ec;border:1px solid #2a2f39;border-radius:4px;');
-    return i;
   }
 
   function logError(what, e) {

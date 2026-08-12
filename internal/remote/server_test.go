@@ -3,12 +3,12 @@ package remote
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
-	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"runtime"
-	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -19,13 +19,13 @@ import (
 // ---------------------------------------------------------------------------
 // Shared test harness
 //
-// Every transport test drives a REAL server over a REAL TLS socket with a REAL
-// gorilla client, because the properties being protected — the origin check,
-// the cookie requirement, the fan-out discipline, the mid-call cancellation —
-// are properties of the wiring, not of any one function, and a test that mocked
-// the wiring would not catch a regression in it. The dispatcher is a fake so the
-// package never imports the root or GStreamer and the whole suite runs at Gate A
-// with CGO_ENABLED=0.
+// Every transport test drives a REAL server over REAL sockets with a REAL
+// gorilla client, because the properties being protected — that ANY connection
+// upgrades with no guard, the fan-out discipline, the mid-call cancellation, the
+// dual-listener bind and fallback — are properties of the wiring, not of any one
+// function, and a test that mocked the wiring would not catch a regression in
+// it. The dispatcher is a fake so the package never imports the root or
+// GStreamer and the whole suite runs at Gate A with CGO_ENABLED=0.
 // ---------------------------------------------------------------------------
 
 // testIndexHTML mimics the built frontend/dist/index.html closely enough to
@@ -56,61 +56,43 @@ func testAssetsFS() fs.FS {
 	}
 }
 
-// testClient builds a client record named "op" with the given capabilities and
-// password "s3cret".
-func testClient(t *testing.T, name, password string, caps ...string) Client {
-	t.Helper()
-	p, err := hashPassword(password)
-	if err != nil {
-		t.Fatalf("hashPassword: %v", err)
-	}
-	return Client{Name: name, PBKDF2: p, Caps: caps}
-}
-
 type harness struct {
-	srv  *Server
-	auth *Authenticator
-	disp *fakeDispatcher
-	addr string
-	hc   *http.Client
+	srv       *Server
+	disp      *fakeDispatcher
+	httpsAddr string // the TLS listener's bound host:port
+	httpAddr  string // the plain-HTTP listener's bound host:port
+	hc        *http.Client
 }
 
-// newHarness starts a loopback TLS server with the given clients and returns a
-// harness. It shortens the login min-delay so timing-floored tests do not add
-// real seconds, and registers cleanup.
-func newHarness(t *testing.T, clients []Client) *harness {
+// newHarness starts a loopback server with BOTH listeners on OS-assigned
+// ephemeral ports and returns a harness. There is no auth to configure — the
+// listener is unauthenticated by design. It registers cleanup.
+func newHarness(t *testing.T) *harness {
 	t.Helper()
 	disp := newFakeDispatcher()
-	auth := NewAuthenticator(clients)
-	auth.minDelay = 5 * time.Millisecond
 	srv := NewServer(Options{
 		Enabled:    true,
 		Bind:       "127.0.0.1",
-		Port:       0, // OS-assigned ephemeral port for the test
+		HTTPPort:   0, // OS-assigned ephemeral port for the test
+		HTTPSPort:  0,
 		Dispatcher: disp,
-		Auth:       auth,
 		Assets:     testAssetsFS(),
 		CertDir:    t.TempDir(),
 		Events:     []string{"status", "sender", "return", "error", "statusKeyCandidates", "levels"},
 		Logf:       t.Logf,
 	})
-	// Shorten the per-write timeout so a test that deliberately stalls the
-	// writer sees it die in a fraction of a second rather than the 10 s
-	// production writeWait — the same reason auth.minDelay is shortened above.
-	// Set BEFORE Start, so no session ever reads it concurrently with a write.
-	// 200 ms is still orders of magnitude longer than a healthy draining
+	// Shorten the per-write timeout so a test that deliberately stalls the writer
+	// sees it die in a fraction of a second rather than the 10 s production
+	// writeWait. Set BEFORE Start, so no session ever reads it concurrently with a
+	// write. 200 ms is still orders of magnitude longer than a healthy draining
 	// client's write, so it changes nothing for every other test.
 	srv.writeDeadline = 200 * time.Millisecond
-	addr, err := srv.Start()
-	if err != nil {
+	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if addr == "" {
-		t.Fatal("Start returned empty address for an enabled server")
+	if srv.HTTPSAddr() == "" || srv.HTTPAddr() == "" {
+		t.Fatalf("Start bound incompletely: http %q https %q", srv.HTTPAddr(), srv.HTTPSAddr())
 	}
-	// One shared HTTP client so the login keep-alive pool is a single connection
-	// the test can drain, rather than a fresh transport (and a fresh pair of pool
-	// goroutines) per call that would masquerade as a leak.
 	hc := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
@@ -120,59 +102,34 @@ func newHarness(t *testing.T, clients []Client) *harness {
 		defer cancel()
 		_ = srv.Close(ctx)
 	})
-	return &harness{srv: srv, auth: auth, disp: disp, addr: addr, hc: hc}
+	return &harness{srv: srv, disp: disp, httpsAddr: srv.HTTPSAddr(), httpAddr: srv.HTTPAddr(), hc: hc}
 }
 
 func (h *harness) httpClient() *http.Client { return h.hc }
 
-// login POSTs credentials and returns the resulting cookies and the HTTP
-// status. It never fails the test itself so callers can assert on the status.
-func (h *harness) login(t *testing.T, user, password string) ([]*http.Cookie, int, []byte) {
+// dial opens the WebSocket over TLS with the given Origin. An empty origin means
+// "the matching one" (https://<addr>); a non-empty one is sent verbatim — the
+// point of several tests being that ANY origin is accepted. There is no cookie:
+// the listener is unauthenticated.
+func (h *harness) dial(t *testing.T, origin string) (*websocket.Conn, *http.Response, error) {
 	t.Helper()
-	body, _ := json.Marshal(loginRequest{User: user, Password: password})
-	req, _ := http.NewRequest(http.MethodPost, "https://"+h.addr+loginPath, strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.httpClient().Do(req)
-	if err != nil {
-		t.Fatalf("login request: %v", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	return resp.Cookies(), resp.StatusCode, respBody
-}
-
-// dial opens the WebSocket with the given cookies and Origin. An empty origin
-// means "the correct one" (https://<addr>).
-func (h *harness) dial(t *testing.T, cookies []*http.Cookie, origin string) (*websocket.Conn, *http.Response, error) {
-	t.Helper()
-	if origin == "" {
-		origin = "https://" + h.addr
-	}
 	d := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 		HandshakeTimeout: 5 * time.Second,
 	}
 	hdr := http.Header{}
-	hdr.Set("Origin", origin)
-	if len(cookies) > 0 {
-		var parts []string
-		for _, c := range cookies {
-			parts = append(parts, c.Name+"="+c.Value)
-		}
-		hdr.Set("Cookie", strings.Join(parts, "; "))
+	if origin == "" {
+		origin = "https://" + h.httpsAddr
 	}
-	return d.Dial("wss://"+h.addr+wsPath, hdr)
+	hdr.Set("Origin", origin)
+	return d.Dial("wss://"+h.httpsAddr+wsPath, hdr)
 }
 
-// connect logs in as user and opens an authenticated socket, reading and
-// returning the hello frame. It fails the test on any error.
-func (h *harness) connect(t *testing.T, user, password string) (*websocket.Conn, map[string]any) {
+// connect opens a socket and reads the hello frame, failing the test on any
+// error. No login, no cookie — just connect.
+func (h *harness) connect(t *testing.T) (*websocket.Conn, map[string]any) {
 	t.Helper()
-	cookies, status, _ := h.login(t, user, password)
-	if status != http.StatusOK {
-		t.Fatalf("login status = %d, want 200", status)
-	}
-	conn, _, err := h.dial(t, cookies, "")
+	conn, _, err := h.dial(t, "")
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -229,86 +186,247 @@ func rpc(t *testing.T, conn *websocket.Conn, id uint64, method string, args ...a
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: off by default, loopback by default, no open unauthenticated listener
+// The open posture: ON by default, wildcard by default
 // ---------------------------------------------------------------------------
 
-func TestStart_DisabledBindsNoSocket(t *testing.T) {
-	// This is the test that protects the operator from the plan itself: "off by
-	// default" is a property with a test, not a comment. With Enabled false —
-	// which is exactly what a missing remote.json yields via DefaultSettings —
-	// Start must bind nothing at all.
+func TestDefaultSettings_OnAndWildcard(t *testing.T) {
+	// The defaults ARE the posture the owner asked for: on, all interfaces. A
+	// missing remote.json yields exactly this, so a fresh machine is listening.
+	d := DefaultSettings()
+	if !d.Enabled {
+		t.Error("DefaultSettings is disabled; the owner's decision is ON by default")
+	}
+	if d.Bind != "0.0.0.0" {
+		t.Errorf("DefaultSettings bind = %q, want 0.0.0.0 (all interfaces)", d.Bind)
+	}
+	if d.HTTPPort != 80 || d.HTTPSPort != 443 {
+		t.Errorf("DefaultSettings ports = %d/%d, want 80/443", d.HTTPPort, d.HTTPSPort)
+	}
+}
+
+func TestStart_DisabledBindsNothing(t *testing.T) {
+	// Enabled false is still honoured: it binds nothing and is a clean no-op.
 	srv := NewServer(Options{
 		Enabled:    false,
-		Bind:       "127.0.0.1",
-		Port:       8443,
+		Bind:       "0.0.0.0",
+		HTTPPort:   80,
+		HTTPSPort:  443,
 		Dispatcher: newFakeDispatcher(),
-		Auth:       NewAuthenticator(nil),
 		Assets:     testAssetsFS(),
 		CertDir:    t.TempDir(),
 	})
-	addr, err := srv.Start()
-	if err != nil {
+	if err := srv.Start(); err != nil {
 		t.Fatalf("Start(disabled) error = %v, want nil", err)
 	}
-	if addr != "" {
-		t.Fatalf("Start(disabled) addr = %q, want empty", addr)
-	}
-	if srv.ln != nil || srv.httpSrv != nil {
-		t.Fatal("Start(disabled) opened a listener")
-	}
-}
-
-func TestDefaultSettings_OffAndLoopback(t *testing.T) {
-	// The defaults themselves are the safe posture, so a missing file cannot be
-	// an accidentally-listening one.
-	d := DefaultSettings()
-	if d.Enabled {
-		t.Error("DefaultSettings enabled; want disabled")
-	}
-	if d.Bind != "127.0.0.1" {
-		t.Errorf("DefaultSettings bind = %q, want 127.0.0.1", d.Bind)
-	}
-}
-
-func TestStart_EnabledLoopbackIsNotWildcard(t *testing.T) {
-	h := newHarness(t, nil)
-	if !strings.HasPrefix(h.addr, "127.0.0.1:") {
-		t.Fatalf("bound addr = %q, want a 127.0.0.1 address", h.addr)
-	}
-	if strings.HasPrefix(h.addr, "0.0.0.0") {
-		t.Fatalf("bound addr = %q is a wildcard bind", h.addr)
-	}
-}
-
-func TestStart_NonLoopbackWithNoClientsRefused(t *testing.T) {
-	// A reachable listener nobody can authenticate to is pure attack surface,
-	// so it is refused before any socket is opened.
-	srv := NewServer(Options{
-		Enabled:    true,
-		Bind:       "192.0.2.10", // TEST-NET-1, non-loopback
-		Port:       8443,
-		Dispatcher: newFakeDispatcher(),
-		Auth:       NewAuthenticator(nil), // zero clients
-		Assets:     testAssetsFS(),
-		CertDir:    t.TempDir(),
-	})
-	addr, err := srv.Start()
-	if err == nil {
-		t.Fatalf("Start(non-loopback, no clients) succeeded with addr %q, want refusal", addr)
-	}
-	if srv.ln != nil {
-		t.Fatal("Start refused but still opened a listener")
+	if srv.Running() || srv.HTTPAddr() != "" || srv.HTTPSAddr() != "" {
+		t.Fatalf("Start(disabled) bound something: running=%v http=%q https=%q",
+			srv.Running(), srv.HTTPAddr(), srv.HTTPSAddr())
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: fan-out reaches every client; a stalled client never blocks it
+// Start binds BOTH listeners, and both serve
+// ---------------------------------------------------------------------------
+
+func TestStart_BindsBothHTTPAndHTTPS(t *testing.T) {
+	h := newHarness(t)
+
+	if h.httpAddr == "" || h.httpsAddr == "" {
+		t.Fatalf("expected both listeners bound: http %q https %q", h.httpAddr, h.httpsAddr)
+	}
+	if h.httpAddr == h.httpsAddr {
+		t.Fatalf("both listeners share an address %q; they must be distinct sockets", h.httpAddr)
+	}
+
+	// The plain-HTTP listener serves the injected index over http://.
+	plain := &http.Client{}
+	resp, err := plain.Get("http://" + h.httpAddr + "/")
+	if err != nil {
+		t.Fatalf("GET http:// index: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("http:// index status = %d, want 200", resp.StatusCode)
+	}
+
+	// The TLS listener serves it over https://.
+	resp2, err := h.httpClient().Get("https://" + h.httpsAddr + "/")
+	if err != nil {
+		t.Fatalf("GET https:// index: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("https:// index status = %d, want 200", resp2.StatusCode)
+	}
+}
+
+func TestWS_OverPlainHTTPSucceeds(t *testing.T) {
+	// A ws:// upgrade over the plain-HTTP listener works too, with no guard.
+	h := newHarness(t)
+	d := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	conn, _, err := d.Dial("ws://"+h.httpAddr+wsPath, http.Header{})
+	if err != nil {
+		t.Fatalf("plain ws:// upgrade failed: %v", err)
+	}
+	defer conn.Close()
+	hello := readFrame(t, conn)
+	if hello["t"] != FrameHello {
+		t.Fatalf("first frame = %v, want hello", hello["t"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ANY connection upgrades: no login, no cookie, no origin/CSRF guard
+// ---------------------------------------------------------------------------
+
+func TestWS_AnyOriginUpgradesWithNoGuard(t *testing.T) {
+	h := newHarness(t)
+
+	// A cross-origin Origin header — exactly the request a same-origin check
+	// would refuse — is accepted, because there is deliberately no such check.
+	conn, _, err := h.dial(t, "https://evil.example")
+	if err != nil {
+		t.Fatalf("cross-origin upgrade was refused; the listener must accept any origin: %v", err)
+	}
+	hello := readFrame(t, conn)
+	if hello["t"] != FrameHello {
+		t.Fatalf("cross-origin first frame = %v, want hello", hello["t"])
+	}
+	conn.Close()
+
+	// A request with NO Origin header at all (a non-browser client) is accepted.
+	d := websocket.Dialer{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		HandshakeTimeout: 5 * time.Second,
+	}
+	conn2, _, err := d.Dial("wss://"+h.httpsAddr+wsPath, http.Header{}) // no Origin, no Cookie
+	if err != nil {
+		t.Fatalf("no-origin upgrade was refused; the listener must accept it: %v", err)
+	}
+	defer conn2.Close()
+	hello2 := readFrame(t, conn2)
+	if hello2["t"] != FrameHello {
+		t.Fatalf("no-origin first frame = %v, want hello", hello2["t"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A busy primary port falls back to the secondary
+// ---------------------------------------------------------------------------
+
+func TestStart_FallsBackWhenPrimaryPortBusy(t *testing.T) {
+	// Occupy a port, then hand it to Start as the HTTP primary. Start must find it
+	// busy and drop to the fallback. The fallback is set to 0 (OS-assigned) for
+	// determinism, so the assertion is simply "the bound port is neither the busy
+	// one nor zero" — proof the fallback path ran.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupying a port: %v", err)
+	}
+	defer occupied.Close()
+	busyPort := occupied.Addr().(*net.TCPAddr).Port
+
+	srv := NewServer(Options{
+		Enabled:    true,
+		Bind:       "127.0.0.1",
+		HTTPPort:   busyPort, // busy
+		HTTPSPort:  0,        // ephemeral; not under test here
+		Dispatcher: newFakeDispatcher(),
+		Assets:     testAssetsFS(),
+		CertDir:    t.TempDir(),
+		Logf:       t.Logf,
+	})
+	srv.httpFallback = 0 // deterministic ephemeral fallback
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start with a busy primary should have used the fallback, got error: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Close(ctx)
+	})
+
+	if srv.HTTPPort() == busyPort {
+		t.Fatalf("HTTP bound the busy primary %d; the fallback did not run", busyPort)
+	}
+	if srv.HTTPPort() == 0 || srv.HTTPAddr() == "" {
+		t.Fatalf("HTTP did not bind a real fallback port: port=%d addr=%q", srv.HTTPPort(), srv.HTTPAddr())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Arm-ownership survives the transport: only the arming seat may write
+// ---------------------------------------------------------------------------
+
+func TestArmOwnership_SecondSeatCannotWriteAgainstTheFirstsArm(t *testing.T) {
+	// Two connections, two distinct connection ids. Seat A arms; seat B's
+	// SendMixerCommands is refused because it did not arm; seat A's is accepted.
+	// This proves the transport hands the dispatcher a distinct id per connection
+	// and threads it through Call, which is what arm-ownership rests on.
+	h := newHarness(t)
+	connA, _ := h.connect(t)
+	defer connA.Close()
+	connB, _ := h.connect(t)
+	defer connB.Close()
+
+	if res := rpc(t, connA, 1, "ArmMixer"); !res["ok"].(bool) {
+		t.Fatalf("seat A ArmMixer refused: %v", res["error"])
+	}
+
+	resB := rpc(t, connB, 1, "SendMixerCommands")
+	if ok, _ := resB["ok"].(bool); ok {
+		t.Fatal("seat B's SendMixerCommands was accepted against seat A's arm")
+	}
+	if msg, _ := resB["error"].(string); !contains(msg, "another seat") {
+		t.Fatalf("seat B refusal = %q, want an arm-ownership refusal", msg)
+	}
+
+	if res := rpc(t, connA, 2, "SendMixerCommands"); !res["ok"].(bool) {
+		t.Fatalf("seat A's own SendMixerCommands was refused: %v", res["error"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The served certificate names a non-loopback LAN address
+// ---------------------------------------------------------------------------
+
+func TestCert_SANsIncludeANonLoopbackIP(t *testing.T) {
+	// The listener binds 0.0.0.0 and clients reach it by LAN IP, so the cert must
+	// name at least one non-loopback interface address or every browser adds a
+	// name-mismatch error. If this machine has no non-loopback interface (a
+	// stripped CI container), there is nothing to assert.
+	ifaceIPs := interfaceIPs()
+	if len(ifaceIPs) == 0 {
+		t.Skip("no non-loopback interface IP on this machine to assert against")
+	}
+	cert, _, err := EnsureCertificate(t.TempDir(), "0.0.0.0")
+	if err != nil {
+		t.Fatalf("EnsureCertificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	var covered bool
+	for _, ip := range ifaceIPs {
+		if certCoversIP(leaf, ip.String()) {
+			covered = true
+			break
+		}
+	}
+	if !covered {
+		t.Errorf("cert SANs %v cover no non-loopback interface IP (%v)", leaf.IPAddresses, ifaceIPs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out reaches every client; a stalled client never blocks it
 // ---------------------------------------------------------------------------
 
 func TestBroadcast_ReachesEveryClient(t *testing.T) {
-	h := newHarness(t, []Client{testClient(t, "op", "s3cret", string(CapView))})
-	c1, _ := h.connect(t, "op", "s3cret")
-	c2, _ := h.connect(t, "op", "s3cret")
+	h := newHarness(t)
+	c1, _ := h.connect(t)
+	c2, _ := h.connect(t)
 
 	h.srv.Broadcast("status", map[string]any{"n": 42})
 
@@ -325,11 +443,11 @@ func TestBroadcast_ReachesEveryClient(t *testing.T) {
 }
 
 func TestBroadcast_NeverBlocksOnAStalledClient(t *testing.T) {
-	h := newHarness(t, []Client{testClient(t, "op", "s3cret", string(CapView))})
-	drainer, _ := h.connect(t, "op", "s3cret")
+	h := newHarness(t)
+	drainer, _ := h.connect(t)
 	// staller connects and NEVER reads; its per-session queue must fill and drop
 	// oldest rather than back-pressure the broadcast.
-	staller, _ := h.connect(t, "op", "s3cret")
+	staller, _ := h.connect(t)
 	_ = staller
 
 	// Fan out far more events than any queue depth; each Broadcast must return
@@ -396,16 +514,16 @@ func TestEnqueueEvent_DropsOldestNeverBlocks(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: disconnect mid-call cancels the call context and leaks no goroutine
+// Disconnect mid-call cancels the call context and leaks no goroutine
 // ---------------------------------------------------------------------------
 
 func TestDisconnect_CancelsInFlightCallAndLeaksNoGoroutine(t *testing.T) {
-	h := newHarness(t, []Client{testClient(t, "op", "s3cret", string(CapMixer))})
+	h := newHarness(t)
 
 	// First, prove the cancellation itself: a disconnect mid-call cancels the
 	// call's context. This is the single highest-consequence property — the call
 	// goroutine must not outlive the socket.
-	conn, _ := h.connect(t, "op", "s3cret")
+	conn, _ := h.connect(t)
 	call, _ := json.Marshal(CallFrame{T: FrameCall, ID: 1, Method: "SlowCall"})
 	if err := conn.WriteMessage(websocket.TextMessage, call); err != nil {
 		t.Fatalf("write SlowCall: %v", err)
@@ -425,13 +543,11 @@ func TestDisconnect_CancelsInFlightCallAndLeaksNoGoroutine(t *testing.T) {
 	// Now prove NO GOROUTINE LEAK, by amplification: a per-connection leak of the
 	// pumps or the dispatch goroutine would grow the count by ~3 per iteration,
 	// so many connect/park/disconnect cycles would leave dozens of stragglers.
-	// A stable count after them proves each connection was fully reaped. This is
-	// robust to the couple of transient runtime/HTTP-pool goroutines an absolute
-	// baseline would trip over.
+	// A stable count after them proves each connection was fully reaped.
 	base := runtime.NumGoroutine()
 	const cycles = 25
 	for i := 0; i < cycles; i++ {
-		c, _ := h.connect(t, "op", "s3cret")
+		c, _ := h.connect(t)
 		cf, _ := json.Marshal(CallFrame{T: FrameCall, ID: 1, Method: "SlowCall"})
 		_ = c.WriteMessage(websocket.TextMessage, cf)
 		select {
@@ -468,45 +584,31 @@ func TestDisconnect_CancelsInFlightCallAndLeaksNoGoroutine(t *testing.T) {
 // hostile-client goroutine leak found in review.
 //
 // THE BUG: writePump returned on a write failure WITHOUT tearing the session
-// down. A client authenticated at ANY capability — even view — that stops
-// reading and floods calls past the in-flight cap strands the read pump and up
-// to maxInFlightCalls dispatch goroutines forever: the writer blocks on the
-// full socket, the results queue fills, and the over-cap SYNCHRONOUS
-// enqueueResult on the read goroutine parks on a `done` channel that a dead
-// writer never closes. The session never leaves the registry — a permanent
-// goroutine + memory leak and a phantom seat on the operator's indicator, on
-// the machine that is on air. The fix is writePump's `defer s.close()`.
+// down. A connection that stops reading and floods calls past the in-flight cap
+// strands the read pump and up to maxInFlightCalls dispatch goroutines forever:
+// the writer blocks on the full socket, the results queue fills, and the
+// over-cap SYNCHRONOUS enqueueResult on the read goroutine parks on a `done`
+// channel that a dead writer never closes. The session never leaves the registry
+// — a permanent goroutine + memory leak and a phantom seat on the operator's
+// indicator, on the machine that is on air. The fix is writePump's
+// `defer s.close()`.
 //
-// The test drives the exact path: a real authenticated socket, reading stopped,
-// flooded past the cap with BigCall (a payload large enough that a single
-// result overflows the socket buffers). The client is left CONNECTED — it is
-// not closed. So there is NO read-path rescue: the only way the session can be
-// reaped is the write pump dying on its own (the shortened write deadline, set
-// by newHarness) and tearing the session down. WITHOUT the fix, writePump
-// returns without close(), the read pump stays parked in enqueueResult, and the
-// session never leaves Clients() — this fails at the deadline. WITH the fix it
-// is reaped shortly after the write deadline fires.
-//
-// (An earlier version closed the client socket to speed things up, and that
-// masked the bug: closing the socket reaps the session via the READ path
-// regardless of the writePump fix, so it passed even when broken. Leaving the
-// client connected is the whole point.)
+// The test drives the exact path: a real socket, reading stopped, flooded past
+// the cap with BigCall (a payload large enough that a single result overflows
+// the socket buffers). The client is left CONNECTED — it is not closed. So there
+// is NO read-path rescue: the only way the session can be reaped is the write
+// pump dying on its own (the shortened write deadline, set by newHarness) and
+// tearing the session down.
 func TestWritePumpDeathReapsAStalledFloodingClient(t *testing.T) {
-	h := newHarness(t, []Client{testClient(t, "op", "s3cret", string(CapView))})
-	conn, _ := h.connect(t, "op", "s3cret")
+	h := newHarness(t)
+	conn, _ := h.connect(t)
 
-	// Stop reading and flood past the cap FROM A GOROUTINE, so the main
-	// goroutine can start polling immediately. maxInFlightCalls BigCall results
-	// (512 KB each — 16 MB) overflow the socket, so the writer blocks; the
-	// results queue fills; the over-cap calls reach the synchronous
-	// enqueueResult and park the read pump. Nothing here closes the socket, so
-	// there is no read-path rescue — only the write deadline can reap it.
-	//
-	// The flood is on its own goroutine because the CLIENT's own writes block
-	// once the server stops reading, and on Windows a blocked write is slow to
-	// error even after the server closes the socket; polling on this goroutine
-	// would otherwise not begin until that unblocked, masking a fast reap.
-	// gorilla permits Close concurrently with a blocked WriteMessage.
+	// Stop reading and flood past the cap FROM A GOROUTINE, so the main goroutine
+	// can start polling immediately. maxInFlightCalls BigCall results (512 KB /
+	// 1 MiB each) overflow the socket, so the writer blocks; the results queue
+	// fills; the over-cap calls reach the synchronous enqueueResult and park the
+	// read pump. Nothing here closes the socket, so there is no read-path rescue —
+	// only the write deadline can reap it.
 	const flood = maxInFlightCalls * 2
 	go func() {
 		for i := 0; i < flood; i++ {
@@ -518,12 +620,12 @@ func TestWritePumpDeathReapsAStalledFloodingClient(t *testing.T) {
 	}()
 	defer conn.Close()
 
-	// The writer dies on the ~200 ms write deadline (newHarness); the fix's
-	// defer close() then unparks the read pump and the session leaves the
-	// registry within a moment. Without the fix it never does.
-	// Reap time is a fixed Windows-loopback stall (~5 s) plus the shortened
-	// write deadline; 12 s is generous margin over that, and it is only ever
-	// reached when the fix is ABSENT (then this fails, as intended).
+	// The writer dies on the ~200 ms write deadline (newHarness); the fix's defer
+	// close() then unparks the read pump and the session leaves the registry
+	// within a moment. Without the fix it never does. Reap time is a fixed
+	// Windows-loopback stall (~5 s) plus the shortened write deadline; 12 s is
+	// generous margin over that, and it is only ever reached when the fix is
+	// ABSENT (then this fails, as intended).
 	deadline := time.Now().Add(12 * time.Second)
 	for {
 		if len(h.srv.Clients()) == 0 {
@@ -537,12 +639,35 @@ func TestWritePumpDeathReapsAStalledFloodingClient(t *testing.T) {
 	}
 }
 
+// TestClose_StopsBothListeners proves Close shuts both sockets: after it returns,
+// neither the HTTP nor the HTTPS address accepts a new connection.
+func TestClose_StopsBothListeners(t *testing.T) {
+	h := newHarness(t)
+	httpAddr, httpsAddr := h.httpAddr, h.httpsAddr
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.srv.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A fresh TCP dial to each bound address must now fail (the listener is
+	// closed). A short dial timeout keeps a stray accept from hanging the test.
+	for _, addr := range []string{httpAddr, httpsAddr} {
+		c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			c.Close()
+			t.Fatalf("address %s still accepts connections after Close", addr)
+		}
+	}
+}
+
 // TestClose_IsBounded proves Close returns within its budget even with a live,
 // parked call — the property that keeps a stray http.Server from wedging the
 // app's shutdown.
 func TestClose_IsBounded(t *testing.T) {
-	h := newHarness(t, []Client{testClient(t, "op", "s3cret", string(CapMixer))})
-	conn, _ := h.connect(t, "op", "s3cret")
+	h := newHarness(t)
+	conn, _ := h.connect(t)
 	call, _ := json.Marshal(CallFrame{T: FrameCall, ID: 1, Method: "SlowCall"})
 	_ = conn.WriteMessage(websocket.TextMessage, call)
 	select {

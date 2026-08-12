@@ -858,3 +858,40 @@ test('the apply confirm is built from the pure model, before anything moves', ()
   );
   assert.match(handler, /populate\(merged\)/, 'the form must redraw from the RETURNED config, the authority');
 });
+
+// ---------------------------------------------------------------------------
+// The Remote access group — status only
+// ---------------------------------------------------------------------------
+//
+// The listener is unauthenticated by the owner's decision (docs/remote-access.md),
+// so the Settings group manages nothing: no client accounts, no capability tiers,
+// no enable/bind/port editing sprawl — just a read-only readout of whether the
+// listener is on and which HTTP/HTTPS ports it is bound on. remotewiring.test.js
+// carries the absence guards; this pins the group's shape and derivation.
+
+test('the Remote access group renders the bound-port status and nothing to configure', () => {
+  const js = ui('settings.js');
+  // The group exists, hidden on a remote client, as its own settings-group.
+  assert.match(js, /openGroup\(remoteHeading, 'settings-group--remote'\)/);
+  assert.match(js, /remoteGroup\.hidden = isRemoteView/);
+  // It reads GetRemoteState and derives "running" from the cert fingerprint —
+  // there is no running field in the new RemoteState shape.
+  assert.match(js, /await backend\.getRemoteState\(\)/);
+  assert.match(
+    js,
+    /s\.certFingerprint === '' \? false : true|s\.certFingerprint !== ''|certFingerprint === ''/,
+    'running must be derived from certFingerprint, not read from a running field',
+  );
+  // It shows the bound HTTP and HTTPS ports/URLs.
+  assert.match(js, /s\.httpURL \|\| \(s\.httpPort/);
+  assert.match(js, /s\.httpsURL \|\| \(s\.httpsPort/);
+});
+
+test('the Remote access group has no listener-configuring controls', () => {
+  // No toggle, no bind box, no port box, no Apply — the group is a readout. A
+  // control here would be editable sprawl the owner asked to keep out.
+  const js = ui('settings.js');
+  for (const gone of ['f-remoteEnabled', 'f-remoteBind', 'f-remotePort', 'Apply listener settings']) {
+    assert.equal(js.includes(gone), false, `settings.js still builds the "${gone}" control`);
+  }
+});

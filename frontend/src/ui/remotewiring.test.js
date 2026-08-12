@@ -89,13 +89,15 @@ function currentSocket() {
   return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
 }
 
-// The hello frame the server would send this client: view-tier methods only,
-// deliberately OMITTING every picture and return method. That omission is the
-// whole degradation mechanism, so it is what the availability assertions below
-// hang on.
+// The hello frame the server would send this client. Its shape is
+// {t, client, methods, events} — no caps, because the listener is unauthenticated
+// and there are no capability tiers (see docs/remote-access.md). `methods` is a
+// subset that deliberately OMITS every picture and return method; that omission
+// is the whole degradation mechanism, so it is what the availability assertions
+// below hang on.
 const HELLO_METHODS = ['GetConfig', 'ListInputDevices', 'GetKVSCredentials'];
 function sendHello(socket) {
-  socket.deliver({ t: 'hello', client: 'client-xyz', caps: ['view'], methods: HELLO_METHODS });
+  socket.deliver({ t: 'hello', client: 'client-xyz', methods: HELLO_METHODS, events: [] });
 }
 
 // ---------------------------------------------------------------------------
@@ -214,4 +216,76 @@ test('app.js gates the destructive beforeunload stops on isRemoteClient()', () =
     /backend\.isRemoteClient\(\)/,
     'the beforeunload stopReturn()/stopPicture() must be gated on isRemoteClient() before they run',
   );
+});
+
+// ---------------------------------------------------------------------------
+// The unauthenticated posture: no client accounts, no capability tiers, and
+// nothing in the APP UI but the bound-port status.
+// ---------------------------------------------------------------------------
+
+test('backend.js and settings.js drop the removed client-management bindings', () => {
+  // The listener is unauthenticated by the owner's decision — no login, no
+  // client accounts, no capability tiers. The three per-client admin methods are
+  // GONE from the Go bound surface, so their JS wrappers and every call site must
+  // go too, or the Settings screen calls a binding that no longer exists.
+  for (const file of ['backend.js', 'settings.js']) {
+    const js = ui(file);
+    for (const gone of [
+      'AddRemoteClient',
+      'SetRemoteClientPassword',
+      'DeleteRemoteClient',
+      'addRemoteClient',
+      'setRemoteClientPassword',
+      'deleteRemoteClient',
+    ]) {
+      assert.equal(
+        js.includes(gone),
+        false,
+        `${file} still references ${gone}; there are no client accounts on an unauthenticated listener`,
+      );
+    }
+  }
+});
+
+test('the Settings remote-access group is status-only', () => {
+  // It shows the bound-port status from GetRemoteState and nothing else: no
+  // client list, no capability checkboxes, no add/set-password/delete controls.
+  const js = ui('settings.js');
+  for (const gone of [
+    'remote-cap',
+    'REMOTE_CAP',
+    'remote-client',
+    'remote-clients',
+    'remote-add',
+    'remote-empty',
+    'remoteCapBoxes',
+    'remoteClientList',
+    'Add client',
+    'Set password',
+  ]) {
+    assert.equal(js.includes(gone), false, `settings.js still carries the client-management artefact "${gone}"`);
+  }
+  // And it DOES render the bound-port status: enabled, the HTTP/HTTPS ports or
+  // URLs, and the certificate fingerprint it derives "running" from.
+  assert.match(js, /backend\.getRemoteState\(\)/, 'the group must read GetRemoteState');
+  assert.match(js, /certFingerprint/, 'running is derived from a non-empty certFingerprint, not a running field');
+  assert.match(js, /httpURL|httpPort/, 'the readout must show the HTTP port/URL');
+  assert.match(js, /httpsURL|httpsPort/, 'the readout must show the HTTPS port/URL');
+});
+
+test('the app shows no unauthenticated-listener warning or secure-context note', () => {
+  // The owner's decision: the risk write-up lives in docs/remote-access.md and
+  // the app UI shows ONLY the bound-port status. A prior (reverted) attempt added
+  // a secure-context / plain-HTTP note to Settings; guard that it stays out of
+  // what the app DISPLAYS. These are phrases such a note would use and that this
+  // file's WHY-comments deliberately do not (the comment uses the hyphenated
+  // "secure-context", never the spaced "secure context").
+  const js = ui('settings.js').toLowerCase();
+  for (const phrase of ['secure context', 'in the clear', 'attack surface', 'preferable', '⚠']) {
+    assert.equal(
+      js.includes(phrase),
+      false,
+      `settings.js shows "${phrase}"; the risk write-up belongs in docs/remote-access.md, not the app UI`,
+    );
+  }
 });

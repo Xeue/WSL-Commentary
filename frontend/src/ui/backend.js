@@ -1495,15 +1495,17 @@ export async function getPresetCredentialStatus() {
 // Remote access administration
 // ---------------------------------------------------------------------------
 //
-// Five bindings, mirroring app_remote.go's host-only remote-admin surface: the
-// LAN bridge's enable/bind/port, the named client records, and their write-only
-// passwords. They configure internal/remote's listener, which is default-OFF
-// and default-loopback.
+// Two bindings, mirroring app_remote.go's host-only remote-admin surface: read
+// the listener's state, and set whether it runs and on what address/ports. The
+// listener is UNAUTHENTICATED by the owner's decision — it runs on a dedicated
+// private facility network and the network is the access control — so there are
+// NO client accounts, NO capability tiers and no per-client admin methods. See
+// docs/remote-access.md.
 //
 // ===================== THESE ARE HOST-ONLY, AND THAT SHAPES THIS ============
 //
-// On the Go side all five are HostOnly: the remote dispatcher refuses every one
-// at every capability, and the hello frame OMITS them, so on a remote browser
+// On the Go side both are HostOnly: the remote dispatcher refuses them from
+// every connection, and the hello frame OMITS them, so on a remote browser
 // window.go.main.App does not carry them at all — a listener that could be
 // reconfigured by one of its own remote clients is one that whoever first gets
 // in can widen to the world. So these exist for the LOCAL Settings screen only,
@@ -1515,17 +1517,14 @@ export async function getPresetCredentialStatus() {
 // remoteAvailable() decides whether the Settings group offers itself against a
 // real build, all-or-nothing for the reason presetsAvailable/pictureAvailable
 // spell out: a build with GetRemoteState but not SetRemoteListener would draw
-// the panel and then fail the moment Apply was pressed. Against the fake backend
-// the group is offered and driven by the in-memory store below, so the dev loop
-// can exercise it without a Wails build.
+// the panel and then fail. Against the fake backend the group is offered and
+// driven by the in-memory store below, so the dev loop can exercise it without a
+// Wails build.
 
 /** The Go method names this adapter binds to. One place, so a rename is one edit. */
 const REMOTE_METHODS = Object.freeze({
   state: 'GetRemoteState',
   setListener: 'SetRemoteListener',
-  addClient: 'AddRemoteClient',
-  setPassword: 'SetRemoteClientPassword',
-  deleteClient: 'DeleteRemoteClient',
 });
 
 /** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
@@ -1541,37 +1540,34 @@ export function remoteAvailable() {
   return REMOTE_METHOD_NAMES.every(hasBinding);
 }
 
-// The fake remote-access store: default-OFF, default-loopback, mirroring
-// internal/remote's own defaults so a `npm run dev` session shows the same
-// starting posture the real Settings screen does. Passwords are never stored,
-// only a "hasPassword" flag, exactly as the real GetRemoteState reports them.
-let fakeRemote = { enabled: false, bind: '127.0.0.1', port: 8443, clients: [] };
+// The fake remote-access store, mirroring internal/remote's OPEN defaults
+// (enabled, all-interfaces, well-known ports with 8080/8443 fallbacks) so a
+// `npm run dev` session shows the same starting posture the real Settings screen
+// does. There are no client records: the listener is unauthenticated.
+let fakeRemote = { enabled: true, bind: '0.0.0.0', httpPort: 80, httpsPort: 443 };
 
 /** fakeRemoteState mirrors app_remote.go's RemoteState shape for the dev loop. */
 function fakeRemoteState() {
   return {
     enabled: fakeRemote.enabled,
     bind: fakeRemote.bind,
-    port: fakeRemote.port,
-    // The fake never binds a real socket, so it is never "running" and has no
-    // certificate to fingerprint — an honest answer, not an invented one.
-    running: false,
-    address: '',
-    url: `https://${fakeRemote.bind}:${fakeRemote.port}`,
-    fingerprint: '',
-    clients: fakeRemote.clients.map((c) => ({
-      name: c.name,
-      caps: c.caps.slice(),
-      hasPassword: c.hasPassword,
-    })),
-    connected: [],
+    httpPort: fakeRemote.httpPort,
+    httpsPort: fakeRemote.httpsPort,
+    // The fake never binds a real socket, so it is never "running" (the Settings
+    // readout derives running from certFingerprint !== '') and has no bound URLs
+    // or certificate to report — an honest answer, not an invented one.
+    httpURL: '',
+    httpsURL: '',
+    certFingerprint: '',
   };
 }
 
 /**
  * Reads the remote-access configuration and live status for the Settings screen:
- * {enabled, bind, port, running, address, url, fingerprint, clients[], connected[]}.
- * clients[] carries a hasPassword boolean, never a hash.
+ * {enabled, bind, httpPort, httpsPort, httpURL, httpsURL, certFingerprint}. There
+ * is no client list and no running flag — the readout derives "running" from a
+ * non-empty certFingerprint, and when running the ports and URLs reflect the
+ * ACTUALLY bound values (a fallback moves 80/443 to 8080/8443).
  */
 export async function getRemoteState() {
   if (hasWails()) return callGoBound(REMOTE_METHODS.state);
@@ -1579,60 +1575,24 @@ export async function getRemoteState() {
 }
 
 /**
- * Enables or disables the listener and sets where it binds, then (on the Go side)
- * validates and restarts it. Validation is Go's: a bind that is not a literal IP,
- * or a non-loopback bind with no clients, is refused with its reason.
+ * Enables or disables the listener and sets where it binds and on which HTTP and
+ * HTTPS ports, then (on the Go side) validates and restarts it. Validation is
+ * Go's: a bind that is not a literal IP, or a port out of 0..65535, is refused
+ * with its reason. There is no non-loopback refusal — a wildcard bind is the
+ * intended default.
  */
-export async function setRemoteListener(enabled, bind, port) {
+export async function setRemoteListener(enabled, bind, httpPort, httpsPort) {
   if (hasWails()) {
-    return callGoBound(REMOTE_METHODS.setListener, enabled === true, String(bind), Number(port));
+    return callGoBound(
+      REMOTE_METHODS.setListener,
+      enabled === true,
+      String(bind),
+      Number(httpPort),
+      Number(httpsPort),
+    );
   }
   fakeRemote.enabled = enabled === true;
   fakeRemote.bind = String(bind).trim();
-  fakeRemote.port = Number(port);
-}
-
-/**
- * Adds a named client with the given capabilities (a subset of "view",
- * "operate", "mixer") and NO password — one is set separately with
- * setRemoteClientPassword before the client can log in, mirroring the "set / not
- * set" secret-badge convention.
- */
-export async function addRemoteClient(name, caps) {
-  if (hasWails()) return callGoBound(REMOTE_METHODS.addClient, name, caps);
-  const trimmed = String(name).trim();
-  if (!trimmed) throw new Error('remote: client name must not be empty (fake)');
-  if (fakeRemote.clients.some((c) => c.name === trimmed)) {
-    throw new Error(`remote: client "${trimmed}" already exists (fake)`);
-  }
-  fakeRemote.clients.push({
-    name: trimmed,
-    caps: Array.isArray(caps) ? caps.slice() : [],
-    hasPassword: false,
-  });
-}
-
-/**
- * Sets or replaces a client's password. Write-only: the plaintext is hashed on
- * the Go side and never readable back, so all the Settings badge can ever show is
- * "set". The fake records only the boolean.
- */
-export async function setRemoteClientPassword(name, password) {
-  if (hasWails()) return callGoBound(REMOTE_METHODS.setPassword, name, password);
-  const client = fakeRemote.clients.find((c) => c.name === name);
-  if (!client) throw new Error(`remote: no client named "${name}" (fake)`);
-  client.hasPassword = String(password).length > 0;
-}
-
-/**
- * Deletes a client and (on the Go side) restarts the listener, which revokes
- * that client's live sessions along with everyone else's.
- */
-export async function deleteRemoteClient(name) {
-  if (hasWails()) return callGoBound(REMOTE_METHODS.deleteClient, name);
-  const before = fakeRemote.clients.length;
-  fakeRemote.clients = fakeRemote.clients.filter((c) => c.name !== name);
-  if (fakeRemote.clients.length === before) {
-    throw new Error(`remote: no client named "${name}" (fake)`);
-  }
+  fakeRemote.httpPort = Number(httpPort);
+  fakeRemote.httpsPort = Number(httpsPort);
 }

@@ -23,18 +23,26 @@
 // method is missing from the table — so a new binding cannot default into being
 // remotely callable.
 //
-// ===================== THE THREE GATES, IN ORDER ============================
+// ===================== THE TWO GATES, IN ORDER =============================
 //
 //  1. ALLOWLIST   unknown method            -> refused ("unknown method")
-//  2. HOST-ONLY   the six native-surface    -> refused at EVERY capability,
-//     methods + the five remote     and absent from the hello
+//  2. HOST-ONLY   the six native-surface    -> refused for EVERY connection,
+//     methods + the two remote      and absent from the hello
 //     admin methods                 methods list (degrade by
 //     OMISSION, not by a refusal the
 //     frontend must be taught)
-//  3. CAPABILITY  view / operate / mixer    -> refused ("requires capability")
 //
-// Only after all three pass are a method's arguments json.Unmarshalled into
-// their real Go types and the real bound method called. Keeping the args opaque
+// There is NO capability gate any more. By the owner's explicit, repeated, final
+// decision the listener is UNAUTHENTICATED — it runs on a dedicated private
+// facility network, and the network is the access control (see
+// docs/remote-access.md). There are no client accounts and no tiers, so every
+// connection that is not host-only gets FULL access to every allowlisted method.
+// The allowlist and the host-only set remain — they are what keep the reachable
+// surface a deliberate, reviewable, drift-guarded decision rather than whatever
+// Wails happens to bind — but the per-tier filtering is gone.
+//
+// Once the two gates pass, a method's arguments are json.Unmarshalled into their
+// real Go types and the real bound method is called. Keeping the args opaque
 // until here is what let internal/remote stay App-agnostic: it never needed to
 // know a method's parameter types.
 //
@@ -45,16 +53,16 @@
 // carries the DOM can carry it, and SetPictureRect takes the CALLING page's CSS
 // rect and devicePixelRatio — a remote browser at another size or DPI would drag
 // the operator's own picture around from its ResizeObserver. So the six picture
-// and SRT-return methods are HostOnly: refused for every remote client at every
-// capability. The remote page gets the WebRTC mosaic and an honest message; it
-// never gets these methods, because the hello frame omits them.
+// and SRT-return methods are HostOnly: refused for every remote connection. The
+// remote page gets the WebRTC mosaic and an honest message; it never gets these
+// methods, because the hello frame omits them.
 //
-// The five remote-admin methods (GetRemoteState, SetRemoteListener,
-// AddRemoteClient, SetRemoteClientPassword, DeleteRemoteClient) are HostOnly for
-// a blunter reason: they change WHO may connect and on WHAT address. A listener
-// that could be reconfigured by one of its own remote clients is a listener that
-// can be widened to the world by whoever first gets in. Those methods exist for
-// the local operator's Settings screen only.
+// The two remote-admin methods (GetRemoteState, SetRemoteListener) are HostOnly
+// for a blunter reason: they change WHETHER the listener runs and on WHAT
+// address and ports. A listener that could be reconfigured by one of its own
+// remote connections could be turned off — or moved — by whoever first gets in.
+// Those methods exist for the local operator's Settings screen only. (The
+// per-client admin methods are gone entirely: there are no clients.)
 package main
 
 import (
@@ -123,23 +131,18 @@ func remoteEventNames() []string {
 // The allowlist table
 // ---------------------------------------------------------------------------
 
-// methodPolicy is one row of the allowlist: the capability tier a method needs,
-// whether it is host-only (refused for every remote client), and whether a
-// remote invocation of it should be written to the audit log because it changes
-// state on a machine that is on air.
+// methodPolicy is one row of the allowlist: whether the method is host-only
+// (refused for every remote connection) and whether a remote invocation of it
+// should be written to the audit log because it changes state on a machine that
+// is on air. There is no capability field: the listener is unauthenticated, so
+// a non-host-only method is reachable by every connection.
 type methodPolicy struct {
-	// cap is the tier a remote client must hold to call this method. For a
-	// host-only method it is a placeholder — the host-only gate refuses the call
-	// before the capability gate is reached — but it is stated rather than left
-	// zero so the row is self-describing and Methods() can be written uniformly.
-	cap remote.Capability
-
-	// hostOnly refuses this method for EVERY remote client at EVERY capability,
-	// and omits it from the hello methods list.
+	// hostOnly refuses this method for EVERY remote connection, and omits it from
+	// the hello methods list.
 	hostOnly bool
 
 	// mutating marks a method whose remote invocation is audit-logged with the
-	// caller's name and address. SetSecret is additionally logged with its KEY
+	// caller's source address. SetSecret is additionally logged with its KEY
 	// (never its value) in the dispatch switch.
 	mutating bool
 }
@@ -149,71 +152,61 @@ type methodPolicy struct {
 // guard in app_remote_test.go fails by name if one does not — so that adding a
 // binding forces a deliberate classification rather than defaulting it open.
 //
-// The classification, stated once so it can be reviewed as a whole:
-//
-//   - VIEW is read-only plus the two always-safe gestures a viewer needs:
-//     reading config/state/devices/presets, the KVS credentials that fetch the
-//     mosaic (over TLS), and DisarmMixer — shutting a gate is always safe, so it
-//     is open to anyone, which is why it is view and not operate.
-//   - OPERATE is configuration and session control: Start/Stop, SaveConfig,
-//     SetSecret, the preset writes, and ArmMixer (which changes NOTHING on the
-//     desk — it only permits a later write).
-//   - MIXER is the arm-gated write path to the live desk (SendMixerCommands) and
-//     the drift baseline it is read against (SetMixerGolden). It is the one tier
-//     that can change what goes to air, so it is off by default in a client's
-//     capabilities and, for SendMixerCommands, additionally gated on the caller
-//     being the seat that armed (see app_mixer.go).
-//   - HOST-ONLY is the six native-surface methods and the five remote-admin
-//     methods; see the file header.
+// With no capability tiers, the classification is binary: a method is either
+// HOST-ONLY (refused for every connection, omitted from the hello list) or
+// reachable by every connection. The mutating flag is not a gate — it only
+// decides whether an invocation is audit-logged. The grouping below is kept for
+// legibility (reads, then state-changing calls, then the arm-gated write, then
+// host-only) but carries no access meaning any more.
 var remoteAllowlist = map[string]methodPolicy{
-	// ---- view: read-only, plus the always-safe DisarmMixer ----
-	"GetConfig":                 {cap: remote.CapView},
-	"GetKVSCredentials":         {cap: remote.CapView},
-	"GetStatusKeyCandidates":    {cap: remote.CapView},
-	"ListEvents":                {cap: remote.CapView},
-	"GetMixerSnapshot":          {cap: remote.CapView},
-	"GetMixerGolden":            {cap: remote.CapView},
-	"GetPictureState":           {cap: remote.CapView},
-	"GetReturnState":            {cap: remote.CapView},
-	"IsSRTReturnSelected":       {cap: remote.CapView},
-	"ListInputDevices":          {cap: remote.CapView},
-	"ListOutputDevices":         {cap: remote.CapView},
-	"ListPresets":               {cap: remote.CapView},
-	"GetActivePreset":           {cap: remote.CapView},
-	"GetPresetCredentialStatus": {cap: remote.CapView},
-	"DisarmMixer":               {cap: remote.CapView},
+	// ---- reads and the always-safe DisarmMixer ----
+	"GetConfig":                 {},
+	"GetKVSCredentials":         {},
+	"GetStatusKeyCandidates":    {},
+	"ListEvents":                {},
+	"GetMixerSnapshot":          {},
+	"GetMixerGolden":            {},
+	"GetPictureState":           {},
+	"GetReturnState":            {},
+	"IsSRTReturnSelected":       {},
+	"ListInputDevices":          {},
+	"ListOutputDevices":         {},
+	"ListPresets":               {},
+	"GetActivePreset":           {},
+	"GetPresetCredentialStatus": {},
+	"DisarmMixer":               {},
 
-	// ---- operate: configuration and session control ----
-	"Start":        {cap: remote.CapOperate, mutating: true},
-	"Stop":         {cap: remote.CapOperate, mutating: true},
-	"SaveConfig":   {cap: remote.CapOperate, mutating: true},
-	"SetSecret":    {cap: remote.CapOperate, mutating: true},
-	"ArmMixer":     {cap: remote.CapOperate, mutating: true},
-	"ApplyPreset":  {cap: remote.CapOperate, mutating: true},
-	"SavePreset":   {cap: remote.CapOperate, mutating: true},
-	"RenamePreset": {cap: remote.CapOperate, mutating: true},
-	"DeletePreset": {cap: remote.CapOperate, mutating: true},
+	// ---- configuration and session control (audit-logged) ----
+	"Start":        {mutating: true},
+	"Stop":         {mutating: true},
+	"SaveConfig":   {mutating: true},
+	"SetSecret":    {mutating: true},
+	"ArmMixer":     {mutating: true},
+	"ApplyPreset":  {mutating: true},
+	"SavePreset":   {mutating: true},
+	"RenamePreset": {mutating: true},
+	"DeletePreset": {mutating: true},
 
-	// ---- mixer: the arm-gated write path and its baseline ----
-	"SendMixerCommands": {cap: remote.CapMixer, mutating: true},
-	"SetMixerGolden":    {cap: remote.CapMixer, mutating: true},
+	// ---- the arm-gated write path and its baseline (audit-logged) ----
+	// SendMixerCommands is still additionally gated on the caller being the seat
+	// that armed (arm-ownership, see app_mixer.go) — that gate is about WHICH
+	// seat holds the open window, not about authentication, so it stays.
+	"SendMixerCommands": {mutating: true},
+	"SetMixerGolden":    {mutating: true},
 
 	// ---- host-only: the native picture/return surface ----
-	// The capability is a placeholder; hostOnly refuses these before the tier is
-	// consulted. They are omitted from Methods() so the shim never installs them.
-	"SetPictureRect":    {cap: remote.CapView, hostOnly: true},
-	"SetPictureVisible": {cap: remote.CapView, hostOnly: true},
-	"StartPicture":      {cap: remote.CapOperate, hostOnly: true},
-	"StopPicture":       {cap: remote.CapOperate, hostOnly: true},
-	"StartReturn":       {cap: remote.CapOperate, hostOnly: true},
-	"StopReturn":        {cap: remote.CapOperate, hostOnly: true},
+	// Refused for every connection and omitted from Methods() so the shim never
+	// installs them.
+	"SetPictureRect":    {hostOnly: true},
+	"SetPictureVisible": {hostOnly: true},
+	"StartPicture":      {hostOnly: true},
+	"StopPicture":       {hostOnly: true},
+	"StartReturn":       {hostOnly: true},
+	"StopReturn":        {hostOnly: true},
 
 	// ---- host-only: remote administration (local Settings screen only) ----
-	"GetRemoteState":          {cap: remote.CapOperate, hostOnly: true},
-	"SetRemoteListener":       {cap: remote.CapOperate, hostOnly: true},
-	"AddRemoteClient":         {cap: remote.CapOperate, hostOnly: true},
-	"SetRemoteClientPassword": {cap: remote.CapOperate, hostOnly: true},
-	"DeleteRemoteClient":      {cap: remote.CapOperate, hostOnly: true},
+	"GetRemoteState":    {hostOnly: true},
+	"SetRemoteListener": {hostOnly: true},
 }
 
 // ---------------------------------------------------------------------------
@@ -238,27 +231,25 @@ func (d *remoteDispatcher) Call(ctx context.Context, client remote.ClientInfo, m
 }
 
 // remoteMethods is the authoritative list the shim installs on
-// window.go.main.App for this client: every allowlisted method that is NOT
-// host-only and that the client's capabilities permit, sorted for a stable hello
-// frame. Host-only methods never appear regardless of capability; higher-tier
-// methods appear only for a client that holds the tier. Absence is the whole
-// degradation mechanism, so this must agree with remoteCall's gates exactly —
-// a method the shim installs but Call refuses would be a button that errors.
+// window.go.main.App for this connection: every allowlisted method that is NOT
+// host-only, sorted for a stable hello frame. With no capability tiers every
+// connection sees the same list; host-only methods never appear. Absence is the
+// whole degradation mechanism, so this must agree with remoteCall's gates
+// exactly — a method the shim installs but Call refuses would be a button that
+// errors.
 func (a *App) remoteMethods(client remote.ClientInfo) []string {
 	out := make([]string, 0, len(remoteAllowlist))
 	for name, pol := range remoteAllowlist {
 		if pol.hostOnly {
 			continue
 		}
-		if remote.Allows(client.Caps, pol.cap) {
-			out = append(out, name)
-		}
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// remoteCall runs the three gates and, if all pass, unmarshals the arguments and
+// remoteCall runs the two gates and, if both pass, unmarshals the arguments and
 // invokes the real bound method. It is the single chokepoint for every remote
 // invocation; the local WebView2 seat never reaches it.
 func (a *App) remoteCall(ctx context.Context, client remote.ClientInfo, method string, args []json.RawMessage) (any, error) {
@@ -267,24 +258,20 @@ func (a *App) remoteCall(ctx context.Context, client remote.ClientInfo, method s
 	if !known {
 		return nil, fmt.Errorf("remote: unknown method %q", method)
 	}
-	// Gate 2: host-only. Refused at every capability. A remote client can only
-	// reach here for a host-only method by CRAFTING a call the shim would never
-	// make (the hello frame omitted it), so the attempt is logged.
+	// Gate 2: host-only. Refused for every connection. A connection can only reach
+	// here for a host-only method by CRAFTING a call the shim would never make
+	// (the hello frame omitted it), so the attempt is logged.
 	if pol.hostOnly {
-		log.Printf("wslcomms: refused host-only method %q from remote client %q (%s)",
-			method, client.Name, client.RemoteAddr)
+		log.Printf("wslcomms: refused host-only method %q from %s", method, client.RemoteAddr)
 		return nil, fmt.Errorf("remote: method %q is host-only and cannot be used from a remote client", method)
 	}
-	// Gate 3: capability tier.
-	if !remote.Allows(client.Caps, pol.cap) {
-		return nil, fmt.Errorf("remote: method %q requires capability %q", method, pol.cap)
-	}
 
-	// Audit every state-changing call before it runs, with the caller's name and
+	// Audit every state-changing call before it runs, with the caller's source
 	// address. This is a machine that is on air; who changed what, from where,
-	// must be in the log.
+	// must be in the log — and with no login, the source address is the only
+	// identity there is.
 	if pol.mutating {
-		log.Printf("wslcomms: remote %s by client %q from %s", method, client.Name, client.RemoteAddr)
+		log.Printf("wslcomms: remote %s from %s", method, client.RemoteAddr)
 	}
 
 	return a.remoteInvoke(ctx, client, method, args)
@@ -357,8 +344,8 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		}
 		// The KEY is logged and the VALUE never is: this is a passphrase crossing
 		// the boundary, and the audit line must not become the leak.
-		log.Printf("wslcomms: remote SetSecret key=%q by client %q from %s (value withheld)",
-			key, client.Name, client.RemoteAddr)
+		log.Printf("wslcomms: remote SetSecret key=%q from %s (value withheld)",
+			key, client.RemoteAddr)
 		return nil, a.SetSecret(key, value)
 	case "ArmMixer":
 		return a.armMixerFrom(client.ID)
@@ -448,11 +435,10 @@ const remoteStopBudget = 1 * time.Second
 const remoteClientsPollInterval = 2 * time.Second
 
 // startRemote (re)builds and starts the listener from the current settings file.
-// It is called once from startup and again by each remote-admin method that
-// changes the settings, so it must be safe to call repeatedly: it stops any
-// existing listener first, which — because internal/remote's Authenticator holds
-// a snapshot of the client list — is also how a client add/delete/password
-// change takes effect and how every live session is revoked.
+// It is called once from startup and again by SetRemoteListener when the
+// operator changes whether the listener runs or where it binds, so it must be
+// safe to call repeatedly: it stops any existing listener first, which is also
+// how the new bind/ports take effect and how every live connection is dropped.
 func (a *App) startRemote() {
 	a.remoteMu.Lock()
 	defer a.remoteMu.Unlock()
@@ -533,18 +519,19 @@ func (a *App) startRemoteLocked() {
 	a.remoteWG.Add(1)
 	go func() {
 		defer a.remoteWG.Done()
-		addr, err := srv.Start()
-		if err != nil {
-			// A bind failure must not block the window or crash the app; it is
-			// reported on the error banner and the app runs on without remote
-			// access, exactly as a first-run configuration problem is.
+		if err := srv.Start(); err != nil {
+			// A bind/listen failure must not block the window or crash the app; it
+			// is reported on the error banner and the app runs on without remote
+			// access, exactly as a first-run configuration problem is. On Windows a
+			// busy 80/443 falls back to 8080/8443 inside Start, so this fires only
+			// when even the fallback is unavailable.
 			a.emitError(fmt.Errorf("wslcomms: the remote-access listener could not start (%w); "+
 				"remote access is OFF this run", err))
 			return
 		}
-		if addr == "" {
-			// Disabled by settings: the safe, do-nothing posture. Nothing bound,
-			// nothing to publish, nothing to poll.
+		if !srv.Running() {
+			// Disabled by settings: the do-nothing posture. Nothing bound, nothing
+			// to publish, nothing to poll.
 			return
 		}
 
@@ -561,7 +548,8 @@ func (a *App) startRemoteLocked() {
 		a.remote.Store(srv)
 		a.remoteMu.Unlock()
 
-		log.Printf("wslcomms: remote access listening on https://%s (cert %s)", addr, srv.Fingerprint())
+		log.Printf("wslcomms: remote access listening (UNAUTHENTICATED) on %s and %s (cert %s)",
+			srv.HTTPURL(), srv.HTTPSURL(), srv.Fingerprint())
 		a.watchRemoteClients(runCtx, srv)
 	}()
 }
@@ -578,10 +566,10 @@ func (a *App) closeRemoteServer(srv *remote.Server) {
 }
 
 // buildRemoteServer assembles the transport's Options from the settings and the
-// application's own pieces: the allowlist dispatcher, an Authenticator over the
-// client list, the SAME embedded frontend the local window serves (fs.Sub'd to
-// the dist root so the remote page is byte-identical), the cert directory, and
-// the event names for the hello frame.
+// application's own pieces: the allowlist dispatcher, the SAME embedded frontend
+// the local window serves (fs.Sub'd to the dist root so the remote page is
+// byte-identical), the cert directory, and the event names for the hello frame.
+// There is no authenticator to build — the listener is unauthenticated.
 func (a *App) buildRemoteServer(settings *remote.Settings) (*remote.Server, error) {
 	dist, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
@@ -594,9 +582,9 @@ func (a *App) buildRemoteServer(settings *remote.Settings) (*remote.Server, erro
 	return remote.NewServer(remote.Options{
 		Enabled:    settings.Enabled,
 		Bind:       settings.Bind,
-		Port:       settings.Port,
+		HTTPPort:   settings.HTTPPort,
+		HTTPSPort:  settings.HTTPSPort,
 		Dispatcher: &remoteDispatcher{app: a},
-		Auth:       remote.NewAuthenticator(settings.Clients),
 		Assets:     dist,
 		CertDir:    certDir,
 		Events:     remoteEventNames(),
@@ -635,9 +623,10 @@ func (a *App) watchRemoteClients(ctx context.Context, srv *remote.Server) {
 }
 
 // RemoteConnectedClient is one connected seat as the home-screen indicator sees
-// it. It deliberately carries no cookie, token or capability detail beyond the
-// name and where it connected from — enough for the operator to know who has a
-// seat, nothing that would be a credential if the event were logged.
+// it. With no authentication there is no client name, so the seat is identified
+// by where it connected from: Name carries the source IP (the host part of the
+// peer address) and Addr the full host:port. That is enough for the operator to
+// know a second seat is present and roughly where it is.
 type RemoteConnectedClient struct {
 	Name string `json:"name"`
 	Addr string `json:"addr"`
@@ -650,15 +639,26 @@ type RemoteConnectedClient struct {
 func remoteClientPayloads(clients []remote.ClientInfo) []RemoteConnectedClient {
 	out := make([]RemoteConnectedClient, 0, len(clients))
 	for _, c := range clients {
-		out = append(out, RemoteConnectedClient{Name: c.Name, Addr: c.RemoteAddr})
+		out = append(out, RemoteConnectedClient{Name: remoteSeatName(c.RemoteAddr), Addr: c.RemoteAddr})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
+		if out[i].Addr != out[j].Addr {
+			return out[i].Addr < out[j].Addr
 		}
-		return out[i].Addr < out[j].Addr
+		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// remoteSeatName reduces a peer host:port to its host, the only stable identity
+// an unauthenticated seat has. It falls back to the whole address if it does not
+// split, which is harmless for a display label.
+func remoteSeatName(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }
 
 // remoteClientsFingerprint is a stable string over the connected connection ids,
@@ -677,29 +677,20 @@ func remoteClientsFingerprint(clients []remote.ClientInfo) string {
 // ---------------------------------------------------------------------------
 
 // RemoteState is what the Settings screen renders: whether the listener is
-// enabled, where it binds, whether it is actually running, the URL and cert
-// fingerprint to trust in a remote browser, the configured clients (with a
-// has-password flag, never the hash), and the seats connected right now.
+// enabled, where it binds, the two ports, the URLs to reach it in a remote
+// browser, and the certificate fingerprint to compare. There are NO client
+// records — the listener is unauthenticated. When the listener is running, the
+// URLs and ports reflect the ACTUALLY bound values (a fallback may have moved
+// 80/443 to 8080/8443); when it is not, they reflect the configured values. A
+// non-empty certFingerprint is the "it is running" signal (empty before Start).
 type RemoteState struct {
-	Enabled     bool                    `json:"enabled"`
-	Bind        string                  `json:"bind"`
-	Port        int                     `json:"port"`
-	Running     bool                    `json:"running"`
-	Address     string                  `json:"address"`
-	URL         string                  `json:"url"`
-	Fingerprint string                  `json:"fingerprint"`
-	Clients     []RemoteClientStatus    `json:"clients"`
-	Connected   []RemoteConnectedClient `json:"connected"`
-}
-
-// RemoteClientStatus is one configured client as the Settings screen sees it:
-// the name, the granted capabilities, and whether a password has been set — a
-// boolean, never the verifier, mirroring the "set / not set" secret-badge
-// convention the Settings screen already uses for the M2L-X and SRT passphrases.
-type RemoteClientStatus struct {
-	Name        string   `json:"name"`
-	Caps        []string `json:"caps"`
-	HasPassword bool     `json:"hasPassword"`
+	Enabled     bool   `json:"enabled"`
+	Bind        string `json:"bind"`
+	HTTPPort    int    `json:"httpPort"`
+	HTTPSPort   int    `json:"httpsPort"`
+	HTTPURL     string `json:"httpURL"`
+	HTTPSURL    string `json:"httpsURL"`
+	Fingerprint string `json:"certFingerprint"`
 }
 
 // GetRemoteState reports the remote-access configuration and live status. It is
@@ -711,98 +702,45 @@ func (a *App) GetRemoteState() (RemoteState, error) {
 		return RemoteState{}, err
 	}
 	st := RemoteState{
-		Enabled: settings.Enabled,
-		Bind:    settings.Bind,
-		Port:    settings.Port,
-		URL:     fmt.Sprintf("https://%s", net.JoinHostPort(settings.Bind, fmt.Sprintf("%d", settings.Port))),
+		Enabled:   settings.Enabled,
+		Bind:      settings.Bind,
+		HTTPPort:  settings.HTTPPort,
+		HTTPSPort: settings.HTTPSPort,
+		HTTPURL:   "http://" + net.JoinHostPort(settings.Bind, fmt.Sprintf("%d", settings.HTTPPort)),
+		HTTPSURL:  "https://" + net.JoinHostPort(settings.Bind, fmt.Sprintf("%d", settings.HTTPSPort)),
 	}
-	for _, c := range settings.Clients {
-		st.Clients = append(st.Clients, RemoteClientStatus{
-			Name:        c.Name,
-			Caps:        c.Caps,
-			HasPassword: c.PBKDF2.Hash != "",
-		})
-	}
-	if srv := a.remote.Load(); srv != nil {
-		if addr := srv.Fingerprint(); addr != "" {
-			// A non-empty fingerprint means Start bound a socket and generated the
-			// cert, i.e. the listener is actually running.
-			st.Running = true
-			st.Fingerprint = addr
-			st.Connected = remoteClientPayloads(srv.Clients())
+	if srv := a.remote.Load(); srv != nil && srv.Fingerprint() != "" {
+		// A non-empty fingerprint means Start bound the sockets and generated the
+		// cert, i.e. the listener is actually running. Prefer the actually-bound
+		// ports and URLs, which differ from the configured ones when a fallback ran.
+		st.Fingerprint = srv.Fingerprint()
+		st.HTTPPort = srv.HTTPPort()
+		st.HTTPSPort = srv.HTTPSPort()
+		if u := srv.HTTPURL(); u != "" {
+			st.HTTPURL = u
+		}
+		if u := srv.HTTPSURL(); u != "" {
+			st.HTTPSURL = u
 		}
 	}
 	return st, nil
 }
 
-// SetRemoteListener changes whether the listener runs and where it binds, then
-// restarts it. HOST-ONLY. It validates BEFORE saving so a bad bind (a hostname,
-// a routable address with no clients) is refused with its reason rather than
-// written and then failing to start.
-func (a *App) SetRemoteListener(enabled bool, bind string, port int) error {
+// SetRemoteListener changes whether the listener runs, where it binds and on
+// which two ports, then restarts it. HOST-ONLY. It validates BEFORE saving so a
+// bad bind (a hostname) or an out-of-range port is refused with its reason
+// rather than written and then failing to start. There is deliberately no guard
+// on WIDENING the bind — a wildcard bind is the owner's intended default.
+func (a *App) SetRemoteListener(enabled bool, bind string, httpPort, httpsPort int) error {
 	settings, err := remote.LoadSettings()
 	if err != nil {
 		return err
 	}
 	settings.Enabled = enabled
 	settings.Bind = strings.TrimSpace(bind)
-	settings.Port = port
+	settings.HTTPPort = httpPort
+	settings.HTTPSPort = httpsPort
 	if err := settings.Validate(); err != nil {
-		return err
-	}
-	if err := settings.Save(); err != nil {
-		return err
-	}
-	a.startRemote()
-	return nil
-}
-
-// AddRemoteClient adds a named client with the given capabilities and no
-// password (the operator sets one with SetRemoteClientPassword before it can log
-// in). HOST-ONLY. It restarts the listener so the new client list — held as a
-// snapshot in the Authenticator — takes effect.
-func (a *App) AddRemoteClient(name string, caps []string) error {
-	settings, err := remote.LoadSettings()
-	if err != nil {
-		return err
-	}
-	if err := settings.AddClient(name, caps); err != nil {
-		return err
-	}
-	if err := settings.Save(); err != nil {
-		return err
-	}
-	a.startRemote()
-	return nil
-}
-
-// SetRemoteClientPassword sets or replaces a client's password. HOST-ONLY. The
-// plaintext is hashed and never stored; there is deliberately no getter. It
-// restarts the listener so the new verifier takes effect and every existing
-// session is revoked.
-func (a *App) SetRemoteClientPassword(name, password string) error {
-	settings, err := remote.LoadSettings()
-	if err != nil {
-		return err
-	}
-	if err := settings.SetClientPassword(name, password); err != nil {
-		return err
-	}
-	if err := settings.Save(); err != nil {
-		return err
-	}
-	a.startRemote()
-	return nil
-}
-
-// DeleteRemoteClient removes a client and restarts the listener, which revokes
-// that client's live sessions along with everyone else's. HOST-ONLY.
-func (a *App) DeleteRemoteClient(name string) error {
-	settings, err := remote.LoadSettings()
-	if err != nil {
-		return err
-	}
-	if err := settings.DeleteClient(name); err != nil {
 		return err
 	}
 	if err := settings.Save(); err != nil {

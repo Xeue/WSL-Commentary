@@ -1,7 +1,6 @@
 package remote
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,37 +20,6 @@ func TestAppDataDirName_MatchesConfig(t *testing.T) {
 	}
 }
 
-func TestPBKDF2_RoundTripAndRejectsWrong(t *testing.T) {
-	p, err := hashPassword("correct horse")
-	if err != nil {
-		t.Fatalf("hashPassword: %v", err)
-	}
-	if p.Salt == "" || p.Hash == "" || p.Iter <= 0 {
-		t.Fatalf("hash produced an incomplete verifier: %+v", p)
-	}
-	if !p.verify("correct horse") {
-		t.Error("verify rejected the correct password")
-	}
-	if p.verify("correct hors") {
-		t.Error("verify accepted a wrong password")
-	}
-	// Two hashes of the same password differ (random salt), so a stolen file
-	// cannot be reversed by matching identical hashes across clients.
-	p2, _ := hashPassword("correct horse")
-	if p.Hash == p2.Hash {
-		t.Error("two hashes of the same password are identical; salt is not random")
-	}
-}
-
-func TestPBKDF2_MalformedRecordVerifiesFalse(t *testing.T) {
-	if (PBKDF2Params{}).verify("anything") {
-		t.Error("an empty verifier accepted a password")
-	}
-	if (PBKDF2Params{Salt: "!!notbase64!!", Iter: 1000, Hash: "x"}).verify("anything") {
-		t.Error("a malformed verifier accepted a password")
-	}
-}
-
 func TestSettings_ValidateRules(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -60,31 +28,34 @@ func TestSettings_ValidateRules(t *testing.T) {
 	}{
 		{
 			name:    "hostname bind refused",
-			s:       Settings{Bind: "example.com", Port: 8443},
+			s:       Settings{Bind: "example.com", HTTPPort: 80, HTTPSPort: 443},
 			wantErr: "not a literal IP",
 		},
 		{
-			name:    "non-loopback with no clients refused",
-			s:       Settings{Bind: "192.0.2.1", Port: 8443},
-			wantErr: "no clients",
+			name: "wildcard bind is the open default and is fine",
+			s:    Settings{Bind: "0.0.0.0", HTTPPort: 80, HTTPSPort: 443},
 		},
 		{
-			name: "non-loopback with a client is fine",
-			s:    Settings{Bind: "192.0.2.1", Port: 8443, Clients: []Client{{Name: "op", Caps: []string{"view"}}}},
+			name: "a specific LAN bind is fine",
+			s:    Settings{Bind: "192.0.2.1", HTTPPort: 80, HTTPSPort: 443},
 		},
 		{
-			name: "loopback with no clients is fine",
-			s:    Settings{Bind: "127.0.0.1", Port: 8443},
+			name: "loopback is fine",
+			s:    Settings{Bind: "127.0.0.1", HTTPPort: 8080, HTTPSPort: 8443},
 		},
 		{
-			name:    "bad port refused",
-			s:       Settings{Bind: "127.0.0.1", Port: 0},
-			wantErr: "port",
+			name: "port 0 is allowed (OS-assigned, for tests)",
+			s:    Settings{Bind: "0.0.0.0", HTTPPort: 0, HTTPSPort: 0},
 		},
 		{
-			name:    "unknown capability refused",
-			s:       Settings{Bind: "127.0.0.1", Port: 8443, Clients: []Client{{Name: "op", Caps: []string{"root"}}}},
-			wantErr: "unknown capability",
+			name:    "negative http port refused",
+			s:       Settings{Bind: "0.0.0.0", HTTPPort: -1, HTTPSPort: 443},
+			wantErr: "httpPort",
+		},
+		{
+			name:    "out-of-range https port refused",
+			s:       Settings{Bind: "0.0.0.0", HTTPPort: 80, HTTPSPort: 70000},
+			wantErr: "httpsPort",
 		},
 	}
 	for _, c := range cases {
@@ -109,20 +80,15 @@ func TestSettings_SaveLoadRoundTripAtomic(t *testing.T) {
 	t.Setenv("APPDATA", dir)
 
 	s := DefaultSettings()
-	s.Enabled = true
 	s.Bind = "127.0.0.1"
-	if err := s.AddClient("producer", []string{"view", "operate"}); err != nil {
-		t.Fatalf("AddClient: %v", err)
-	}
-	if err := s.SetClientPassword("producer", "hunter2"); err != nil {
-		t.Fatalf("SetClientPassword: %v", err)
-	}
+	s.HTTPPort = 8080
+	s.HTTPSPort = 8443
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// The file exists under %APPDATA%\WSLComms\remote\remote.json and no temp
-	// file is left behind.
+	// The file exists under %APPDATA%\WSLComms\remote\remote.json and no temp file
+	// is left behind.
 	remoteDir := filepath.Join(dir, appDataDirName, remoteDirName)
 	entries, _ := os.ReadDir(remoteDir)
 	for _, e := range entries {
@@ -135,41 +101,68 @@ func TestSettings_SaveLoadRoundTripAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSettings: %v", err)
 	}
-	if !got.Enabled || got.Bind != "127.0.0.1" || len(got.Clients) != 1 {
+	if !got.Enabled || got.Bind != "127.0.0.1" || got.HTTPPort != 8080 || got.HTTPSPort != 8443 {
 		t.Fatalf("round-trip lost data: %+v", got)
-	}
-	if !got.Clients[0].PBKDF2.verify("hunter2") {
-		t.Error("stored password does not verify after round-trip")
 	}
 }
 
-func TestLoadSettings_MissingFileReturnsSafeDefaults(t *testing.T) {
+func TestLoadSettings_MissingFileReturnsOpenDefaults(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("APPDATA", dir)
 	got, err := LoadSettings()
 	if err != nil {
 		t.Fatalf("LoadSettings on a missing file: %v", err)
 	}
-	if got.Enabled {
-		t.Error("missing remote.json loaded as enabled; want disabled")
+	// The owner's decision: a machine with no remote.json is ON, all interfaces.
+	if !got.Enabled {
+		t.Error("missing remote.json loaded as disabled; want enabled (ON by default)")
 	}
-	if got.Bind != "127.0.0.1" {
-		t.Errorf("missing remote.json bind = %q, want loopback", got.Bind)
+	if got.Bind != "0.0.0.0" {
+		t.Errorf("missing remote.json bind = %q, want 0.0.0.0", got.Bind)
+	}
+	if got.HTTPPort != 80 || got.HTTPSPort != 443 {
+		t.Errorf("missing remote.json ports = %d/%d, want 80/443", got.HTTPPort, got.HTTPSPort)
 	}
 }
 
-// TestSettings_NeverSerializesPlaintext is the mirror of internal/config's
-// TestSave_NeverWritesSecretFields: whatever remote.json contains, it must never
-// contain a plaintext password. Only the PBKDF2 verifier is on disk.
-func TestSettings_NeverSerializesPlaintext(t *testing.T) {
-	s := DefaultSettings()
-	_ = s.AddClient("op", []string{"view"})
-	_ = s.SetClientPassword("op", "s0oper-secret-passphrase")
-	data, err := json.Marshal(s)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+// TestLoadSettings_MigratesLegacyFile proves an old authenticated-era remote.json
+// — with a single TLS "port" and a "clients" array — loads without error, drops
+// the clients, and folds the old port onto httpsPort. A machine upgraded from the
+// previous scheme must keep working, not fail to parse.
+func TestLoadSettings_MigratesLegacyFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("APPDATA", dir)
+
+	remoteDir := filepath.Join(dir, appDataDirName, remoteDirName)
+	if err := os.MkdirAll(remoteDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-	if strings.Contains(string(data), "s0oper-secret-passphrase") {
-		t.Fatal("remote.json serialization contains the plaintext password")
+	legacy := `{
+  "version": 1,
+  "enabled": true,
+  "bind": "192.0.2.1",
+  "port": 9443,
+  "clients": [ { "name": "op", "caps": ["view"], "pbkdf2": {"salt":"x","iter":1000,"hash":"y"} } ]
+}`
+	if err := os.WriteFile(filepath.Join(remoteDir, settingsFileName), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("writing legacy file: %v", err)
+	}
+
+	got, err := LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings on a legacy file: %v", err)
+	}
+	if !got.Enabled || got.Bind != "192.0.2.1" {
+		t.Fatalf("legacy fields not preserved: %+v", got)
+	}
+	if got.HTTPSPort != 9443 {
+		t.Errorf("legacy port 9443 was not migrated onto httpsPort (got %d)", got.HTTPSPort)
+	}
+	if got.HTTPPort != defaultHTTPPort {
+		t.Errorf("httpPort = %d, want the default %d (the legacy file had no httpPort)", got.HTTPPort, defaultHTTPPort)
+	}
+	// The migrated settings must still be bindable.
+	if err := got.Validate(); err != nil {
+		t.Errorf("migrated settings do not validate: %v", err)
 	}
 }

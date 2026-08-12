@@ -1349,12 +1349,13 @@ input[type='range'] {
   max-width: 22rem;
 }
 
-/* The Settings "Remote access" group. It uses the shared .settings-group grid
-   like every other group; these rules style only the pieces that are unique to
-   it — the read-only URL/fingerprint lines and the client list. */
+/* The Settings "Remote access" group is status-only: it uses the shared
+   .settings-group grid like every other group, and the one rule here styles the
+   read-only bound-port/URL lines. There is no client UI — the listener is
+   unauthenticated by design (see docs/remote-access.md). */
 
-/* The URL and certificate-fingerprint lines are read-only facts to copy into a
-   remote browser, so they are monospaced and selectable, muted like a hint. */
+/* The bound-port / URL lines are read-only facts to copy into a remote browser,
+   so they are monospaced and selectable, muted like a hint. */
 .remote-readout {
   grid-column: 1 / -1;
   margin: 0;
@@ -1364,73 +1365,6 @@ input[type='range'] {
   word-break: break-all;
   -webkit-user-select: text;
   user-select: text;
-}
-
-/* The client list spans the whole group width: each row is a self-contained
-   card so a client's name, capabilities, password badge and actions read as one
-   unit rather than flowing into the grid's device-width columns. */
-.remote-clients {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.remote-client {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 0.75rem;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel-alt);
-}
-
-.remote-client-name {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.remote-client-caps {
-  font-size: 0.78rem;
-  color: var(--text-muted);
-}
-
-/* The add-a-client row and the capability checkboxes for it. Laid out inline so
-   the name box, the three capability boxes and the Add button sit on one line on
-   a wide window and wrap gracefully on a narrow one. */
-.remote-add {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 0.75rem;
-}
-
-.remote-caps {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 0.75rem;
-  align-items: center;
-}
-
-.remote-cap {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: 0.82rem;
-  color: var(--text-muted);
-}
-
-/* The empty-state line when no clients are configured: a non-loopback listener
-   with no clients is refused, so this is also the instruction for how to make a
-   LAN address legal. Muted, not alarming. */
-.remote-empty {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: 0.82rem;
-  color: var(--text-muted);
 }
 
 /* ==================================================================== */
