@@ -26,20 +26,33 @@ Follow it top to bottom. It assumes nothing is installed except Windows.
 
 ## 0. What you are building
 
-One installer that lays down one program folder:
+**Two deliverables, from the same staged folder.** Pick by how it is being
+handed over, not by which is better — they ship identical binaries.
+
+**1. `wslcomms-portable.exe` — one file, 19.8 MB** (section 3.6). Copy it
+anywhere and run it. No installer, no admin rights, no Program Files. Best for
+getting a build to someone quickly, for a locked-down laptop, or for running
+from a stick at a venue. It unpacks to `%LOCALAPPDATA%` on first run.
+
+**2. `wslcomms-setup.exe` — the conventional installer** (section 3.5). Start
+menu entry, Add/Remove Programs, per-machine install. Needs admin. Best for a
+managed deployment. Lays down one program folder:
 
 ```
 C:\Program Files\WSL Studios\WSL Commentary\
-  wslcomms.exe                     ~15 MB   Go + Wails + embedded frontend + embedded WebView2 bootstrapper
+  wslcomms.exe                     20.3 MB  Go + Wails + embedded frontend + embedded WebView2 bootstrapper
   slate.png                                 1920x1080 slate, fed to filesrc ! pngdec ! imagefreeze
-  *.dll                            60-110 MB GStreamer / GLib / MinGW runtime (default AppDir layout — see section 6)
-  gst\lib\gstreamer-1.0\*.dll               the thirteen allowlisted plugins
+  *.dll                            21.5 MB  GStreamer / GLib / MinGW runtime (default AppDir layout — see section 6)
+  gst\lib\gstreamer-1.0\*.dll       1.4 MB  the fifteen allowlisted plugins
   gst\BUNDLE-MANIFEST.txt                   what was shipped, with SHA-256 for every file
   licenses\                                 LGPL-2.1 text, written offer, third-party notice
 ```
 
-Installed footprint **70–120 MB** (specification section 11). Nothing else is
-installed. No service is registered. Nothing runs when the app is closed.
+Installed footprint **43 MB**. Nothing else is installed. No service is
+registered. Nothing runs when the app is closed.
+
+Neither needs GStreamer, MinGW or anything else preinstalled on the target
+machine. Both need the WebView2 runtime, which Windows 11 ships with.
 
 ---
 
@@ -317,8 +330,29 @@ powershell -ExecutionPolicy Bypass -File build\bundle-gst.ps1
 This copies the runtime **from an explicit file list, never a directory copy**,
 because a directory copy would drag GPL `x264enc` into a commercial deliverable.
 It fails loudly if a listed file is missing, refuses to copy anything matching
-`*x264*`, audits its own output, walks the import table of everything it copied,
-and prints the total size (expect **60–110 MB**).
+the patterns in `build\forbidden-names.ps1`, audits its own output, walks the
+import table of everything it copied, and prints the total size (expect
+**22.9 MB**; measured 2026-08-12, 15 plugins and 35 runtime files).
+
+Two behaviours are worth knowing about before you run it.
+
+**It strips debug sections, and proves it did no harm.** The GStreamer mingw
+distribution ships its DLLs with full DWARF, and that is **58% of the bundle** —
+`libstdc++-6.dll` alone is 25.3 MB of which 23 MB is `.debug_info` and friends,
+and stripped it is 2.2 MB. Nothing in a shipped product reads those sections, so
+they are pure download and disk. Because stripping edits a binary we
+redistribute, the script counts each file's exported symbols with `objdump`
+before and after and **fails the whole run if the count changes**. `-NoStrip`
+turns it off and restores the old ~54 MB bundle.
+
+**It refuses to start if the destination is locked.** A running `wslcomms.exe`
+holds every plugin DLL it has loaded. Before this check existed, the script
+cleaned the destination, then failed on the first file it could not overwrite —
+leaving some plugins present, some missing, and a `registry.bin` still listing
+all of them. The app then started and died at `gst.Init` with *"the bundled
+GStreamer … is incomplete"*. That happened for real on 2026-08-12. The script
+now proves every destination file is writable **before deleting anything**, names
+the process holding them, and exits having changed nothing.
 
 Useful switches:
 
@@ -326,6 +360,7 @@ Useful switches:
 build\bundle-gst.ps1 -DryRun                 # validate the file list, touch nothing (works with no GStreamer)
 build\bundle-gst.ps1 -GstRoot D:\gstreamer\1.0\mingw_x86_64
 build\bundle-gst.ps1 -CoreDllLayout GstBin   # runtime DLLs in gst\bin instead of beside the exe — read section 6 first
+build\bundle-gst.ps1 -NoStrip                # keep debug sections; bundle goes back to ~54 MB
 build\bundle-gst.ps1 -NoDependencyReport     # do not do this at Gate B
 ```
 
@@ -344,6 +379,63 @@ Output: `dist\installer\wslcomms-setup.exe`.
 `dist\wslcomms.exe`, `dist\slate.png` and `dist\licenses\LGPL-2.1.txt` are all
 present. The manifest check is a provenance gate: only `bundle-gst.ps1` writes
 that file, so a hand-assembled `gst\` folder cannot be packaged by accident.
+
+### 3.6 The portable single executable
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build\pack-portable.ps1 -Version 1.0.0
+```
+
+Output: `build\dist\wslcomms-portable.exe` — **one 19.8 MB file, and nothing
+else**. Copy it to any Windows 11 machine and run it. No installer, no admin
+rights, nothing to preinstall but the WebView2 runtime that Windows 11 already
+has.
+
+**Why a launcher and not a self-extracting `wslcomms.exe`.** You cannot make
+`wslcomms.exe` unpack its own DLLs. Its PE import table names four of them —
+`libglib-2.0-0.dll`, `libgobject-2.0-0.dll`, `libgstreamer-1.0-0.dll`,
+`libgstvideo-1.0-0.dll` — and the Windows loader resolves imports **when the
+process is created, before any Go code runs**. By the time a `main()` could
+unpack anything, the loader has already failed. Check it yourself:
+
+```powershell
+objdump -p build\bin\wslcomms.exe | Select-String "DLL Name"
+```
+
+So `cmd\portable` is a separate program that imports nothing native at all —
+`objdump` shows `kernel32.dll` and nothing else. It unpacks the staged tree to
+`%LOCALAPPDATA%\WSLComms\runtime\<payload digest>\` and starts *that* copy of
+`wslcomms.exe`, whose loader then finds its DLLs sitting beside it.
+
+What the design buys:
+
+| Property | How |
+|---|---|
+| Upgrades cannot corrupt a running copy | The directory is named after the payload's SHA-256, so a new build unpacks alongside rather than over |
+| No partial runtime is ever visible | Unpacks to a temporary directory, then a single atomic rename |
+| Two launches at once are safe | Both unpack privately; the loser of the rename uses the winner's copy |
+| Settings survive upgrades | Config stays in `%APPDATA%\WSLComms`, outside the versioned directory |
+| One entry in Task Manager | The launcher starts the app and exits; it does not wait |
+| Failures are visible | It is linked `-H windowsgui` and has no console, so errors go to a message box, never to a stderr nobody can see |
+| An archive cannot write outside the unpack directory | Zip-slip check on every entry (`safeRelPath`), tested |
+
+The script verifies the staged folder before packing: 15 plugins, all four
+required files present, and `BUNDLE-MANIFEST.txt` recording a **passing**
+dependency check — a bundle whose closure was never verified is exactly the one
+that fails on a machine that is not the build host. It packs an **explicit file
+list**, not the folder, for the same reason `bundle-gst.ps1` does; a sweep once
+picked up a stale 26 MB zip that had been left in the staging directory. Both
+scripts apply the same licensing list from `build\forbidden-names.ps1`.
+
+The payload (`cmd\portable\payload.zip`, ~17 MB) and the icon resource
+(`cmd\portable\rsrc_windows_amd64.syso`) are generated and git-ignored. Without
+the `portable` build tag the package compiles against a stub, so a clean
+checkout still builds and tests without them.
+
+**Antivirus.** An executable that unpacks and launches another executable is a
+shape some heuristic scanners dislike. The version resource and icon this script
+compiles in help; code-signing would settle it, and is the right answer if this
+is ever handed to people outside the team.
 
 ---
 
@@ -463,16 +555,21 @@ is the fix. That is a change in `internal/gst`, not here.
 
 ## 7. Sizes to expect
 
-| | Expected | Source |
-|---|---|---|
-| `wslcomms.exe` | ~15 MB | spec section 11 |
-| GStreamer bundle | 60–110 MB | spec sections 3 and 11 |
-| Installed footprint | 70–120 MB | spec section 11 |
-| `wslcomms-setup.exe` | smaller than the above, LZMA2 solid — measure it | — |
+All **measured on 2026-08-12**, not estimated. The spec's original 60–110 MB
+band was written before anyone could build one and is superseded.
 
-`bundle-gst.ps1` warns if the bundle falls outside 60–110 MB. Under: something
-is missing. Over: something is being copied that should not be — open
-`BUNDLE-MANIFEST.txt` and find out what.
+| | Measured | Note |
+|---|---|---|
+| `wslcomms.exe` | 20.3 MB | |
+| GStreamer bundle, stripped | **22.9 MB** | 15 plugins, 35 runtime files |
+| GStreamer bundle, `-NoStrip` | 54.1 MB | the 31.2 MB difference is all DWARF |
+| Staged `build\bin\` total | 43.3 MB | exe + bundle + slate + licences, 60 files |
+| `wslcomms-portable.exe` | **19.8 MB** | the whole thing in one file; payload compresses 43.3 → 17.4 MB |
+| `wslcomms-setup.exe` | not yet measured | needs Inno Setup |
+
+`bundle-gst.ps1` warns if the bundle falls outside 15–40 MB stripped (40–80 MB
+with `-NoStrip`). Under: something is missing. Over: something is being copied
+that should not be — open `BUNDLE-MANIFEST.txt` and find out what.
 
 ---
 
@@ -556,6 +653,11 @@ check for itself.
 | Start fails with a passphrase error | libsrt has no crypto backend bundled | section 5, step 5 |
 | `bundle-gst.ps1` says `MISSING REQUIRED FILE` | a DLL has a different name in this build | section 5, step 2 |
 | `bundle-gst.ps1` says `STRAY` | something copied files into `dist\gst` by other means | re-run without `-KeepExisting` |
+| `bundle-gst.ps1` says `The destination is locked` | `wslcomms.exe` is running and holding its plugin DLLs | close the app and re-run; **nothing was changed**, the existing bundle still works |
+| `gst.Init: the bundled GStreamer … is incomplete` naming specific plugins | a `bundle-gst.ps1` run was interrupted after cleaning but before copying | close the app, delete `%LOCALAPPDATA%\WSLComms\registry.bin`, re-run `bundle-gst.ps1` |
+| `STRIPPING DAMAGED <file>` | `strip` changed a DLL's export count — should be impossible | re-run with `-NoStrip` and report it; do not ship the stripped bundle |
+| `pack-portable.ps1`: `Expected 15 GStreamer plugins, found N` | the staged bundle is incomplete | run `bundle-gst.ps1` first, with the app closed |
+| Portable exe does nothing when double-clicked | it always reports failures in a message box, so this means the child started and exited | check `%LOCALAPPDATA%\WSLComms\runtime\` was written, then run the unpacked `wslcomms.exe` directly to see its error |
 | ISCC: `dist\gst\BUNDLE-MANIFEST.txt is missing` | the bundle was not produced by `bundle-gst.ps1` | section 3.4 |
 | ISCC: `Unknown directive: ArchitecturesAllowed` value | Inno older than 6.3 | section 2.8 |
 | Script blocked by execution policy | default Windows policy | run with `powershell -ExecutionPolicy Bypass -File …` |
@@ -566,7 +668,9 @@ check for itself.
 
 | File | What it is |
 |---|---|
-| `bundle-gst.ps1` | The DLL allowlist and the staging script. The licensing control. |
+| `bundle-gst.ps1` | The DLL allowlist and the staging script. Strips debug sections and verifies it did no harm. |
+| `forbidden-names.ps1` | The licensing control: names that must never be redistributed. Shared by both scripts above and below, so the two cannot drift apart. |
+| `pack-portable.ps1` | Packs a staged folder into `dist\wslcomms-portable.exe` — one file, no installer. Section 3.6. |
 | `installer.iss` | Inno Setup script: per-machine, one feature, no options. |
 | `licenses\LGPL-2.1.txt` | GNU LGPL 2.1, verbatim. |
 | `licenses\GPL-3.0.txt`, `licenses\GCC-RUNTIME-LIBRARY-EXCEPTION-3.1.txt` | For `libgcc_s_seh-1.dll` and `libstdc++-6.dll`. This product is not GPL; the exception is why. |

@@ -115,7 +115,9 @@ param(
     [switch]$NoDependencyReport,
     [switch]$AllowUnresolved,
     [switch]$KeepExisting,
-    [string]$DependencyTool
+    [string]$DependencyTool,
+    [switch]$NoStrip,
+    [string]$StripTool
 )
 
 Set-StrictMode -Version Latest
@@ -145,8 +147,23 @@ $ScriptVersion = '1.0.0'
 # The band below is the measured figure with room either side: enough slack that
 # a GStreamer point release does not trip it, tight enough that a directory copy
 # (the whole install is 2.4 GB) or a silently dropped plugin still does.
-$ExpectedMinBytes = 40MB
-$ExpectedMaxBytes = 80MB
+#
+# RE-MEASURED 2026-08-12, after stripping became the default: 22.9 MB. The
+# GStreamer mingw distribution ships its DLLs with full DWARF debug sections,
+# and they are 58% of the bundle by size. libstdc++-6.dll alone is 25.3 MB, of
+# which 23 MB is .debug_info and friends; stripped it is 2.2 MB with all 17,800
+# exports intact. Nothing in a shipped product reads those sections - they
+# describe C++ standard-library internals we do not debug and cannot patch - so
+# they are 31 MB of download and disk for no return. -NoStrip restores the old
+# behaviour and the old band.
+if ($NoStrip) {
+    $ExpectedMinBytes = 40MB
+    $ExpectedMaxBytes = 80MB
+}
+else {
+    $ExpectedMinBytes = 15MB
+    $ExpectedMaxBytes = 40MB
+}
 
 # ---------------------------------------------------------------------------
 # Forbidden names. The licensing control.
@@ -156,28 +173,13 @@ $ExpectedMaxBytes = 80MB
 # tree after the copy. A match is fatal, always, with no override switch -
 # there is deliberately no -Force here.
 #
-# x264 is the one the specification names (GPL-2.0-or-later; mfh264enc replaces
-# it). The rest are in the same family: GPL, or patent-encumbered, or both, and
-# none of them has any business in this pipeline.
-$ForbiddenPatterns = @(
-    '*x264*'        # GPL-2.0-or-later. THE reason this script exists.
-    '*x265*'        # GPL-2.0-or-later.
-    '*libav*'       # gst-libav / FFmpeg: licence depends on how it was built. Not ours to assume.
-    '*ffmpeg*'      # as above.
-    '*avcodec*'     # FFmpeg component.
-    '*avformat*'    # FFmpeg component.
-    '*avfilter*'    # FFmpeg component.
-    '*postproc*'    # FFmpeg component, GPL.
-    '*swscale*'     # FFmpeg component.
-    '*swresample*'  # FFmpeg component.
-    '*ugly*'        # gst-plugins-ugly: the set exists precisely because of licensing.
-    '*faac*'        # patent-encumbered AAC encoder. We use mfaacenc (the OS).
-    '*lame*'        # LGPL but patent-encumbered MP3; nothing here needs MP3.
-    '*mpeg2enc*'    # GPL.
-    '*a52dec*'      # GPL.
-    '*dvdread*'     # GPL.
-    '*libmad*'      # GPL.
-)
+# The list itself lives in build\forbidden-names.ps1 because build\pack-portable.ps1
+# redistributes these same binaries inside a single executable and must apply the
+# identical list. Two copies of a licensing control is one copy too many.
+. (Join-Path $PSScriptRoot 'forbidden-names.ps1')
+if (-not $ForbiddenPatterns -or $ForbiddenPatterns.Count -eq 0) {
+    throw 'build\forbidden-names.ps1 did not define $ForbiddenPatterns. Refusing to stage a bundle with the licensing control disabled.'
+}
 
 # ---------------------------------------------------------------------------
 # The file list.
@@ -576,6 +578,73 @@ function Get-ImportedDllName {
     return $names.ToArray()
 }
 
+function Get-ExportSignature {
+    <#
+    .SYNOPSIS
+        A fingerprint of a PE file's export table: the count of exported names.
+    .DESCRIPTION
+        This is the check that makes stripping safe to do by default. `strip`
+        removes symbol and debug sections; a DLL's exports live in the export
+        data directory, which is not a symbol table and is not touched. That is
+        the theory. This function is how the script proves it on every file it
+        strips, rather than trusting it.
+
+        Counting names rather than diffing the full table is deliberate: it is
+        one objdump pass, and any strip that damaged the export directory would
+        change the count (almost certainly to zero, since a corrupt directory
+        does not parse). Returns -1 if the tool could not be run, which the
+        caller treats as "unverified" rather than "unchanged".
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$ToolKind
+    )
+
+    # dumpbin's export listing is formatted differently and this check is not
+    # worth a second parser; with dumpbin the strip is simply not verified, and
+    # the caller says so.
+    if ($ToolKind -ne 'objdump') { return -1 }
+
+    $out = & $Tool -p $Path 2>&1
+    if ($LASTEXITCODE -ne 0) { return -1 }
+
+    # objdump prints the export table as "\t[<ordinal>] <name>" lines under
+    # "Export Address Table". Counting the ordinal-prefixed lines is stable
+    # across binutils versions in a way that section offsets are not.
+    $n = 0
+    foreach ($line in $out) {
+        if ([regex]::IsMatch([string]$line, '^\s*\[\s*\d+\s*\]\s+\S')) { $n++ }
+    }
+    return $n
+}
+
+function Find-StripTool {
+    <#
+    .SYNOPSIS
+        Locates binutils strip. Returns $null if there is none.
+    .DESCRIPTION
+        Same shape as Find-DependencyTool: explicit path wins, then PATH, then
+        the MinGW prefix that build\env.ps1 puts this script's toolchain in.
+    #>
+    param([string]$Explicit)
+
+    if ($Explicit) {
+        if (-not (Test-Path -LiteralPath $Explicit)) {
+            throw "-StripTool '$Explicit' does not exist."
+        }
+        return $Explicit
+    }
+    foreach ($name in @('strip', 'x86_64-w64-mingw32-strip')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @('C:\msys64\mingw64\bin\strip.exe')) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return $null
+}
+
 function Test-SystemDll {
     <#
     .SYNOPSIS
@@ -655,6 +724,23 @@ function Remove-StagedTree {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $DistDir) { $DistDir = Join-Path $repoRoot 'dist' }
+
+# Make the destination absolute before anything derives a path from it.
+#
+# A relative -DistDir (say 'build\bin') is the natural thing to type, and it
+# works for PowerShell's own cmdlets because they resolve against PowerShell's
+# location. But this script also hands paths to .NET - [System.IO.File]::Open
+# in the lock check, [System.IO.Path]::GetFullPath in the destination audit -
+# and .NET resolves relative paths against the PROCESS working directory, which
+# Set-Location does not update. The two disagree, and the audit then compares
+# paths rooted in one place against files found in another and calls every
+# single file a stray.
+#
+# Fixing it once here is the whole fix; every Join-Path below inherits it.
+if (-not [System.IO.Path]::IsPathRooted($DistDir)) {
+    $DistDir = Join-Path (Get-Location).ProviderPath $DistDir
+}
+$DistDir = [System.IO.Path]::GetFullPath($DistDir)
 
 Write-Host ''
 Write-Host '=== bundle-gst.ps1 ===================================================='
@@ -754,6 +840,64 @@ if ($DryRun) {
     exit 0
 }
 
+# --- pre-flight: is anything holding the destination open? -------------------
+# This check exists because its absence cost a working install. A running
+# wslcomms.exe holds every plugin DLL it has loaded. The clean step below
+# happily deletes the files it CAN delete, then the copy fails on the first one
+# it cannot - leaving a destination with some plugins present, some missing, and
+# a registry.bin that still lists all of them. The app then starts and fails at
+# gst.Init with "the bundled GStreamer is incomplete".
+#
+# So: prove every file this run intends to write is writable BEFORE deleting
+# anything. A locked file here means the bundle is left exactly as it was.
+Write-Host 'Checking the destination is writable...'
+$locked = New-Object System.Collections.Generic.List[string]
+foreach ($r in $resolved) {
+    if (-not (Test-Path -LiteralPath $r.Dest -PathType Leaf)) { continue }
+
+    # Convert-Path, not the raw $r.Dest. PowerShell resolves a relative path
+    # against its own location; [System.IO.File] resolves it against the
+    # process working directory, and the two are not the same object. Passing
+    # the relative path makes .NET look somewhere else, fail to find it, and
+    # throw FileNotFoundException - which derives from IOException, so a naive
+    # catch reports every file in the bundle as locked.
+    $abs = (Convert-Path -LiteralPath $r.Dest)
+    try {
+        $fs = [System.IO.File]::Open($abs, 'Open', 'ReadWrite', 'None')
+        $fs.Close()
+        $fs.Dispose()
+    }
+    catch [System.IO.FileNotFoundException] {
+        # Not there is not the same as held open, and only the second is fatal.
+        continue
+    }
+    catch [System.IO.DirectoryNotFoundException] {
+        continue
+    }
+    catch [System.IO.IOException] {
+        $locked.Add($abs)
+    }
+}
+if ($locked.Count -gt 0) {
+    Write-Host ''
+    Write-Host "  $($locked.Count) staged file(s) are open in another process, for example:"
+    foreach ($l in ($locked | Select-Object -First 4)) { Write-Host "    $l" }
+    Write-Host ''
+    # Naming the process turns "something has it locked" into an instruction.
+    $holders = @(Get-Process -Name 'wslcomms' -ErrorAction SilentlyContinue)
+    if ($holders.Count -gt 0) {
+        foreach ($h in $holders) { Write-Host "  wslcomms.exe is running (pid $($h.Id)). Close it and re-run." }
+    }
+    else {
+        Write-Host '  No wslcomms.exe is running, so something else holds them - an installer,'
+        Write-Host '  an antivirus scan, or an Explorer preview. Close it and re-run.'
+    }
+    Write-Host ''
+    throw "The destination is locked. NOTHING HAS BEEN CHANGED - the existing bundle is intact and the app will still start."
+}
+Write-Host ("  all {0} destination file(s) are writable." -f $resolved.Count)
+Write-Host ''
+
 # --- clean -------------------------------------------------------------------
 if (-not $KeepExisting) {
     Write-Host 'Cleaning destination...'
@@ -783,6 +927,101 @@ foreach ($r in $resolved) {
 }
 Write-Host ("  copied {0} file(s)." -f $copied.Count)
 Write-Host ''
+
+# --- strip -------------------------------------------------------------------
+# Runs before the audit and the dependency report on purpose: everything
+# downstream - the stray-file audit, the closure check, the manifest hashes and
+# the size band - then describes the bytes that actually ship, not the bytes
+# that were copied and then changed underneath them.
+$stripStats = @{ Ran = $false; Tool = ''; Before = 0L; After = 0L; Files = 0; Verified = 0; Unverified = 0 }
+if ($NoStrip) {
+    Write-Host 'Stripping: SKIPPED (-NoStrip). The bundle keeps its debug sections.'
+    Write-Host ''
+}
+else {
+    $stripExe = Find-StripTool -Explicit $StripTool
+    if ($null -eq $stripExe) {
+        Write-Warning 'No strip found (strip, x86_64-w64-mingw32-strip). The bundle will be roughly'
+        Write-Warning 'three times larger than it needs to be - about 58% of it is DWARF debug'
+        Write-Warning 'sections. strip ships with the MinGW binutils you installed for Gate B; put'
+        Write-Warning 'it on PATH and re-run, or pass -StripTool <path>. This is not fatal.'
+        Write-Host ''
+    }
+    else {
+        # The export check needs objdump. If there is none, stripping still runs
+        # but says plainly that it was not verified.
+        $verifyTool = Find-DependencyTool -Explicit $DependencyTool
+        $canVerify = ($null -ne $verifyTool) -and ($verifyTool.Kind -eq 'objdump')
+
+        Write-Host "Stripping debug sections (via $stripExe)..."
+        if (-not $canVerify) {
+            Write-Warning '  no objdump available: export tables will NOT be checked after stripping.'
+        }
+
+        foreach ($c in $copied) {
+            $before = $c.Bytes
+            $exportsBefore = -1
+            if ($canVerify) {
+                $exportsBefore = Get-ExportSignature -Path $c.Dest -Tool $verifyTool.Path -ToolKind $verifyTool.Kind
+            }
+
+            # Strip a copy, not the staged file: a strip that fails partway
+            # through would otherwise leave a truncated DLL in the bundle, and
+            # the whole point of this script is that the destination is never
+            # in a state nobody chose.
+            $tmp = "$($c.Dest).stripping"
+            Copy-Item -LiteralPath $c.Dest -Destination $tmp -Force
+            & $stripExe --strip-all $tmp 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                throw "strip failed on '$($c.Name)' (exit $LASTEXITCODE). The staged file is untouched. Re-run with -NoStrip to bundle without stripping."
+            }
+
+            $after = (Get-Item -LiteralPath $tmp).Length
+            if ($after -le 0 -or $after -gt $before) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                throw "strip produced an implausible result for '$($c.Name)': $before bytes became $after. The staged file is untouched."
+            }
+
+            if ($canVerify) {
+                $exportsAfter = Get-ExportSignature -Path $tmp -Tool $verifyTool.Path -ToolKind $verifyTool.Kind
+                if ($exportsBefore -lt 0 -or $exportsAfter -lt 0) {
+                    $stripStats.Unverified++
+                }
+                elseif ($exportsAfter -ne $exportsBefore) {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    throw "STRIPPING DAMAGED '$($c.Name)': it exported $exportsBefore symbols before and $exportsAfter after. The staged file is untouched. Re-run with -NoStrip and report this."
+                }
+                else {
+                    $stripStats.Verified++
+                }
+            }
+            else {
+                $stripStats.Unverified++
+            }
+
+            Move-Item -LiteralPath $tmp -Destination $c.Dest -Force
+            $c.Bytes = $after
+            $c.Sha256 = (Get-FileHash -LiteralPath $c.Dest -Algorithm SHA256).Hash
+            $stripStats.Before += $before
+            $stripStats.After += $after
+            $stripStats.Files++
+        }
+
+        $stripStats.Ran = $true
+        $stripStats.Tool = $stripExe
+        $saved = $stripStats.Before - $stripStats.After
+        Write-Host ("  stripped {0} file(s): {1:N1} MB -> {2:N1} MB, saving {3:N1} MB ({4:N0}%)." -f `
+                $stripStats.Files, ($stripStats.Before / 1MB), ($stripStats.After / 1MB), ($saved / 1MB), ($saved * 100 / $stripStats.Before))
+        if ($stripStats.Unverified -gt 0) {
+            Write-Host ("  export tables checked on {0} file(s); {1} NOT checked." -f $stripStats.Verified, $stripStats.Unverified)
+        }
+        else {
+            Write-Host ("  every stripped file exports exactly what it exported before.")
+        }
+        Write-Host ''
+    }
+}
 
 # --- audit the destination ---------------------------------------------------
 # Third forbidden-name check, and the check that catches a stale bundle: every
@@ -923,6 +1162,16 @@ if ($depReport.Ran) {
 else {
     $lines.Add('Dependency check : NOT RUN - the dependency closure of this bundle is UNVERIFIED')
 }
+if ($stripStats.Ran) {
+    $saved = $stripStats.Before - $stripStats.After
+    $lines.Add("Debug sections   : STRIPPED via $($stripStats.Tool) - $('{0:N1}' -f ($stripStats.Before / 1MB)) MB became $('{0:N1}' -f ($stripStats.After / 1MB)) MB")
+    $lines.Add("                   ($('{0:N1}' -f ($saved / 1MB)) MB of DWARF removed; export tables verified unchanged on $($stripStats.Verified) file(s), unverified on $($stripStats.Unverified))")
+    $lines.Add('                   The sha256 values below are of the STRIPPED files, which are the')
+    $lines.Add('                   files that ship. They will not match the GStreamer distribution.')
+}
+else {
+    $lines.Add('Debug sections   : NOT STRIPPED - files are byte-identical to the source tree')
+}
 $lines.Add('')
 $lines.Add('Every file below was named explicitly in bundle-gst.ps1. No directory copy was')
 $lines.Add('performed. No file matching any of these patterns may be present, and the script')
@@ -956,6 +1205,9 @@ Write-Host ("  plugins       : {0}" -f @($copied | Where-Object { $_.Kind -eq 'P
 Write-Host ("  runtime files : {0}" -f @($copied | Where-Object { $_.Kind -eq 'Runtime' }).Count)
 Write-Host ("  GStreamer     : {0}" -f $gstVersion)
 Write-Host ("  manifest      : {0}" -f $manifestPath)
+if ($stripStats.Ran) {
+    Write-Host ("  stripped      : {0:N1} MB of debug sections removed" -f (($stripStats.Before - $stripStats.After) / 1MB))
+}
 Write-Host ("  TOTAL SIZE    : {0:N1} MB ({1:N0} bytes)" -f ($totalBytes / 1MB), $totalBytes)
 Write-Host '======================================================================='
 
@@ -971,8 +1223,9 @@ if ($skippedOptional.Count -gt 0) {
 
 if ($totalBytes -lt $ExpectedMinBytes -or $totalBytes -gt $ExpectedMaxBytes) {
     Write-Host ''
-    Write-Warning ("Bundle is {0:N1} MB. Expected {1:N0}-{2:N0} MB, around the 52.5 MB measured at Gate B." -f `
-            ($totalBytes / 1MB), ($ExpectedMinBytes / 1MB), ($ExpectedMaxBytes / 1MB))
+    $measured = if ($NoStrip) { '54.1 MB unstripped' } else { '22.9 MB stripped' }
+    Write-Warning ("Bundle is {0:N1} MB. Expected {1:N0}-{2:N0} MB, around the {3} measured on 2026-08-12." -f `
+            ($totalBytes / 1MB), ($ExpectedMinBytes / 1MB), ($ExpectedMaxBytes / 1MB), $measured)
     Write-Warning 'Under: something is missing, most likely an optional file that is not optional'
     Write-Warning 'on this build. Over: something is being copied that should not be - check the'
     Write-Warning 'manifest file list before shipping.'
