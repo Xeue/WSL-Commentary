@@ -754,8 +754,8 @@ test('the default picture latency is 120 everywhere it is written down', () => {
 //
 // The pure model has its own file (presets.test.js). What is asserted HERE is
 // the Settings form's half of the contract: where the group sits, that the
-// sending gate reaches its buttons, that the machine-fields note names all
-// four fields, and — the one that guards the whole feature's data path — that
+// sending gate reaches its buttons, and — the one that guards the whole
+// feature's data path — that
 // collectConfig() did not grow a preset key, because saveConfig REPLACES the
 // stored document and a key with no Go field is discarded silently
 // (pictureSource is the standing example of that trap).
@@ -785,7 +785,7 @@ test('Apply and Delete are gated on the sending state, with the reason on the co
   assert.match(setSending, /sendingNow = sending === true/);
   assert.match(setSending, /renderPresetButtons\(\)/);
 
-  const buttons = js.slice(js.indexOf('function renderPresetButtons()'), js.indexOf('function renderPresetScopeLine'));
+  const buttons = js.slice(js.indexOf('function renderPresetButtons()'), js.indexOf('async function refreshPresets'));
   assert.match(buttons, /applyPresetBtn\.disabled = none \|\| sendingNow/);
   assert.match(buttons, /deletePresetBtn\.disabled = none \|\| sendingNow/);
   assert.match(buttons, /Disabled while SENDING/, 'the reason must be on the control, not in a log');
@@ -800,18 +800,16 @@ test('Apply and Delete are gated on the sending state, with the reason on the co
   );
 });
 
-test('the permanent note names all four MACHINE fields with their current values', () => {
-  // The whole feature's safety story is "your microphone and headphones are
-  // not in here", and showing the current values is how the operator SEES
-  // that they survived an apply. The tags are paired BY POSITION with
-  // presets.js's MACHINE_FIELD_LABELS — presets.js itself may not spell them.
+test('the preset card carries no scope readout or machine-fields note', () => {
+  // Both were removed at the operator's request — the card is the picker and
+  // its buttons only. The safety they narrated (a preset cannot carry a device
+  // id) is still enforced by construction in presets.js and Go's whitelist, so
+  // there is nothing to render. Guard the absence so the waffle cannot creep
+  // back.
   const js = ui('settings.js');
-  const tags = js.slice(js.indexOf('const MACHINE_NOTE_TAGS'), js.indexOf(';', js.indexOf('const MACHINE_NOTE_TAGS')));
-  for (const tag of ['audioDeviceId', 'headphoneDeviceId', 'headphoneEndpointId', 'slatePath']) {
-    assert.ok(tags.includes(`'${tag}'`), `the note's tag list must include ${tag}`);
-  }
-  assert.match(js, /renderPresetNote\(config\)/, 'populate must refresh the note with the loaded values');
-  assert.match(js, /Never part of a preset/, 'the note must be a statement, not a hint');
+  assert.equal(/Never part of a preset/.test(js), false, 'the machine-fields note must be gone');
+  assert.equal(/Credentials scope/.test(js), false, 'the credential-scope readout must be gone');
+  assert.equal(/renderPresetNote|renderPresetScopeLine|MACHINE_NOTE_TAGS/.test(js), false, 'their render code must be gone too');
 });
 
 test('collectConfig still restates every config.Config json tag and no preset key', () => {

@@ -300,15 +300,10 @@ test('the Devices group is gone: device selection is the main screen, only', () 
 // The presets card contract
 // ---------------------------------------------------------------------------
 
-test('the preset card has a home before the presets land', () => {
-  // The CSS CONTRACT only, so this passes before and after the parallel
-  // presets work; that plan's own test asserts settings.js opens the group.
-  for (const selector of ['.settings-group--presets', '.preset-picker', '.preset-actions', '.preset-note']) {
+test('the preset card has a home', () => {
+  // The CSS CONTRACT for the picker + its buttons. The .preset-note caution
+  // rule is gone with the note itself (removed at the operator's request).
+  for (const selector of ['.settings-group--presets', '.preset-picker', '.preset-actions']) {
     assert.ok(sheet.includes(selector), `main.css must declare ${selector} for the presets UI to land into`);
   }
-  assert.match(
-    sheet,
-    /\.preset-note\s*\{[^}]*color:\s*var\(--amber\)/,
-    'the device-ids-are-this-PC\'s-hardware caution must read as a caution, not a fault',
-  );
 });

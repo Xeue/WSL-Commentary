@@ -3,12 +3,9 @@ import { validateConfig } from './validate.js';
 import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
-// The instance-preset model: the diff for the confirm dialog, the whitelist
-// filter that mirrors Go's, and the machine-field LABELS for the permanent
-// note. Pure — presets.js cannot name a machine field's tag, by design, so
-// the tag/label pairing happens here, where the four fields already have
-// controls. See MACHINE_NOTE_TAGS below.
-import { diffPreset, describeIgnoredKeys, filterPresetFields, MACHINE_FIELD_LABELS } from './presets.js';
+// The instance-preset model: the diff for the confirm dialog and the whitelist
+// filter that mirrors Go's.
+import { diffPreset, describeIgnoredKeys, filterPresetFields } from './presets.js';
 // The pure event auto-select / picker rule. It decides, from the instance's
 // event list and the URL-derived id, whether to auto-select a lone event or
 // offer a picker; this file turns that answer into the hidden field, a note or a
@@ -256,37 +253,12 @@ export function createSettingsView(handlers) {
   presetPicker.appendChild(presetActions);
   currentGroup.appendChild(presetPicker);
 
-  // Which Credential Manager scope is live, and which of its three
-  // credentials exist — GetPresetCredentialStatus's booleans, never a value.
-  const presetScopeLine = document.createElement('p');
-  presetScopeLine.className = 'field-hint preset-scope';
-  currentGroup.appendChild(presetScopeLine);
-
-  // THE ONE SENTENCE THIS CARD EXISTS TO MAKE UNMISSABLE, permanent and with
-  // the current values shown: the operator SEES that their hardware survived
-  // an apply, rather than being asked to trust that it did.
-  const presetNote = document.createElement('p');
-  presetNote.className = 'preset-note';
-  currentGroup.appendChild(presetNote);
-
-  // The four MACHINE tags, paired BY POSITION with presets.js's
-  // MACHINE_FIELD_LABELS. The tags are spelled HERE and not there on purpose:
-  // presets.js proves by its own source text that it cannot name a machine
-  // field, and this file already owns form controls for all four, so the
-  // pairing lives beside the fields it describes. settings.test.js asserts
-  // the two lists are the same length and that the note names every tag.
-  const MACHINE_NOTE_TAGS = ['audioDeviceId', 'headphoneDeviceId', 'headphoneEndpointId', 'slatePath'];
-
-  function renderPresetNote(config) {
-    const parts = MACHINE_NOTE_TAGS.map((tag, i) => {
-      const value = config ? config[tag] : '';
-      return `${MACHINE_FIELD_LABELS[i]}: ${value || '(not set)'}`;
-    });
-    presetNote.textContent =
-      "Never part of a preset — this PC's hardware and files stay put when an instance is " +
-      'applied: ' + parts.join(' · ');
-  }
-  renderPresetNote(null);
+  // The active-instance / credential-scope readout and the "never part of a
+  // preset" machine-fields note were both removed at the operator's request —
+  // the card is just the picker and its buttons now. The safety they described
+  // (a preset can never carry a device id) is still enforced by construction
+  // in presets.js and Go's whitelist; it simply no longer narrates itself in
+  // the UI.
 
   function selectedPresetSummary() {
     return presetSummaries.find((p) => p.id === presetSelect.value) || null;
@@ -318,41 +290,14 @@ export function createSettingsView(handlers) {
     deletePresetBtn.title = sendingNow ? sendingReason : none ? 'No preset to delete.' : '';
   }
 
-  function renderPresetScopeLine(status) {
-    if (!presetsSupported) {
-      presetScopeLine.textContent =
-        'This build has no instance presets; the fields below still work as before.';
-      return;
-    }
-    const activeName =
-      activePreset && activePreset.id
-        ? `Active instance: ${
-            (presetSummaries.find((p) => p.id === activePreset.id) || { name: activePreset.id }).name
-          }.`
-        : 'No instance preset applied.';
-    if (!status) {
-      presetScopeLine.textContent = activeName;
-      return;
-    }
-    const scopeName = status.scope
-      ? `"${status.scope}"`
-      : "this machine's original entries";
-    const cred = (label, exists) => `${label} ${exists ? 'stored' : 'NOT stored'}`;
-    presetScopeLine.textContent =
-      `${activeName} Credentials scope: ${scopeName} — ` +
-      `${cred('M2L-X password', status.m2lx)} · ${cred('SRT passphrase', status.srt)} · ` +
-      `${cred('SRT return passphrase', status.srtreturn)}.`;
-  }
-
   /**
-   * refreshPresets re-reads the picker, the active record and the credential
-   * status. Each failure degrades its own line rather than blanking the rest,
-   * for the same reason open() loads config and suggestions separately.
+   * refreshPresets re-reads the picker and the active record. Each failure
+   * degrades its own line rather than blanking the rest, for the same reason
+   * open() loads config and suggestions separately.
    */
   async function refreshPresets() {
     if (!presetsSupported) {
       renderPresetButtons();
-      renderPresetScopeLine(null);
       return;
     }
     try {
@@ -380,14 +325,7 @@ export function createSettingsView(handlers) {
       presetSelect.textContent = '';
       setSaveMessage(`Could not list the saved instances: ${err.message}`, true);
     }
-    let status = null;
-    try {
-      status = await backend.getPresetCredentialStatus();
-    } catch (err) {
-      console.error('wslcomms: could not read the credential status', err);
-    }
     renderPresetButtons();
-    renderPresetScopeLine(status);
   }
 
   async function handleApplyPreset() {
@@ -1097,12 +1035,10 @@ export function createSettingsView(handlers) {
   // --- populate / collect --------------------------------------------
 
   function populate(config) {
-    // The diff baseline for Apply, and the values the machine-fields note
-    // shows. Recorded BEFORE the form gets a chance to be edited: the confirm
-    // dialog compares a preset against what is SAVED, not against keystrokes
-    // that were never saved.
+    // The diff baseline for Apply. Recorded BEFORE the form gets a chance to be
+    // edited: the confirm dialog compares a preset against what is SAVED, not
+    // against keystrokes that were never saved.
     lastLoadedConfig = config;
-    renderPresetNote(config);
     fields.m2lxHost.input.value = config.m2lxHost || '';
     fields.alias.input.value = config.alias || '';
     fields.eventId.input.value = config.eventId || '';

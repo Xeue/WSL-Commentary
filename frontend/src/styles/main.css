@@ -851,9 +851,7 @@ input[type='range'] {
 .settings-group > .suggestions,
 .settings-group > .secrets-hint,
 .settings-group > .tile-grid,
-.settings-group > .preset-picker,
-.settings-group > .preset-scope,
-.settings-group > .preset-note {
+.settings-group > .preset-picker {
   grid-column: 1 / -1;
 }
 
@@ -1088,20 +1086,9 @@ input[type='range'] {
   flex: 0 0 auto;
 }
 
-/* Which Credential Manager scope this instance's passwords live under. */
-.preset-scope {
-  margin: 0;
-}
-
-/* THE ONE SENTENCE THIS CARD EXISTS TO MAKE UNMISSABLE: an instance carries the
-   M2L-X coordinates and nothing else. The commentary input and the headphones
-   are this PC's hardware and are never in a preset — a device id from another
-   machine is exactly the phantom-endpoint failure already under investigation.
-   Amber because it is a caution, not a fault. */
-.preset-note {
-  margin: 0;
-  color: var(--amber);
-}
+/* .preset-scope and .preset-note are gone with the readout and the
+   machine-fields note they styled — removed at the operator's request. The
+   card is the picker and its buttons now. */
 
 /* OPAQUE, never an rgba. mixer.css:407-421 records what happens otherwise:
    "A sticky element with a translucent background is not a header, it is a
