@@ -939,6 +939,12 @@ func (a *App) startup(ctx context.Context) {
 		a.emitError(a.gstInitErr)
 	}
 
+	// The seven fixed facility instances are baked in (app_builtin_presets.go).
+	// Seed their preset files and M2L-X passwords BEFORE the active-preset
+	// record is read below: a machine that already has one applied must sign in
+	// on this launch, and a fresh machine must find all seven in the picker.
+	a.seedBuiltinPresets()
+
 	// The active-preset record decides WHICH Credential Manager entries the
 	// control plane signs in with, so it must be read BEFORE startControlPlane
 	// — the sign-in loop reads the M2L-X password immediately, and a scope set
