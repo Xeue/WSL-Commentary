@@ -63,13 +63,13 @@ export const TRANSCEIVER_PLAN = Object.freeze([
 ]);
 
 /**
- * DEFAULT_RETURN_MID is mid 2 — aux1 / CLN. spec §7 and §9: with effects routed
- * to master+aux1 and commentary routed to master only, aux1 is inherently an
- * N-1, so the commentator hears the match without hearing themselves delayed by
- * the ~489 ms cloud round trip. The app cannot verify that routing convention;
- * it is in the handover note.
+ * DEFAULT_RETURN_MID is mid 4 — MIC1, the mix-minus feed the operator labels
+ * "Monitor 1" and has chosen as the default return. It is a MIC mix-minus (N-1)
+ * derived from the mic inputs, so a commentator on it hears the match without
+ * hearing themselves delayed by the ~489 ms cloud round trip. Kept in step with
+ * config.DefaultReturnMid and returns.js's DEFAULT_RETURN_MID.
  */
-export const DEFAULT_RETURN_MID = 2;
+export const DEFAULT_RETURN_MID = 4;
 
 /**
  * BUS_MAP describes each mid. `label` is short enough for a dropdown; `detail`

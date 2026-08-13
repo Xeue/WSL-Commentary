@@ -224,7 +224,7 @@ function defaultFakeConfig() {
     srtReturnPort: 40501, // config.DefaultSRTReturnPort — Output 1, src=pgm (DIRTY programme)
     srtReturnPBKeyLen: 0, // config.DefaultSRTReturnPBKeyLen — Output 1 measured encrypted=false
     pictureLatencyMs: 120, // config.DefaultPictureLatencyMs — the picture window's SRT buffer
-    returnMid: 2, // config.DefaultReturnMid (aux1/CLN)
+    returnMid: 4, // config.DefaultReturnMid (MIC1 / "Monitor 1")
     monitorTile: { x: 0, y: 360, w: 640, h: 360 }, // config.DefaultMonitorTile
     returnGainDb: 18, // config.DefaultReturnGainDB
     slatePath: 'slate.png', // config.DefaultSlateFilename

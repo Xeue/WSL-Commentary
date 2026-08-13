@@ -58,7 +58,7 @@ function blankConfig() {
     audioDeviceId: '',
     headphoneDeviceId: '',
     headphoneEndpointId: '',
-    returnMid: 2,
+    returnMid: 4,
     returnChannel: 'stereo',
     returnSource: 'webrtc',
     srtReturnPort: 40501,

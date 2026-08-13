@@ -31,12 +31,12 @@
  * track for track. An operator hunting for a clean return was being offered
  * five options named after something else.
  *
- * MIDS 4 TO 6 ARE MIX-MINUS FEEDS DERIVED FROM THE MIC INPUTS, and that is
- * stated in the UI rather than left as folklore: on an event that uses none of
- * the MIC inputs they carry nothing at all. A commentator who switches to one
- * and hears silence needs to know the feed does not exist, because the
- * alternative reading - "my headphones have died, thirty seconds before
- * kick-off" - is the one they will otherwise reach.
+ * THE DISPLAY LABELS ARE THE FACILITY'S OWN NAMES, set by the operator; the
+ * `name` field keeps M2L-X's enum code (PGM, CLN, MON, MIC1..3, PFL) as the
+ * technical truth. The mapping the operator chose is, in mid order: Program
+ * Dirty, Program Clean, Aux, Monitor 1, Monitor 2, Monitor 3, PFL. Mids 4 to 6
+ * (labelled Monitor 1..3) are still the MIX-MINUS feeds derived from the MIC
+ * inputs — on an event that uses none of them they carry nothing at all.
  *
  * Note that frontend/src/monitor/buses.js carries its own mid-to-BUS map, which
  * is a measured claim about M2L-X's routing and is WP-5a's to change. Its
@@ -45,10 +45,11 @@
  */
 
 /**
- * DEFAULT_RETURN_MID is mid 2, CLN. Unchanged: it is the intended return, and
- * config.DefaultReturnMid on the Go side agrees.
+ * DEFAULT_RETURN_MID is mid 4, MIC1 (labelled "Monitor 1"): the operator's
+ * chosen default return. config.DefaultReturnMid on the Go side agrees, and so
+ * does monitor/buses.js.
  */
-export const DEFAULT_RETURN_MID = 2;
+export const DEFAULT_RETURN_MID = 4;
 
 /**
  * RETURN_BUSES is every audio track the monitor subscribes to, in mid order.
@@ -66,37 +67,37 @@ export const RETURN_BUSES = Object.freeze([
   Object.freeze({
     mid: 1,
     name: 'PGM',
-    label: 'PGM (master)',
+    label: 'Program Dirty',
   }),
   Object.freeze({
     mid: 2,
     name: 'CLN',
-    label: 'CLN (aux1)',
+    label: 'Program Clean',
   }),
   Object.freeze({
     mid: 3,
     name: 'MON',
-    label: 'MON (monitor)',
+    label: 'Aux',
   }),
   Object.freeze({
     mid: 4,
     name: 'MIC1',
-    label: 'MIC1 (mix-minus)',
+    label: 'Monitor 1',
   }),
   Object.freeze({
     mid: 5,
     name: 'MIC2',
-    label: 'MIC2 (mix-minus)',
+    label: 'Monitor 2',
   }),
   Object.freeze({
     mid: 6,
     name: 'MIC3',
-    label: 'MIC3 (mix-minus)',
+    label: 'Monitor 3',
   }),
   Object.freeze({
     mid: 7,
     name: 'PFL',
-    label: 'PFL (pre-fade listen)',
+    label: 'PFL',
   }),
 ]);
 

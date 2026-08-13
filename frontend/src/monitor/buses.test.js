@@ -34,13 +34,13 @@ test('the transceiver plan is exactly what spec §7 requires', () => {
   assert.deepEqual([...AUDIO_MIDS], [1, 2, 3, 4, 5, 6, 7]);
 });
 
-test('the default return is mid 2, aux1/CLN', () => {
-  // spec §7 and §9. aux1 is inherently an N-1 when effects go to master+aux1 and
-  // commentary does not, so it is the only bus the commentator can monitor
-  // without hearing themselves delayed by the ~489 ms cloud round trip.
-  assert.equal(DEFAULT_RETURN_MID, 2);
-  assert.equal(busForMid(2).bus, 'aux1');
-  assert.equal(busForMid(2).sony, 'CLN');
+test('the default return is mid 4, mon1/MIC1 ("Monitor 1")', () => {
+  // The operator's chosen default: MIC1, a mix-minus (N-1) derived from the mic
+  // inputs, so a commentator on it hears the match without hearing themselves
+  // delayed by the ~489 ms cloud round trip.
+  assert.equal(DEFAULT_RETURN_MID, 4);
+  assert.equal(busForMid(4).bus, 'mon1');
+  assert.equal(busForMid(4).sony, 'MIC1');
 });
 
 test('the measured mid-to-bus map', async (t) => {
@@ -107,7 +107,7 @@ test('isValidReturnMid', async (t) => {
 test('normaliseReturnMid', async (t) => {
   const cases = [
     { name: 'a valid mid passes through', in: 1, fallback: undefined, want: 1 },
-    { name: 'the CLN default passes through', in: 2, fallback: undefined, want: 2 },
+    { name: 'the MIC1 default passes through', in: 4, fallback: undefined, want: 4 },
     { name: 'PFL passes through', in: 7, fallback: undefined, want: 7 },
     {
       name: 'a numeric string from config.json is accepted',
@@ -115,11 +115,11 @@ test('normaliseReturnMid', async (t) => {
       fallback: undefined,
       want: 3,
     },
-    { name: 'mid 0 is not a bus and falls back', in: 0, fallback: undefined, want: 2 },
-    { name: 'out of range falls back', in: 12, fallback: undefined, want: 2 },
-    { name: 'undefined falls back', in: undefined, fallback: undefined, want: 2 },
-    { name: 'NaN falls back', in: NaN, fallback: undefined, want: 2 },
-    { name: 'garbage falls back', in: 'CLN', fallback: undefined, want: 2 },
+    { name: 'mid 0 is not a bus and falls back', in: 0, fallback: undefined, want: 4 },
+    { name: 'out of range falls back', in: 12, fallback: undefined, want: 4 },
+    { name: 'undefined falls back', in: undefined, fallback: undefined, want: 4 },
+    { name: 'NaN falls back', in: NaN, fallback: undefined, want: 4 },
+    { name: 'garbage falls back', in: 'CLN', fallback: undefined, want: 4 },
     {
       name: 'an explicit fallback is honoured — this is how setReturnMid keeps the current bus',
       in: 'nonsense',
@@ -127,10 +127,10 @@ test('normaliseReturnMid', async (t) => {
       want: 5,
     },
     {
-      name: 'a bad explicit fallback falls back to the CLN default',
+      name: 'a bad explicit fallback falls back to the MIC1 default',
       in: 'nonsense',
       fallback: 99,
-      want: 2,
+      want: 4,
     },
   ];
   for (const c of cases) {

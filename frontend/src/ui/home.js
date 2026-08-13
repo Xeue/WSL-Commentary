@@ -690,7 +690,7 @@ export function createHomeView(handlers) {
     opt.textContent = bus.label;
     returnSelect.appendChild(opt);
   }
-  returnSelect.value = String(DEFAULT_RETURN_MID); // mid 2, CLN, stays the default
+  returnSelect.value = String(DEFAULT_RETURN_MID); // mid 4, MIC1 / "Monitor 1"
   returnSelect.addEventListener('change', () => handlers.onReturnChange(Number(returnSelect.value)));
 
   const returnGroup = document.createElement('div');

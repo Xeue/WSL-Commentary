@@ -313,8 +313,10 @@ const (
 	// times the measured 21 ms median round-trip time.
 	DefaultSRTLatencyMs = 120
 
-	// DefaultReturnMid is the transceiver mid routed to the headphones: aux1/CLN.
-	DefaultReturnMid = 2
+	// DefaultReturnMid is the transceiver mid routed to the headphones: mid 4,
+	// MIC1 — the mix-minus feed the operator labels "Monitor 1" and chose as the
+	// default return.
+	DefaultReturnMid = 4
 
 	// ReturnSourceWebRTC is the KVS/WebRTC return, and the default. It is the
 	// path that has been used on air.
