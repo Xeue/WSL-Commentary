@@ -259,7 +259,6 @@ func validConfig() *Config {
 	cfg.M2LXHost = "m2lx.example.com"
 	cfg.Alias = "commentator1"
 	cfg.EventID = "event-42"
-	cfg.SRTHost = "srt.example.com"
 	cfg.SRTPort = 8890
 	cfg.StatusKey = "cam7"
 	cfg.AudioDeviceID = "{00000000-0000-0000-0000-000000000001}"
@@ -297,17 +296,13 @@ func TestValidate(t *testing.T) {
 			wantSub: "eventId",
 		},
 		{
-			// Empty srtHost is the normal case, not an error: it means "the
-			// same host as M2L-X". See EffectiveSRTHost.
-			name:    "empty srtHost with an m2lxHost to fall back to",
-			modify:  func(c *Config) { c.SRTHost = "" },
-			wantErr: false,
-		},
-		{
-			name:    "empty srtHost and empty m2lxHost",
-			modify:  func(c *Config) { c.SRTHost = ""; c.M2LXHost = "" },
+			// There is no srtHost field any more: the SRT host is always the
+			// M2L-X host (EffectiveSRTHost), so an empty m2lxHost is the only way
+			// to have no SRT host, and that is already reported as m2lxHost.
+			name:    "empty m2lxHost leaves no SRT host to dial",
+			modify:  func(c *Config) { c.M2LXHost = "" },
 			wantErr: true,
-			wantSub: "srtHost",
+			wantSub: "m2lxHost",
 		},
 		{
 			name:    "srtPort zero",
@@ -430,9 +425,9 @@ func TestValidate_JoinsAllProblems(t *testing.T) {
 		t.Fatal("Validate() on zero Config: error = nil, want non-nil")
 	}
 	// statusKey is absent from this list on purpose: it is not required to
-	// send. srtHost is present because a zero Config has no m2lxHost either, so
-	// there is nothing for it to fall back to.
-	for _, want := range []string{"m2lxHost", "alias", "eventId", "srtHost", "audioDeviceId", "srtPort", "returnMid"} {
+	// send. There is no srtHost either — the SRT host is always the M2L-X host,
+	// so a zero Config's missing SRT host IS the missing m2lxHost.
+	for _, want := range []string{"m2lxHost", "alias", "eventId", "audioDeviceId", "srtPort", "returnMid"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Validate() error = %v, missing expected substring %q", err, want)
 		}
@@ -463,22 +458,17 @@ func TestDefaults_PassesValidateExceptRequiredFields(t *testing.T) {
 
 func TestEffectiveSRTHost(t *testing.T) {
 	// The operator's complaint that produced this: "I shouldn't need to specify
-	// the SRT host again, it will be the same as the m2lx host." The cases below
-	// are every way the two can be written on the Settings screen.
+	// the SRT host again, it will be the same as the m2lx host." There is no
+	// srtHost field any more — the SRT host is ALWAYS the M2L-X host with any
+	// scheme, path and port stripped off. The cases below are every way m2lxHost
+	// can be written on the Settings screen.
 	tests := []struct {
 		name     string
 		m2lxHost string
-		srtHost  string
 		want     string
 	}{
 		{
-			name:     "an explicit srtHost always wins",
-			m2lxHost: "m2lx.example.com",
-			srtHost:  "srt-ingest.example.com",
-			want:     "srt-ingest.example.com",
-		},
-		{
-			name:     "empty srtHost falls back to a bare m2lxHost",
+			name:     "a bare m2lxHost is used as-is",
 			m2lxHost: "m2lx-wslstudios-matcht.etapsiota.com",
 			want:     "m2lx-wslstudios-matcht.etapsiota.com",
 		},
@@ -513,17 +503,6 @@ func TestEffectiveSRTHost(t *testing.T) {
 			want:     "[2001:db8::1]",
 		},
 		{
-			name:    "whitespace around an explicit srtHost is trimmed",
-			srtHost: "  srt.example.com  ",
-			want:    "srt.example.com",
-		},
-		{
-			name:     "a whitespace-only srtHost is treated as empty",
-			m2lxHost: "m2lx.example.com",
-			srtHost:  "   ",
-			want:     "m2lx.example.com",
-		},
-		{
 			name: "nothing configured resolves to nothing, not to a guess",
 			want: "",
 		},
@@ -531,7 +510,7 @@ func TestEffectiveSRTHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Config{M2LXHost: tt.m2lxHost, SRTHost: tt.srtHost}
+			c := &Config{M2LXHost: tt.m2lxHost}
 			if got := c.EffectiveSRTHost(); got != tt.want {
 				t.Errorf("EffectiveSRTHost() = %q, want %q", got, tt.want)
 			}
@@ -540,16 +519,12 @@ func TestEffectiveSRTHost(t *testing.T) {
 }
 
 func TestEffectiveSRTHostDoesNotMutateTheConfig(t *testing.T) {
-	// The frontend shows the derived host as a placeholder under an empty
-	// srtHost field. If reading it wrote it back, the next Save would persist a
-	// copy of m2lxHost into srtHost and the two would silently stop tracking
-	// each other the day the M2L-X host changed.
+	// EffectiveSRTHost derives the SRT host from m2lxHost on every read. It must
+	// be a pure read: if it wrote the stripped value back into M2LXHost, the
+	// scheme and port a later sign-in needs would be gone.
 	c := &Config{M2LXHost: "https://m2lx.example.com:8443"}
 	if got := c.EffectiveSRTHost(); got != "m2lx.example.com" {
 		t.Fatalf("EffectiveSRTHost() = %q", got)
-	}
-	if c.SRTHost != "" {
-		t.Errorf("EffectiveSRTHost() wrote %q into SRTHost; it must stay empty", c.SRTHost)
 	}
 	if c.M2LXHost != "https://m2lx.example.com:8443" {
 		t.Errorf("EffectiveSRTHost() changed M2LXHost to %q", c.M2LXHost)

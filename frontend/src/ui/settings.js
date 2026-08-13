@@ -1,6 +1,6 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
-import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
+import { parseLiveOperationURL, formatLiveOperationURL } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
 // The instance-preset model: the diff for the confirm dialog and the whitelist
@@ -51,7 +51,6 @@ function blankConfig() {
     m2lxHost: '',
     alias: '',
     eventId: '',
-    srtHost: '',
     srtPort: 0,
     srtLatencyMs: 120,
     pbkeylen: 0,
@@ -595,16 +594,10 @@ export function createSettingsView(handlers) {
   srtHeading.textContent = 'SRT output';
   openGroup(srtHeading);
 
-  // Optional and clearly secondary: on every instance seen so far the SRT
-  // listener answers on the same name as the REST API, and the operator should
-  // not have to type it twice. internal/config.EffectiveSRTHost owns the
-  // fallback; this field is the override for an ingest published elsewhere.
-  addField(
-    'srtHost',
-    'SRT host — optional',
-    textInput('f-srtHost'),
-    'Blank = same host as M2L-X.',
-  );
+  // There is no SRT host field: the SRT listener is ALWAYS the M2L-X host
+  // (internal/config.EffectiveSRTHost derives it), so there is nothing to type
+  // and nothing to drift out of step when an instance is switched. Removed at
+  // the operator's request.
   addField('srtPort', 'SRT port', numberInput('f-srtPort'));
   addField('srtLatencyMs', 'SRT latency (ms)', numberInput('f-srtLatencyMs'), 'Default 120.');
   addField(
@@ -1012,25 +1005,12 @@ export function createSettingsView(handlers) {
     fields.eventId.input.value = parsed.eventId;
     liveURLNote.textContent = `Host "${parsed.host}", event "${parsed.eventId}".`;
     liveURLNote.hidden = false;
-    refreshSRTPlaceholder();
   }
 
   // 'input' rather than 'change': a paste should fill the fields the moment it
   // lands, not when focus leaves.
   liveURLInput.addEventListener('input', applyLiveURL);
   liveURLInput.addEventListener('change', applyLiveURL);
-
-  /**
-   * refreshSRTPlaceholder shows the host an empty srtHost will actually dial —
-   * the same string internal/config.EffectiveSRTHost will resolve. "Optional"
-   * without saying what the default is would just move the guesswork.
-   */
-  function refreshSRTPlaceholder() {
-    const derived = bareHost(fields.m2lxHost.input.value);
-    fields.srtHost.input.placeholder = derived
-      ? `Same as M2L-X: ${derived}`
-      : 'Same as the M2L-X host';
-  }
 
   // --- populate / collect --------------------------------------------
 
@@ -1042,7 +1022,6 @@ export function createSettingsView(handlers) {
     fields.m2lxHost.input.value = config.m2lxHost || '';
     fields.alias.input.value = config.alias || '';
     fields.eventId.input.value = config.eventId || '';
-    fields.srtHost.input.value = config.srtHost || '';
     fields.srtPort.input.value = String(config.srtPort ?? 0);
     fields.srtLatencyMs.input.value = String(config.srtLatencyMs ?? 120);
     fields.pbkeylen.input.value = String(config.pbkeylen ?? 0);
@@ -1083,7 +1062,6 @@ export function createSettingsView(handlers) {
     liveURLInput.value = formatLiveOperationURL(config.m2lxHost, config.eventId);
     showDerived();
     hideLiveURLMessages();
-    refreshSRTPlaceholder();
     refreshSecretBadges();
     clearAllErrors();
     saveMessage.hidden = true;
@@ -1109,7 +1087,6 @@ export function createSettingsView(handlers) {
       m2lxHost: fields.m2lxHost.input.value.trim(),
       alias: fields.alias.input.value.trim(),
       eventId: fields.eventId.input.value.trim(),
-      srtHost: fields.srtHost.input.value.trim(),
       srtPort: Number(fields.srtPort.input.value),
       srtLatencyMs: Number(fields.srtLatencyMs.input.value),
       pbkeylen: Number(fields.pbkeylen.input.value),

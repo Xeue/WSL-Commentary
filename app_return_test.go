@@ -373,14 +373,13 @@ func TestStartReturnPassesTheConfiguredOptions(t *testing.T) {
 }
 
 func TestStartReturnUsesTheHostFallbackNotASecondHostField(t *testing.T) {
-	// An empty srtHost means "the same host as M2L-X". The return must go
-	// through EffectiveSRTHost rather than reading SRTHost directly, or a
-	// perfectly ordinary configuration dials the empty string.
+	// The SRT host is always the M2L-X host. The return must go through
+	// EffectiveSRTHost, which strips the scheme, port and path off m2lxHost, or
+	// a perfectly ordinary configuration dials a host with a scheme in it.
 	a, _ := newTestApp(t)
 	mon := withFakeReturn(a)
 
 	cfg := srtReturnConfig()
-	cfg.SRTHost = ""
 	cfg.M2LXHost = "https://m2lx.example.com:8443/"
 	setConfig(a, cfg)
 

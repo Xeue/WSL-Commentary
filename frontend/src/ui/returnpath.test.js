@@ -600,7 +600,6 @@ test('a build with no SRT bindings starts on WebRTC without a banner', async () 
 
 test('returnOptsFingerprint changes for every field gst.ReturnOpts is built from', () => {
   const base = {
-    srtHost: 'm2lx.example',
     m2lxHost: 'm2lx.example',
     srtReturnPort: 40501,
     srtLatencyMs: 120,
@@ -650,7 +649,7 @@ test('RETURN_OPTS_CONFIG_KEYS covers every config field app_return.go reads', ()
 
   // Every cfg.<Something> the function reads, mapped to its config.json key.
   const goToJSON = {
-    EffectiveSRTHost: ['srtHost', 'm2lxHost'],
+    EffectiveSRTHost: ['m2lxHost'],
     EffectiveSRTReturnPort: ['srtReturnPort'],
     SRTLatencyMs: ['srtLatencyMs'],
     // The RETURN path's key length, not the send path's PBKeyLen. If

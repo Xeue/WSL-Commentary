@@ -65,7 +65,6 @@ function validForm() {
     m2lxHost: 'm2lx.example.com',
     alias: 'wsl-comms-ro',
     eventId: 'dl9-5p5ah0bd-empd',
-    srtHost: '',
     srtPort: 40001,
     srtLatencyMs: 120,
     pbkeylen: 0,

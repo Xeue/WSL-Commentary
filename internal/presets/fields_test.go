@@ -69,11 +69,12 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 	}
 }
 
-// TestClassificationCounts pins the 14 + 4 + 2 = 20 split the design document
-// records, so growth in any table is a deliberate, reviewed change.
+// TestClassificationCounts pins the 13 + 4 + 2 = 19 split (srtHost was removed
+// — the SRT host is always derived from m2lxHost), so growth in any table is a
+// deliberate, reviewed change.
 func TestClassificationCounts(t *testing.T) {
-	if got := len(InstanceFields); got != 14 {
-		t.Errorf("len(InstanceFields) = %d, want 14", got)
+	if got := len(InstanceFields); got != 13 {
+		t.Errorf("len(InstanceFields) = %d, want 13", got)
 	}
 	if got := len(MachineFields); got != 4 {
 		t.Errorf("len(MachineFields) = %d, want 4", got)
@@ -132,7 +133,6 @@ func fullConfig() *config.Config {
 		M2LXHost:            "wembley.example.com",
 		Alias:               "wsl-comms-ro",
 		EventID:             "dl9-wembley",
-		SRTHost:             "srt-ingest.example.com",
 		SRTPort:             40005,
 		SRTLatencyMs:        240,
 		PBKeyLen:            16,

@@ -212,7 +212,6 @@ function defaultFakeConfig() {
     m2lxHost: '',
     alias: '',
     eventId: '',
-    srtHost: '',
     srtPort: 0,
     srtLatencyMs: 120, // config.DefaultSRTLatencyMs
     pbkeylen: 0,

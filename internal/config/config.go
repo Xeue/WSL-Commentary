@@ -63,15 +63,13 @@ type Config struct {
 	// /api/live_operation/kvs/webrtc_token/{eventId}.
 	EventID string `json:"eventId"`
 
-	// SRTHost is the hostname or address of the M2L-X SRT listener that this
-	// application dials as a caller.
-	//
-	// It is OPTIONAL. Empty means "the same host as M2L-X": on every instance
-	// seen so far the SRT listener answers on the same name as the REST API, and
-	// asking the operator to type that name a second time is one more thing to
-	// get wrong under pressure. Read it through EffectiveSRTHost, never
-	// directly, so the fallback happens in exactly one place.
-	SRTHost string `json:"srtHost"`
+	// The SRT host is NOT a field. It is ALWAYS the M2L-X host with any scheme,
+	// path and port stripped off — see EffectiveSRTHost. On every instance the
+	// SRT listener answers on the same name as the REST API, so a separate,
+	// overridable srtHost was a field that could only drift out of step (and
+	// did — it silently kept a stale value when an instance was switched). It
+	// was removed at the operator's request; a config.json or preset that still
+	// carries the old "srtHost" key is simply ignored on load.
 
 	// SRTPort is the port of that SRT listener.
 	SRTPort int `json:"srtPort"`
@@ -528,23 +526,19 @@ func (c *Config) Save() error {
 	return nil
 }
 
-// EffectiveSRTHost returns the host this application dials for SRT: SRTHost
-// when it is set, and otherwise the M2L-X host with any scheme, path and port
-// stripped off.
+// EffectiveSRTHost returns the host this application dials for SRT: always the
+// M2L-X host with any scheme, path and port stripped off. There is no longer a
+// separate srtHost override — see the note where the field used to be.
 //
-// Empty SRTHost is the normal case, not a misconfiguration — see the field
-// comment. An explicit SRTHost is an override for the one case that needs it,
-// an SRT ingest published under a different name, and is returned verbatim
-// apart from surrounding whitespace.
+// The name and signature are kept so the four call sites (the send path,
+// app_picture, app_return, internal/gst) need no change; it is simply now a
+// one-line derivation.
 //
 // M2LXHost may carry an explicit "http://" or "https://" prefix (internal/m2lx
 // resolveHost accepts one, and cmd/mockm2lx needs it) and a port. Neither
 // belongs in the host half of the srt:// URI internal/gst builds, so both are
 // removed. An IPv6 literal keeps its brackets, because that URI needs them.
 func (c *Config) EffectiveSRTHost() string {
-	if h := strings.TrimSpace(c.SRTHost); h != "" {
-		return h
-	}
 	return hostOnly(c.M2LXHost)
 }
 
@@ -679,7 +673,7 @@ func (c *Config) ValidateReturn() error {
 
 	if c.EffectiveSRTHost() == "" {
 		errs = append(errs, errors.New(
-			"the SRT return has no host to dial: set m2lxHost, or srtHost to override it"))
+			"the SRT return has no host to dial: set m2lxHost"))
 	}
 
 	return errors.Join(errs...)
@@ -725,10 +719,9 @@ func hostOnly(host string) string {
 // range of transceiver mids the KVS signalling channel can address.
 //
 // Deliberately NOT required: statusKey, which only names the node the three
-// WebSocket-derived lamps read (see the field comment), and srtHost, which
-// defaults to the M2L-X host (see EffectiveSRTHost). Neither is needed to put a
-// feed on air, and requiring statusKey in particular made the app unstartable
-// until the operator had guessed a value that nothing in the API can tell them.
+// WebSocket-derived lamps read (see the field comment). It is not needed to put
+// a feed on air, and requiring it once made the app unstartable until the
+// operator had guessed a value that nothing in the API can tell them.
 //
 // WP-1 addition beyond the WP-0 contract; see the package doc comment.
 func (c *Config) Validate() error {
@@ -749,10 +742,9 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.EffectiveSRTHost() == "" {
-		errs = append(errs, errors.New(
-			"srtHost is required when m2lxHost is empty: leave srtHost blank to dial the M2L-X host"))
-	}
+	// EffectiveSRTHost is empty exactly when m2lxHost is, which the required
+	// check above already reports — so there is no separate SRT-host error to
+	// add here any more (there is no srtHost field to be the other cause).
 
 	if c.SRTPort < 1 || c.SRTPort > 65535 {
 		errs = append(errs, fmt.Errorf("srtPort must be between 1 and 65535, got %d", c.SRTPort))

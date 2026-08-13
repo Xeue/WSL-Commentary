@@ -95,7 +95,6 @@ func validConfig() *config.Config {
 	c.M2LXHost = "127.0.0.1:8080"
 	c.Alias = "wsl-comms-ro"
 	c.EventID = "matcht"
-	c.SRTHost = "127.0.0.1"
 	c.SRTPort = 4001
 	c.StatusKey = "cam7"
 	c.AudioDeviceID = "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}"
@@ -214,7 +213,6 @@ func TestControlPlaneChanged(t *testing.T) {
 	withStatusKey := *base
 	withStatusKey.StatusKey = "cam9"
 	withSRT := *base
-	withSRT.SRTHost = "10.0.0.1"
 	withSRT.SRTPort = 5000
 	withEvent := *base
 	withEvent.EventID = "another-event"
@@ -722,13 +720,13 @@ func TestGetConfigReturnsACopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig() error = %v", err)
 	}
-	got.SRTHost = "mutated-by-the-caller"
+	got.M2LXHost = "mutated-by-the-caller"
 
 	again, err := a.GetConfig()
 	if err != nil {
 		t.Fatalf("GetConfig() error = %v", err)
 	}
-	if again.SRTHost == "mutated-by-the-caller" {
+	if again.M2LXHost == "mutated-by-the-caller" {
 		t.Fatal("GetConfig() handed out the live configuration; a caller mutated it without SaveConfig")
 	}
 }
@@ -1039,11 +1037,11 @@ func TestStartRefusesAnIncompleteConfigurationAndNamesTheFields(t *testing.T) {
 		{"missing m2lxHost", func(c *config.Config) { c.M2LXHost = "" }, "m2lxHost"},
 		{"missing alias", func(c *config.Config) { c.Alias = "" }, "alias"},
 		{"missing eventId", func(c *config.Config) { c.EventID = "" }, "eventId"},
-		// srtHost and statusKey are deliberately absent from this list: an empty
-		// srtHost means "the same host as M2L-X" (config.EffectiveSRTHost) and an
-		// empty statusKey costs the three WebSocket lamps, not the feed. Both are
-		// covered by TestStartAcceptsAnEmptySRTHostAndStatusKey below.
-		{"missing srtHost AND m2lxHost", func(c *config.Config) { c.SRTHost = ""; c.M2LXHost = "" }, "srtHost"},
+		// statusKey is deliberately absent from this list: an empty statusKey
+		// costs the three WebSocket lamps, not the feed, and is covered by
+		// TestStartAcceptsAnEmptySRTHostAndStatusKey below. There is no srtHost
+		// field any more — the SRT host is always the M2L-X host, so a missing
+		// SRT host IS a missing m2lxHost, already the first case above.
 		{"missing audioDeviceId", func(c *config.Config) { c.AudioDeviceID = "" }, "audioDeviceId"},
 		{"port zero", func(c *config.Config) { c.SRTPort = 0 }, "srtPort"},
 		{"port out of range", func(c *config.Config) { c.SRTPort = 70000 }, "srtPort"},
@@ -1118,8 +1116,8 @@ func TestStartStopRoundTrip(t *testing.T) {
 		return attached
 	})
 	sink, _ := stub.AttachedSink()
-	if sink.Host != cfg.SRTHost || sink.Port != cfg.SRTPort {
-		t.Fatalf("sink dialled %s:%d, want %s:%d", sink.Host, sink.Port, cfg.SRTHost, cfg.SRTPort)
+	if sink.Host != cfg.EffectiveSRTHost() || sink.Port != cfg.SRTPort {
+		t.Fatalf("sink dialled %s:%d, want %s:%d", sink.Host, sink.Port, cfg.EffectiveSRTHost(), cfg.SRTPort)
 	}
 	if sink.Passphrase != "a-passphrase" {
 		t.Fatalf("sink passphrase = %q, want the one from the credential store", sink.Passphrase)
@@ -2361,8 +2359,8 @@ func TestSenderOptsCarriesAConnectErrorReporterToTheErrorEvent(t *testing.T) {
 	}
 
 	// The sink is still built from the configuration and the credential store.
-	if opts.Sink.Host != cfg.SRTHost || opts.Sink.Port != cfg.SRTPort {
-		t.Fatalf("sink = %s:%d, want %s:%d", opts.Sink.Host, opts.Sink.Port, cfg.SRTHost, cfg.SRTPort)
+	if opts.Sink.Host != cfg.EffectiveSRTHost() || opts.Sink.Port != cfg.SRTPort {
+		t.Fatalf("sink = %s:%d, want %s:%d", opts.Sink.Host, opts.Sink.Port, cfg.EffectiveSRTHost(), cfg.SRTPort)
 	}
 	if opts.Sink.Passphrase != "a-passphrase" {
 		t.Fatalf("sink passphrase = %q, want the one from the credential store", opts.Sink.Passphrase)
@@ -2707,13 +2705,12 @@ func TestStartAcceptsAnEmptySRTHostAndDialsTheM2LXHost(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.M2LXHost = "http://m2lx.example.com:8080"
-	cfg.SRTHost = ""
 	a.cfgMu.Lock()
 	a.cfg = cfg
 	a.cfgMu.Unlock()
 
 	if err := a.Start(); err != nil {
-		t.Fatalf("Start() with an empty srtHost error = %v, want nil", err)
+		t.Fatalf("Start() dialling the derived SRT host error = %v, want nil", err)
 	}
 	t.Cleanup(func() { _ = a.Stop() })
 
@@ -2765,7 +2762,6 @@ func TestSenderOptsResolvesTheSRTHostAndReportsUnderThatName(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.M2LXHost = "m2lx.example.com"
-	cfg.SRTHost = ""
 	opts := a.senderOpts(cfg, "")
 
 	if opts.Sink.Host != "m2lx.example.com" {

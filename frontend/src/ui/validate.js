@@ -85,12 +85,8 @@ export function validateConfig(config) {
     errors.eventId = 'Event ID is required.';
   }
 
-  // srtHost is OPTIONAL: empty means "the same host as M2L-X", which is what it
-  // is on every instance seen so far. internal/config.EffectiveSRTHost does the
-  // fallback, and it is the only place that does it.
-  if (!isBlank(config.srtHost) && hasScheme(config.srtHost)) {
-    errors.srtHost = 'Enter a bare host or address — no "srt://".';
-  }
+  // There is no srtHost to validate: the SRT host is always derived from
+  // m2lxHost (internal/config.EffectiveSRTHost), which strips any scheme itself.
 
   if (!isInt(config.srtPort) || config.srtPort < 1 || config.srtPort > 65535) {
     errors.srtPort = 'SRT port must be a whole number from 1 to 65535.';

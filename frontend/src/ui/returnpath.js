@@ -477,8 +477,7 @@ export function createReturnPath(io) {
  * somebody adjusted the contribution feed's encryption.
  */
 export const RETURN_OPTS_CONFIG_KEYS = Object.freeze([
-  'srtHost',
-  'm2lxHost', // EffectiveSRTHost falls back to it
+  'm2lxHost', // the SRT host is always derived from it — EffectiveSRTHost
   'srtReturnPort',
   'srtLatencyMs',
   'srtReturnPBKeyLen',

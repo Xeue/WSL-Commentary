@@ -213,10 +213,6 @@ func TestValidateReturn(t *testing.T) {
 		{"srt selected", func(c *Config) { c.ReturnSource = ReturnSourceSRT }, false, ""},
 		{"left channel", func(c *Config) { c.ReturnChannel = ReturnChannelLeft }, false, ""},
 		{"right channel", func(c *Config) { c.ReturnChannel = ReturnChannelRight }, false, ""},
-		{"srtHost overrides an empty m2lxHost", func(c *Config) {
-			c.M2LXHost = ""
-			c.SRTHost = "srt.example.com"
-		}, false, ""},
 		// The three key lengths SRT's AES-CTR supports, with 0 meaning no
 		// encryption is negotiated at all.
 		{"return pbkeylen 0", func(c *Config) { c.SRTReturnPBKeyLen = 0 }, false, ""},

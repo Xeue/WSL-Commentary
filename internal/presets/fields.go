@@ -72,9 +72,8 @@ var InstanceFields = []string{
 	"alias",
 	// The KVS webrtc_info/webrtc_token event.
 	"eventId",
-	// Override for that instance's SRT ingest name (empty follows m2lxHost).
-	"srtHost",
-	// That instance's commentary ingest port.
+	// That instance's commentary ingest port. (There is no srtHost field: the
+	// SRT host is always derived from m2lxHost — see config.EffectiveSRTHost.)
 	"srtPort",
 	// Retransmission budget for the path to that instance.
 	"srtLatencyMs",

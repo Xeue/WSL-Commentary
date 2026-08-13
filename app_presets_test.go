@@ -31,7 +31,6 @@ import (
 func quietConfig() *config.Config {
 	c := validConfig()
 	c.M2LXHost = ""
-	c.SRTHost = "127.0.0.1"
 	return c
 }
 

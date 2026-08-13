@@ -61,7 +61,6 @@ function liveConfig() {
     m2lxHost: 'wembley.example.com',
     alias: 'wsl-comms-ro',
     eventId: 'dl9-wembley',
-    srtHost: '',
     srtPort: 40005,
     srtLatencyMs: 120,
     pbkeylen: 0,
@@ -101,7 +100,7 @@ test('INSTANCE_FIELD_LABELS mirrors the Go whitelist exactly', () => {
     [...goTags].sort(),
     'presets.js INSTANCE_FIELD_LABELS and internal/presets.InstanceFields must list the same tags',
   );
-  assert.equal(jsTags.length, 14, 'the whitelist is 14 INSTANCE fields; growth is a reviewed decision');
+  assert.equal(jsTags.length, 13, 'the whitelist is 13 INSTANCE fields (srtHost was removed); growth is a reviewed decision');
   for (const { label } of INSTANCE_FIELD_LABELS) {
     assert.ok(label && typeof label === 'string', 'every whitelisted tag needs a screen label');
   }

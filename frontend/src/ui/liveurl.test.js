@@ -154,10 +154,10 @@ test('formatLiveOperationURL returns nothing when either half is missing', () =>
   assert.equal(formatLiveOperationURL(undefined, undefined), '');
 });
 
-// bareHost mirrors internal/config's hostOnly, which is what actually decides
-// the SRT target when srtHost is left blank. These cases are the same ones as
-// TestEffectiveSRTHost in internal/config/config_test.go: if the two ever
-// disagree, the Settings screen's "same as M2L-X" placeholder is a lie.
+// bareHost mirrors internal/config's hostOnly, which is what EffectiveSRTHost
+// uses to derive the SRT target from the M2L-X host. These cases are the same
+// ones as TestEffectiveSRTHost in internal/config/config_test.go: if the two
+// ever disagree, the SRT host the UI implies and the one Go dials differ.
 test('bareHost matches the Go fallback for every shape of host', () => {
   assert.equal(bareHost('m2lx.example.com'), 'm2lx.example.com');
   assert.equal(bareHost('https://m2lx.example.com'), 'm2lx.example.com');

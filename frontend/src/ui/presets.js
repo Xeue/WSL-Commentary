@@ -37,7 +37,6 @@ export const INSTANCE_FIELD_LABELS = Object.freeze([
   Object.freeze({ tag: 'm2lxHost', label: 'M2L-X host' }),
   Object.freeze({ tag: 'alias', label: 'Alias' }),
   Object.freeze({ tag: 'eventId', label: 'Event ID' }),
-  Object.freeze({ tag: 'srtHost', label: 'SRT host' }),
   Object.freeze({ tag: 'srtPort', label: 'SRT port' }),
   Object.freeze({ tag: 'srtLatencyMs', label: 'SRT latency (ms)' }),
   Object.freeze({ tag: 'pbkeylen', label: 'Passphrase key length' }),

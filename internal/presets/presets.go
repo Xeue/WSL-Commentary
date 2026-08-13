@@ -76,7 +76,7 @@ type Preset struct {
 	// Fields holds the whitelisted configuration values under their EXACT
 	// config.json tags — see InstanceFields. RawMessage rather than a struct so
 	// that "absent" and "zero" stay distinguishable: a preset that never
-	// mentions srtHost must not blank an operator's override on apply.
+	// mentions srtLatencyMs must not blank an operator's value on apply.
 	Fields map[string]json.RawMessage `json:"fields"`
 }
 
