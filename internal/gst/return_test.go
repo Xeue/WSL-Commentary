@@ -1411,16 +1411,38 @@ func TestChooseOutputDeviceKeepsTheIDWhenEnumerationFAILED(t *testing.T) {
 	}
 }
 
-// TestChooseOutputDeviceSurvivesAMachineWithNoPlaybackDevices covers the empty
-// list, which is a different sentence from "your device is missing" and is worth
-// its own wording: it is itself a fault.
-func TestChooseOutputDeviceSurvivesAMachineWithNoPlaybackDevices(t *testing.T) {
+// TestChooseOutputDeviceKeepsTheIDWhenTheENUMERATIONWasEmpty is the same
+// distinction as the test above, in the disguise the port gave it.
+//
+// A failed probe used to arrive as an error and does not any more.
+// gst_device_monitor_new returning nil is logged inside enumerateDevices and
+// reported upwards as an empty slice with no error, so ListOutputDevices can now
+// only fail for one reason — Init has not been called — and the probe that broke
+// hardest is the one that claims success and offers nothing. Read as "your
+// device is gone" that silently moves the commentator off their headphone
+// endpoint onto the default device, which is exactly the confusion the listErr
+// rule exists to prevent, arriving through the door that rule no longer covers.
+//
+// The empty list must therefore behave like the error and not like a lookup
+// miss: the configured id survives, and the diagnostic blames the probe.
+func TestChooseOutputDeviceKeepsTheIDWhenTheENUMERATIONWasEmpty(t *testing.T) {
 	id, why := chooseOutputDevice(macOSHeadphones, nil, nil)
-	if id != "" {
-		t.Fatalf("id = %q, want the default device", id)
+	if id != macOSHeadphones {
+		t.Fatalf("an EMPTY enumeration dropped the configured device: got %q, want %q; "+
+			"a machine with a sound card has at least one playback device, so an empty list is a "+
+			"fault in the probe and not evidence the endpoint has gone", id, macOSHeadphones)
 	}
-	if !strings.Contains(why, "nothing at all") {
-		t.Errorf("a machine reporting no playback devices is not called out as such:\n%s", why)
+	if why == "" {
+		t.Fatal("a machine reporting no playback devices at all is itself a fault and must be said out loud")
+	}
+	if !strings.Contains(why, macOSHeadphones) {
+		t.Errorf("the diagnostic does not name the endpoint it is talking about:\n%s", why)
+	}
+	// It must not read as the fallback line. An operator who sees "using the
+	// DEFAULT playback device" goes looking for their headphones in the dropdown;
+	// what has actually happened is that the device monitor did not work.
+	if strings.Contains(why, "DEFAULT") {
+		t.Errorf("the empty-enumeration diagnostic claims a fallback that did not happen:\n%s", why)
 	}
 }
 
@@ -1433,6 +1455,14 @@ func TestDescribeDevicesRendersNamesAndIDs(t *testing.T) {
 	got := describeDevices([]Device{{ID: "NDIAudio", Name: "NDI Audio"}})
 	if !strings.Contains(got, "NDIAudio") || !strings.Contains(got, "NDI Audio") {
 		t.Fatalf("describeDevices = %q; it must carry both the id and the display name", got)
+	}
+	// The empty list is no longer reachable through chooseOutputDevice, which
+	// answers an empty enumeration before it composes a list. It still has to
+	// render as words: this goes straight after "On offer: " in a log line, and a
+	// renderer that returned the empty string there would leave a sentence that
+	// stops in mid-air and reads as a truncated log.
+	if describeDevices(nil) == "" {
+		t.Error("describeDevices(nil) renders nothing, which reads as a truncated log line")
 	}
 }
 
@@ -1455,5 +1485,15 @@ func TestVetOutputDeviceIDGoesThroughTheLiveDeviceList(t *testing.T) {
 	if got := vetOutputDeviceID("wslcomms-no-such-device"); got != "" {
 		t.Fatalf("vetOutputDeviceID passed an absent device through as %q; the sink must be left "+
 			"on the platform default instead", got)
+	}
+	// Nothing configured is answered without a probe at all — buildLocked calls
+	// this once per attempt and the reconnect machine attempts for ever, so a
+	// machine on the default playback device would otherwise run a whole
+	// GstDeviceMonitor for the life of the monitor to be told what the empty
+	// string already says. The short circuit is not observable from here; what is
+	// observable is that it did not change the answer.
+	if got := vetOutputDeviceID(""); got != "" {
+		t.Fatalf("vetOutputDeviceID(\"\") = %q, want the empty string: nothing configured means "+
+			"the platform default and it must not be turned into a device", got)
 	}
 }

@@ -658,9 +658,14 @@ fi
 # vendored libgstreamer and libglib carry LC_BUILD_VERSION minos 26.0 — the
 # .app cannot run on anything older no matter what LSMinimumSystemVersion
 # claims, and dyld's refusal at launch is not a message anybody can act on.
-# Wails' stock Info.plist says 10.13.0, which would be a lie by fifteen major
-# versions. So the floor is computed here and written into the manifest, and
-# ship-darwin.sh refuses to ship if Info.plist promises support below it.
+# Wails' stock Info.plist says 10.13.0, a number arm64 cannot reach at all.
+#
+# So the floor is computed here and written into the manifest, and
+# ship-darwin.sh stage 5 RAISES the shipped bundle's LSMinimumSystemVersion to
+# it before signing. It is deliberately not compared against a number checked
+# into the tree: this one tracks the build machine, build/darwin/Info.plist's
+# tracks the product, and a stage that refused on the difference would only ever
+# be satisfied by hand-editing the product's floor to a build-host accident.
 FLOOR="0"
 while IFS= read -r f; do
     file "$f" 2>/dev/null | grep -q 'Mach-O' || continue

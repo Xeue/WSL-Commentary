@@ -32,8 +32,10 @@
 #      closure and relinks the app's own binary. AFTER the build, because it
 #      rewrites that binary's load commands and a later `wails build` would
 #      silently undo it; step 8's audit is the backstop for exactly that.
-#   5. FLOOR. Refuse to ship if Info.plist promises an older macOS than the
-#      vendored dylibs can actually run on.
+#   5. FLOOR. Reconcile the two deployment floors that meet here — the
+#      product's, from build/darwin/Info.plist, and this particular payload's,
+#      measured by stage 4 — and raise the SHIPPED key to the higher of them,
+#      loudly. Nothing after this stage re-derives Info.plist.
 #   6. SIGN, inside out.
 #   7. NOTARISE the .app, staple it.
 #   8. DMG, sign it, notarise it, staple it, and assess the finished artefact
@@ -256,26 +258,70 @@ step "4. vendoring GStreamer"
 
 # ── Stage 5: the deployment floor ───────────────────────────────────────────
 #
-# The bundler measured the highest LC_BUILD_VERSION minos across everything it
-# staged. Info.plist's LSMinimumSystemVersion is a PROMISE to the installer and
-# to the Finder. If the promise is lower than the measurement, the .app
-# installs on a Mac it cannot run on and dies in dyld before any of this
-# project's code executes, with a message no operator can act on.
+# TWO NUMBERS MEET HERE, and they are different kinds of thing. Getting that
+# wrong is what this stage now exists to prevent, in both directions.
+#
+#   PLIST_MIN, from build/darwin/Info.plist, is the PRODUCT's floor. It is
+#   11.0: the architecture's own floor (arm64 macOS begins at Big Sur), which
+#   is also the app binary's measured minos and is above every macOS API this
+#   application calls. It is stable, it is derived, and it is checked in. See
+#   note 3 in that file for the derivation.
+#
+#   FLOOR, from the bundle manifest stage 4 just wrote, is THIS PAYLOAD's
+#   floor: the highest LC_BUILD_VERSION minos across the vendored GStreamer
+#   closure. Homebrew builds its bottles for the build machine's macOS major
+#   version, so it is a property of the machine this ran on and it moves when
+#   that machine is upgraded. Today it is 26.0.
+#
+# LSMinimumSystemVersion is a PROMISE to the installer and to the Finder, and
+# the artefact has to keep it, so the shipped key must be the HIGHER of the
+# two. Promise lower than the payload can run on and the .app installs on a Mac
+# it cannot launch on, dying in dyld before any of this project's code executes
+# with a message no operator can act on.
+#
+# This used to be a refusal instead of a reconciliation, and the refusal is what
+# put a build-machine accident into a checked-in file: the only way to satisfy it
+# was to hand-edit Info.plist to 26.0, which is not true of the product and would
+# have to be edited again on the next OS upgrade. So the shipped copy is raised
+# here, where the measurement is, and said out loud — never silently, because a
+# floor that moves without anyone noticing is how a release stops installing on
+# the facility's Macs.
+#
+# ORDERING, checked rather than assumed: this runs after stage 4 (which creates
+# the manifest) and before stage 6 (which seals the bundle), and nothing after
+# it re-reads LSMinimumSystemVersion or re-derives Contents/Info.plist from
+# build/darwin/Info.plist — the only later PlistBuddy call reads
+# CFBundleExecutable. The manifest hashes Contents/Frameworks, Contents/MacOS
+# and Contents/Resources/gstreamer-1.0 only, so mutating Contents/Info.plist
+# does not invalidate it.
 step "5. deployment floor"
 MANIFEST="$APP/Contents/Resources/GST-BUNDLE-MANIFEST.txt"
 FLOOR="$(sed -n 's/^MINOS-FLOOR=//p' "$MANIFEST" | head -1)"
-PLIST_MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")"
+# `|| true` and the discarded stderr are load-bearing under `set -e`: PlistBuddy
+# exits 1 with "Entry … Does Not Exist" on a missing key (measured), and an
+# unguarded command substitution would abort the script with that message
+# instead of the one below, which says what to do about it.
+PLIST_MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+    "$APP/Contents/Info.plist" 2>/dev/null || true)"
 [ -n "$FLOOR" ] || fail "the bundle manifest has no MINOS-FLOOR line."
+[ -n "$PLIST_MIN" ] || fail "the built bundle's Info.plist has no LSMinimumSystemVersion.
+       build/darwin/Info.plist sets it; if it is missing, Wails wrote its own
+       template over that file. See the header comment in build/darwin/Info.plist."
 LOWEST="$(printf '%s\n%s\n' "$FLOOR" "$PLIST_MIN" | sort -V | head -1)"
 if [ "$LOWEST" != "$FLOOR" ]; then
-    fail "Info.plist promises macOS $PLIST_MIN but the vendored dylibs require macOS $FLOOR.
-       Homebrew builds its bottles for the build machine's macOS major version,
-       so the floor moves when the build machine is upgraded. Either raise
-       LSMinimumSystemVersion in build/darwin/Info.plist to $FLOOR, or build the
-       GStreamer closure on a machine running the oldest macOS you intend to
-       support. Do not ship the difference."
+    /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $FLOOR" "$APP/Contents/Info.plist"
+    echo "  the product's floor is macOS $PLIST_MIN, but the VENDORED GStreamer in this"
+    echo "  build requires macOS $FLOOR, so the shipped Info.plist now says $FLOOR."
+    echo ""
+    echo "  That is a property of the BUILD HOST, not of this product: Homebrew builds"
+    echo "  its bottles for the build machine's macOS major version. To ship a lower"
+    echo "  floor, build the GStreamer closure on a machine running the oldest macOS"
+    echo "  you intend to support. Do NOT edit LSMinimumSystemVersion in"
+    echo "  build/darwin/Info.plist to chase this number — that field is the product's"
+    echo "  floor and this stage is what reconciles it with a particular build."
+else
+    echo "  payload requires macOS $FLOOR, Info.plist promises $PLIST_MIN — consistent"
 fi
-echo "  payload requires macOS $FLOOR, Info.plist promises $PLIST_MIN — consistent"
 
 # ── Stage 6: signing, inside out ────────────────────────────────────────────
 #

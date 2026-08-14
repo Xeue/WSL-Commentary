@@ -82,7 +82,9 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
     shipped is
       WSL Commentary.app/Contents/Resources/GST-BUNDLE-MANIFEST.txt
     which carries a SHA-256 for every file, exactly as its Windows counterpart
-    does.
+    does. Section C2 enumerates the part of that closure this section does not
+    cover - everything the otool walk pulled in that is neither GStreamer nor
+    GLib - and reconciles it against sections B and C, which describe Windows.
 
   GLib, GObject, GIO, GModule     LGPL-2.1-or-later
     Windows: UNVERIFIED - the exact GLib version is whatever the GStreamer
@@ -144,6 +146,234 @@ C. PERMISSIVE LICENCES - shipped as DLLs, unmodified
     MinGW-w64 runtime licence (permissive; winpthreads is MIT/BSD-style).
     UNVERIFIED - copy the exact notice from the MinGW-w64 distribution used at
     Gate B.
+
+------------------------------------------------------------------
+C2. PERMISSIVE LICENCES - the macOS closure, shipped as .dylib files,
+    unmodified
+------------------------------------------------------------------
+
+Sections B and C enumerate the WINDOWS closure, which is an explicit file list
+inside build\bundle-gst.ps1 and can therefore be read out of a script. The
+macOS closure is COMPUTED - section A says why - so it is enumerated here from
+the ARTEFACT instead. Every file named below was read out of
+
+  WSL Commentary.app/Contents/Resources/GST-BUNDLE-MANIFEST.txt
+
+of a built bundle - 48 Mach-O files, and the same 48 in the notarised 0.1.0
+.dmg and in a fresh run of build/bundle-gst-darwin.sh, compared file by file -
+which carries a SHA-256 for every file that shipped. Each licence was then read
+from the COPYING or LICENSE file in the corresponding Homebrew keg on the build
+host, and NOT from `brew info`: section G already gives this file cause to
+distrust that metadata, which is wrong about fdk-aac.
+
+FIRST, WHAT SECTIONS B AND C LIST THAT THE macOS BUNDLE DOES NOT CONTAIN. It is
+recorded rather than left to inference, because an absence that is only inferred
+gets re-inferred, and next time wrongly.
+
+  libgcc (libgcc_s_seh-1.dll)     MinGW-w64 ONLY. Not in the macOS closure.
+  libstdc++ (libstdc++-6.dll)     Nothing on macOS is compiled by GCC, and the
+                                  C++ runtime there is the operating system's
+                                  /usr/lib/libc++.1.dylib - which libsrt links
+                                  and which this product does not distribute.
+                                  Section B is therefore Windows-only in
+                                  substance. GPL-3.0.txt and
+                                  GCC-RUNTIME-LIBRARY-EXCEPTION-3.1.txt are
+                                  present in the macOS bundle because the whole
+                                  licences folder is copied into it, not
+                                  because anything in that bundle is under
+                                  them.
+
+  libffi (MIT, section C)         Not in the macOS closure. MEASURED:
+                                  libgobject-2.0.0.dylib links
+                                  /usr/lib/libffi.dylib, the system copy.
+
+  zlib (section C)                Not in the macOS closure. libgio-2.0.0,
+                                  libgsttag-1.0.0 and libpng16.16 all link
+                                  /usr/lib/libz.1.dylib.
+
+  GNU libiconv (section A)        Not in the macOS closure, which closes the
+                                  question section A leaves open with "present
+                                  if the GStreamer build links them": libglib
+                                  and libintl both link
+                                  /usr/lib/libiconv.2.dylib. libintl itself IS
+                                  bundled, IS LGPL, and stays in section A.
+
+  OpenSSL (libcrypto, libssl)     IS in the macOS closure, and section C's "if"
+                                  is therefore answered for this platform:
+                                  libsrt 1.5.6 uses OpenSSL 3.6.3 as its crypto
+                                  backend, so libcrypto.3.dylib and
+                                  libssl.3.dylib ship. Apache-2.0, as section C
+                                  states, and Apache-2.0.txt is in this folder.
+
+AND NOW WHAT IS IN THE macOS CLOSURE AND APPEARS NOWHERE ABOVE. Seven files,
+all permissive, none of them reciprocal. All seven arrive by the same route,
+which is worth stating once rather than seven times:
+
+  Every one of them is a dependency of libgstopengl.dylib or of its support
+  library libgstgl-1.0.0.dylib. glimagesink lives in libgstopengl.dylib and is
+  the picture sink this product actually proved (section A, and
+  build/bundle-gst-darwin.sh step 1). Five of the seven are X.Org client
+  libraries, and they are there because Homebrew builds gst-plugins-base's GL
+  support with the X11/GLX window system compiled in ALONGSIDE the Cocoa one,
+  so both of those libraries name X11 in hard LC_LOAD_DYLIB entries. dyld
+  resolves LC_LOAD_DYLIB at dlopen time, so they ship or the plugin does not
+  load at all and the sink simply is not there. They are not surplus and they
+  cannot be dropped; dropping them means building GStreamer from source with
+  -Dgl_winsys=cocoa, which is a different supply chain from the vendored
+  Homebrew bottles this product uses.
+
+  X.Org client libraries          MIT (the X.Org / X11 variant)
+
+    libX11.6.dylib        libx11 1.8.13    linked by libgstgl, libgstopengl
+    libX11-xcb.1.dylib    libx11 1.8.13    linked by libgstgl
+    libxcb.1.dylib        libxcb 1.17.0    linked by libX11, libgstgl
+    libXau.6.dylib        libxau 1.0.12    linked by libxcb
+    libXdmcp.6.dylib      libxdmcp 1.1.5   linked by libxcb
+
+    These licences require the copyright notice and the permission notice to
+    travel with the binaries, which is what this file is for, so they are
+    transcribed rather than referred to.
+
+    libXau and libXdmcp, from their COPYING files verbatim, differing only in
+    the years on the copyright line:
+
+      Copyright 1988, 1993, 1994, 1998  The Open Group        (libXau)
+      Copyright 1989, 1998  The Open Group                    (libXdmcp)
+
+      Permission to use, copy, modify, distribute, and sell this software and
+      its documentation for any purpose is hereby granted without fee,
+      provided that the above copyright notice appear in all copies and that
+      both that copyright notice and this permission notice appear in
+      supporting documentation.
+
+      The above copyright notice and this permission notice shall be included
+      in all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+      OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+      MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+      IN NO EVENT SHALL THE OPEN GROUP BE LIABLE FOR ANY CLAIM, DAMAGES OR
+      OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+      ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+      OTHER DEALINGS IN THE SOFTWARE.
+
+      Except as contained in this notice, the name of The Open Group shall not
+      be used in advertising or otherwise to promote the sale, use or other
+      dealings in this Software without prior written authorization from The
+      Open Group.
+
+    libxcb, from its COPYING file verbatim:
+
+      Copyright (C) 2001-2006 Bart Massey, Jamey Sharp, and Josh Triplett.
+      All Rights Reserved.
+
+      Permission is hereby granted, free of charge, to any person obtaining a
+      copy of this software and associated documentation files (the
+      "Software"), to deal in the Software without restriction, including
+      without limitation the rights to use, copy, modify, merge, publish,
+      distribute, sublicense, and/or sell copies of the Software, and to
+      permit persons to whom the Software is furnished to do so, subject to
+      the following conditions:
+
+      The above copyright notice and this permission notice shall be included
+      in all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+      OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+      MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+      IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+      LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+      FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+      DEALINGS IN THE SOFTWARE.
+
+      Except as contained in this notice, the names of the authors or their
+      institutions shall not be used in advertising or otherwise to promote
+      the sale, use or other dealings in this Software without prior written
+      authorization from the authors.
+
+    libX11 is the one component in this bundle whose notice will not fit in
+    this file honestly. Its COPYING is 899 lines and carries 74 separate
+    copyright statements - The Open Group, the X Consortium, Oracle, Red Hat,
+    IBM, the XFree86 Project, Digital Equipment Corporation, SunSoft, Silicon
+    Graphics, Sony, Toshiba, Fujitsu, OMRON, Oki, Fuji Xerox, Wyse Technology,
+    Keith Packard, Jamey Sharp, Josh Triplett and others - each under an
+    MIT/X11-style permission notice of the same shape as the two above.
+    Summarising 74 copyright holders as "various" is not a transcription, so it
+    is not done here: item 5 of section I is the outstanding work, which is to
+    ship that COPYING verbatim beside this file.
+
+    One of the 74 is the Free Software Foundation, which is the entry that
+    makes a reader stop, so it is disposed of here rather than left to be
+    rediscovered: it reads "Copyright (c) 1999-2000 Free Software Foundation,
+    Inc." and it is followed by the ordinary MIT permission notice. It is not
+    a GPL or LGPL grant and it does not change anything in section A or B.
+
+    The terms themselves are not in doubt and are the X.Org standard licence,
+    which COPYING introduces in its own words:
+
+      The following is the 'standard copyright' agreed upon by most
+      contributors, and is currently the canonical license preferred by the
+      X.Org Foundation. This is a slight variant of the common MIT license
+      form published by the Open Source Initiative at
+      http://www.opensource.org/licenses/mit-license.php
+
+  graphene (libgraphene-1.0.0.dylib)               MIT
+    graphene 1.10.8. The SIMD matrix and vector library GstGL uses for its
+    transformation maths; linked by libgstopengl.dylib. From LICENSE.txt
+    verbatim:
+
+      Copyright 2014 Emmanuele Bassi. All rights reserved.
+
+      Permission is hereby granted, free of charge, to any person obtaining a
+      copy of this software and associated documentation files (the
+      "Software"), to deal in the Software without restriction, including
+      without limitation the rights to use, copy, modify, merge, publish,
+      distribute, sublicense, and/or sell copies of the Software, and to
+      permit persons to whom the Software is furnished to do so, subject to
+      the following conditions:
+
+      The above copyright notice and this permission notice shall be included
+      in all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+      OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+      MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+      IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+      CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+      TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+      SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  libjpeg (libjpeg.8.dylib)                        IJG License
+    libjpeg-turbo 3.2.0, linked by libgstopengl.dylib. The seventh file, and
+    with graphene one of the two that are not there because of X11.
+
+    Which of libjpeg-turbo's licences applies depends on WHICH library is
+    shipped, and only one of them is: LICENSE.md divides the project between
+    the libjpeg API library, under the IJG License, and the TurboJPEG API
+    library, under the Modified (3-clause) BSD License. libjpeg.8.dylib is the
+    libjpeg API library. libturbojpeg is a separate file and is not in this
+    bundle, so BSD-3-Clause is not the operative licence here despite being
+    the one usually quoted for libjpeg-turbo. The SIMD code inside
+    libjpeg.8.dylib is under the zlib License, which LICENSE.md states is
+    subsumed by the IJG License in this context.
+
+    The IJG License carries an obligation this file must discharge rather than
+    merely record. Condition (2) of the LEGAL ISSUES section of README.ijg:
+
+      "If only executable code is distributed, then the accompanying
+       documentation must state that 'this software is based in part on the
+       work of the Independent JPEG Group'."
+
+    Only executable code is distributed. Accordingly, and as a statement of
+    this product and not as a quotation:
+
+      This software is based in part on the work of the Independent JPEG
+      Group.
+
+    Condition (1) of the same section requires the copyright notice, the
+    conditions and the no-warranty disclaimer to accompany the work; README.ijg
+    is the document that carries them, and item 5 of section I covers shipping
+    it beside this file for the same reason it covers libX11's COPYING.
 
 ------------------------------------------------------------------
 D. LINKED INTO wslcomms.exe - Go
@@ -379,26 +609,42 @@ Every line above marked UNVERIFIED is a line that could not be established on
 the machine this file was written on, because no GStreamer installation was
 present (Gate B closed). Each one is a fact that exists on the build host the
 moment GStreamer is installed. They must all be resolved before this product is
-given to anyone outside the project:
+given to anyone outside the project.
+
+Note that every remaining UNVERIFIED marker is now a WINDOWS one. The macOS
+build host does have GStreamer, which is how section C2 was written from a real
+bundle manifest and real keg licence files; Gate B is the Windows gate and it is
+still shut.
+
+What is outstanding:
 
   1. The exact GLib version ON WINDOWS. The macOS one is recorded (2.88.2).
-  2. Which of libiconv, OpenSSL and mbedTLS are actually bundled - read the
-     bundle manifest, which lists exactly what was shipped.
+  2. Which of libiconv, OpenSSL and mbedTLS are actually bundled ON WINDOWS -
+     read gst\BUNDLE-MANIFEST.txt, which lists exactly what was shipped. The
+     macOS half of this question is closed: section C2 answers it from the
+     bundle manifest (OpenSSL 3.6.3 yes, libiconv no, mbedTLS no).
   3. The verbatim copyright notices for ORC, libpng, zlib and the MinGW-w64
      runtime.
   4. The identity and contact details in WRITTEN-OFFER.txt.
-  5. NEW WITH THE macOS BUILD, and it is a real gap rather than a formality:
-     sections B and C were written against the Windows closure and have not
-     been reconciled against the macOS one. The macOS bundle is a computed
-     closure of roughly fifty Mach-O files, and while every plugin in it is
-     accounted for in section A, the transitively pulled-in libraries are not
-     individually enumerated here the way the Windows ones are. Known to differ:
-     libgcc and libstdc++ are MinGW-only and are NOT in the macOS bundle (the
-     C++ runtime there is the operating system's libc++); libjpeg and several
-     X11 client libraries ARE in the macOS closure and appear nowhere above.
-     The manifest at Contents/Resources/GST-BUNDLE-MANIFEST.txt is the
-     authoritative list to work from. Do not release the macOS build to anyone
-     outside the project until each entry in it has a licence recorded here.
+  5. Two verbatim licence documents that belong beside this file and are not
+     here yet. This is what is LEFT of the macOS reconciliation gap; section C2
+     now enumerates the whole computed closure, so every entry in
+     Contents/Resources/GST-BUNDLE-MANIFEST.txt has a licence recorded, and
+     what remains is the two notices too long to inline:
+
+       libx11 1.8.13   COPYING, 899 lines, 74 copyright statements. The MIT
+                       terms require the notice to travel with the binary and
+                       section C2 can only summarise the holders.
+       jpeg-turbo      README.ijg. Condition (1) of its LEGAL ISSUES section
+       3.2.0           requires the copyright notice, the conditions and the
+                       disclaimer to accompany the work. Condition (2), the
+                       acknowledgement, IS discharged in section C2.
+
+     Both exist on the build host inside the Homebrew kegs the bundle was built
+     from. Copy them into this folder as X11-COPYING.txt and IJG-README.txt -
+     build/ship-darwin.sh copies build/licenses/*.txt into the .app, so no
+     other change is needed to make them ship - and record their byte counts
+     and SHA-256 in section H the way the other texts are recorded.
 
 This file is a factual notice, not legal advice. Have it and WRITTEN-OFFER.txt
 reviewed by whoever signs off the commercial deliverable.

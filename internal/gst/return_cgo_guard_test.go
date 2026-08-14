@@ -17,6 +17,9 @@
 package gst
 
 import (
+	"go/ast"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -314,40 +317,161 @@ func TestTheDarwinPredicateDoesNotClassifyIDs(t *testing.T) {
 	}
 }
 
+// windowsReturnDecodeSpecs and windowsReturnRenderSpecs are the two Windows
+// element lists as they must appear, character for character with the comments
+// stripped — which is what funcBody renders.
+//
+// # Why the whole text and not a search for the element names
+//
+// This test used to be six strings.Contains checks, and they were satisfied by
+// mutations that genuinely changed what the operator's machine plays. A
+// containment check cannot see element ORDER, cannot see element COUNT, and
+// cannot see a field that has been added to a spec — so an extra audioconvert
+// appended to the render tail, a second decoder in front of mfaacdec, or a
+// factory pointed at the wrong name const all passed a test whose whole purpose
+// was to say the Windows tail had not moved. Five such mutations were tried
+// against it and all five passed.
+//
+// The exact text is not a nicety here. Gate A on a Mac never compiles this file
+// — it is cgo && windows — so the only thing standing between an edit made here
+// while working on macOS and the on-air machine is a source guard, and a source
+// guard that cannot see the change is not a guard.
+//
+// The cost is that a DELIBERATE change to the Windows tail fails this test. That
+// is the intent: CONTRACT.md rule 4 makes the on-air Windows build the thing a
+// port may not regress, so touching it has to be a decision that is written
+// down. Update the literal here, in the same commit, and say in the message what
+// was measured on the operator's machine.
+const windowsReturnDecodeSpecs = `func returnDecodeSpecs() []returnElementSpec {
+	return []returnElementSpec{
+		{factory: "mfaacdec", name: nameReturnDecode},
+	}
+}`
+
+const windowsReturnRenderSpecs = `func returnRenderSpecs() []returnElementSpec {
+	return []returnElementSpec{
+		{factory: "audioresample", name: nameReturnResample},
+	}
+}`
+
 // TestTheWindowsTailIsUnchangedByThePort is the promise the port made to the
 // operator's machine.
 //
 // Every line of return_cgo_windows.go was lifted out of return_cgo.go unmodified.
-// mfaacdec takes aacparse's output as it comes, wasapi2sink takes the endpoint id
-// as a string, and low-latency is set. If the macOS work ever has to reach into
-// the Windows tail, that is a decision somebody makes on purpose and this test is
-// where they record it.
+// mfaacdec takes aacparse's output as it comes, the render tail is the resampler
+// and nothing else, the sink is wasapi2sink and takes the endpoint id as a
+// string, and low-latency is set to true. If the macOS work ever has to reach
+// into the Windows tail, that is a decision somebody makes on purpose and this
+// test is where they record it.
+//
+// The two element lists are pinned as whole text; see the constants above for
+// why containment checks were not enough. The sink function is not, because it
+// is prose as well as code — its log wording is free to improve — so the three
+// facts about it that reach the sound card are pinned individually instead.
 func TestTheWindowsTailIsUnchangedByThePort(t *testing.T) {
 	fset, file := parseSource(t, returnCgoWindowsSourceFile)
 
-	decode := funcBody(t, fset, file, "", "returnDecodeSpecs")
-	if !strings.Contains(decode, `"mfaacdec"`) {
-		t.Error("the Windows decode chain no longer uses mfaacdec")
-	}
-	if strings.Contains(decode, "capsfilter") {
-		t.Error("a capsfilter has appeared in the Windows decode chain. mfaacdec negotiates ADTS " +
-			"directly; the one on macOS is there because atdec does not, and it must not be " +
-			"copied across on the assumption that it is harmless.")
+	for _, tc := range []struct{ fn, want, why string }{
+		{
+			fn:   "returnDecodeSpecs",
+			want: windowsReturnDecodeSpecs,
+			why: "mfaacdec advertises stream-format={raw,adts} and negotiates whatever aacparse " +
+				"offers, so the Windows decode chain is the decoder and nothing else. The " +
+				"capsfilter on macOS is there because atdec silently decodes ADTS to digital " +
+				"silence, and it must not be copied across on the assumption that it is harmless.",
+		},
+		{
+			fn:   "returnRenderSpecs",
+			want: windowsReturnRenderSpecs,
+			why: "the mix matrix pins audioconvert at two channels and wasapi2sink opens a stereo " +
+				"shared-mode stream, so the Windows render tail has nothing to reconcile and is " +
+				"the resampler alone. The macOS tail has more in it because a CoreAudio device " +
+				"need not be stereo, which is a fact about that platform and not a better idea.",
+		},
+	} {
+		got := funcBody(t, fset, file, "", tc.fn)
+		if got != tc.want {
+			t.Errorf("%s in %s is not the text that went on air.\n\n--- it now reads ---\n%s\n"+
+				"\n--- it must read ---\n%s\n\n%s\n\nIf the change is deliberate, update the "+
+				"literal in this file in the same commit and record what was measured on the "+
+				"operator's machine.",
+				tc.fn, returnCgoWindowsSourceFile, got, tc.want, tc.why)
+		}
 	}
 
-	render := funcBody(t, fset, file, "", "returnRenderSpecs")
-	if !strings.Contains(render, `"audioresample"`) || strings.Contains(render, "capsfilter") {
-		t.Error("the Windows render tail is no longer just the resampler; wasapi2sink opens a " +
-			"stereo stream and has nothing to reconcile")
+	// The sink FACTORY, which nothing else asserts. return_cgo.go builds the sink
+	// from this const, so a one-word edit here — to the older "wasapisink", say,
+	// during a bundle repair — silently changes which plugin plays the return, and
+	// that plugin has no low-latency property for the guard below to find.
+	if got := stringConstValue(t, file, "returnSinkFactory"); got != "wasapi2sink" {
+		t.Errorf("%s: returnSinkFactory = %q, want \"wasapi2sink\". wasapi2 is what the "+
+			"contribution path already captures with, so the bundle carries it; its device "+
+			"property takes the IMMDevice endpoint id string that ListOutputDevices reports, "+
+			"and no other sink on this platform does.", returnCgoWindowsSourceFile, got)
 	}
 
 	sink := funcBody(t, fset, file, "", "configureReturnSinkLocked")
-	if !strings.Contains(sink, `setStringProperty(sink, "device"`) {
-		t.Error("the Windows sink no longer takes its endpoint id as a string")
+	if !strings.Contains(sink, `setStringProperty(sink, "device", deviceID)`) {
+		t.Error("the Windows sink no longer takes its endpoint id as a string through the " +
+			"type-checked setter. wasapi2sink's device property is a gchar*, and the check is " +
+			"what would make a future plugin that changed it fail loudly rather than leave the " +
+			"monitor on the default endpoint with a green lamp.")
 	}
-	if !strings.Contains(sink, `"low-latency"`) {
-		t.Error("the Windows sink no longer asks wasapi2 for the low-latency shared-mode period")
+	// The literal true, not just the property name. A guard that only looked for
+	// "low-latency" would be satisfied by a hasProperty call with the set deleted,
+	// and by SetObjectProperty("low-latency", false) — which is the wasapi2 default
+	// and adds a shared-mode buffering period to a commentator's monitor with
+	// nothing anywhere saying so.
+	if !strings.Contains(sink, `sink.SetObjectProperty("low-latency", true)`) {
+		t.Error("the Windows sink no longer asks wasapi2 for the low-latency shared-mode period " +
+			"with an explicit true")
 	}
+	if !strings.Contains(sink, `hasProperty(sink, "low-latency")`) {
+		t.Error("the low-latency set is no longer guarded by hasProperty. The property is " +
+			"wasapi2's own and the older wasapi plugin has not got it, so an unguarded set " +
+			"emits a GLib CRITICAL on every reconnect after a bundle repair substitutes one " +
+			"for the other.")
+	}
+}
+
+// stringConstValue returns the unquoted value of a package-level string constant
+// declared in file, or fails the test if there is no such declaration.
+//
+// It reads the AST rather than the file text so that a const named in a comment
+// — and this package comments heavily — cannot satisfy a caller looking for the
+// declaration. It is the same shape TestPlatformElementContractIsPinned uses on
+// the contribution path's element consts, kept local because the two want
+// different failure messages.
+func stringConstValue(t *testing.T, file *ast.File, name string) string {
+	t.Helper()
+
+	var value string
+	var found bool
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, ident := range spec.Names {
+			if ident.Name != name || i >= len(spec.Values) {
+				continue
+			}
+			lit, ok := spec.Values[i].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			unquoted, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				continue
+			}
+			value, found = unquoted, true
+		}
+		return true
+	})
+	if !found {
+		t.Fatalf("no package-level string constant %s is declared", name)
+	}
+	return value
 }
 
 // TestBuildLockedVetsTheHeadphoneEndpointBeforeTheSinkSeesIt is where the

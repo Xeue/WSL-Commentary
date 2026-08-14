@@ -10,6 +10,20 @@
 //	configureCaptureSource  given that persisted string, point the capture source
 //	                      at the device it names.
 //
+// It also carries two small pieces of per-platform VOCABULARY that the shared
+// code in gst_cgo.go has to speak but cannot know:
+//
+//	skipDetail            the platform's tail on the enumeration summary line —
+//	                      on Windows, the WASAPI loopback count.
+//	bundleAllowlistNoun   what one file in the GStreamer bundle is called, for
+//	                      Init's missing-element error.
+//
+// Neither is a device question, and elements_windows.go is arguably the tidier
+// home for the second. They are here because that file is deliberately a CLOSED
+// list — its own header promises it and its twin declare exactly the same six
+// identifiers and nothing else — whereas this pair is already the place where
+// the platform's own vocabulary about its audio stack lives.
+//
 // Owner: WP-3a. Its twin is deviceprovider_darwin.go, and everything below was
 // lifted out of gst_cgo.go unchanged when the twin was written — same checks,
 // same order, same log lines. Windows behaviour is byte-identical to what it
@@ -30,10 +44,30 @@
 package gst
 
 import (
+	"fmt"
 	"log"
+	"sync/atomic"
 
 	gogst "github.com/go-gst/go-gst/pkg/gst"
 )
+
+// bundleAllowlistNoun is the Windows word for one file in the bundled
+// GStreamer, and it exists so that Init's "the bundle is incomplete" error
+// names something the person reading it can search for.
+//
+// "DLL allowlist" is the term the whole of the rest of this project uses for
+// the thing that decides which files reach the bundle — build/bundle-gst.ps1
+// implements it, and RUNNING.md, CONTRACT.md, BUILD-NOTES.md,
+// docs/windows-app-spec.md, docs/project-plan.md and build/README.md all call it
+// that. When Init became platform-neutral the sentence was generalised to
+// "plugin allowlist", which reads fine and costs the Windows operator the exact
+// phrase that finds the documentation. Restoring it as a per-platform constant
+// is the only way to keep it: "DLL" is simply wrong about a macOS bundle, which
+// contains none.
+//
+// A constant per platform rather than a runtime.GOOS branch inside Init, for the
+// reason the whole package gives: there is deliberately no runtime.GOOS in it.
+const bundleAllowlistNoun = "DLL"
 
 // propLoopback is the GstStructure key under which wasapi2's device provider
 // marks an Audio/Source entry as its loopback republication of a RENDER
@@ -81,13 +115,39 @@ var endpointIDKeys = []string{"device.actual-id", "device.id", "device.strid", "
 // loopback=true to "make them work" would put the operator's own monitor mix
 // on air, which is the deliberate non-goal recorded in device_id.go.
 //
-// Every rejection logs its reason. A device missing from the dropdown is
-// otherwise indistinguishable from a device that is not plugged in.
+// Every rejection logs its reason, INCLUDING the provider rejection, which used
+// to be the one silent one. A device missing from the dropdown is otherwise
+// indistinguishable from a device that is not plugged in.
 func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 	// Devices from any other provider are discarded rather than offered,
 	// because the id below is passed verbatim to wasapi2src and only wasapi2's
 	// ids are meaningful there.
+	//
+	// This branch was silent for the whole of the Windows build's life, and the
+	// case for leaving it silent is real: it can fire once per endpoint, and the
+	// dev machine enumerates 25 of them. It is logged anyway, for two reasons.
+	//
+	// First, on the SHIPPED bundle it should fire nought times. The DLL
+	// allowlist stages exactly two plugins that register a device provider,
+	// wasapi2 and mediafoundation, and mediafoundation's enumerates Video/Source
+	// — so every device reaching a monitor filtered to Audio/Source ought to be
+	// a wasapi2 one. (UNVERIFIED against 1.28.5 on the target machine; the line
+	// is harmless if that is wrong, because it gates nothing.) A machine where
+	// it DOES fire is a machine that has picked up a foreign GStreamer, which is
+	// the failure the whole GST_PLUGIN_SYSTEM_PATH sequence in Init exists to
+	// prevent and which produces no other message anywhere.
+	//
+	// Second, the alternative was to correct the two doc comments that promise
+	// every skip is logged — this one and ListInputDevices'. That trades a
+	// diagnostic for a smaller log on the one path where the symptom is "the
+	// dropdown is empty" and there is nothing at all to read. If it ever does
+	// become noisy, the noise IS the diagnosis rather than a reason to delete
+	// the line.
 	if api := props.GetString("device.api"); api != "wasapi2" {
+		log.Printf("gst: ListInputDevices: skipping %q: device.api is %q, not wasapi2 — its id would "+
+			"be meaningless to %s, which is the only element this build opens a capture endpoint "+
+			"with; device properties are %s",
+			dev.GetDisplayName(), api, captureSourceFactory, structureFieldNames(props))
 		return "", false
 	}
 	// The loopback filter. GetBoolean fails unless the field exists AND is
@@ -98,6 +158,7 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 	// endpoint it mirrors. Checked before endpointID so a device being
 	// skipped never costs the CreateElement fallback.
 	if loop, ok := props.GetBoolean(propLoopback); ok && loop {
+		loopbacksSkipped.Add(1)
 		log.Printf("gst: ListInputDevices: skipping %q (%s): %s=true — it is wasapi2's loopback "+
 			"republication of a playback endpoint, and opening it would put the operator's own "+
 			"monitor mix on air", dev.GetDisplayName(), props.GetString("device.id"), propLoopback)
@@ -130,6 +191,48 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 			"this line is the diagnosis", dev.GetDisplayName(), id, CaptureEndpointPrefix)
 	}
 	return id, true
+}
+
+// loopbacksSkipped counts the loopback republications captureDeviceID refused
+// during the enumeration currently in progress. It is DIAGNOSTIC ONLY: nothing
+// reads it but skipDetail, and no decision anywhere depends on its value.
+//
+// atomic rather than a plain int because ListInputDevices is reachable from two
+// goroutines at once — the Wails binding and the LAN control bridge both call
+// it, and neither serialises against the other. The atomic buys freedom from a
+// torn read and from the race detector, and nothing else: two enumerations
+// overlapping can still attribute one's loopbacks to the other's summary line.
+// That is accepted deliberately, because the alternative is a mutex held across
+// a device enumeration to make a log line prettier, and because the number is
+// never load-bearing. The per-device skip lines above are the record; this is
+// the total at the bottom of them.
+var loopbacksSkipped atomic.Int64
+
+// resetSkipDetail starts a fresh count. ListInputDevices calls it before its
+// loop, so that the summary describes THIS enumeration rather than every
+// enumeration since the process started — which matters because the operator
+// reopens the Settings screen, and a number that only ever grows would read as
+// loopback devices multiplying.
+func resetSkipDetail() { loopbacksSkipped.Store(0) }
+
+// skipDetail is the Windows tail of the enumeration summary log line.
+//
+// The count it restores was in that line before the platform seam existed, and
+// it is the single most useful number in it: on the dev machine 11 of 25
+// Audio/Source entries were wasapi2's loopback republications of playback
+// endpoints, and offering them is the defect this whole filter exists for. The
+// seam moved the filter behind captureDeviceID and the summary was left saying
+// only how many devices were skipped in total, which cannot distinguish "the
+// loopback filter did its job" from "eleven of the operator's microphones
+// vanished".
+//
+// It prints even when the count is zero, on purpose. Zero loopbacks on a
+// Windows machine is itself a surprise worth seeing — wasapi2 republishes every
+// render endpoint, so a machine with any playback device at all should have
+// some — and a phrase that is always present is a phrase a log search finds.
+func skipDetail() string {
+	return fmt.Sprintf(", %d of them WASAPI loopback republications of playback endpoints",
+		loopbacksSkipped.Load())
 }
 
 // endpointID extracts the IMMDevice endpoint ID GUID for one device.

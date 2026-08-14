@@ -80,6 +80,12 @@ covered properly in section 7: Homebrew builds its bottles for the build
 machine's macOS major version, so **the oldest macOS your release can run on is
 the macOS your build machine is running**. On this box that is 26.0.
 
+That is a property of the *bottles*, not of this product. The product's own
+floor is macOS 11.0 — the arm64 floor, which is also the app binary's measured
+`minos` — and `build/darwin/Info.plist` says so. The 26.0 is measured per build
+and `ship-darwin.sh` stage 5 raises the *shipped* copy of the key to it. Build
+the closure on an older Mac and the shipped number falls, with no source edit.
+
 The only part of the tree that builds without any of this is Gate A:
 
 ```sh
@@ -88,6 +94,37 @@ CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go t
 
 That works because `internal/gst` has a pure-Go stub twin. It does not produce
 a shippable application.
+
+**Gate A does not test the root package, and on macOS you have to notice that.**
+`app.go`, `app_return.go`, `app_picture.go` and every one of their tests are
+behind `//go:build dev || production || bindings`, so with no tags the untagged
+`main_nocgo.go` is all that is left of `wslcomms` and the run says exactly
+`?   wslcomms   [no test files]`. On Windows that is a shrug — `go test -tags dev
+.` picks them up with cgo still off. On macOS it is not, because the same tags
+drag in Wails' Objective-C frontend, and Wails' frontend is where this port's
+link-time breakage lives. Covering it needs Gate B:
+
+```sh
+CGO_LDFLAGS="-framework UniformTypeIdentifiers" CGO_ENABLED=1 go test -tags "dev gststub" . -count=1
+```
+
+Both additions earn their place. `gststub` keeps `internal/gst` on its pure-Go
+twin even though cgo is now on for Wails' sake — without it the cgo half is
+selected, the root package's tests reference stub-only symbols such as
+`gst.StubPipeline`, and the package fails to COMPILE. The framework flag is
+upstream Wails' omission: its darwin frontend references `UTType` and declares
+no `#cgo LDFLAGS` for it, so the Wails CLI injects the flag from outside
+(`third_party/wails-v2.13.0/pkg/commands/build/base.go:349`, and
+`build/ship-darwin.sh:174` does the same); `go test` injects nothing, so the
+LINK fails on `Undefined symbols for architecture arm64:
+"_OBJC_CLASS_$_UTType"`. See `app.go`'s header, which says the same thing from
+the other side.
+
+`-tags "bindings gststub"` also compiles and is **not** the gate to use.
+`bindings` is the Wails CLI's binding-generation mode: it leaves the desktop
+frontend out of the link entirely, so it passes without ever exercising the
+Objective-C that the `UTType` failure comes from. It would go green on precisely
+the breakage this gate exists to catch.
 
 ---
 
@@ -142,7 +179,7 @@ Two escape hatches, neither for a release:
 | 2 | **Name.** `wslcomms.app` → `WSL Commentary.app` |
 | 3 | **Payload.** `slate.png` and the licence texts |
 | 4 | **Vendor.** `bundle-gst-darwin.sh` — the GStreamer closure |
-| 5 | **Floor.** Refuse to ship a bundle that promises an OS it cannot run on |
+| 5 | **Floor.** Raise the shipped `LSMinimumSystemVersion` to what the payload measures |
 | 6 | **Sign,** inside out, hardened runtime |
 | 7 | **Notarise the .app,** staple it |
 | 8 | **Disk image,** sign, notarise, staple |
@@ -359,12 +396,26 @@ Three things the stock template gets wrong, in order of expense:
    not own, derived from `wails.json`'s `name`, so renaming the project would
    silently change the identity that the TCC grant, the keychain ACL and the
    notarisation ticket are keyed on. It is a **literal** in our copy.
-3. **`LSMinimumSystemVersion 10.13.0`**, which for this bundle is a lie by
-   fifteen major versions — see below.
+3. **`LSMinimumSystemVersion 10.13.0`**, a number that is not reachable on this
+   platform at all: arm64 macOS begins at 11.0, and the toolchain clamps
+   `-mmacosx-version-min=10.13` up to 11.0 (measured, on both the compiler and
+   the shipped `Contents/MacOS/wslcomms`). Our copy says **11.0** — the arm64
+   floor, which is also the app binary's own `minos`. See below for why that is
+   not the same number as the payload's.
 
-### The deployment floor is measured, not chosen
+### Two floors meet at stage 5
 
-Homebrew builds its bottles for the build machine's macOS major version:
+There are two deployment floors in this bundle and they are different kinds of
+thing. Confusing them is what put a build-machine accident into a checked-in
+file once already.
+
+**The product's floor** lives in `build/darwin/Info.plist` and is **11.0**. It
+is derived, not picked: arm64 macOS starts at Big Sur, the app binary carries
+`minos 11.0`, and every macOS API this application calls is older than that.
+It is stable across build machines, which is what makes it safe to check in.
+
+**The payload's floor** is measured on every build. Homebrew builds its bottles
+for the build machine's macOS major version:
 
 ```
 $ otool -l Contents/Frameworks/libgstreamer-1.0.0.dylib | grep -A1 minos
@@ -374,12 +425,20 @@ $ otool -l Contents/Frameworks/libgstreamer-1.0.0.dylib | grep -A1 minos
 dyld will not map that on anything older. The `.app` would install happily on
 macOS 14 and fail to launch with a message no operator can act on. So the
 bundler computes the highest `LC_BUILD_VERSION minos` across the whole staged
-payload, writes it into the manifest as `MINOS-FLOOR`, and **stage 5 refuses to
-ship** if `Info.plist` promises anything lower.
+payload and writes it into the manifest as `MINOS-FLOOR`.
 
-Lowering the floor is a matter of building GStreamer against an older SDK, or
-running the release build on an older Mac. It is not a matter of editing the
-number.
+**Stage 5 reconciles them**, and ships the higher of the two: it raises the
+built bundle's `LSMinimumSystemVersion` to `MINOS-FLOOR` when the payload needs
+more than the product promises, and prints why. Today that means the `.app` an
+operator receives still says 26.0. Stage 5 also fails outright if the built
+`Info.plist` has no such key at all, which is the signature of Wails having
+written its own template over `build/darwin/Info.plist`.
+
+Stage 5 used to *refuse* instead, and the only way to satisfy the refusal was to
+edit the number in `build/darwin/Info.plist` to match whichever Mac last ran the
+build — which is exactly the edit not to make. Lowering the floor an operator
+sees is a matter of building GStreamer against an older SDK, or running the
+release build on an older Mac. It is still not a matter of editing the number.
 
 ### Entitlements: one key
 
@@ -561,7 +620,14 @@ dependency.
 
 1. `git status` clean, on the release commit.
 2. Bump `info.productVersion` in `wails.json`. Nothing else carries a version.
-3. Gate A green: `CGO_ENABLED=0 go build ./... && go vet ./... && go test ./... -count=1`.
+3. Gate A green: `CGO_ENABLED=0 go build ./... && go vet ./... && go test ./... -count=1`,
+   **and then Gate B**, because Gate A prints `?   wslcomms   [no test files]`
+   and shipping on that alone would release `app.go`, `app_return.go` and
+   `app_picture.go` untested and, worse, unlinked against Wails' Objective-C
+   frontend:
+   `CGO_LDFLAGS="-framework UniformTypeIdentifiers" CGO_ENABLED=1 go test -tags "dev gststub" . -count=1`.
+   Section 1 explains both flags and why `-tags "bindings gststub"` is not a
+   substitute for them.
 4. `build/ship-darwin.sh <version>` — the version argument is a deliberate
    double-check against step 2, not a second source of truth.
 5. Read the output. Specifically: the licence gate line, `0 of N Mach-O files

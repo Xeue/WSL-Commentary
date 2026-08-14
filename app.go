@@ -17,11 +17,32 @@
 //
 // Wails on macOS is not pure Go — its whole darwin frontend reaches Cocoa and
 // WKWebView through Objective-C — so with CGO_ENABLED=0 the tagged build fails
-// inside Wails rather than here, and the same tests need
+// inside Wails rather than here, and the same tests need a second build tag and
+// a linker flag that Windows never has to think about:
 //
-//	CGO_ENABLED=1 go test -tags dev . -count=1
+//	CGO_LDFLAGS="-framework UniformTypeIdentifiers" CGO_ENABLED=1 \
+//		go test -tags "dev gststub" . -count=1
 //
-// which still runs against the internal/gst stub and still touches no device.
+// gststub is what makes that line EQUIVALENT to the Windows line above rather
+// than a different test. internal/gst selects its halves on cgo, not on the
+// platform — gst_cgo.go is `cgo && !gststub` — so turning cgo on to satisfy
+// Wails also swaps the real go-gst pipeline in underneath these tests, and they
+// reference stub-only symbols: gst.StubPipeline at app_test.go:1165 and ten
+// more. Without the tag the package does not COMPILE, never mind touch a device.
+// With it, cgo is on for Wails and off for GStreamer, which is exactly the split
+// this gate wants.
+//
+// The framework flag is upstream Wails' omission, not ours. Its darwin frontend
+// references UTType but the package declares no matching #cgo LDFLAGS, so the
+// Wails CLI injects the flag from outside, at
+// third_party/wails-v2.13.0/pkg/commands/build/base.go:349. `go test` is not the
+// Wails CLI and injects nothing, so the link — not the compile — fails with
+// "Undefined symbols for architecture arm64: _OBJC_CLASS_$_UTType".
+// build/ship-darwin.sh:176 already exports the same flag for the same reason;
+// this is that flag, at test time. Note the failure only reaches a build that
+// LINKS: `go vet` type-checks and links nothing, which is why main.go's vet
+// instruction needs neither of these and is correct as it stands.
+//
 // Gate A itself is untagged, reaches main_nocgo.go instead of this file, and is
 // unaffected on both platforms.
 //
@@ -446,11 +467,16 @@ const (
 	// the abandonment is for, and why a teardown that abandons anything ends the
 	// process itself rather than returning into an exit path that would have to
 	// step over the wedged thread. See teardown.
-	// a.stopPictureForTeardown is two bounded halves in sequence. The monitor's
-	// Stop is prompt for the same reasons StopReturn's is; the overlay window's
-	// Close posts a quit to its own message thread and waits gst's
-	// overlayCloseBudget, two seconds, before abandoning that thread and saying
-	// so. pictureStopBudget is four seconds, which is that pair with room.
+	// a.stopPictureForTeardown is two halves in sequence, and only the second
+	// bounds itself. The monitor's Stop is ordinarily prompt for the same reasons
+	// StopReturn's is, but that is a measurement, not a guarantee: it ends in a
+	// synchronous state change, and the paragraph above applies to it in full.
+	// The overlay window's Close does guarantee it — it posts a quit to its own
+	// message thread and waits gst's overlayCloseBudget, two seconds, before
+	// abandoning that thread and saying so. pictureStopBudget is four seconds,
+	// which is that pair with room. See the Bounding note on
+	// stopPictureForTeardown, which sets out which half is bounded by what and
+	// why the timeout in picture_cgo.go is not the bound it looks like.
 	//
 	// The remote listener adds one more second (remoteStopBudget, in
 	// app_remote.go): closing a TLS http.Server and its session goroutines is

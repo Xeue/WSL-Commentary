@@ -522,10 +522,14 @@ func doInit(appDir string) error {
 	gogst.Init()
 
 	if missing := missingElements(); len(missing) > 0 {
+		// bundleAllowlistNoun, not a fixed word: the Windows build documents
+		// this as the "DLL allowlist" in seven places, so that is the phrase a
+		// Windows operator reading this line will search for, and it is wrong
+		// about a .app. See deviceprovider_windows.go for the full argument.
 		return fmt.Errorf(
 			"gst: Init: the bundled GStreamer in %q is incomplete: %s "+
-				"(check the plugin allowlist and that the registry at %q was rebuilt)",
-			pluginDir, strings.Join(missing, ", "), registryPath)
+				"(check the %s allowlist and that the registry at %q was rebuilt)",
+			pluginDir, strings.Join(missing, ", "), bundleAllowlistNoun, registryPath)
 	}
 
 	log.Printf("gst: initialised, plugins from %q, registry %q", pluginDir, registryPath)
@@ -663,6 +667,14 @@ func enumerateDevices(class string) []gogst.Device {
 // shared: they are about the dropdown, not about the platform. Every skip is
 // logged by captureDeviceID with the reason, because a device missing from the
 // dropdown is otherwise indistinguishable from a device that is not plugged in.
+//
+// The summary line keeps one platform-owned TAIL, skipDetail, because how many
+// devices were skipped does not say why and the useful "why" is not the same on
+// the two platforms — on Windows it is the loopback count, which was in this
+// line before the seam existed and is the number that tells an operator the
+// filter worked rather than that their microphones disappeared. It is a string
+// appended to a log message and nothing else reads it: no branch anywhere,
+// on either platform, depends on what it returns.
 func ListInputDevices() ([]Device, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: ListInputDevices: Init has not been called")
@@ -679,6 +691,11 @@ func ListInputDevices() ([]Device, error) {
 	byID := make(map[string]int, len(devices))
 	audioSources := 0 // everything with the Audio/Source class, any provider
 	skipped := 0      // Audio/Source devices captureDeviceID refused to offer
+	// The platform's own tally of WHY, reset so that the summary below describes
+	// this enumeration and not every one since the process started. It is
+	// diagnostic only and gates nothing; the platform seam owns both halves
+	// because what is worth counting differs entirely between them.
+	resetSkipDetail()
 	for _, dev := range devices {
 		if dev == nil {
 			continue
@@ -725,8 +742,8 @@ func ListInputDevices() ([]Device, error) {
 		byID[id] = len(out)
 		out = append(out, Device{ID: id, Name: name})
 	}
-	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped",
-		len(out), audioSources, captureSourceFactory, skipped)
+	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped%s",
+		len(out), audioSources, captureSourceFactory, skipped, skipDetail())
 	return out, nil
 }
 

@@ -754,18 +754,37 @@ func (a *App) forwardPictureStates(states <-chan gst.PictureState, diag string) 
 //
 // # Bounding
 //
-// Both halves are individually bounded. gst.PictureMonitor.Stop is bounded by
-// the GStreamer timeouts in picture_cgo.go on either platform.
-// gst.PictureOverlay.Close is bounded by overlayCloseBudget on Windows, where
-// there is a message-pump thread of ours to join, and is unconditionally prompt
-// on macOS, where there is no thread of ours at all. This whole function then
-// runs inside app.go's teardownStep, which abandons it if it overruns and
-// force-exits the process. See App.teardown.
+// The two halves are bounded differently, and only one of them is bounded by
+// anything of its own.
 //
-// Only the Windows overlay can therefore report gst.ErrAbandonedThread, and that
-// is correct rather than an asymmetry to be tidied away: on macOS there is
-// nothing to abandon, and wrapping the sentinel would end every ordinary quit
-// with a hard exit.
+// gst.PictureOverlay.Close bounds itself: overlayCloseBudget on Windows, where
+// there is a message-pump thread of ours to join, and unconditionally prompt on
+// macOS, where there is no thread of ours at all. It is therefore the only half
+// that can report gst.ErrAbandonedThread, and only on Windows — which is correct
+// rather than an asymmetry to be tidied away: on macOS there is nothing to
+// abandon, and wrapping the sentinel would end every ordinary quit with a hard
+// exit.
+//
+// gst.PictureMonitor.Stop is NOT, on either platform, and the timeout in
+// picture_cgo.go is not the bound it looks like. That call is
+// BlockSetState(StateNull, elementShutdownTimeout) at picture_cgo.go:1253, and
+// go-gst v0.0.2's BlockSetState (pkg/gst/element_manual.go:37-45) only reaches
+// the timeout at all when SetState returns ASYNC — it calls GetState(timeout)
+// inside `if ret == StateChangeAsync`, and returns SetState's own answer
+// otherwise. A DOWNWARD transition to NULL never returns ASYNC: GStreamer
+// completes it synchronously before returning. So the timeout is dead code on
+// this path, and what Stop actually costs is however long
+// gst_element_set_state takes, which takes no timeout and cannot be
+// interrupted. A wedged audio endpoint or a stuck decoder hangs it for ever.
+//
+// The only real bound on that half is therefore the one imposed from OUTSIDE:
+// this whole function runs inside app.go's teardownStep under
+// pictureStopBudget, which ABANDONS it if it overruns and force-exits the
+// process. That is not a fallback for the timeout; it is the mechanism. See the
+// budget block above App.teardown, which says the same thing generally: none of
+// those figures bounds the synchronous half of a state change, which is exactly
+// why the abandonment exists and why abandoning anything ends the process rather
+// than returning into an exit path that would have to step over a wedged thread.
 func (a *App) stopPictureForTeardown() error {
 	var problems []error
 

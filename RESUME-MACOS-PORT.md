@@ -57,10 +57,26 @@ Gate A passing is necessary, not sufficient. Treat the whole diff as unreviewed.
 3. **Build and run on Windows.** Nothing here has been compiled by a real
    Windows toolchain, only cross-vetted. `CGO_ENABLED=1` with MinGW and the
    bundled GStreamer is the real test, and Gate B's smoke test is the standard.
-4. **Prune the bundle.** `libX11.6.dylib`, `libX11-xcb.1.dylib`, `libXau` and
-   `libXdmcp` are being vendored into the .app. On macOS that is almost certainly
-   dead weight dragged in transitively by the closure walker in
-   `build/bundle-gst-darwin.sh`. Find what links them and exclude it.
+4. ~~**Prune the bundle.**~~ **Do not prune the X11 libraries.** An earlier
+   version of this list called `libX11.6.dylib`, `libX11-xcb.1.dylib`, `libXau`
+   and `libXdmcp` "almost certainly dead weight". They are not. Measured with
+   `otool -L` on the staged bundle:
+
+       libgstopengl.dylib  ->  libX11.6, libgraphene-1.0.0, libjpeg.8
+       libgstgl-1.0.0      ->  libX11.6, libX11-xcb.1, libxcb.1
+       libxcb.1            ->  libXau.6, libXdmcp.6
+
+   Homebrew builds gst-plugins-base's GL support with the X11/GLX window system
+   compiled in alongside the Cocoa one, so these are hard `LC_LOAD_DYLIB`
+   entries, not a `dlopen` the plugin could decline. `glimagesink` lives in
+   `libgstopengl.dylib` and is the picture sink that was actually proven in a
+   Wails `NSWindow`; delete its dependencies and the plugin fails to load and
+   the sink is simply absent. The only way to drop them is to build GStreamer
+   from source with `-Dgl_winsys=cocoa`, which means abandoning the Homebrew
+   bottles the whole bundling approach rests on. All seven together are 1.85 MB
+   of a 49 MB bundle — leave them. They are now enumerated, with licences, in
+   `build/licenses/NOTICE.txt` section C2, which is where they should have been
+   from the start: they were being redistributed and were not being attributed.
 5. **Exercise the real hardware paths.** Everything to do with M2L-X was proven
    against loopback SRT and `cmd/mockm2lx`, never against a live instance. The
    send path, the return path and the picture all need a real run.

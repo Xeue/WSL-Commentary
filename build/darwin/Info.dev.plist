@@ -21,9 +21,14 @@
     and testing it against a permission grant nobody in the field will have is
     how you ship a bundle that gets killed on a customer's Mac.
 
-  * LSMinimumSystemVersion is absent. The dev bundle is never distributed and
-    the floor in Info.plist is a statement about the VENDORED GStreamer, which
-    a dev build does not contain — it loads Homebrew's.
+  * LSMinimumSystemVersion is absent, and stays absent. A dev bundle only ever
+    runs on the machine that built it, and it contains no vendored GStreamer —
+    it loads Homebrew's from the Cellar — so the only floor it could honestly
+    state is that machine's own. Info.plist's 11.0 is a statement about the
+    PRODUCT (see note 3 there), and ship-darwin.sh raises the shipped copy of
+    it to whatever the vendored payload measures; neither of those mechanisms
+    has anything to say about a bundle that is never shipped, so the key is
+    left off rather than given a number that would mean nothing.
 
   And one thing that is NOT different, and matters more than either: a `dev`
   build serves the frontend from a path relative to the CURRENT WORKING

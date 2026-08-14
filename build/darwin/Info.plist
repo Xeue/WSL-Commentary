@@ -48,21 +48,59 @@
      from here — it is a flock name, not an OS-visible identity, and changing
      it is internal/… territory rather than the packager's.
 
-  3. LSMinimumSystemVersion 10.13.0, which for this bundle is a lie by fifteen
-     major versions. MEASURED on the staged tree, not assumed: Homebrew builds
-     its bottles for the build machine's macOS major version, so every
-     vendored dylib carries LC_BUILD_VERSION minos 26.0 —
+  3. LSMinimumSystemVersion 10.13.0, which is not a floor anybody can reach on
+     this platform. The number here is 11.0, and because both a too-low and a
+     too-high value are shipping defects, it is worth being exact about what
+     this key means in this bundle and what it does not.
+
+     WHAT IT IS: the floor of THE PRODUCT, derived rather than picked.
+
+       - arm64 macOS begins at 11.0 Big Sur. This product ships arm64 only, so
+         no lower number can ever be true of a binary that runs at all.
+       - The shipped app binary agrees. Wails' darwin build injects
+         -mmacosx-version-min=10.13 into the cgo compile and link
+         (third_party/wails-v2.13.0/pkg/commands/build/base.go), and the
+         toolchain clamps that to the architecture's own floor. MEASURED, both
+         halves:
+
+           clang -arch arm64 -mmacosx-version-min=10.13 …   ->  minos 11.0
+           otool -l "WSL Commentary.app/Contents/MacOS/wslcomms"
+                                                            ->  minos 11.0
+
+         So 10.13 is not a target here, it is a flag that becomes 11.0.
+       - Nothing this app asks of the OS is newer than that. VideoToolbox
+         dates to 10.8, CoreAudio and AudioToolbox older still, WKWebView to
+         10.10, and NSOpenGL — which is what glimagesink ends up on — older
+         again. The microphone TCC prompt in note 1 arrived in 10.14.
+         NSLocalNetworkUsageDescription below is a macOS 15 key, and a usage
+         description an older macOS does not recognise is ignored rather than
+         rejected, so it raises nothing.
+
+     WHAT IT IS NOT: a claim about the VENDORED GStreamer, and that distinction
+     is the entire point of this note. Homebrew builds its bottles for the
+     build machine's macOS major version, so on a Mac running macOS 26 every
+     vendored dylib carries LC_BUILD_VERSION minos 26.0 — MEASURED, all 45
+     staged dylibs and the three GStreamer tools beside them:
 
        otool -l Contents/Frameworks/libgstreamer-1.0.0.dylib | grep -A1 minos
          minos 26.0
 
-     — and dyld refuses to map them on anything older. The .app would install
-     happily on macOS 14 and then fail to launch with a dyld message no
-     operator can act on. build/bundle-gst-darwin.sh computes the real floor
-     across the whole staged payload and writes MINOS-FLOOR into the bundle
-     manifest; build/ship-darwin.sh refuses to ship when this key promises
-     support below it. Lowering the floor is a matter of building GStreamer
-     against an older SDK, not of editing this number.
+     That 26 is an accident of whichever Mac last ran the build. It moves the
+     day that machine is upgraded, and a number with that property must not be
+     a literal in a file that is checked in — it was one, and the effect was an
+     artefact that refused to install on every Mac below macOS 26 for a reason
+     no part of this product actually requires.
+
+     So it is measured per build instead of asserted here.
+     build/bundle-gst-darwin.sh step 4c computes the highest floor across the
+     whole staged payload and writes MINOS-FLOOR into the bundle manifest;
+     build/ship-darwin.sh stage 5 raises the SHIPPED bundle's
+     LSMinimumSystemVersion to that value before signing, and says so loudly
+     when it has to. The .app an operator receives therefore always states the
+     truth about itself — today that is 26.0 — while this file states the truth
+     about the product. Build the closure on a machine running the oldest macOS
+     this product intends to support and the shipped number falls to 11.0 with
+     no edit here.
 
   DELIBERATELY ABSENT, so that nobody adds them back "for completeness":
 
@@ -121,9 +159,13 @@
         <key>CFBundleIconFile</key>
         <string>iconfile</string>
 
-        <!-- 26.0, and it is measured rather than chosen. See note 3 above. -->
+        <!-- 11.0: the arm64 floor, which is also this binary's own minos and
+             is above every macOS API the app uses. It is the PRODUCT's floor.
+             The vendored GStreamer's floor is a per-build measurement and
+             ship-darwin.sh raises the shipped copy of this key to it — do not
+             hand-edit this number to match a particular build. Note 3. -->
         <key>LSMinimumSystemVersion</key>
-        <string>26.0</string>
+        <string>11.0</string>
         <key>LSApplicationCategoryType</key>
         <string>public.app-category.video</string>
 

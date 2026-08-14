@@ -100,6 +100,36 @@ import (
 // no numeric id among them.
 const propUniqueID = "unique-id"
 
+// bundleAllowlistNoun is the macOS word for one file in the bundled GStreamer,
+// used by Init's "the bundle is incomplete" error. See the Windows twin for why
+// this is a per-platform constant rather than one shared word: "DLL" is the term
+// every Windows build document uses and the phrase a Windows operator will
+// search for, and it is simply wrong here, because a .app contains none.
+//
+// "dylib" is the right word for both halves of the macOS bundle —
+// build/bundle-gst-darwin.sh stages Contents/Resources/gstreamer-1.0/*.dylib as
+// the plugins and Contents/Frameworks/*.dylib as their closure — and it is what
+// that script's own output calls them.
+const bundleAllowlistNoun = "dylib"
+
+// resetSkipDetail and skipDetail are the macOS half of the enumeration summary
+// line's platform tail. They do nothing, and that is the correct implementation
+// rather than a stub waiting to be filled in.
+//
+// The Windows twin counts wasapi2's loopback republications of playback
+// endpoints, because on that platform every render endpoint is republished as a
+// fake Audio/Source and the number of them that were filtered out is the most
+// useful figure in the line. CoreAudio has no such republication — see this
+// file's header — so there is nothing to count. Printing "0 loopbacks" here
+// would assert a filter that does not exist and quietly invite a future reader
+// to go looking for the macOS loopback rule, of which there is none.
+//
+// The generic part of the summary — offered, total, skipped — is shared and
+// already covers the only skip this platform has, which is a device publishing
+// no unique-id.
+func resetSkipDetail()   {}
+func skipDetail() string { return "" }
+
 // captureDeviceID reports whether one enumerated Audio/Source device should be
 // offered in the commentary input dropdown, and under what persistable id.
 //

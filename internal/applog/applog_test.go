@@ -22,23 +22,19 @@ func resetLogger(t *testing.T) {
 	})
 }
 
-// TestDefaultDirIsNotSomewhereTheSystemMayDelete is the whole reason DefaultDir
-// is a platform twin rather than one function with a fallback.
+// TestDefaultDirIsUsableAsALogDirectory holds the half of DefaultDir's contract
+// that is the same sentence on both platforms: an absolute path, with a
+// WSLComms component, that Prune can be pointed at.
 //
-// The Windows implementation resolves LOCALAPPDATA and falls back to
-// os.UserCacheDir, which on Windows is the same directory. On macOS
-// LOCALAPPDATA is always empty, so that fallback is not a fallback at all — it
-// is the answer, and it is ~/Library/Caches, which Apple documents as purgeable
-// and which the system may empty under disk pressure. The log file is the only
-// diagnosis a headless commentary position ever produces. Losing it
-// intermittently, on the machine that has been running hardest, is the exact
-// failure this package was written to prevent, wearing a different hat.
-//
-// The assertion is deliberately about what the path must NOT be. Pinning the
-// literal directory would be a change-detector; pinning "not a cache" is the
-// property that matters and the one somebody could plausibly undo while tidying
-// two similar-looking functions into one.
-func TestDefaultDirIsNotSomewhereTheSystemMayDelete(t *testing.T) {
+// The half that differs is asserted in the tagged twins beside this file,
+// because the two platforms disagree about which directory is the wrong answer
+// and a single test could only have stated one of them. applog_darwin_test.go
+// carries "not the user cache directory"; applog_windows_test.go carries
+// "under %LOCALAPPDATA%, ending in WSLComms\logs" — which on Windows IS the
+// user cache directory, os.UserCacheDir returning %LocalAppData% there. Asking
+// for "not a cache" on Windows fails by construction against a DefaultDir that
+// has never been anything but correct, so it is asked only where it is true.
+func TestDefaultDirIsUsableAsALogDirectory(t *testing.T) {
 	dir, err := DefaultDir()
 	if err != nil {
 		t.Fatalf("DefaultDir() error = %v", err)
@@ -53,18 +49,6 @@ func TestDefaultDirIsNotSomewhereTheSystemMayDelete(t *testing.T) {
 		t.Errorf("DefaultDir() = %q has no WSLComms component. On macOS the parent is "+
 			"~/Library/Logs, which is shared with every other application on the machine, and "+
 			"Prune walks whatever it is given", dir)
-	}
-
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		t.Skipf("no user cache directory on this machine to compare against: %v", err)
-	}
-	if rel, err := filepath.Rel(cache, dir); err == nil && !strings.HasPrefix(rel, "..") {
-		t.Errorf("DefaultDir() = %q is inside the user cache directory %q. On macOS that is "+
-			"~/Library/Caches, which the operating system is entitled to delete without "+
-			"warning; the log belongs in ~/Library/Logs. internal/gst's registryFile makes the "+
-			"opposite choice on purpose — a purged plugin registry costs one rescan, a purged "+
-			"log costs the only evidence there was", dir, cache)
 	}
 }
 

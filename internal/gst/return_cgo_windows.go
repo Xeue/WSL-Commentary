@@ -119,8 +119,31 @@ func returnRenderSpecs() []returnElementSpec {
 //     in this direction too: only a POSITIVE capture identification skips, and
 //     an unrecognised shape is offered, because refusing unknown shapes would
 //     empty the dropdown on a future id-shape change.
+//
+// Every rejection logs its reason, INCLUDING the provider rejection. That was
+// the one silent branch here for as long as it was silent in captureDeviceID,
+// and the two are fixed together on purpose: they are declared mirrors, so one
+// logging and one not would leave the two dropdowns disagreeing about what a
+// missing device means.
 func playbackDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
+	// The reasoning for logging this branch is captureDeviceID's, in
+	// deviceprovider_windows.go, and is not repeated in full: on the SHIPPED
+	// bundle it should fire nought times, because the DLL allowlist stages only
+	// wasapi2 and mediafoundation and the latter's provider enumerates
+	// Video/Source — so a machine where it DOES fire has picked up a foreign
+	// GStreamer, which is exactly what Init's GST_PLUGIN_SYSTEM_PATH sequence
+	// exists to prevent and which produces no other message anywhere.
+	//
+	// The one thing that differs on this side is the SYMPTOM the line has to
+	// explain. A capture device missing from the dropdown is at least visible
+	// against the machine's other microphones; the headphone dropdown going
+	// empty looks identical to "the return path is not built yet", and with no
+	// line at all there is nothing to read between that and a bundle fault.
 	if api := props.GetString("device.api"); api != "wasapi2" {
+		log.Printf("gst: ListOutputDevices: skipping %q: device.api is %q, not wasapi2 — its id "+
+			"would be meaningless to %s, which is the only element this build opens a playback "+
+			"endpoint with; device properties are %s",
+			dev.GetDisplayName(), api, returnSinkFactory, structureFieldNames(props))
 		return "", false
 	}
 	id := endpointID(dev, props)

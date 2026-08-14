@@ -667,12 +667,32 @@ func MixMatrixString(m [][]float32) string {
 // operator can diagnose from the log line below and fix in the dropdown; no
 // monitor is a commentary position working blind. So this falls back, loudly.
 //
-// # An enumeration that FAILS is not an enumeration that found nothing
+// # A PROBE THAT DID NOT RUN is not a probe that found nothing
 //
 // listErr non-nil means the device monitor could not be run at all. The
 // configured id is then passed through unchanged, because "we could not check"
 // must never be read as "it is not there" — that would take a perfectly good
 // headphone endpoint away from the operator over a transient failure to probe.
+//
+// An EMPTY list is the same fault wearing different clothes, and since the
+// macOS port it is the shape the fault actually takes. ListOutputDevices now
+// returns an error for exactly one reason — Init has not been called — because
+// the failure that used to produce one, gst_device_monitor_new returning nil,
+// is logged inside enumerateDevices and reported upwards as an empty slice with
+// no error at all. So the probe that failed hardest is the probe that says it
+// succeeded and found nothing, and reading that as "your headphones are gone"
+// is precisely the confusion the paragraph above exists to prevent. An empty
+// list therefore keeps the configured id too.
+//
+// Being wrong about that costs nothing. A machine that genuinely has no
+// playback device has no default to fall back TO, so the two answers arrive at
+// the same silence; and a stale id that does reach a sink is already handled
+// there — wasapi2sink ignores an endpoint id it does not recognise, and
+// configureReturnSinkLocked on macOS falls back to the default output device
+// with a log line when the UID will not resolve. Being wrong the other way
+// moves the commentator off their configured endpoint on the strength of a
+// probe that never ran, silently, which is the outcome this whole section
+// exists to forbid.
 func chooseOutputDevice(configured string, available []Device, listErr error) (id, why string) {
 	if configured == "" {
 		// Nothing configured. The caller says so itself, in the words of its own
@@ -685,6 +705,15 @@ func chooseOutputDevice(configured string, available []Device, listErr error) (i
 				"headphone endpoint %q (%v); using it anyway — a failure to probe must not cost the "+
 				"operator a device that is present",
 			configured, listErr)
+	}
+	if len(available) == 0 {
+		return configured, fmt.Sprintf(
+			"gst: return monitor: the playback device enumeration came back EMPTY while checking the "+
+				"configured headphone endpoint %q; using it anyway — a machine with a sound card has "+
+				"at least one playback device, so an empty list is a fault in the probe and not "+
+				"evidence that the endpoint has gone. Something is wrong with the device monitor or "+
+				"with the audio service; the log line from enumerateDevices above says which",
+			configured)
 	}
 	for _, dev := range available {
 		if dev.ID == configured {
@@ -731,6 +760,12 @@ func chooseOutputDevice(configured string, available []Device, listErr error) (i
 // It renders both because either alone is useless in the situation this is
 // printed in. A name cannot be matched against the file, and an id cannot be
 // matched against the dropdown the operator is looking at.
+//
+// The empty case is defensive rather than reachable from chooseOutputDevice,
+// which now answers an empty enumeration before it gets this far — see the
+// probe-that-did-not-run section there. It is kept because this renders a list
+// for a log line and a renderer that produces "On offer: " with nothing after
+// it reads as a truncated log rather than as a fact.
 func describeDevices(devices []Device) string {
 	if len(devices) == 0 {
 		return "nothing at all — this machine is reporting no playback devices, which is itself " +
@@ -753,7 +788,19 @@ func describeDevices(devices []Device) string {
 //
 // ListOutputDevices is supplied by whichever twin is compiled, so at Gate A this
 // vets against the stub list and at Gate B against the real device monitor.
+//
+// Nothing configured is answered without probing. chooseOutputDevice gives the
+// same answer for the empty string and keeps its own copy of the rule — it is
+// pure, and its callers are its tests — but getting the answer from it would
+// cost a whole GstDeviceMonitor run first: providers opened, every playback
+// device on the machine enumerated, the monitor torn down again. buildLocked
+// calls this once per attempt, and the reconnect machine attempts for ever, so
+// on a machine left on the default playback device that is an unbounded series
+// of probes to be told what the empty string already says.
 func vetOutputDeviceID(configured string) string {
+	if configured == "" {
+		return ""
+	}
 	devices, err := ListOutputDevices()
 	id, why := chooseOutputDevice(configured, devices, err)
 	if why != "" {

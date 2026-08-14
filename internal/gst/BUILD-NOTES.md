@@ -1078,13 +1078,22 @@ binary run from that shell fails to load `libgstwasapi2.dll`:
 ```
 GStreamer-WARNING **: Failed to load plugin '...\libgstwasapi2.dll':
     The specified procedure could not be found.
-gst: ListInputDevices: gst_device_monitor_start failed; falling back to a one-shot probe
+gst: enumerateDevices(Audio/Source): gst_device_monitor_start failed; falling back to a one-shot probe
 ```
 
 and `ListInputDevices` returns **zero** devices — which reads exactly like a broken bundle and is
 not one. Reversing it breaks the toolchain instead: with GStreamer's `bin` first, `ld` exits 57
 linking anything with cgo. **The two directories are mutually incompatible and each must lead only
 for its own job.** Build with MSYS2 first; run with GStreamer first.
+
+Match on `enumerateDevices`, not on the `ListInputDevices:` prefix that line used to carry, and do
+not ask for the old prefix back — it would make the log **worse**. The probe is one shared function
+now: `ListInputDevices` calls it with `Audio/Source`, `ListOutputDevices` with `Audio/Sink`, and
+darwin's `resolveCaptureDeviceIndex` calls it as well. A `ListInputDevices:` prefix stamped on a
+Sink probe would blame the capture list for a return-monitor failure — the wrong half of the
+application, at the moment someone is reading the log to find out which half broke. The device
+class in the parentheses is what carries that now, so read it: this symptom is the `Audio/Source`
+one, and the same line with `Audio/Sink` is a different fault.
 
 Reproduced outside Go, so it is not a Go or cgo effect: `gst-inspect-1.0 wasapi2src` fails with
 MSYS2 first on `PATH` and succeeds with it last or absent — but only when the executable is run
