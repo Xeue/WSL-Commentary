@@ -556,6 +556,40 @@ export async function listEvents() {
   return fakeEvents.map((e) => ({ ...e }));
 }
 
+// App.CredentialStoreName: what THIS platform's credential vault is called, so
+// a dialog can name it instead of guessing. See the bound method's own comment
+// in app.go for why the answer is resolved in Go rather than switched on in
+// JavaScript.
+
+/** CredentialStoreName's bound method name. One place, so a rename is one edit. */
+const CREDENTIAL_STORE_NAME_METHOD = 'CredentialStoreName';
+
+/**
+ * The name of the OS credential store, for use inside a sentence: it is always
+ * the object of a preposition ("delete the stored passwords from %s"), so the
+ * whole phrase comes back article and all, and the two platforms differ —
+ * "Windows Credential Manager" takes none, "the macOS login Keychain" does.
+ *
+ * Never throws and never returns empty. A build without the binding is an older
+ * one, which by definition is Windows-only, so the Windows phrase is the right
+ * fallback rather than a blank that would leave a dangling "from ." in the
+ * dialog. A `npm run dev` session gets the same string, since the fake backend
+ * has no platform of its own.
+ *
+ * @returns {Promise<string>}
+ */
+export async function credentialStoreName() {
+  if (hasWails()) {
+    try {
+      const got = await callGoBound(CREDENTIAL_STORE_NAME_METHOD);
+      if (typeof got === 'string' && got.trim() !== '') return got;
+    } catch {
+      // BindingMissingError, or anything else: fall through to the default.
+    }
+  }
+  return 'Windows Credential Manager';
+}
+
 // subscribe wires cb to event, using the real Wails runtime's EventsOn/
 // EventsOff when present and the fake bus otherwise. It returns an
 // unsubscribe function either way.

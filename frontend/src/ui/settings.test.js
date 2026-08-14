@@ -884,6 +884,151 @@ test('the Remote access group renders the bound-port status and nothing to confi
   assert.match(js, /s\.httpsURL \|\| \(s\.httpsPort/);
 });
 
+// ---------------------------------------------------------------------------
+// The M2L-X address field
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT THESE PIN, found by running the macOS build. The address box ran
+// its contents through parseLiveOperationURL, which REQUIRES a
+// /live-operation/<event id> segment. Pasting the instance's own address —
+//
+//     https://m2lx-wslstudios-matcht.etapsiota.com
+//
+// — was therefore refused with an error and did not even fill the host in, so
+// the operator was still made to go and find a full live-operation URL for an
+// id the application can now ask for itself (GET /api/events/overview, via
+// internal/m2lx/events.go and App.ListEvents).
+//
+// The parsing itself is pure and is driven for real in liveurl.test.js. What is
+// asserted HERE is the FORM's half: that the field is wired to the parser that
+// takes both forms, that a bare address does not throw away an event id that is
+// already known, and that the event listing is actually asked for on that path
+// — a picker that never populates would leave the operator exactly where the
+// refused paste left them.
+
+test('the address field is wired to the parser that takes BOTH forms', () => {
+  const js = ui('settings.js');
+  assert.match(js, /import \{ parseM2LXAddress, formatM2LXAddress \} from '\.\/liveurl\.js'/);
+  assert.match(js, /const parsed = parseM2LXAddress\(raw\)/, 'the field must parse with parseM2LXAddress');
+  assert.equal(
+    /parseLiveOperationURL/.test(js),
+    false,
+    'the address field is back on the strict parser, which refuses the instance address outright',
+  );
+});
+
+test('the address field no longer asks for the live-operation page', () => {
+  // The label and the placeholder are the only instructions on this row. A
+  // placeholder showing "/live-operation/…" tells the operator to go and find
+  // one even though the box no longer needs it.
+  const js = ui('settings.js');
+  const field = js.slice(js.indexOf('const liveURLInput = textInput'), js.indexOf('function addHiddenField'));
+  assert.ok(field.length > 0, 'settings.js must still build the address row');
+  assert.equal(
+    /placeholder = '[^']*live-operation/.test(field),
+    false,
+    'the placeholder still shows a live-operation URL as the shape to type',
+  );
+  assert.match(field, /instance address is enough/, 'the hint must say the instance address suffices');
+  assert.match(
+    field,
+    /full live-operation URL is also accepted/,
+    'and that the pasted URL still works — it is the only source of an id before sign-in',
+  );
+});
+
+test('a bare address sets the host and does not clear a known event id', () => {
+  // The stored id is the fallback for every case the instance cannot be
+  // enumerated (not signed in, unreachable, an older build). Blanking it on a
+  // keystroke would throw away the one value that works offline.
+  const js = ui('settings.js');
+  const apply = js.slice(js.indexOf('function applyLiveURL()'), js.indexOf('// \'input\' rather than \'change\''));
+  assert.ok(apply.length > 0, 'settings.js must still have applyLiveURL');
+  assert.match(apply, /fields\.m2lxHost\.input\.value = parsed\.host/);
+  assert.match(
+    apply,
+    /if \(parsed\.eventId !== ''\) fields\.eventId\.input\.value = parsed\.eventId/,
+    'the event id must only be written when the address actually carried one',
+  );
+});
+
+test('populate puts the host back in the box even when no event is chosen', () => {
+  // formatLiveOperationURL returns '' unless BOTH halves are known, so a config
+  // with a host and no event drew an empty address box: the screen reporting no
+  // instance while the application was signed in to one.
+  const js = ui('settings.js');
+  assert.match(js, /liveURLInput\.value = formatM2LXAddress\(config\.m2lxHost, config\.eventId\)/);
+});
+
+test('the event listing is asked for on the address path and after a save', () => {
+  const js = ui('settings.js');
+  const apply = js.slice(js.indexOf('function applyLiveURL()'), js.indexOf('// \'input\' rather than \'change\''));
+  assert.match(
+    apply,
+    /scheduleEventRefresh\(parsed\.host\)/,
+    'entering a bare address must lead to a listing, or the picker never populates',
+  );
+  // Debounced, because applyLiveURL runs on every keystroke.
+  assert.match(js, /ADDRESS_SETTLE_MS/, 'the listing must wait for the address to settle');
+  assert.match(js, /setTimeout\(\(\) => \{\s*addressSettleTimer = null;/);
+
+  // And after a save, which for a NEW instance is the first moment a listing can
+  // succeed at all: the client is rebuilt from the saved config and signs in.
+  assert.match(js, /if \(saved\) void refreshEventsAfterSave\(hostChanged\)/);
+  assert.match(js, /await refreshEvents\(\);/, 'open() must still list on entry');
+});
+
+test('events are only listed for the instance the app is actually signed in to', () => {
+  // THE TRAP THIS CLOSES. backend.listEvents() takes no host — App.ListEvents
+  // uses the client the control plane built from the SAVED configuration — so
+  // listing while a different address is being typed would answer with the
+  // PREVIOUS instance's events, and the auto-select rule would then write
+  // another instance's event id into this form.
+  const js = ui('settings.js');
+  assert.match(
+    js,
+    /if \(host === '' \|\| host !== savedM2LXHost \|\| host === listedHost\) return;/,
+    'the listing must be gated on the address matching the saved host',
+  );
+  assert.match(
+    js,
+    /Press Save settings to sign in to this instance/,
+    'and when it does not match, the operator must be told what to do about it',
+  );
+
+  // The Go side of the same fact: a host-taking ListEvents would make the gate
+  // unnecessary, and leaving the gate in place would then be a bug of its own.
+  const go = read(repoRoot, 'app.go');
+  assert.match(
+    go,
+    /func \(a \*App\) ListEvents\(\) \(\[\]m2lx\.Event, error\)/,
+    'App.ListEvents has grown a parameter; the Settings screen gates on the saved host because it has none',
+  );
+  assert.match(ui('backend.js'), /export async function listEvents\(\) \{/);
+});
+
+test('liveurl.js no longer claims the events cannot be listed', () => {
+  // The header used to state, at length, that no endpoint listed events and
+  // that the pasted URL was therefore the ONLY source of an id. That is the
+  // belief the defect was built on, internal/m2lx/events.go disproves it, and a
+  // comment asserting it would send the next reader back round the same loop.
+  const js = ui('liveurl.js');
+  assert.equal(
+    /there is no event-list endpoint|NO endpoint that lists it/.test(js),
+    false,
+    'liveurl.js still says no endpoint lists events; internal/m2lx/events.go calls one',
+  );
+  assert.match(js, /\/api\/events\/overview/, 'and it should name the endpoint that does');
+  assert.match(
+    read(repoRoot, 'internal', 'm2lx', 'events.go'),
+    /eventsOverviewPath = "\/api\/events\/overview"/,
+    'the endpoint liveurl.js names must be the one Go calls',
+  );
+  // The historical note stays: the paste path is still supported and still the
+  // only source of an id before a successful sign-in.
+  assert.match(js, /live-operation/, 'the strict form must still be documented');
+});
+
 test('the Remote access group has no listener-configuring controls', () => {
   // No toggle, no bind box, no port box, no Apply — the group is a readout. A
   // control here would be editable sprawl the owner asked to keep out.

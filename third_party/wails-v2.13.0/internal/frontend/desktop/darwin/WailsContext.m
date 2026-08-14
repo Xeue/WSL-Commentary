@@ -538,6 +538,248 @@ extern void didReceiveNotificationResponse(const char *jsonPayload, const char* 
 }
 #endif
 
+// WSLCOMMS PATCH — WKUIDelegate's three JavaScript panels: alert, confirm and
+// prompt. The second of the two reasons this vendored copy of Wails exists; see
+// third_party/README.md for the upstream text, the diff and how to re-apply it.
+//
+// THE BUG THIS REMOVES. On macOS, every preset operation on the Settings page
+// silently did nothing: Apply, "Save current as...", Rename, Delete, and
+// Delete's second "also remove the stored passwords" question all appeared to
+// work and no-op'd. The preset dropdown on the HOME screen applied instantly and
+// correctly, and that contrast is the entire diagnosis: the five broken
+// operations are the five that sit behind a window.confirm() or a
+// window.prompt() (frontend/src/ui/settings.js, lines 347, 366, 382, 396 and
+// 404) and the home dropdown is the one control that asks the operator nothing.
+//
+// WKWebView does not draw those panels itself — it has no built-in UI for them
+// at all. It routes alert/confirm/prompt to its WKUIDelegate, and when the
+// delegate does not implement the matching method WebKit shows NOTHING and hands
+// the page the CANCELLED answer: confirm() returns false, prompt() returns null.
+// So `if (!window.confirm(text)) return;` returned immediately, every time, with
+// no dialog, no exception, no console output and nothing in the log to find.
+// Upstream v2.13.0 declares WKUIDelegate on this class (WailsContext.h:34) and
+// implements exactly one of the protocol's methods, runOpenPanelWithParameters,
+// so all three panels were missing.
+//
+// WINDOWS IS UNAFFECTED, and that is not an assumption: this is a darwin-only
+// source file that the WebView2 path never compiles, and WebView2 is Chromium,
+// which draws these three dialogs natively. The on-air Windows build is
+// bit-for-bit what it was.
+//
+// SHEET-MODAL, NOT APP-MODAL, and this is the decision that could hang the
+// application if it went the other way. -[NSAlert runModal] does not return
+// until the operator answers; it spins a modal run loop in
+// NSModalPanelRunLoopMode, and the main DISPATCH queue is serviced from the
+// common modes, so main-queue blocks can sit unserviced for the whole life of
+// the dialog. internal/gst/overlay_darwin.go — the picture surface, an NSView
+// that is a SIBLING of this WKWebView inside the same contentView — does all of
+// its AppKit work by dispatch_async to the main queue, and does one dispatch_sync
+// at construction. An app-modal alert therefore stalls the picture's geometry
+// and can block a Go caller outright until somebody clicks a button that is not
+// visibly attached to anything. beginSheetModalForWindow:completionHandler:
+// returns immediately, keeps the ordinary run loop turning, and puts the sheet
+// on the window the operator is already looking at.
+//
+// THE COMPLETION HANDLER MUST BE CALLED EXACTLY ONCE ON EVERY PATH. This is not
+// tidiness: WKWebView raises an Objective-C exception if one of these handlers
+// is never invoked or is invoked twice — an uncaught ObjC exception in the
+// AppKit event loop, i.e. a crash of a live commentary position, not a warning.
+// Never-called is the worse of the two because it also parks the page's
+// JavaScript thread for ever. Every method below therefore funnels every exit
+// through one `respond` block that latches a flag, and the one path that is easy
+// to forget — webView.window being nil, which happens if the window is torn down
+// between the page asking and us answering — answers with the cancelled value
+// rather than returning silently.
+//
+// MAIN THREAD, WITHOUT A REDUNDANT DISPATCH. WKWebView delivers WKUIDelegate
+// callbacks on the main thread; it has to, because every documented
+// implementation of them is AppKit UI, and the sibling method above
+// (runOpenPanelWithParameters, upstream) already relies on it by touching
+// NSOpenPanel directly. Measured rather than assumed: a WKWebView harness
+// wrapping these exact methods logged isMainThread=1 on every one of five
+// panels. So the AppKit calls below are made directly. If a future WebKit ever
+// changes that, the fix is dispatch_ASYNC to the main queue guarded by
+// [NSThread isMainThread] — never dispatch_sync, which deadlocks instantly when
+// the queue you are waiting on is the one you are running on.
+//
+// NO SECURITY ORIGIN IN THE TEXT. Chromium shows "example.com says" only for
+// content that is not the app's own; for a same-origin page it shows the bare
+// message, and this application is entirely same-origin (its own wails:// asset
+// handler, no iframes, no remote content). Prefixing the operator's "Apply the
+// instance ...?" with an origin they have never heard of would be noise in the
+// middle of a match, so `frame.securityOrigin` is deliberately unused.
+
+// wslcommsPanelAlertWithMessage builds the NSAlert shared by all three panels.
+//
+// The split is what makes these dialogs readable. JavaScript hands over one
+// string; NSAlert has two slots, a bold heading and a smaller body, and the
+// Apply confirmation is 300-odd characters of "Apply the instance "X"?" followed
+// by a blank line and a field-by-field diff. Putting all of that in messageText
+// renders the entire diff in bold heading type; putting all of it in
+// informativeText leaves the alert with no heading at all. So the first line
+// becomes the heading and the remainder the body — which is exactly how these
+// messages are already written in settings.js, and degrades correctly for the
+// single-line ones (heading only, no body).
+//
+// Returns an AUTORELEASED alert, per the Cocoa naming rules this file is
+// compiled under: the cgo build has no -fobjc-arc, so ownership here is manual
+// and only a method beginning alloc/new/copy may return +1. Nothing in the
+// callers retains it either, which is worth stating because it looks like a bug
+// and is not: AppKit owns an alert for as long as its sheet is attached.
+// Verified, because getting it wrong would close the sheet under the operator
+// and hand the page an answer it never gave — a harness that raised a sheet and
+// then deliberately never clicked it still had that sheet standing, unanswered,
+// twenty seconds later.
+- (NSAlert *)wslcommsPanelAlertWithMessage:(NSString *)message {
+    NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+    [alert setAlertStyle:NSAlertStyleInformational];
+
+    NSString *heading = message != nil ? message : @"";
+    NSString *body = @"";
+    NSRange firstBreak = [heading rangeOfString:@"\n"];
+    if (firstBreak.location != NSNotFound) {
+        body = [[heading substringFromIndex:firstBreak.location]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        heading = [heading substringToIndex:firstBreak.location];
+    }
+
+    [alert setMessageText:heading];
+    if ([body length] > 0) {
+        [alert setInformativeText:body];
+    }
+    return alert;
+}
+
+- (void)webView:(WKWebView *)webView runJavaScriptAlertPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(void))completionHandler {
+
+    // One exit funnel, latched. See the note above: twice is an exception,
+    // never is a hung page.
+    __block BOOL answered = NO;
+    void (^respond)(void) = ^{
+        if (answered) {
+            return;
+        }
+        answered = YES;
+        completionHandler();
+    };
+
+    NSAlert *alert = [self wslcommsPanelAlertWithMessage:message];
+    // A single button, because alert() has a single outcome. It is added first,
+    // so it is both the rightmost and the default: Return dismisses.
+    [alert addButtonWithTitle:@"OK"];
+
+    NSWindow *host = webView.window;
+    if (host == nil) {
+        // No window to hang a sheet on — the WebView is being torn down. The
+        // page still has to be released, and for alert() there is nothing to
+        // report but "you have been dismissed".
+        respond();
+        return;
+    }
+
+    [alert beginSheetModalForWindow:host completionHandler:^(NSModalResponse response) {
+        respond();
+    }];
+}
+
+- (void)webView:(WKWebView *)webView runJavaScriptConfirmPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(BOOL result))completionHandler {
+
+    __block BOOL answered = NO;
+    void (^respond)(BOOL) = ^(BOOL result) {
+        if (answered) {
+            return;
+        }
+        answered = YES;
+        completionHandler(result);
+    };
+
+    NSAlert *alert = [self wslcommsPanelAlertWithMessage:message];
+    // Order is the API: the first button added is rightmost and default. Read
+    // back off the live sheet in the harness — OK's key equivalent is Return and
+    // Cancel's is Escape, the latter assigned by AppKit purely because the button
+    // is titled "Cancel". Escape is what somebody dismisses a dialog with mid-
+    // match without reading it, and it must be the harmless answer.
+    [alert addButtonWithTitle:@"OK"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSWindow *host = webView.window;
+    if (host == nil) {
+        // NO is the safe answer as well as the honest one: every confirm() in
+        // this application gates a destructive or disruptive action (apply a
+        // preset mid-match, delete a preset, delete stored passwords), so a
+        // dialog nobody can see must read as "do not".
+        respond(NO);
+        return;
+    }
+
+    [alert beginSheetModalForWindow:host completionHandler:^(NSModalResponse response) {
+        respond(response == NSAlertFirstButtonReturn);
+    }];
+}
+
+- (void)webView:(WKWebView *)webView runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+    defaultText:(NSString *)defaultText initiatedByFrame:(WKFrameInfo *)frame
+    completionHandler:(void (^)(NSString *result))completionHandler {
+
+    // nil, not @"", is the cancelled answer: WebKit maps a nil result to
+    // JavaScript null, and settings.js tests `if (!name || !name.trim())`, so an
+    // empty string would be read as "cancelled" too — but only nil is what
+    // window.prompt is specified to return, and only nil is what Chromium hands
+    // the Windows build.
+    __block BOOL answered = NO;
+    void (^respond)(NSString *) = ^(NSString *result) {
+        if (answered) {
+            return;
+        }
+        answered = YES;
+        completionHandler(result);
+    };
+
+    NSAlert *alert = [self wslcommsPanelAlertWithMessage:prompt];
+    [alert addButtonWithTitle:@"OK"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    // NSAlert has no text field of its own; an accessory view is the only way to
+    // get one, and the alert grows to fit it. 320pt is wide enough for the
+    // longest thing this application asks for, an M2L-X instance name.
+    NSTextField *input = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 320, 24)] autorelease];
+    [input setStringValue:defaultText != nil ? defaultText : @""];
+    [alert setAccessoryView:input];
+
+    // The caret has to start in the box, or the first thing the operator types
+    // goes nowhere and the panel looks broken. setInitialFirstResponder: is the
+    // documented way to ask for that and IS NOT ENOUGH ON ITS OWN — measured in
+    // the harness: with only this line the sheet opened with the alert panel
+    // itself as firstResponder and the field unfocused, because NSAlert sets up
+    // its own responder chain when it lays the sheet out. It is kept because it
+    // is what the keyboard loop uses when focus comes back round; the
+    // makeFirstResponder below, AFTER the sheet has been begun, is what actually
+    // puts the caret in the field. Making the field first responder also selects
+    // its whole contents, which is what Chromium does and what Rename — the one
+    // call site that passes a defaultText — wants: type to replace, click to
+    // edit in place.
+    [[alert window] setInitialFirstResponder:input];
+
+    NSWindow *host = webView.window;
+    if (host == nil) {
+        respond(nil);
+        return;
+    }
+
+    [alert beginSheetModalForWindow:host completionHandler:^(NSModalResponse response) {
+        // stringValue is read HERE, when the sheet closes, and not before: read
+        // at presentation time it would return the seeded default rather than
+        // what the operator typed. The field is guaranteed to still be alive —
+        // copying this block onto the heap retained everything it captures,
+        // including input, which is why it does not matter that the local
+        // reference above was autoreleased.
+        respond(response == NSAlertFirstButtonReturn ? [input stringValue] : nil);
+    }];
+    [[alert window] makeFirstResponder:input];
+}
+
 - (void)webView:(nonnull WKWebView *)webView startURLSchemeTask:(nonnull id<WKURLSchemeTask>)urlSchemeTask {
     // This callback is run with an autorelease pool
     processURLRequest(self, urlSchemeTask);

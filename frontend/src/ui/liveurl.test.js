@@ -12,7 +12,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseLiveOperationURL, formatLiveOperationURL, bareHost } from './liveurl.js';
+import {
+  parseLiveOperationURL,
+  parseM2LXAddress,
+  formatLiveOperationURL,
+  formatM2LXAddress,
+  bareHost,
+} from './liveurl.js';
 
 const HOST = 'm2lx-wslstudios-matcht.etapsiota.com';
 const EVENT = 'dl9-5p5ah0bd-empd';
@@ -136,6 +142,184 @@ test('rejects empty and non-string input', () => {
     assert.equal(typeof got.error, 'string');
     assert.notEqual(got.error, '');
   }
+});
+
+// ---------------------------------------------------------------------------
+// parseM2LXAddress: the field the operator actually types into
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT THESE PIN. The address field ran everything through
+// parseLiveOperationURL, which REQUIRES a /live-operation/<id> segment, so
+// pasting the instance's own address — the obvious thing to type, and the thing
+// the app itself can turn into an event id through /api/events/overview — was
+// refused with an error and the host was never filled in. The operator was
+// still forced to go and find a full live-operation URL for an id the app can
+// now ask for.
+//
+// Both forms must therefore work, and the full-URL form must keep working
+// EXACTLY as it did: it is the only source of an event id before sign-in
+// succeeds, and it is what is written down in operators' notes.
+
+test('accepts the bare instance address, leaving the event to the API', () => {
+  assert.deepEqual(parseM2LXAddress(`https://${HOST}`), { ok: true, host: HOST, eventId: '' });
+});
+
+test('accepts the bare address in every shape a paste arrives in', () => {
+  for (const input of [
+    HOST, // no scheme at all
+    `http://${HOST}`, // http, as the strict parser also allows
+    `https://${HOST}/`, // trailing slash
+    `HTTPS://${HOST}`, // the scheme is matched case-insensitively
+    `  https://${HOST}  \n`, // a paste's whitespace
+    `https://${HOST}?tab=audio#mix`, // query and fragment, both meaningless here
+    `https://user:pass@${HOST}/`, // credentials, which are not part of the host
+  ]) {
+    assert.deepEqual(
+      parseM2LXAddress(input),
+      { ok: true, host: HOST, eventId: '' },
+      `${JSON.stringify(input)} must be accepted as the instance address`,
+    );
+  }
+});
+
+test('keeps a port on the bare address, because the port is part of the host', () => {
+  // internal/config.EffectiveSRTHost reduces this to the bare host for SRT, but
+  // the API client dials exactly what is stored — dropping :8443 here would send
+  // the sign-in to port 443 of an instance that is not there.
+  assert.deepEqual(parseM2LXAddress(`https://${HOST}:8443/`), {
+    ok: true,
+    host: `${HOST}:8443`,
+    eventId: '',
+  });
+  assert.deepEqual(parseM2LXAddress('[2001:db8::1]:8443'), {
+    ok: true,
+    host: '[2001:db8::1]:8443',
+    eventId: '',
+  });
+});
+
+test('accepts an IP address and localhost, which are hosts an engineer does use', () => {
+  for (const host of ['192.168.1.50', '192.168.1.50:8443', 'localhost', 'localhost:8443', '[2001:db8::1]']) {
+    const got = parseM2LXAddress(`https://${host}`);
+    assert.equal(got.ok, true, `${host} must be accepted`);
+    assert.equal(got.host, host);
+  }
+});
+
+test('the full live-operation URL still fills BOTH fields, exactly as before', () => {
+  // Muscle memory, and the URLs already written down in notes. This is also the
+  // fallback the whole feature degrades to when the instance cannot be listed,
+  // so it must not become a second-class path.
+  for (const input of [FULL, `${FULL}/`, `${HOST}/live-operation/${EVENT}`, `${FULL}/audio/mixer`]) {
+    assert.deepEqual(
+      parseM2LXAddress(input),
+      { ok: true, host: HOST, eventId: EVENT },
+      `${input} must still yield both halves`,
+    );
+  }
+  // And it agrees with the strict parser wherever the strict parser accepts.
+  assert.deepEqual(parseM2LXAddress(FULL), parseLiveOperationURL(FULL));
+});
+
+test('a live-operation URL truncated before the id is taken as the instance address', () => {
+  // The host is still unambiguous and the id it lost is precisely the one the
+  // events API supplies. Refusing it would be the old dead end by another route.
+  for (const input of [`https://${HOST}/live-operation`, `https://${HOST}/live-operation/`]) {
+    assert.deepEqual(parseM2LXAddress(input), { ok: true, host: HOST, eventId: '' }, input);
+  }
+});
+
+test('rejects a scheme this app cannot speak, by name', () => {
+  for (const input of [`ftp://${HOST}`, `file://${HOST}/live-operation/${EVENT}`]) {
+    const got = parseM2LXAddress(input);
+    assert.equal(got.ok, false, `${input} was accepted`);
+    assert.match(got.error, /ftp|file/);
+  }
+});
+
+test('rejects empty and non-string input with a reason', () => {
+  for (const input of ['', '   ', null, undefined, 42, {}]) {
+    const got = parseM2LXAddress(input);
+    assert.equal(got.ok, false, `${JSON.stringify(input)} was accepted`);
+    assert.equal(typeof got.error, 'string');
+    assert.notEqual(got.error, '');
+  }
+});
+
+test('rejects an address with no host in it', () => {
+  const got = parseM2LXAddress('https:///live-operation/x');
+  assert.equal(got.ok, false);
+  assert.match(got.error, /host/);
+});
+
+test('does not let a bare word through as a hostname', () => {
+  // THE POINT OF THE HOST CHECK. Nothing downstream examines this string again:
+  // it is saved as m2lxHost, dialled by the API client and reduced to the SRT
+  // target. A typo accepted here comes back as a DNS failure inside a reconnect
+  // ladder that does not name the field that caused it.
+  for (const input of ['m2lx', 'wslstudios', 'the m2lx box', 'not a url at all']) {
+    const got = parseM2LXAddress(input);
+    assert.equal(got.ok, false, `${JSON.stringify(input)} was accepted as a host`);
+    assert.equal(typeof got.error, 'string');
+    assert.notEqual(got.error, '');
+  }
+  // And it says WHICH word, so the operator can see what was read.
+  assert.match(parseM2LXAddress('m2lx').error, /m2lx/);
+});
+
+test('rejects malformed hosts and ports rather than storing them', () => {
+  const cases = [
+    `${HOST}:`, // a colon with no port
+    `${HOST}:https`, // the scheme typed as the port
+    `${HOST}:0`, // out of range, both ends
+    `${HOST}:70000`,
+    `${HOST}..com`, // an empty label
+    `-${HOST}`, // a label may not start with a hyphen
+    `${HOST}-`,
+    '2001:db8::1', // IPv6 must be bracketed, or its last group looks like a port
+    '[2001:db8::1', // no closing bracket
+    '[not:an:address!]',
+  ];
+  for (const input of cases) {
+    const got = parseM2LXAddress(input);
+    assert.equal(got.ok, false, `${JSON.stringify(input)} was accepted as a host`);
+  }
+});
+
+test('a full live-operation URL is NOT held to the host check', () => {
+  // parseLiveOperationURL never checked the host, it ships on air on Windows,
+  // and the /live-operation/ segment is itself the evidence that a real address
+  // was pasted. A proxy on a single-label internal name must keep working.
+  assert.deepEqual(parseM2LXAddress(`https://m2lx/live-operation/${EVENT}`), {
+    ok: true,
+    host: 'm2lx',
+    eventId: EVENT,
+  });
+});
+
+test('formatM2LXAddress round-trips both forms back through the parser', () => {
+  // populate() writes this back into the field, and the field is parsed again on
+  // the next keystroke: a shape that does not survive the round trip is a
+  // Settings screen that reports an error against a value nobody typed.
+  assert.equal(formatM2LXAddress(HOST, EVENT), FULL);
+  assert.deepEqual(parseM2LXAddress(formatM2LXAddress(HOST, EVENT)), {
+    ok: true,
+    host: HOST,
+    eventId: EVENT,
+  });
+
+  // The half that formatLiveOperationURL could not express: a configured host
+  // with no event yet used to draw an EMPTY address box, which reads as "no
+  // instance set" while the app is talking to one.
+  assert.equal(formatM2LXAddress(HOST, ''), `https://${HOST}`);
+  assert.deepEqual(parseM2LXAddress(formatM2LXAddress(HOST, '')), {
+    ok: true,
+    host: HOST,
+    eventId: '',
+  });
+  assert.equal(formatM2LXAddress(`https://${HOST}/`, undefined), `https://${HOST}`);
+  assert.equal(formatM2LXAddress('', EVENT), '', 'with no host there is nothing to show');
+  assert.equal(formatM2LXAddress(undefined, undefined), '');
 });
 
 test('formatLiveOperationURL round-trips with the parser', () => {

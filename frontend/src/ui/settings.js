@@ -1,6 +1,10 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
-import { parseLiveOperationURL, formatLiveOperationURL } from './liveurl.js';
+// The address field's parser and its formatter. parseM2LXAddress takes EITHER
+// the instance's base URL (the event id then comes from the events API) or a
+// full live-operation URL (which still fills both); formatM2LXAddress is what
+// populate puts back, and shows the host on its own when no event is chosen.
+import { parseM2LXAddress, formatM2LXAddress } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
 // The instance-preset model: the diff for the confirm dialog and the whitelist
@@ -401,8 +405,13 @@ export function createSettingsView(handlers) {
     // machine's original passwords and Go refuses to delete them from here.
     let alsoCredentials = false;
     if (preset.credentialScope) {
+      // The store is NAMED by Go, not written in here: this same dialog runs on
+      // Windows and on macOS, and naming the wrong one sends the operator to a
+      // control panel their machine does not have. backend.credentialStoreName
+      // never throws and never returns empty, so it needs no guard.
+      const storeName = await backend.credentialStoreName();
       alsoCredentials = window.confirm(
-        `Also delete the stored passwords for "${preset.name}" from Windows Credential Manager? ` +
+        `Also delete the stored passwords for "${preset.name}" from ${storeName}? ` +
           'Choose Cancel to keep them (they are reused if you re-create the preset with the same name).',
       );
     }
@@ -435,23 +444,33 @@ export function createSettingsView(handlers) {
   // THREE BOXES: address, username, password — at the operator's request.
   //
   // The host and the event ID used to be two more editable fields under this
-  // one, and they were waffle in field form: both are read out of the pasted
-  // live-operation address, an instance only ever has the one event, and the
-  // API has NO way to list events — probed again on 2026-08-12 against the
-  // live instance (/api/live_operation/events and friends all 404) and
-  // confirmed by reading the SPA bundle, whose only real endpoints are
-  // sign-in, refresh, the two KVS calls and the two websockets. So the URL is
-  // not merely the convenient source of the event id; it is the ONLY source,
-  // and a picker for "multiple events" has nothing to ask. The two derived
-  // values still exist as config fields and still travel in presets — they
-  // are kept as HIDDEN inputs (never appended to the DOM) so populate,
-  // collectConfig, validation and the preset diff all work unchanged, and the
+  // one, and they were waffle in field form: both are read out of the address
+  // typed here. They still exist as config fields and still travel in presets,
+  // so they are kept as HIDDEN inputs (never appended to the DOM) — populate,
+  // collectConfig, validation and the preset diff all work unchanged — and the
   // derived line under the address shows the operator what was read.
+  //
+  // THE ADDRESS IS THE INSTANCE, NOT THE PAGE. This box used to demand a full
+  // /live-operation/<event id> URL, on the strength of a probe that concluded
+  // no endpoint listed events. That was wrong (see liveurl.js's header and
+  // internal/m2lx/events.go), and the operator ran into the consequence:
+  // pasting the instance's own address was refused with an error, so they were
+  // still made to go and find a live-operation URL for an id the app can ask
+  // for itself. Both forms are accepted now — a bare address leaves the event
+  // to the picker below, a full URL fills both fields as it always did, which
+  // matters because the pasted id is the only source there is before sign-in
+  // succeeds.
   const liveURLInput = textInput('f-liveUrl');
-  liveURLInput.placeholder = 'https://m2lx-…/live-operation/…';
+  liveURLInput.placeholder = 'https://m2lx-wslstudios-matcht.etapsiota.com';
   liveURLInput.autocomplete = 'off';
   liveURLInput.spellcheck = false;
-  const liveURLRow = row('M2L-X address', 'f-liveUrl', liveURLInput);
+  const liveURLRow = row(
+    'M2L-X address',
+    'f-liveUrl',
+    liveURLInput,
+    'The instance address is enough — the event is found from the instance and chosen below. ' +
+      'A full live-operation URL is also accepted, and fills the event in from its own path.',
+  );
   const liveURLNote = document.createElement('p');
   liveURLNote.className = 'field-hint field-note';
   liveURLNote.hidden = true;
@@ -488,11 +507,17 @@ export function createSettingsView(handlers) {
   // The derived line is now the only rendering of host and event, so it is
   // shown whenever they are known rather than only after a paste — populate
   // calls this on open.
+  //
+  // With no event id it says so in words rather than printing event "": an
+  // empty pair of quotes reads as a failure, and on the bare-address form there
+  // is no failure — the id simply has not been fetched yet.
   const showDerived = () => {
     const host = fields.m2lxHost.input.value;
     const event = fields.eventId.input.value;
     liveURLNote.hidden = !(host || event);
-    liveURLNote.textContent = `Host "${host}", event "${event}".`;
+    liveURLNote.textContent = event
+      ? `Host "${host}", event "${event}".`
+      : `Host "${host}", event not chosen yet.`;
   };
 
   // --- the event auto-select / picker -----------------------------------
@@ -505,6 +530,17 @@ export function createSettingsView(handlers) {
   // changes where the value comes FROM. When the app cannot list (not signed in,
   // no host, an older build, any error), neither the picker nor the note shows
   // and the URL-derived behaviour above stands exactly as it was.
+  //
+  // WHICH INSTANCE GETS LISTED IS NOT THIS SCREEN'S CHOICE. backend.listEvents()
+  // takes no host: App.ListEvents uses the API client the control plane built,
+  // and that client follows the SAVED configuration — saveConfigFrom restarts
+  // the control plane when the host or alias changes (app.go). So an address
+  // typed into the box above cannot be enumerated until it has been saved and
+  // signed in to, and asking anyway would answer with the PREVIOUS instance's
+  // events — which, on the auto-select rule, would quietly write another
+  // instance's event id into this form. Hence savedM2LXHost below: the events
+  // are only asked for when the address on screen is the one the app is
+  // actually signed in to, and the operator is told to save when it is not.
   //
   // The rule itself is in events.js (pure, tested); this is the wiring.
   const eventSelect = document.createElement('select');
@@ -559,7 +595,14 @@ export function createSettingsView(handlers) {
     eventSelectRow.wrap.hidden = true;
     if (choice.autoSelected) {
       fields.eventId.input.value = choice.selectedId;
-      eventNote.textContent = `Event "${choice.selectedName}" (auto-selected).`;
+      // An auto-selection that differs from what is stored is an unsaved change
+      // the operator did not make and cannot see — the field it lands in is
+      // hidden. Say so, or they leave Settings believing the event is set and
+      // the next launch goes back to the old id.
+      const unsaved = choice.selectedId !== savedEventId;
+      eventNote.textContent = unsaved
+        ? `Event "${choice.selectedName}" (auto-selected) — press Save settings to keep it.`
+        : `Event "${choice.selectedName}" (auto-selected).`;
       eventNote.hidden = false;
       showDerived();
       return;
@@ -573,12 +616,22 @@ export function createSettingsView(handlers) {
    * pure rule. It swallows every failure to the console: not signed in, no host,
    * an older build without the binding, a network error — none of these may
    * break the screen, and all of them mean "fall back to the URL-derived id".
+   *
+   * @returns {Promise<number>} how many usable events were listed; 0 for every
+   *          failure, so a caller can decide whether it is worth asking again
+   *          without having to distinguish "empty instance" from "not yet".
    */
   async function refreshEvents() {
     try {
       const events = await backend.listEvents();
       const usable = Array.isArray(events) ? events.filter((e) => e && e.id) : [];
       renderEventChoice(chooseEvent(usable, fields.eventId.input.value), usable);
+      // Only a listing that FOUND something counts as done. An empty answer is
+      // usually "signed in to nothing yet" rather than "this instance has no
+      // events", and recording it as done would mean the address settling, or a
+      // save, never asks again.
+      if (usable.length > 0) listedHost = savedM2LXHost;
+      return usable.length;
     } catch (err) {
       eventSelectRow.wrap.hidden = true;
       eventNote.hidden = true;
@@ -586,6 +639,65 @@ export function createSettingsView(handlers) {
         'wslcomms: could not list events; the URL-derived event id stands',
         err?.message || err,
       );
+      return 0;
+    }
+  }
+
+  // WHAT THE BACKEND ACTUALLY HAS, as opposed to what is in the boxes. The API
+  // client follows the saved configuration (see the note above), so these two
+  // are what decide whether listing events is meaningful and whether an
+  // auto-selected event is an unsaved change. They are set by populate and by a
+  // successful save — NOT by lastLoadedConfig, which is the Apply-preset diff
+  // baseline and deliberately stays at the last POPULATED config.
+  let savedM2LXHost = '';
+  let savedEventId = '';
+
+  /** The host the last SUCCESSFUL listing was made against; '' when none has. */
+  let listedHost = '';
+
+  /**
+   * How long the address field must sit still before its host is used to ask
+   * for events. applyLiveURL runs on every keystroke ('input', so that a paste
+   * lands immediately), and without this an operator TYPING an address would
+   * put one HTTP request on the instance per character.
+   */
+  const ADDRESS_SETTLE_MS = 400;
+  let addressSettleTimer = null;
+
+  /**
+   * scheduleEventRefresh asks for the instance's events once the address has
+   * stopped changing, but only when asking can produce a truthful answer: the
+   * address on screen must be the one the app is signed in to, and that host
+   * must not already have answered.
+   */
+  function scheduleEventRefresh(host) {
+    if (host === '' || host !== savedM2LXHost || host === listedHost) return;
+    if (addressSettleTimer !== null) clearTimeout(addressSettleTimer);
+    addressSettleTimer = setTimeout(() => {
+      addressSettleTimer = null;
+      void refreshEvents();
+    }, ADDRESS_SETTLE_MS);
+  }
+
+  /**
+   * refreshEventsAfterSave is the other half of "the picker must populate after
+   * a bare address was entered". Saving a NEW host restarts the control plane,
+   * and sign-in to it is asynchronous — a listing attempted in the same turn as
+   * the save answers "not signed in to M2L-X yet" every time. So it asks again,
+   * twice, spaced far enough apart to cover a sign-in round trip, and then
+   * stops: this is a convenience, not a poll, and the operator can always
+   * re-open Settings.
+   *
+   * The ladder keeps running if the operator leaves the screen, and a later
+   * open() may overlap it. That is safe rather than merely tolerated: both
+   * paths do the same thing — read the list, apply the pure rule, render — so
+   * the worst an overlap can do is render the same answer twice.
+   */
+  async function refreshEventsAfterSave(hostChanged) {
+    if ((await refreshEvents()) > 0 || !hostChanged) return;
+    for (const delay of [1500, 4000]) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if ((await refreshEvents()) > 0) return;
     }
   }
 
@@ -981,9 +1093,15 @@ export function createSettingsView(handlers) {
   }
 
   /**
-   * applyLiveURL parses whatever is in the address field and fills the two
+   * applyLiveURL parses whatever is in the address field and fills the hidden
    * fields below it. It reports what it read, so a paste is visibly a paste
    * and not a hope, and it refuses clearly rather than silently doing nothing.
+   *
+   * Either form is accepted. A bare instance address sets the host and LEAVES
+   * THE EVENT ID ALONE — it does not clear it, because the stored id is the
+   * fallback for every case where the instance cannot be enumerated, and
+   * blanking it on a keystroke would throw away the one value that works
+   * offline. The picker below overwrites it when the instance answers.
    */
   function applyLiveURL() {
     const raw = liveURLInput.value.trim();
@@ -992,7 +1110,7 @@ export function createSettingsView(handlers) {
       return;
     }
 
-    const parsed = parseLiveOperationURL(raw);
+    const parsed = parseM2LXAddress(raw);
     if (!parsed.ok) {
       liveURLNote.hidden = true;
       liveURLRow.errorEl.textContent = parsed.error;
@@ -1002,9 +1120,20 @@ export function createSettingsView(handlers) {
 
     liveURLRow.errorEl.hidden = true;
     fields.m2lxHost.input.value = parsed.host;
-    fields.eventId.input.value = parsed.eventId;
-    liveURLNote.textContent = `Host "${parsed.host}", event "${parsed.eventId}".`;
-    liveURLNote.hidden = false;
+    if (parsed.eventId !== '') fields.eventId.input.value = parsed.eventId;
+    showDerived();
+
+    // Then either ask the instance what its events are, or say plainly why it
+    // cannot be asked yet. Saying nothing is what the old field did, and it is
+    // how an operator ends up looking at a screen that has quietly decided
+    // nothing. The prompt is skipped when the address itself supplied an id:
+    // that id belongs to the host beside it and needs no instance to confirm it.
+    if (parsed.host === savedM2LXHost) {
+      scheduleEventRefresh(parsed.host);
+    } else if (parsed.eventId === '') {
+      liveURLNote.textContent +=
+        ' Press Save settings to sign in to this instance; its events are listed once it answers.';
+    }
   }
 
   // 'input' rather than 'change': a paste should fill the fields the moment it
@@ -1019,6 +1148,11 @@ export function createSettingsView(handlers) {
     // edited: the confirm dialog compares a preset against what is SAVED, not
     // against keystrokes that were never saved.
     lastLoadedConfig = config;
+    // What the backend is configured with, which is what its API client is
+    // signed in to. Kept beside the fields rather than read back out of them,
+    // because the fields are about to be edited and these two must not follow.
+    savedM2LXHost = (config.m2lxHost || '').trim();
+    savedEventId = (config.eventId || '').trim();
     fields.m2lxHost.input.value = config.m2lxHost || '';
     fields.alias.input.value = config.alias || '';
     fields.eventId.input.value = config.eventId || '';
@@ -1059,9 +1193,14 @@ export function createSettingsView(handlers) {
     fields.m2lxPassword.input.value = '';
     fields.srtPassphrase.input.value = '';
     fields.srtReturnPassphrase.input.value = '';
-    liveURLInput.value = formatLiveOperationURL(config.m2lxHost, config.eventId);
-    showDerived();
+    liveURLInput.value = formatM2LXAddress(config.m2lxHost, config.eventId);
+    // ORDER MATTERS, and it was the wrong way round: hideLiveURLMessages()
+    // clears the derived line as well as the error, so calling it after
+    // showDerived() blanked the one thing on this row that says which host and
+    // event the screen is holding — on a screen where both fields are hidden.
+    // Clear first, then draw.
     hideLiveURLMessages();
+    showDerived();
     refreshSecretBadges();
     clearAllErrors();
     saveMessage.hidden = true;
@@ -1168,6 +1307,11 @@ export function createSettingsView(handlers) {
     }
     clearAllErrors();
     saveBtn.disabled = true;
+    // Whether this save moves the app to a different instance decides how hard
+    // it is worth trying to list events afterwards; read before the save, used
+    // after it.
+    const hostChanged = config.m2lxHost !== savedM2LXHost;
+    let saved = false;
     try {
       await backend.saveConfig(config);
       const m2lxPassword = fields.m2lxPassword.input.value;
@@ -1189,6 +1333,9 @@ export function createSettingsView(handlers) {
         fields.srtReturnPassphrase.input.value = '';
       }
       refreshSecretBadges();
+      savedM2LXHost = config.m2lxHost;
+      savedEventId = config.eventId;
+      saved = true;
       setSaveMessage('Settings saved.', false);
       handlers.onSaved(config);
     } catch (err) {
@@ -1196,6 +1343,13 @@ export function createSettingsView(handlers) {
     } finally {
       saveBtn.disabled = false;
     }
+
+    // Saving a bare instance address is the moment the app can first sign in to
+    // it, so it is the moment its events become listable — and the operator who
+    // typed that address has nothing yet in the event field. Deliberately NOT
+    // awaited: the save is finished and reported, and a picker that fills in a
+    // second later must not hold the Save button down while it waits.
+    if (saved) void refreshEventsAfterSave(hostChanged);
   }
 
   // --- remote access status ---------------------------------------------

@@ -142,6 +142,24 @@ struct Preferences {
     API_AVAILABLE(macos(12.0));
 #endif
 
+// WSLCOMMS PATCH — see third_party/README.md.
+//
+// WKUIDelegate's three JavaScript panels. Upstream v2.13.0 implements none of
+// them, and WKWebView draws no dialog of its own: with the methods absent,
+// window.alert shows nothing, window.confirm returns false and window.prompt
+// returns null, which silently disabled every preset operation on the Settings
+// page. Declared here for the same reason as the callback above — so the header
+// admits that this class differs from the release — and, unlike that one,
+// without an SDK guard, because these three have existed since WebKit shipped
+// WKWebView in macOS 10.10 and we build against far newer.
+- (void)webView:(WKWebView *)webView runJavaScriptAlertPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(void))completionHandler;
+- (void)webView:(WKWebView *)webView runJavaScriptConfirmPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(BOOL result))completionHandler;
+- (void)webView:(WKWebView *)webView runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+    defaultText:(NSString *)defaultText initiatedByFrame:(WKFrameInfo *)frame
+    completionHandler:(void (^)(NSString *result))completionHandler;
+
 @end
 
 

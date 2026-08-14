@@ -1701,6 +1701,33 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 // one small GET, well inside the budget already sized for the whole KVS chain,
 // so it reuses that constant rather than introducing a second one that would
 // have to be kept in step with it.
+// CredentialStoreName returns what this platform's credential vault is CALLED,
+// for an operator reading it in the GUI: "Windows Credential Manager" or "the
+// macOS login Keychain".
+//
+// It exists because the frontend was naming one platform's facility on both.
+// settings.js's delete-a-preset flow asks a second question — "also delete the
+// stored passwords?" — and had "Windows Credential Manager" written into the
+// string. On a Mac that sends the operator hunting for a control panel their
+// machine does not have, at the moment they are trying to undo something.
+//
+// It went unnoticed until the macOS port because that dialog had never been
+// SEEN on a Mac: WKWebView routes window.confirm through its WKUIDelegate, and
+// upstream Wails implements no JavaScript panel methods, so every preset dialog
+// silently answered "cancelled" and drew nothing. Fixing the delegate
+// (third_party/patches/0002) made the wrong words visible for the first time.
+//
+// The name is resolved in GO rather than switched on in JavaScript, for the
+// same reason secrets.StoreName itself is per-platform beside New: internal/
+// secrets is the only thing that KNOWS, and a runtime.GOOS switch in the
+// frontend would be a second place to change if a third platform or a different
+// backing store ever appears. There is still no getter for a credential VALUE
+// across the Wails boundary — this returns the name of the store, never its
+// contents.
+func (a *App) CredentialStoreName() string {
+	return secrets.StoreName()
+}
+
 func (a *App) ListEvents() ([]m2lx.Event, error) {
 	a.ctlMu.Lock()
 	client := a.client
