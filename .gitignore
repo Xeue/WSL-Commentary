@@ -4,6 +4,20 @@
 *.exe
 *.syso
 
+# ...but NOT the binaries vendored inside third_party/, which are source, not
+# build output. `*.exe` above silently excluded
+# third_party/wails-v2.13.0/internal/webview2runtime/MicrosoftEdgeWebview2Setup.exe,
+# which webview2installer.go go:embed's. The result compiled on the machine that
+# vendored Wails, because the file was sitting there untracked, and failed on
+# every fresh clone with
+#
+#	webview2installer.go:9:12: pattern MicrosoftEdgeWebview2Setup.exe: no matching files found
+#
+# — but ONLY under -tags production/dev, because an untagged `go build ./...`
+# uses main_nocgo.go and never reaches Wails at all. So the Windows gate this
+# port was being judged by could not see it.
+!third_party/**/*.exe
+
 # Go
 /vendor/
 
