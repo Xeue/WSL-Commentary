@@ -658,14 +658,31 @@ test('a Settings save reaches a RUNNING SRT return, not just the controls', () =
   // still in their right ear. Deterministic, not a race, and silent.
   const src = ui('app.js');
 
-  const start = src.indexOf('function onConfigSaved(config)');
-  assert.ok(start > 0, 'app.js must handle a Settings save');
-  const body = src.slice(start, src.indexOf('\n  function applyReturnOptionsFromConfig', start));
+  // The re-application lives in applyConfigLive, and onConfigSaved is that plus
+  // showHome(). The split exists so applying a PRESET can have the first without
+  // the second (it used to navigate the operator off the Settings screen), and
+  // it means the obligation this test is about belongs to the live half —
+  // otherwise the preset apply, which is the path that rebuilds every
+  // connection, would be the one path that skipped the running SRT return.
+  const start = src.indexOf('function applyConfigLive(config)');
+  assert.ok(start > 0, 'app.js must re-apply a whole saved config to the live objects');
+  const body = src.slice(start, src.indexOf('\n  /**', start + 1));
   assert.match(
     body,
     /applyReturnOptionsFromConfig\(\)/,
     'a Settings save must apply the saved return options to a running SRT return',
   );
+
+  // And the Save BUTTON still ends where it always did. Save is "I am finished
+  // with this form": an operator who presses it and stays on the form has to go
+  // and find Back to learn whether anything happened. This is the line that must
+  // not be deleted to make the preset apply stop navigating — that is what
+  // applyConfigLive is for.
+  const savedStart = src.indexOf('function onConfigSaved(config)');
+  assert.ok(savedStart > 0, 'app.js must handle a Settings save');
+  const saved = src.slice(savedStart, src.indexOf('\n  }', savedStart));
+  assert.match(saved, /applyConfigLive\(config\)/, 'a save re-applies everything a preset apply does');
+  assert.match(saved, /showHome\(\)/, 'and then goes back, which is the Save button\'s own contract');
 
   const applyStart = src.indexOf('function applyReturnOptionsFromConfig()');
   const apply = src.slice(applyStart, src.indexOf('\n  }', applyStart));

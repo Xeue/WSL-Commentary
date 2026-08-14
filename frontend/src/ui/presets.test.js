@@ -272,10 +272,66 @@ test("app.js's apply handler adopts the RETURNED config and never touches a mach
 
   // And the rebuild obligations the sequence exists for.
   assert.match(body, /mixerHost\.close\(\)/, 'an armed drawer pointed at a different desk must close');
-  assert.match(body, /onConfigSaved\(merged\)/, 'the Settings-save pathway is reused, not restated');
+  // THE REUSE IS THE POINT, AND SO IS THE HALF IT LEAVES BEHIND.
+  //
+  // applyConfigLive is onConfigSaved without its closing showHome(): the same
+  // tile, mid, channel, gain, dropdowns and running-SRT-return re-application,
+  // and none of the navigation. Reaching it through onConfigSaved is what threw
+  // the operator off the Settings screen to the main screen every time they
+  // pressed Apply — the owner's report — while a preset applied from the header
+  // picker has no business "returning" to the screen it is already on either.
+  //
+  // The guard is a pair: call the live half, and do not restate it. A second
+  // copy of that sequence is the drift this test has always existed to stop.
+  assert.match(
+    body,
+    /applyConfigLive\(merged\)/,
+    'the live half of the Settings-save pathway is reused, not restated',
+  );
+  for (const navigates of ['onConfigSaved(', 'showHome()']) {
+    assert.ok(
+      !body.includes(navigates),
+      `the apply calls ${navigates}: applying a preset must leave the operator exactly where ` +
+        'they were, which on the Settings screen means still on it, at the same scroll position',
+    );
+  }
   assert.match(body, /setUpMonitor\(merged\)/, 'the KVS monitor must be REBUILT: its credentials are the old event\'s');
   assert.match(body, /monitor = null/, 'the old monitor must be dropped before the rebuild');
   assert.match(body, /stopPicture\(\)[\s\S]*startPicture\(\)/, 'a running picture is restarted against the new instance');
+});
+
+// The guard above forbids showHome() in applyPresetAndRefresh, which is only
+// half the hole. applyConfigLive is what that function calls, so a showHome()
+// added INSIDE it navigates on apply again — the owner's exact report, twice —
+// and every assertion in this file, and all 780 tests, still pass. The pair of
+// them is what makes the defect unwritable rather than merely uncalled.
+//
+// Stated as "the navigation lives in onConfigSaved and nowhere else" rather
+// than as a ban on one identifier: the point is not that showHome is spelled
+// that way, it is that exactly one of the two functions is allowed to move the
+// operator, and it is the one the Save button calls.
+test('applyConfigLive re-applies the config and does not navigate', () => {
+  const src = codeOnly(ui('app.js'));
+
+  const liveStart = src.indexOf('function applyConfigLive(config)');
+  assert.ok(liveStart >= 0, 'applyConfigLive is gone: the live/navigate split is the fix for the apply bug');
+  const live = src.slice(liveStart, src.indexOf('\n  }', liveStart));
+
+  assert.ok(
+    !live.includes('showHome()'),
+    'applyConfigLive navigates. It is the half a preset apply calls precisely because it must ' +
+      'NOT move the operator: pressing Apply on Settings has to leave them on Settings, at the ' +
+      'same scroll position, and the header picker has no screen to return to either',
+  );
+
+  // And the other half of the contract: onConfigSaved is that plus the
+  // navigation, so the Save button still ends where it always did. Without this
+  // the split could be "fixed" by making both halves navigate nowhere, which
+  // would silently strand every Save on the Settings screen.
+  const savedStart = src.indexOf('function onConfigSaved(config)');
+  const saved = src.slice(savedStart, src.indexOf('\n  }', savedStart));
+  assert.match(saved, /applyConfigLive\(config\)/, 'onConfigSaved must reuse the live half, not restate it');
+  assert.match(saved, /showHome\(\)/, 'the Save button must still return the operator to the main screen');
 });
 
 test('backend.js requires all seven preset bindings, derived from one table', () => {

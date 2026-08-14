@@ -119,9 +119,15 @@ export function mountApp(root) {
   const settings = createSettingsView({
     onBack: showHome,
     onSaved: onConfigSaved,
-    // The instance-preset apply. Settings owns the confirm dialog; this file
-    // owns the sequence — because the sequence has to reach the monitor, the
-    // mixer host and the picture, none of which Settings can see.
+    // The instance-preset apply. Settings owns the preview drawn on the form
+    // and the button that commits it; this file owns the sequence — because the
+    // sequence has to reach the monitor, the mixer host and the picture, none of
+    // which Settings can see.
+    //
+    // It ends where it started. Applying a preset used to go through
+    // onConfigSaved, which ends in showHome(), so pressing Apply on the Settings
+    // screen threw the operator back to the main screen — see applyConfigLive
+    // for why the re-application and the navigation are now two things.
     onApplyPreset: applyPresetAndRefresh,
   });
 
@@ -465,7 +471,8 @@ export function mountApp(root) {
    * applyRemoteConfig adopts a config another controller saved and re-applies
    * only the parts that are safe to change under a page that did not ask for it:
    * the monitor tile, the return bus/channel/gain, the headphone selection and
-   * the input dropdown. It is onConfigSaved's live-safe subset, on purpose:
+   * the input dropdown. It is a strict subset of applyConfigLive, on purpose —
+   * smaller even than that, because this page did not ask for any of it:
    *
    *   - NO showHome() — the whole reason this is not onConfigSaved(). A remote
    *     operator editing Settings must not be ejected because somebody at the
@@ -884,7 +891,33 @@ export function mountApp(root) {
     safeMonitorCall((m) => m.setLevel(fraction));
   }
 
-  function onConfigSaved(config) {
+  /**
+   * applyConfigLive re-applies a whole saved configuration to everything on this
+   * page that was built from one: the monitor tile, the return bus, the channel,
+   * the gain, the device dropdowns — and a RUNNING SRT return, which none of
+   * those reach.
+   *
+   * =============== IT DOES NOT DECIDE WHICH VIEW IS ON SCREEN ================
+   *
+   * That is the whole reason it exists apart from onConfigSaved, and the two
+   * callers differ in exactly that one thing:
+   *
+   *   Save settings   the operator has finished with the form. onConfigSaved is
+   *                   this plus showHome(): you press Save, you are done, you go
+   *                   back. That is the button's contract, not an accident.
+   *   Apply preset    the operator pressed a button ON the Settings screen and
+   *                   asked for an instance switch, nothing else. Applying used
+   *                   to run through onConfigSaved, so it inherited the
+   *                   showHome() and ejected them to the main screen — losing
+   *                   the scroll position and the focus of somebody who was
+   *                   part-way down a two-screenful form. That is the defect the
+   *                   owner reported after using the build.
+   *
+   * applyRemoteConfig above is the third member of this family and stays a
+   * separate, SMALLER subset: another seat's save must not rebuild this page's
+   * return path, so it is not expressible as "this minus something".
+   */
+  function applyConfigLive(config) {
     currentConfig = config;
     home.setTile(config.monitorTile);
     home.setReturnMid(config.returnMid);
@@ -911,7 +944,6 @@ export function mountApp(root) {
       const sink = selectedHeadphoneId();
       if (sink && currentReturnSource !== RETURN_SOURCE_SRT) m.setSinkId(sink);
     });
-    showHome();
 
     // AND APPLY IT TO A RUNNING SRT RETURN, which the lines above do not.
     //
@@ -926,6 +958,21 @@ export function mountApp(root) {
     // rebuilding on every Save would take the return away for a second or two
     // because somebody corrected a typo in the event id.
     applyReturnOptionsFromConfig();
+  }
+
+  /**
+   * onConfigSaved is what the SAVE SETTINGS button gets: the live re-application
+   * above, and then back to the main screen.
+   *
+   * The showHome() is the entire difference between the two, and it is load
+   * bearing for Save — an operator who presses Save and stays on the form has to
+   * find the Back button to see whether anything happened. Anything that wants
+   * the re-application WITHOUT the navigation calls applyConfigLive directly;
+   * the way to get one is never to delete the line from the other.
+   */
+  function onConfigSaved(config) {
+    applyConfigLive(config);
+    showHome();
   }
 
   /**
@@ -979,9 +1026,14 @@ export function mountApp(root) {
    *   - the mixer drawer is closed (and with it disarmed on the Go side by
    *     ApplyPreset itself): an open arm window pointed at a different desk
    *     is a write gate nobody can see;
-   *   - onConfigSaved reuses the whole Settings-save pathway — tile, mid,
-   *     channel, gain, dropdowns, a running SRT audio return;
-   *   - the KVS monitor is torn down and REBUILT, which onConfigSaved does
+   *   - applyConfigLive reuses the whole Settings-save pathway — tile, mid,
+   *     channel, gain, dropdowns, a running SRT audio return — WITHOUT its
+   *     showHome(). Not onConfigSaved, which is that plus the navigation: both
+   *     callers of this function want the operator left exactly where they are.
+   *     From the Settings screen that means the same scroll position on the same
+   *     form (settings.js restores it around the redraw), and from the header
+   *     picker it means home, which is where they already are;
+   *   - the KVS monitor is torn down and REBUILT, which applyConfigLive does
    *     not do: setUpMonitor is otherwise called exactly once, at init, and
    *     the peer connection holds credentials fetched for the OLD event —
    *     without this the commentator keeps hearing the previous event until
@@ -998,7 +1050,7 @@ export function mountApp(root) {
     currentConfig = merged;
 
     mixerHost.close();
-    onConfigSaved(merged);
+    applyConfigLive(merged);
 
     // The KVS monitor rebuild. Stop is best-effort — a monitor that never
     // started still needs the new one built over it.

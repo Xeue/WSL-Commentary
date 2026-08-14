@@ -11,13 +11,17 @@
 //
 // ===================== WHY A PREVIEW EXISTS AT ALL ==========================
 //
-// Applying a preset rewrites most of the form and restarts every monitor. Until
-// now the only place an operator could read what it would change was inside the
+// Applying a preset rewrites most of the form and restarts every monitor. The
+// only place an operator could read what it would change used to be inside the
 // confirm() dialog — a modal listing thirteen possible rows, read once, in a
 // hurry, with the form it describes hidden behind it. The change is legible on
-// the FORM now: the box shows the value the preset would put there, the old
-// value is stated beside it, and the dialog is reduced to the count and the
-// consequence.
+// the FORM now: the box shows the value the preset would put there and the old
+// value is stated beside it.
+//
+// The dialog has since gone entirely (the owner: "we don't need the confirm
+// popup now we have the green text"), which is why describePresetPreview's line
+// ends with the consequence the dialog used to carry. Nothing that was in that
+// modal is now unsaid; it is said without a modal.
 //
 // ============== THE TWO CASES THAT BREAK A NAIVE VERSION ====================
 //
@@ -128,7 +132,7 @@ export function planPresetPreview(diff, fields, controls) {
 
 /**
  * describePresetPreview words the one line in the instance card that tells the
- * operator a preview is on screen and WHERE to look.
+ * operator a preview is on screen, WHERE to look, and what pressing Apply costs.
  *
  * It names every changed field, including the ones with no box of their own,
  * because the form is about two screenfuls deep: green boxes below the fold are
@@ -136,6 +140,18 @@ export function planPresetPreview(diff, fields, controls) {
  * for no changes so the caller can `if (msg)` — selecting the active preset, or
  * one that differs in nothing, must leave the screen exactly as it was rather
  * than announce an empty result.
+ *
+ * ================== THE CLOSING SENTENCE IS NOT DECORATION ==================
+ *
+ * It is what the confirm dialog used to say, moved here when the dialog was
+ * removed — and it is the half of the dialog the diff could not replace. The
+ * green boxes say what changes; nothing on the form says that committing them
+ * tears down and re-dials the KVS monitor and the SRT picture, which is several
+ * seconds of black picture and silence, or that the device fields the operator
+ * can see on the main screen are deliberately NOT part of a preset and will not
+ * move. An operator who is told the first and not the second reads the black
+ * picture as a fault. Brief, because this is a line read at a glance, and last,
+ * because it is the consequence rather than the content.
  *
  * @param {string} name  the preset's name, as the operator sees it in the picker
  * @param {Array<{label: string}>} rows  planPresetPreview's output
@@ -147,6 +163,8 @@ export function describePresetPreview(name, rows) {
   const labels = list.map((r) => r.label).join(', ');
   return (
     `Applying "${name}" would change ${list.length === 1 ? '1 setting' : `${list.length} settings`}, ` +
-    `marked below: ${labels}. Nothing has changed yet — press Apply to commit.`
+    `marked below: ${labels}. Nothing has changed yet — press Apply to commit: the monitor and ` +
+    'the picture then reconnect (a few seconds of black and silence), and your input and ' +
+    'headphone devices are not part of a preset and stay as they are.'
   );
 }

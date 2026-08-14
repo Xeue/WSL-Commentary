@@ -504,7 +504,22 @@ STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
+# THE VOLUME NAME MUST NOT EQUAL THE BUNDLE NAME. This used to be -volname
+# "$APP_NAME", i.e. "WSL Commentary", while the bundle inside it is
+# "WSL Commentary.app" — and hdiutil then fails the whole build with
+#
+#	could not access /Volumes/WSL Commentary/WSL Commentary.app - Operation not permitted
+#	hdiutil: create failed - Operation not permitted
+#
+# It is a name collision, not a permissions problem, and it was worth pinning
+# down because "Operation not permitted" on macOS 26 reads like TCC and sends
+# you looking for a Full Disk Access grant that changes nothing. Measured, three
+# ways: the same bundle into a volume called "WSL Commentary 0.1.0" succeeds;
+# a bundle renamed plain.app into a volume called "WSL Commentary" succeeds;
+# the two together fail every time. Appending the version also gives the mounted
+# volume a name that says which build is being installed, which is worth having
+# on a machine that has mounted three of them this week.
+hdiutil create -volname "$APP_NAME $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
 rm -rf "$STAGE"
 # The disk image is signed too, but WITHOUT the hardened runtime and without
 # entitlements: it is a container, not code, and codesign's runtime option on a

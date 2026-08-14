@@ -9,8 +9,11 @@ import { validateConfig } from './validate.js';
 import { parseM2LXAddress, formatM2LXAddress } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
-// The instance-preset model: the diff the preview and the confirm dialog are
-// both built from, and the whitelist filter that mirrors Go's.
+// The instance-preset model: the diff the preview on the form is built from,
+// and the whitelist filter that mirrors Go's — which is what tells the operator
+// that a hand-edited or foreign preset file carries keys the apply will drop.
+// Both are read by renderPresetPreview now; the confirm dialog that used to
+// read them is gone, see handleApplyPreset.
 import { diffPreset, describeIgnoredKeys, filterPresetFields } from './presets.js';
 // What SELECTING a preset draws on this form, decided in a pure module and
 // applied to the controls down at renderPresetPreview. See presetpreview.js for
@@ -271,8 +274,17 @@ export function createSettingsView(handlers) {
   // THE ONE LINE THAT SAYS A PREVIEW IS ON SCREEN, and which fields to go and
   // look at. The form is about two screenfuls deep, so green boxes below the
   // fold are only findable if something names them; this is that something, and
-  // describePresetPreview words it. Hidden — never an empty flourish — when the
-  // selected preset is the active one or differs in nothing.
+  // describePresetPreview words it.
+  //
+  // It is also where the confirm dialog's two non-diff facts went when the
+  // dialog was removed: the cost of applying (the monitor and the picture
+  // reconnect; the device fields are not part of a preset) and the keys a
+  // hand-edited file carries that will be dropped. Everything the operator used
+  // to have to dismiss a modal to read is now here, in the card, above the
+  // fields it points at — see renderPresetPreview.
+  //
+  // Hidden — never an empty flourish — when the selected preset is the active
+  // one, differs in nothing, and carries nothing that will be ignored.
   const presetPreviewLine = document.createElement('p');
   presetPreviewLine.className = 'field-hint preset-preview-summary';
   presetPreviewLine.hidden = true;
@@ -349,7 +361,12 @@ export function createSettingsView(handlers) {
       // one preset while another is previewed, say. A preview that describes a
       // preset the picker is no longer showing is a set of green boxes with
       // nothing on screen to explain them, so it goes.
-      if (presetPreview !== null && presetPreview.presetId !== presetSelect.value) {
+      //
+      // Read off the LINE and not off presetPreview: the line is the one thing
+      // that is always there when anything is (see presetPreviewLineFor), so a
+      // preset selected only for its ignored-key warning is covered by the same
+      // rule rather than being the case that slips through.
+      if (presetPreviewLineFor !== '' && presetPreviewLineFor !== presetSelect.value) {
         clearPresetPreview();
       }
     } catch (err) {
@@ -364,49 +381,48 @@ export function createSettingsView(handlers) {
     const preset = selectedPresetSummary();
     if (!preset || typeof handlers.onApplyPreset !== 'function') return;
 
-    // The confirm dialog: what will CHANGE, and what the file carries that a
-    // preset does not honour. Both computed here, before anything moves, so
-    // the operator confirms what will actually happen.
-    const changes = diffPreset(lastLoadedConfig, preset.fields);
-    const { ignored } = filterPresetFields(preset.fields);
-    const ignoredNote = describeIgnoredKeys(ignored);
-
-    // ================ WHY THE DIALOG IS STILL HERE ========================
+    // ================ THERE IS NO CONFIRM DIALOG ANY MORE =====================
     //
-    // It KEEPS its place: it is the last chance to back out of an action that
-    // restarts the KVS monitor, the SRT return and the picture, and Go refuses
-    // it outright mid-send — a button whose consequences reach the
-    // commentator's ears deserves a question. What it is NOT any more is the
-    // only place the diff is legible.
+    // APPLY APPLIES. The modal that stood here asked the question the form now
+    // answers by itself, in the owner's words after using the build: "we don't
+    // need the confirm popup now we have the green text". It was not merely an
+    // extra click — it was drawn OVER the thing it described, so a thirteen-line
+    // list read in a hurry was standing in front of the same change marked in
+    // green on the very boxes it lands in.
     //
-    // So it does not repeat the preview. When the change is already drawn on
-    // the form behind the modal, the dialog states its SIZE and its
-    // consequences; thirteen lines nobody reads are worse than a count that is
-    // read, and the detail is three inches away on the form. When there is no
-    // preview on screen — the picker was never touched this visit, so Apply
-    // acts on the selection refreshPresets made — the dialog is the only
-    // rendering there is, and it lists every change exactly as it always did.
-    const previewing = presetPreview !== null && presetPreview.presetId === preset.id;
-    const count = changes.length === 1 ? '1 setting' : `${changes.length} settings`;
-    const summary = previewing
-      ? `This changes ${count} — the fields marked in green on the form behind this window.\n\n`
-      : changes.length
-        ? `This changes:\n${changes.map((c) => `  ${c.label}: ${c.from} -> ${c.to}`).join('\n')}\n\n`
-        : 'No field differs from the current settings.\n\n';
-    const text =
-      `Apply the instance "${preset.name}"?\n\n` +
-      summary +
-      (ignoredNote ? `${ignoredNote}\n\n` : '') +
-      'The monitor and the picture will reconnect to the new instance. ' +
-      'Your input and headphone devices are not part of a preset and stay as they are.';
-    if (!window.confirm(text)) return;
+    // THE TWO THINGS IT SAID THAT THE PREVIEW DOES NOT COVER WERE MOVED, NOT
+    // DROPPED. Both are on the preset preview summary line in the card above,
+    // read at a glance and without dismissing anything:
+    //
+    //   - the keys a hand-edited or foreign preset FILE carries that a preset
+    //     does not honour — filterPresetFields/describeIgnoredKeys, now read by
+    //     renderPresetPreview, which is also the only place that can state them
+    //     BEFORE the operator commits;
+    //   - that applying reconnects the monitor and the picture, and that the
+    //     input and headphone devices are not part of a preset and stay as they
+    //     are — describePresetPreview's closing sentence.
+    //
+    // What made the dialog dispensable is that the gate on this action was never
+    // the dialog. Go's ApplyPreset REFUSES while SENDING and renderPresetButtons
+    // disables this button with that reason on it; off air the cost is a few
+    // seconds of black picture and silence, and on air the refusal — not a
+    // question nobody reads at speed — is what prevents it.
 
-    // WHERE THE OPERATOR IS, read before anything moves. Apply must leave them
-    // on this screen at this scroll position: clearing the preview removes its
-    // notes, the form gets shorter, and a scroll container whose content
-    // shrinks has its scrollTop clamped by the browser — which is the page
-    // jumping under somebody who only pressed a button. Disabling a focused
-    // button also blurs it, so the focus is put back too.
+    // WHERE THE OPERATOR IS, read before anything moves.
+    //
+    // This is the code that now has to make "Apply leaves you where you were"
+    // true, and it could not be judged before: app.js's apply used to end in
+    // onConfigSaved, which ends in showHome(), so by the time these lines ran
+    // the Settings view was HIDDEN — and a hidden element has no layout, reads
+    // scrollTop 0 and takes no assignment. The restore could neither work nor be
+    // seen not to. The apply goes through applyConfigLive now and this screen
+    // stays on top, so the restore is live.
+    //
+    // It is still needed with the navigation gone, for two separate reasons:
+    // clearing the preview removes its notes, so the form gets SHORTER, and a
+    // scroll container whose content shrinks has its scrollTop clamped by the
+    // browser — the page jumping under somebody who only pressed a button. And
+    // disabling a focused button blurs it, so the focus is put back as well.
     const scrollTop = form.scrollTop;
     const hadFocus = document.activeElement === applyPresetBtn;
 
@@ -415,18 +431,51 @@ export function createSettingsView(handlers) {
       // app.js owns the sequence — apply, adopt the RETURNED config, rebuild
       // the monitors — and hands the merged config back for this form.
       const merged = await handlers.onApplyPreset(preset.id);
-      // The preview stops being a preview: these are the values now. Cleared
-      // explicitly rather than relying on populate() below, because a handler
-      // that returns nothing must still not leave green boxes claiming a change
-      // that has already happened.
+      // The preview stops being a preview: these are the values now, so the
+      // green goes. Cleared explicitly rather than relying on populate() below,
+      // because a handler that returns nothing must still not leave green boxes
+      // claiming a change that has already happened.
+      //
+      // There is now exactly ONE route past this line that leaves the preview
+      // standing — a throw, caught below, where nothing moved and the preview is
+      // therefore still true. The other one used to be the declined confirm,
+      // which returned above it; with the dialog gone, reaching the await at all
+      // means the values are committed.
       clearPresetPreview();
       if (merged) populate(merged);
-      setSaveMessage(`Applied "${preset.name}".`, false);
+      // The dialog used to warn about this before the fact; the summary line
+      // warns about it before the fact now, and this says it AT the fact —
+      // several seconds of black picture and silence, on the screen the operator
+      // is still standing on, is worth a sentence at the moment it starts.
+      setSaveMessage(`Applied "${preset.name}". The monitor and the picture are reconnecting.`, false);
+
+      // THE SCREEN STAYS, SO THE SCREEN HAS TO BE RIGHT.
+      //
+      // This is the obligation that came with not navigating away. Applying used
+      // to end on the main screen, and the operator's next visit to Settings ran
+      // open(), which re-lists the instance's events; staying here means open()
+      // never runs, and the event picker would go on offering the PREVIOUS
+      // instance's events beside a host box that now names a different one — a
+      // list an operator can choose from, which is worse than no list.
+      //
+      // The same ladder a host-changing save uses, and for the same reason:
+      // ApplyPreset re-scopes the credentials and re-points the M2L-X client, so
+      // sign-in to the new instance is asynchronous and a listing in this turn
+      // answers "not signed in" every time. `true` unconditionally — even a
+      // preset that leaves the host string alone has changed the credential
+      // scope, so the round trip is real either way. Not awaited: the apply is
+      // finished and reported, and every failure inside it hides the picker
+      // rather than leaving a stale one up.
+      void refreshEventsAfterSave(true);
     } catch (err) {
       // Nothing moved, so the preview is still true and still on screen.
       setSaveMessage(`Could not apply "${preset.name}": ${err.message}`, true);
     } finally {
       await refreshPresets();
+      // ORDER: refresh first (it re-enables the button this function disabled,
+      // and focus() on a disabled button does nothing), focus second, and the
+      // scroll LAST — because focusing a control inside a scroll container
+      // scrolls it into view, which would undo the restore if it came first.
       if (hadFocus && !applyPresetBtn.disabled) applyPresetBtn.focus();
       form.scrollTop = scrollTop;
     }
@@ -541,6 +590,20 @@ export function createSettingsView(handlers) {
   /** The decoration currently on the form, or null. See clearPresetPreview. */
   let presetPreview = null;
 
+  /**
+   * The preset the summary line in the card is currently describing, or '' when
+   * the line is hidden.
+   *
+   * It is NOT presetPreview.presetId, and the difference is the whole reason it
+   * exists: the line can be on screen with NOTHING behind it on the form — a
+   * preset that changes no field but whose file carries keys a preset does not
+   * honour says exactly that, and says it only here. Anything asking "is there
+   * something on screen about a preset" has to read this, or a picker that moves
+   * (a delete, a rename) leaves a note about a preset the operator can no longer
+   * see selected.
+   */
+  let presetPreviewLineFor = '';
+
   /** The class that marks a row as previewed; main.css pairs it with the note. */
   const PREVIEW_CLASS = 'field--preset-preview';
 
@@ -617,6 +680,14 @@ export function createSettingsView(handlers) {
    * lets populate() and handleSave() call it unconditionally.
    */
   function clearPresetPreview() {
+    // THE LINE GOES FIRST, AND UNCONDITIONALLY. It can be on screen with no
+    // decoration behind it: a preset that changes nothing but carries keys a
+    // preset does not honour says so, and says it in this line alone. Clearing
+    // it after the `presetPreview === null` guard below would strand exactly
+    // that case — a note about a preset the picker has since moved off.
+    presetPreviewLine.hidden = true;
+    presetPreviewLine.textContent = '';
+    presetPreviewLineFor = '';
     if (presetPreview === null) return;
     for (const box of presetPreview.boxes) {
       box.input.value = box.value;
@@ -625,8 +696,6 @@ export function createSettingsView(handlers) {
     for (const wrap of presetPreview.wraps) wrap.classList.remove(PREVIEW_CLASS);
     for (const note of presetPreview.notes) note.remove();
     presetPreview = null;
-    presetPreviewLine.hidden = true;
-    presetPreviewLine.textContent = '';
     // The derived line reads the m2lxHost and eventId BOXES, so restoring them
     // without redrawing it leaves it quoting the preset that has just been
     // taken off the form. See renderPresetPreview's matching call.
@@ -673,10 +742,22 @@ export function createSettingsView(handlers) {
     // the tags never arrive.
     const diff = diffPreset(lastLoadedConfig, preset.fields);
     const rows = planPresetPreview(diff, preset.fields, previewControls(diff));
+
+    // WHAT THE FILE CARRIES THAT A PRESET DOES NOT HONOUR. This used to be
+    // computed in handleApplyPreset and shown inside the confirm dialog; the
+    // dialog is gone, and this is the one place that can still state the fact
+    // BEFORE the operator commits. It is a real fact about a hand-edited or
+    // foreign file — Go drops those keys and reports them — and the diff cannot
+    // express it, because diffPreset iterates the whitelist and a key outside it
+    // never reaches a row.
+    const ignoredNote = describeIgnoredKeys(filterPresetFields(preset.fields).ignored);
+
     // The active preset, or one that differs in nothing: nothing to say, so
-    // nothing is said. An "this preset changes 0 settings" line would be an
-    // empty flourish on the one selection that needs no attention at all.
-    if (rows.length === 0) return;
+    // nothing is said. A "this preset changes 0 settings" line would be an empty
+    // flourish on the one selection that needs no attention at all — unless the
+    // file carries junk keys, which is worth saying about a preset that changes
+    // nothing at all.
+    if (rows.length === 0 && ignoredNote === '') return;
 
     const state = { presetId: preset.id, boxes: [], wraps: [], notes: [] };
     for (const row of rows) {
@@ -708,9 +789,23 @@ export function createSettingsView(handlers) {
       state.notes.push(note);
     }
 
-    presetPreview = state;
-    presetPreviewLine.textContent = describePresetPreview(preset.name, rows);
+    // Only when something was actually drawn on the form. `state` with no rows
+    // has no boxes to give back and no notes to remove, and handleSave's "the
+    // preview was withdrawn" message reads presetPreview !== null — a state
+    // recorded for a summary line and nothing else would make that message a
+    // claim about work the operator never saw.
+    if (rows.length > 0) presetPreview = state;
+
+    // ONE LINE, TWO JOBS, both inherited from the dialog that used to carry
+    // them: what changes and where to look for it (describePresetPreview, which
+    // also states the cost of applying), and what the file carries that will be
+    // dropped. Joined here rather than inside either module, so each pure module
+    // still owns exactly its own sentence.
+    presetPreviewLine.textContent = [describePresetPreview(preset.name, rows), ignoredNote]
+      .filter(Boolean)
+      .join(' ');
     presetPreviewLine.hidden = false;
+    presetPreviewLineFor = preset.id;
 
     // The derived line under the address box is built from the m2lxHost and
     // eventId boxes, and a preset that changes the host has just moved one of

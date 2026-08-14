@@ -28,10 +28,12 @@
 
 /**
  * INSTANCE_FIELD_LABELS is the JS mirror of internal/presets.InstanceFields,
- * in the order the confirm dialog lists changes, each with the label the
+ * in the order the preview draws and lists changes, each with the label the
  * operator sees on the Settings screen. presets.test.js asserts this list
  * against the Go whitelist's json tags, because the two drifting apart is
- * silent: a tag missing here is a change the confirm dialog never mentions.
+ * silent: a tag missing here is a change nothing on the form ever mentions —
+ * and since the confirm dialog was removed there is no second rendering left to
+ * catch it.
  */
 export const INSTANCE_FIELD_LABELS = Object.freeze([
   Object.freeze({ tag: 'm2lxHost', label: 'M2L-X host' }),
@@ -71,10 +73,10 @@ export const MACHINE_FIELD_LABELS = Object.freeze([
 ]);
 
 /**
- * formatValue renders one config value for the confirm dialog. Objects (the
- * monitor tile) become compact JSON; absent values are said to be absent
- * rather than rendered as "undefined", because "(not set)" is a statement and
- * "undefined" is a bug report.
+ * formatValue renders one config value for the "was X, becomes Y" note beside a
+ * previewed row. Objects (the monitor tile) become compact JSON; absent values
+ * are said to be absent rather than rendered as "undefined", because "(not set)"
+ * is a statement and "undefined" is a bug report.
  */
 function formatValue(value) {
   if (value === undefined || value === null || value === '') return '(not set)';
@@ -91,9 +93,11 @@ function formatValue(value) {
  * carrying a machine field produces no diff row for it, because this function
  * cannot see it. Use filterPresetFields to find out what such a file carries.
  *
- * The comparison is on the rendered strings, which is deliberate: the dialog
- * shows the rendered strings, and a "difference" the operator cannot see in
- * the dialog is a confirmation they cannot give honestly. One consequence,
+ * The comparison is on the rendered strings, which is deliberate: what the
+ * preview puts on the form and states beside it ARE those strings, and a
+ * "difference" that renders identically would be a green box the operator can
+ * see no change in — now the only rendering there is, since Apply no longer
+ * stops to explain itself in a dialog. One consequence,
  * accepted: a PARTIAL monitorTile in a hand-edited preset (Go merges it
  * field-by-field) renders as the fragment it is, e.g. {"x":1120,"y":720},
  * beside the full live tile — visibly a partial update rather than a lie
@@ -119,11 +123,12 @@ export function diffPreset(currentConfig, fields, labels = INSTANCE_FIELD_LABELS
 }
 
 /**
- * filterPresetFields mirrors internal/presets.Filter for the confirm dialog:
+ * filterPresetFields mirrors internal/presets.Filter for the UI:
  * {kept, ignored} where `kept` holds only whitelisted keys and `ignored` is
  * the sorted list of everything else — the keys Go will drop and report when
- * the preset is applied. Shown BEFORE the apply, so the operator confirms
- * what will actually happen rather than what the file claims.
+ * the preset is applied. Read on SELECTION and stated in the preset preview's
+ * summary line, so the operator is told what will actually happen rather than
+ * what the file claims — before they commit, rather than from a banner after.
  *
  * The fake backend uses this too, so a dev session in the browser drops the
  * same keys a real apply would.

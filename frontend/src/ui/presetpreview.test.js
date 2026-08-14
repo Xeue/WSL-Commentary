@@ -263,6 +263,44 @@ test('the summary names the preset, the count and every changed field', () => {
   assert.match(line, /Apply/, 'and it must say what commits it');
 });
 
+test('the summary line carries what the confirm dialog used to say about applying', () => {
+  // The dialog that stood in front of this form is gone (settings.js's
+  // handleApplyPreset says why). Two of the three things it said were not the
+  // diff, and this line is where one and a half of them went — the third, the
+  // unhonoured keys a hand-edited file carries, is describeIgnoredKeys and is
+  // joined on by settings.js so each pure module owns only its own sentence.
+  //
+  // Neither of these is expressible in a green box. An operator who is shown
+  // what changes but not that committing it re-dials the KVS monitor and the SRT
+  // picture reads the several seconds of black picture and silence as a fault —
+  // and one who is not told the device fields are excluded goes looking for the
+  // headphone selection a preset never touched.
+  const preset = { statusKey: 'cam7' };
+  const rows = planPresetPreview(diffPreset(liveConfig(), preset), preset, { statusKey: TEXT });
+  const line = describePresetPreview('Match G', rows);
+  assert.match(line, /monitor and the picture then reconnect/, 'applying restarts every monitor; say so');
+  assert.match(line, /black and silence/, 'and say what that looks like, or it reads as a fault');
+  assert.match(
+    line,
+    /input and headphone devices are not part of a preset and stay as they are/,
+    'the machine fields are excluded BY CONSTRUCTION; an operator who is not told hunts for them',
+  );
+
+  // Still one line to read at a glance, not a paragraph. The dialog got away
+  // with thirteen rows because it stopped everything; this does not stop
+  // anything, so it has to stay readable at speed.
+  assert.ok(
+    line.length < 400,
+    `the summary line is ${line.length} characters: it is read at a glance, in a card above the ` +
+      'fields it points at, not settled down with',
+  );
+
+  // And the quiet case stays quiet. A preset that changes nothing says nothing —
+  // the consequence is a consequence OF the changes, so it must not appear on
+  // its own and turn the active selection into an announcement.
+  assert.equal(describePresetPreview('Match G', []), '');
+});
+
 test('one change is "1 setting", not "1 settings"', () => {
   const preset = { statusKey: 'cam7' };
   const rows = planPresetPreview(diffPreset(liveConfig(), preset), preset, { statusKey: TEXT });

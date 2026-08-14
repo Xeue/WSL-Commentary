@@ -867,8 +867,10 @@ test('selecting a preset previews it — on the change event, not on Apply', () 
 
   const render = js.slice(js.indexOf('function renderPresetPreview()'), js.indexOf("presetSelect.addEventListener('change'"));
   assert.ok(render.length > 0, 'settings.js must define renderPresetPreview');
-  // Built from the diff the confirm dialog already uses. A second comparison
-  // written here could disagree with the one the operator confirms against.
+  // Built from the pure model, against the SAVED config — not a second
+  // comparison written here, which could disagree with the one the apply makes.
+  // This is now the ONLY rendering of the change there is: the confirm dialog
+  // that used to carry its own copy has gone.
   assert.match(render, /diffPreset\(lastLoadedConfig, preset\.fields\)/);
   assert.match(render, /planPresetPreview\(diff, preset\.fields, previewControls\(diff\)\)/);
   // Redraw, never layer: switching the picker from one preset to another must
@@ -879,11 +881,16 @@ test('selecting a preset previews it — on the change event, not on Apply', () 
     'the redraw must clear FIRST, or two selections in a row stack their notes',
   );
   // And the quiet case: the active preset, or one that differs in nothing,
-  // leaves the screen exactly as it was.
+  // leaves the screen exactly as it was — UNLESS the file carries keys a preset
+  // does not honour, which is a fact about the file rather than about the diff
+  // and is worth stating even when nothing would change. That note used to live
+  // in the confirm dialog, which fired on every apply including a no-change one;
+  // widening the quiet case is how it keeps that reach without a modal.
   assert.match(
     render,
-    /if \(rows\.length === 0\) return;/,
-    'a preset that changes nothing must draw nothing — not an empty flourish',
+    /if \(rows\.length === 0 && ignoredNote === ''\) return;/,
+    'a preset that changes nothing and carries nothing unhonoured must draw nothing — ' +
+      'not an empty flourish',
   );
 });
 
@@ -926,6 +933,28 @@ test('applying clears the preview and leaves the operator where they are', () =>
     'the apply must clear the preview as soon as it has committed',
   );
 
+  // AND NOTHING MAY TURN BACK BEFORE IT. The declined confirm used to be a
+  // second way out of this function, and it sat above every line below — the
+  // scroll read, the commit and the clear alike. With the dialog gone the only
+  // early return is the "no preset selected" guard at the top; a new one added
+  // underneath it would be a press of Apply that silently does nothing, on a
+  // button whose whole job is now to apply.
+  //
+  // Comments stripped first, and that is not incidental: the prose explaining
+  // why the dialog went talks about the SRT return and about a returned config,
+  // and a guard that a word does not appear must never be satisfiable — or
+  // breakable — by an explanation of itself.
+  const guard = "typeof handlers.onApplyPreset !== 'function') return;";
+  const afterGuard = handler.slice(handler.indexOf(guard) + guard.length);
+  const beforeCommit = afterGuard
+    .slice(0, afterGuard.indexOf('const scrollTop = form.scrollTop;'))
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.ok(
+    !/\breturn\b/.test(beforeCommit),
+    'Apply applies: nothing may return between the press and the commit',
+  );
+
   // SAME PAGE, SAME SCROLL POSITION. Clearing the preview removes its notes,
   // the form gets shorter, and a scroll container whose content shrinks has its
   // scrollTop clamped by the browser — the page moving under someone who only
@@ -941,25 +970,72 @@ test('applying clears the preview and leaves the operator where they are', () =>
       `applying a preset must not ${gone}: the operator stays on this screen, where they were`,
     );
   }
-});
 
-test('the confirm dialog survives, but stops being the only place the diff is legible', () => {
-  // It EARNS its place: the last chance to back out of an action that restarts
-  // the KVS monitor, the SRT return and the picture. What it must not be is a
-  // thirteen-line list read in a modal with the form it describes hidden behind
-  // it — so when the preview is on screen the dialog states the size of the
-  // change, and when it is not (the picker was never touched this visit) it
-  // still lists every field, because then it is the only rendering there is.
-  const js = ui('settings.js');
-  const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
-  assert.match(handler, /window\.confirm\(/, 'apply must still be confirmed');
+  // AND THE SCREEN THEY ARE LEFT ON HAS TO BE RIGHT. Staying is what makes this
+  // necessary: open() is what re-lists the instance's events, open() runs on
+  // entering Settings, and an apply that never leaves never triggers it — so the
+  // event picker would keep offering the OLD instance's events beside a host box
+  // naming the new one. A list an operator can choose the wrong thing from is
+  // worse than no list.
   assert.match(
     handler,
-    /const previewing = presetPreview !== null && presetPreview\.presetId === preset\.id;/,
-    'the dialog must know whether the change is already visible behind it',
+    /void refreshEventsAfterSave\(true\)/,
+    'an apply must re-list the events for the instance it just switched to',
   );
-  assert.match(handler, /marked in green on the form behind this window/);
-  assert.match(handler, /`This changes:\\n\$\{changes\.map/, 'and keep the full list for when there is no preview');
+});
+
+test('the confirm dialog is gone, and everything it carried has somewhere else to be', () => {
+  // THE DIALOG LOST ITS ARGUMENT. It was the last chance to back out of an
+  // action that restarts the KVS monitor, the SRT return and the picture — but
+  // it was drawn OVER the form it described, so its thirteen-line list stood in
+  // front of the same change now marked in green on the boxes it lands in, and
+  // it is not the safety on this button in any case: Go's ApplyPreset refuses
+  // while SENDING, and this screen disables Apply with that reason on it. The
+  // owner, having used the build: "we don't need the confirm popup now we have
+  // the green text."
+  //
+  // What this test guards is the OTHER half — that removing it lost nothing.
+  // The dialog said three things and only one of them was the diff.
+  const js = ui('settings.js');
+  const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
+  assert.ok(
+    !handler.includes('window.confirm('),
+    'Apply must apply: the modal both duplicated the preview and stood in front of it',
+  );
+
+  // 1. THE KEYS A FILE CARRIES THAT A PRESET DOES NOT HONOUR. A real fact about
+  //    a hand-edited or foreign file, and one the diff cannot express — the
+  //    whitelist means those keys never reach a row. It must still be said, and
+  //    said BEFORE the operator commits, so it moved to the selection preview.
+  const render = js.slice(js.indexOf('function renderPresetPreview()'), js.indexOf("presetSelect.addEventListener('change'"));
+  assert.match(
+    render,
+    /describeIgnoredKeys\(filterPresetFields\(preset\.fields\)\.ignored\)/,
+    'the ignored-key note must survive the dialog it used to live in',
+  );
+  assert.match(
+    render,
+    /presetPreviewLine\.textContent = \[describePresetPreview\(preset\.name, rows\), ignoredNote\]/,
+    'and reach the operator on the summary line, which needs no dismissing',
+  );
+
+  // 2. WHAT APPLYING COSTS: the monitor and the picture reconnect, and the
+  //    device fields deliberately do not move. Nothing on the form says either,
+  //    so describePresetPreview's line says both — driven for real, on the
+  //    rendered string, in presetpreview.test.js rather than grepped as prose
+  //    out of a source file here.
+  //
+  //    And it is said a second time at the moment it starts, on this screen,
+  //    because by then the preview line has gone with the green.
+  assert.match(
+    handler,
+    /setSaveMessage\(`Applied "\$\{preset\.name\}"\. The monitor and the picture are reconnecting\.`/,
+    'several seconds of black picture and silence, unexplained, reads as a fault',
+  );
+
+  // 3. And the diff itself, which was already on the form and is the reason the
+  //    dialog could go at all.
+  assert.match(render, /diffPreset\(lastLoadedConfig, preset\.fields\)/);
 });
 
 test('the preview is readable without colour, and an emptied box still reads as a change', () => {
@@ -989,6 +1065,29 @@ test('the preview restores exactly what it borrowed', () => {
   assert.match(clear, /wrap\.classList\.remove\(PREVIEW_CLASS\)/);
   assert.match(clear, /note\.remove\(\)/);
   assert.match(clear, /presetPreview = null;/);
+
+  // THE SUMMARY LINE GOES FIRST, ABOVE THE "nothing is previewed" GUARD.
+  //
+  // It can be on screen with no decoration behind it: a preset that changes no
+  // field, but whose file carries keys a preset does not honour, is announced in
+  // that line and nowhere else — that warning came off the confirm dialog and
+  // this is where it landed. Clearing it below the guard would strand it on a
+  // picker that has since moved, which is a caution about a preset the operator
+  // can no longer see selected.
+  assert.match(
+    clear,
+    /presetPreviewLine\.hidden = true;\s*presetPreviewLine\.textContent = '';\s*presetPreviewLineFor = '';\s*if \(presetPreview === null\) return;/,
+    'the line must be cleared unconditionally, before the decorations are',
+  );
+
+  // And whatever asks "is anything on screen about a preset" must read the LINE,
+  // for the same reason: it is the half that is always there when anything is.
+  const refresh = js.slice(js.indexOf('async function refreshPresets()'), js.indexOf('async function handleApplyPreset()'));
+  assert.match(
+    refresh,
+    /if \(presetPreviewLineFor !== '' && presetPreviewLineFor !== presetSelect\.value\)/,
+    'a refresh that moves the selection must withdraw the line as well as the green',
+  );
 });
 
 test('a field with no row of its own gets its preview where the operator can see it', () => {
@@ -1012,12 +1111,22 @@ test('a field with no row of its own gets its preview where the operator can see
   );
 });
 
-test('the apply confirm is built from the pure model, before anything moves', () => {
+test('what the operator is shown before an apply is built from the pure model', () => {
+  // This used to be about the confirm dialog, which computed the diff and the
+  // ignored keys itself, in the handler, "before anything moves". The dialog is
+  // gone; the obligation is not, it has moved one step earlier — to SELECTION,
+  // where both are drawn on the form and stated in the card, still from the pure
+  // model and still against the SAVED config rather than against keystrokes.
   const js = ui('settings.js');
+  const render = js.slice(js.indexOf('function renderPresetPreview()'), js.indexOf("presetSelect.addEventListener('change'"));
+  assert.match(render, /diffPreset\(lastLoadedConfig, preset\.fields\)/, 'the preview must diff against the SAVED config');
+  assert.match(render, /filterPresetFields\(preset\.fields\)/, 'and name the keys the apply will ignore');
+
+  // The handler is then only the commit, and it still owns nothing it should
+  // not: app.js runs the sequence because it can reach the monitor and the
+  // picture, and the form redraws from the RETURNED config, which is the
+  // authority — never from the preset fields this screen happens to hold.
   const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
-  assert.match(handler, /diffPreset\(lastLoadedConfig, preset\.fields\)/, 'the dialog must diff against the SAVED config');
-  assert.match(handler, /filterPresetFields\(preset\.fields\)/, 'and name the keys the apply will ignore');
-  assert.match(handler, /window\.confirm\(/, 'apply must be confirmed; it rewrites most of the form');
   assert.match(
     handler,
     /await handlers\.onApplyPreset\(preset\.id\)/,

@@ -1099,6 +1099,14 @@ input[type='range'] {
    changed, because the form is two screenfuls deep and a green box below the
    fold is only findable if something says to go and look.
 
+   THAT LINE IS ALSO WHERE THE CONFIRM DIALOG WENT. Apply no longer opens a
+   modal (the owner: the popup was redundant once the change was on the form, and
+   it took them off this screen), so the two things the modal said that the green
+   boxes cannot — applying reconnects the monitor and the picture, and a
+   hand-edited file's unhonoured keys will be dropped — are appended to the
+   summary line instead. It is prose, it wraps, and it is meant to be read
+   without dismissing anything.
+
    GREEN IS NOT THE ONLY SIGNAL, and that is a requirement rather than a
    flourish: a colour-blind operator, and a gallery projector that renders this
    screen washed out, must both read it. So the change is carried three ways —
@@ -1142,11 +1150,14 @@ input[type='range'] {
 }
 
 /* Inside the instance card, above the fields it points at. Not a warning
-   colour: nothing has happened yet and nothing is wrong.
+   colour: nothing has happened yet and nothing is wrong — including the
+   reconnect sentence, which describes what Apply WILL cost, not a fault.
 
    No max-width of its own — it is a .field-hint, and the 68ch measure the
    settings hints already share is what keeps a twelve-field list from running
-   to lines nobody reaches the end of. */
+   to lines nobody reaches the end of. Nothing clamps the height either: this
+   line took over the confirm dialog's content and a hand-edited file can push
+   it to four or five lines, and a truncated warning is worse than a long one. */
 .preset-preview-summary {
   margin: 0.2rem 0 0;
   color: var(--green);
