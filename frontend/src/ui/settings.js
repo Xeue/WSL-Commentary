@@ -1,15 +1,22 @@
 import * as backend from './backend.js';
 import { validateConfig } from './validate.js';
-// The address field's parser and its formatter. parseM2LXAddress takes EITHER
-// the instance's base URL (the event id then comes from the events API) or a
-// full live-operation URL (which still fills both); formatM2LXAddress is what
-// populate puts back, and shows the host on its own when no event is chosen.
+// The address field's parser and its formatter, and they are deliberately not
+// symmetrical. parseM2LXAddress takes EITHER the instance's base URL (the event
+// id then comes from the events API) or a full live-operation URL (which still
+// fills both fields); formatM2LXAddress writes back the BASE ADDRESS ONLY —
+// see its comment for why the app must never hand back a longer URL than the
+// one that was pasted.
 import { parseM2LXAddress, formatM2LXAddress } from './liveurl.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import { normaliseReturnSource, DEVICE_KEY_SRT } from './returnsource.js';
-// The instance-preset model: the diff for the confirm dialog and the whitelist
-// filter that mirrors Go's.
+// The instance-preset model: the diff the preview and the confirm dialog are
+// both built from, and the whitelist filter that mirrors Go's.
 import { diffPreset, describeIgnoredKeys, filterPresetFields } from './presets.js';
+// What SELECTING a preset draws on this form, decided in a pure module and
+// applied to the controls down at renderPresetPreview. See presetpreview.js for
+// the two cases that break a naive version of this (a <select>, and a new value
+// that is empty).
+import { planPresetPreview, describePresetPreview } from './presetpreview.js';
 // The pure event auto-select / picker rule. It decides, from the instance's
 // event list and the URL-derived id, whether to auto-select a lone event or
 // offer a picker; this file turns that answer into the hidden field, a note or a
@@ -199,7 +206,12 @@ export function createSettingsView(handlers) {
 
   function addField(key, labelText, input, hint) {
     const { wrap, errorEl } = row(labelText, input.id, input, hint);
-    fields[key] = { input, errorEl };
+    // The WRAP is kept as well as the input: the preset preview decorates the
+    // whole row — a mark on the label's side of the box and a "was X, becomes
+    // Y" line under it — and reaching for input.parentElement instead would
+    // work for the rows this function builds and quietly return null for the
+    // hidden fields, which is the case the preview most needs to detect.
+    fields[key] = { input, errorEl, wrap };
     currentGroup.appendChild(wrap);
     return input;
   }
@@ -255,6 +267,16 @@ export function createSettingsView(handlers) {
   presetActions.append(applyPresetBtn, savePresetBtn, renamePresetBtn, deletePresetBtn);
   presetPicker.appendChild(presetActions);
   currentGroup.appendChild(presetPicker);
+
+  // THE ONE LINE THAT SAYS A PREVIEW IS ON SCREEN, and which fields to go and
+  // look at. The form is about two screenfuls deep, so green boxes below the
+  // fold are only findable if something names them; this is that something, and
+  // describePresetPreview words it. Hidden — never an empty flourish — when the
+  // selected preset is the active one or differs in nothing.
+  const presetPreviewLine = document.createElement('p');
+  presetPreviewLine.className = 'field-hint preset-preview-summary';
+  presetPreviewLine.hidden = true;
+  currentGroup.appendChild(presetPreviewLine);
 
   // The active-instance / credential-scope readout and the "never part of a
   // preset" machine-fields note were both removed at the operator's request —
@@ -323,6 +345,13 @@ export function createSettingsView(handlers) {
       } else if (previous && presetSummaries.some((p) => p.id === previous)) {
         presetSelect.value = previous;
       }
+      // A refresh can move the selection under a preview — deleting or renaming
+      // one preset while another is previewed, say. A preview that describes a
+      // preset the picker is no longer showing is a set of green boxes with
+      // nothing on screen to explain them, so it goes.
+      if (presetPreview !== null && presetPreview.presetId !== presetSelect.value) {
+        clearPresetPreview();
+      }
     } catch (err) {
       presetSummaries = [];
       presetSelect.textContent = '';
@@ -340,27 +369,66 @@ export function createSettingsView(handlers) {
     // the operator confirms what will actually happen.
     const changes = diffPreset(lastLoadedConfig, preset.fields);
     const { ignored } = filterPresetFields(preset.fields);
-    const lines = changes.map((c) => `  ${c.label}: ${c.from} -> ${c.to}`);
     const ignoredNote = describeIgnoredKeys(ignored);
+
+    // ================ WHY THE DIALOG IS STILL HERE ========================
+    //
+    // It KEEPS its place: it is the last chance to back out of an action that
+    // restarts the KVS monitor, the SRT return and the picture, and Go refuses
+    // it outright mid-send — a button whose consequences reach the
+    // commentator's ears deserves a question. What it is NOT any more is the
+    // only place the diff is legible.
+    //
+    // So it does not repeat the preview. When the change is already drawn on
+    // the form behind the modal, the dialog states its SIZE and its
+    // consequences; thirteen lines nobody reads are worse than a count that is
+    // read, and the detail is three inches away on the form. When there is no
+    // preview on screen — the picker was never touched this visit, so Apply
+    // acts on the selection refreshPresets made — the dialog is the only
+    // rendering there is, and it lists every change exactly as it always did.
+    const previewing = presetPreview !== null && presetPreview.presetId === preset.id;
+    const count = changes.length === 1 ? '1 setting' : `${changes.length} settings`;
+    const summary = previewing
+      ? `This changes ${count} — the fields marked in green on the form behind this window.\n\n`
+      : changes.length
+        ? `This changes:\n${changes.map((c) => `  ${c.label}: ${c.from} -> ${c.to}`).join('\n')}\n\n`
+        : 'No field differs from the current settings.\n\n';
     const text =
       `Apply the instance "${preset.name}"?\n\n` +
-      (lines.length ? `This changes:\n${lines.join('\n')}\n\n` : 'No field differs from the current settings.\n\n') +
+      summary +
       (ignoredNote ? `${ignoredNote}\n\n` : '') +
       'The monitor and the picture will reconnect to the new instance. ' +
       'Your input and headphone devices are not part of a preset and stay as they are.';
     if (!window.confirm(text)) return;
+
+    // WHERE THE OPERATOR IS, read before anything moves. Apply must leave them
+    // on this screen at this scroll position: clearing the preview removes its
+    // notes, the form gets shorter, and a scroll container whose content
+    // shrinks has its scrollTop clamped by the browser — which is the page
+    // jumping under somebody who only pressed a button. Disabling a focused
+    // button also blurs it, so the focus is put back too.
+    const scrollTop = form.scrollTop;
+    const hadFocus = document.activeElement === applyPresetBtn;
 
     applyPresetBtn.disabled = true;
     try {
       // app.js owns the sequence — apply, adopt the RETURNED config, rebuild
       // the monitors — and hands the merged config back for this form.
       const merged = await handlers.onApplyPreset(preset.id);
+      // The preview stops being a preview: these are the values now. Cleared
+      // explicitly rather than relying on populate() below, because a handler
+      // that returns nothing must still not leave green boxes claiming a change
+      // that has already happened.
+      clearPresetPreview();
       if (merged) populate(merged);
       setSaveMessage(`Applied "${preset.name}".`, false);
     } catch (err) {
+      // Nothing moved, so the preview is still true and still on screen.
       setSaveMessage(`Could not apply "${preset.name}": ${err.message}`, true);
     } finally {
       await refreshPresets();
+      if (hadFocus && !applyPresetBtn.disabled) applyPresetBtn.focus();
+      form.scrollTop = scrollTop;
     }
   }
 
@@ -436,6 +504,235 @@ export function createSettingsView(handlers) {
     renderPresetButtons();
   }
 
+  // --- the preset preview -------------------------------------------------
+  //
+  // SELECTING a preset now SHOWS what applying it would do, on the form itself:
+  // every box the preset would change holds the value it would put there, in
+  // green, with the value it is replacing stated beside it. Pressing Apply
+  // commits it and the green goes, because those values are then simply the
+  // values.
+  //
+  // Before this, the picker's selection did nothing visible at all and the
+  // change was described only inside the confirm() dialog — thirteen possible
+  // lines, read once, in a hurry, with the form they describe hidden behind the
+  // modal.
+  //
+  // ================== A PREVIEW IS NOT AN EDIT ==============================
+  //
+  // The preview writes into the REAL controls, because a ghost drawn over a box
+  // is a second rendering of a value that can disagree with the first, and
+  // because a <select> has nowhere to draw one. That makes exactly one thing
+  // dangerous — collectConfig reads those controls — and it is closed in one
+  // place: handleSave withdraws the preview before it collects. Every other
+  // route out of the preview also restores the boxes it borrowed:
+  //
+  //   - populate() clears first, so a preview can never outlive the config it
+  //     was computed against (it is the diff BASELINE that would otherwise go
+  //     stale, silently);
+  //   - selecting another preset redraws from scratch rather than layering;
+  //   - typing into a previewed box hands that box back to the operator.
+  //
+  // There is no unsaved-changes guard on this screen to fire — leaveSettings
+  // calls handlers.onBack() and nothing else, and the only beforeunload handler
+  // in the application (app.js) stops the return and the picture. Checked,
+  // because a preview that tripped a "you have unsaved changes" prompt would be
+  // the app lying about work the operator did not do.
+
+  /** The decoration currently on the form, or null. See clearPresetPreview. */
+  let presetPreview = null;
+
+  /** The class that marks a row as previewed; main.css pairs it with the note. */
+  const PREVIEW_CLASS = 'field--preset-preview';
+
+  /**
+   * What an emptied box says while it is previewed. GREEN IS NOT THE ONLY
+   * SIGNAL — colour-blind operators, and a projector in a gallery — and an
+   * empty green box says less than any other kind: the placeholder, the note
+   * under the row and the summary line in the card all state the change in
+   * words as well.
+   */
+  const PREVIEW_CLEARED_PLACEHOLDER = 'cleared by this preset';
+
+  /**
+   * PREVIEW_SURROGATES: where a change lands when the field has no row of its
+   * own. It mirrors ERROR_SURROGATES further down, for the same reason — a
+   * hidden field's decoration is attached to nothing and is a change the
+   * operator cannot see.
+   *
+   *   m2lxHost    the address box IS the host's rendering, so the box previews
+   *               the base address the preset's host would produce. Never the
+   *               live-operation form: that is the shape the write path just
+   *               stopped producing, and a preview is a write path.
+   *   monitorTile ONE config value spread over four boxes, and Go merges it
+   *               field-by-field — a partial tile changes two of the four. Four
+   *               green numbers with no old values beside them would claim four
+   *               independent changes; one note under the grid states the pair
+   *               the model actually compared.
+   *
+   * Lazily evaluated: these rows are built further down this function.
+   */
+  const PREVIEW_SURROGATES = Object.freeze({
+    m2lxHost: () => ({ wrap: liveURLRow.wrap, input: liveURLInput, format: formatM2LXAddress }),
+    monitorTile: () => ({ wrap: tileGrid, input: null }),
+  });
+
+  /** previewTargetFor resolves a whitelisted tag to the row that shows it. */
+  function previewTargetFor(tag) {
+    if (Object.prototype.hasOwnProperty.call(PREVIEW_SURROGATES, tag)) {
+      return PREVIEW_SURROGATES[tag]();
+    }
+    const field = fields[tag];
+    // No wrap means a hidden input with no row on screen. It gets no
+    // decoration; the summary line still names it, which is the whole reason
+    // that line lists every changed field rather than counting them.
+    return field && field.wrap ? { wrap: field.wrap, input: field.input } : null;
+  }
+
+  /**
+   * previewControls describes, for the tags in this diff only, what settings.js
+   * has on screen for each — which is all the pure planner needs to decide what
+   * may be written into a control. Built per render rather than once, because a
+   * <select>'s option list is the authority on what it can express and reading
+   * it here means there is no second copy of it to drift.
+   */
+  function previewControls(diff) {
+    const controls = {};
+    for (const { tag } of diff) {
+      const target = previewTargetFor(tag);
+      const input = target && target.input;
+      if (!input) {
+        controls[tag] = { box: 'none' };
+      } else if (input.tagName === 'SELECT') {
+        controls[tag] = { box: 'select', options: [...input.options].map((o) => o.value) };
+      } else {
+        controls[tag] = { box: 'input', format: target.format };
+      }
+    }
+    return controls;
+  }
+
+  /**
+   * clearPresetPreview puts every borrowed control back exactly as it was and
+   * removes the marks. Safe to call when there is no preview, which is what
+   * lets populate() and handleSave() call it unconditionally.
+   */
+  function clearPresetPreview() {
+    if (presetPreview === null) return;
+    for (const box of presetPreview.boxes) {
+      box.input.value = box.value;
+      box.input.placeholder = box.placeholder;
+    }
+    for (const wrap of presetPreview.wraps) wrap.classList.remove(PREVIEW_CLASS);
+    for (const note of presetPreview.notes) note.remove();
+    presetPreview = null;
+    presetPreviewLine.hidden = true;
+    presetPreviewLine.textContent = '';
+    // The derived line reads the m2lxHost and eventId BOXES, so restoring them
+    // without redrawing it leaves it quoting the preset that has just been
+    // taken off the form. See renderPresetPreview's matching call.
+    showDerived();
+  }
+
+  /**
+   * releasePreviewedControl hands a box back to the operator the moment they
+   * type in it: their value stands, and the green mark — which claims the box
+   * holds the PRESET's value — comes off it.
+   *
+   * The row's note stays, and deliberately: it says what the preset would do to
+   * this field, which is still true, and applying would overwrite their edit
+   * along with everything else.
+   */
+  function releasePreviewedControl(target) {
+    if (presetPreview === null) return;
+    const i = presetPreview.boxes.findIndex((b) => b.input === target);
+    if (i < 0) return;
+    const [box] = presetPreview.boxes.splice(i, 1);
+    box.input.placeholder = box.placeholder;
+    // The mark belongs to the ROW, and a row can hold more than one previewed
+    // control (the tile grid is that shape today, the address row was), so it
+    // comes off only when nothing previewed is left on it.
+    if (!presetPreview.boxes.some((b) => b.wrap === box.wrap)) {
+      box.wrap.classList.remove(PREVIEW_CLASS);
+    }
+  }
+
+  /**
+   * renderPresetPreview draws the selected preset's changes onto the form. It
+   * CLEARS FIRST, unconditionally: switching the picker from one preset to
+   * another must redraw, never layer a second set of notes under the first.
+   */
+  function renderPresetPreview() {
+    clearPresetPreview();
+    const preset = selectedPresetSummary();
+    // No baseline, no honest diff: before the first populate() every field
+    // would read as "(not set) -> x", which is a preview of the wrong thing.
+    if (!preset || !lastLoadedConfig) return;
+
+    // The diff is presets.js's, not a second comparison written here. It is
+    // also what stops a hand-edited preset file decorating a device-id field:
+    // the tags never arrive.
+    const diff = diffPreset(lastLoadedConfig, preset.fields);
+    const rows = planPresetPreview(diff, preset.fields, previewControls(diff));
+    // The active preset, or one that differs in nothing: nothing to say, so
+    // nothing is said. An "this preset changes 0 settings" line would be an
+    // empty flourish on the one selection that needs no attention at all.
+    if (rows.length === 0) return;
+
+    const state = { presetId: preset.id, boxes: [], wraps: [], notes: [] };
+    for (const row of rows) {
+      const target = previewTargetFor(row.tag);
+      if (!target) continue;
+
+      if (target.input && row.boxValue !== null) {
+        state.boxes.push({
+          input: target.input,
+          wrap: target.wrap,
+          value: target.input.value,
+          placeholder: target.input.placeholder,
+        });
+        target.input.value = row.boxValue;
+        if (row.cleared) target.input.placeholder = PREVIEW_CLEARED_PLACEHOLDER;
+        if (!state.wraps.includes(target.wrap)) {
+          target.wrap.classList.add(PREVIEW_CLASS);
+          state.wraps.push(target.wrap);
+        }
+      }
+
+      // The note goes on every changed row, box or no box: it carries the from
+      // and the to in words, which is what makes the green readable to someone
+      // who cannot see that it is green.
+      const note = document.createElement('p');
+      note.className = 'field-hint preset-preview-note';
+      note.textContent = row.note;
+      target.wrap.appendChild(note);
+      state.notes.push(note);
+    }
+
+    presetPreview = state;
+    presetPreviewLine.textContent = describePresetPreview(preset.name, rows);
+    presetPreviewLine.hidden = false;
+
+    // The derived line under the address box is built from the m2lxHost and
+    // eventId boxes, and a preset that changes the host has just moved one of
+    // them. Without this the row states two different hosts at once — the
+    // preset's, in green, in the box, and the machine's, in prose, immediately
+    // beneath it — which reads as a bug in the preview rather than as the two
+    // halves of one row disagreeing. The line follows the boxes; the green is
+    // what marks the whole row as not yet applied.
+    showDerived();
+  }
+
+  // SELECT previews, APPLY commits. The change event, not the button.
+  presetSelect.addEventListener('change', () => renderPresetPreview());
+
+  // Typing into a previewed box takes it back off the preview. Delegated to the
+  // form — one listener rather than one per previewed control per redraw — and
+  // on BOTH events because a <select> announces itself with 'change' and never
+  // with 'input'. Setting .value from script fires neither, so drawing the
+  // preview cannot trip this.
+  form.addEventListener('input', (e) => releasePreviewedControl(e.target));
+  form.addEventListener('change', (e) => releasePreviewedControl(e.target));
+
   // --- connection -------------------------------------------------------
   const connectionHeading = document.createElement('h2');
   connectionHeading.textContent = 'M2L-X connection';
@@ -469,7 +766,8 @@ export function createSettingsView(handlers) {
     'f-liveUrl',
     liveURLInput,
     'The instance address is enough — the event is found from the instance and chosen below. ' +
-      'A full live-operation URL is also accepted, and fills the event in from its own path.',
+      'A full live-operation URL is also accepted, and fills the event in from its own path; ' +
+      'this box then shows the instance address on its own, which is all it needs.',
   );
   const liveURLNote = document.createElement('p');
   liveURLNote.className = 'field-hint field-note';
@@ -1144,6 +1442,12 @@ export function createSettingsView(handlers) {
   // --- populate / collect --------------------------------------------
 
   function populate(config) {
+    // FIRST, before a single box is written. A preview holds the operator's own
+    // values so it can give them back, and it is a diff against the config
+    // below — so a preview that outlived a populate() would restore stale
+    // values over fresh ones and describe a comparison that no longer exists.
+    // One line here covers every caller: open(), a failed load, and the apply.
+    clearPresetPreview();
     // The diff baseline for Apply. Recorded BEFORE the form gets a chance to be
     // edited: the confirm dialog compares a preset against what is SAVED, not
     // against keystrokes that were never saved.
@@ -1193,7 +1497,13 @@ export function createSettingsView(handlers) {
     fields.m2lxPassword.input.value = '';
     fields.srtPassphrase.input.value = '';
     fields.srtReturnPassphrase.input.value = '';
-    liveURLInput.value = formatM2LXAddress(config.m2lxHost, config.eventId);
+    // THE BASE ADDRESS, never a live-operation URL. This line used to pass the
+    // event id as well, and formatM2LXAddress then re-synthesised
+    // https://<host>/live-operation/<id> — so an operator who pasted the
+    // instance's address got a longer one back on the next load. The event id
+    // is not lost by this: it is in fields.eventId, on the derived line below
+    // and on the event picker's own row.
+    liveURLInput.value = formatM2LXAddress(config.m2lxHost);
     // ORDER MATTERS, and it was the wrong way round: hideLiveURLMessages()
     // clears the derived line as well as the error, so calling it after
     // showDerived() blanked the one thing on this row that says which host and
@@ -1298,6 +1608,14 @@ export function createSettingsView(handlers) {
 
   async function handleSave() {
     saveMessage.hidden = true;
+    // THE LINE THAT MAKES "A PREVIEW IS NOT AN EDIT" TRUE. The preview writes
+    // the preset's values into the real controls, so collectConfig would
+    // otherwise save them — half-applying a preset from a button that says Save
+    // settings, with no confirmation, no credential scope and no monitor
+    // rebuild, which is the worst possible way for an instance switch to
+    // happen. Withdrawn first; the save writes what the form actually holds.
+    const hadPreview = presetPreview !== null;
+    clearPresetPreview();
     const config = collectConfig();
     const errors = validateConfig(config);
     if (Object.keys(errors).length > 0) {
@@ -1336,7 +1654,16 @@ export function createSettingsView(handlers) {
       savedM2LXHost = config.m2lxHost;
       savedEventId = config.eventId;
       saved = true;
-      setSaveMessage('Settings saved.', false);
+      // Say that the green went, and why. An operator who had a preview on
+      // screen just watched several boxes revert as they pressed Save, and
+      // silence there reads as the save having gone wrong.
+      setSaveMessage(
+        hadPreview
+          ? 'Settings saved. The preset preview was withdrawn — it was never part of the form; ' +
+              'press Apply to switch to that instance.'
+          : 'Settings saved.',
+        false,
+      );
       handlers.onSaved(config);
     } catch (err) {
       setSaveMessage(`Could not save settings: ${err.message}`, true);

@@ -15,7 +15,6 @@ import assert from 'node:assert/strict';
 import {
   parseLiveOperationURL,
   parseM2LXAddress,
-  formatLiveOperationURL,
   formatM2LXAddress,
   bareHost,
 } from './liveurl.js';
@@ -297,45 +296,62 @@ test('a full live-operation URL is NOT held to the host check', () => {
   });
 });
 
-test('formatM2LXAddress round-trips both forms back through the parser', () => {
-  // populate() writes this back into the field, and the field is parsed again on
-  // the next keystroke: a shape that does not survive the round trip is a
-  // Settings screen that reports an error against a value nobody typed.
-  assert.equal(formatM2LXAddress(HOST, EVENT), FULL);
-  assert.deepEqual(parseM2LXAddress(formatM2LXAddress(HOST, EVENT)), {
-    ok: true,
-    host: HOST,
-    eventId: EVENT,
-  });
+test('formatM2LXAddress writes the base address and nothing else', () => {
+  // THE COMPLAINT THIS CLOSES: "it seems to do some stuff where it is writing
+  // URLs with extra parts, not just pasting the whole URL in". This function
+  // asked formatLiveOperationURL first, so a config holding both halves drew
+  // https://host/live-operation/<id> into the box on every load — a longer
+  // string than the one the operator pasted, naming a page rather than an
+  // instance.
+  assert.equal(formatM2LXAddress(HOST), `https://${HOST}`);
+  assert.ok(!formatM2LXAddress(HOST).includes('live-operation'));
 
-  // The half that formatLiveOperationURL could not express: a configured host
-  // with no event yet used to draw an EMPTY address box, which reads as "no
-  // instance set" while the app is talking to one.
-  assert.equal(formatM2LXAddress(HOST, ''), `https://${HOST}`);
-  assert.deepEqual(parseM2LXAddress(formatM2LXAddress(HOST, '')), {
-    ok: true,
-    host: HOST,
-    eventId: '',
-  });
-  assert.equal(formatM2LXAddress(`https://${HOST}/`, undefined), `https://${HOST}`);
-  assert.equal(formatM2LXAddress('', EVENT), '', 'with no host there is nothing to show');
-  assert.equal(formatM2LXAddress(undefined, undefined), '');
+  // A host pasted with a scheme or a trailing slash is still reduced to the one
+  // canonical spelling, so re-populating the form does not churn the box.
+  assert.equal(formatM2LXAddress(`https://${HOST}/`), `https://${HOST}`);
+  assert.equal(formatM2LXAddress(`  ${HOST}  `), `https://${HOST}`);
+  assert.equal(formatM2LXAddress(''), '', 'with no host there is nothing to show');
+  assert.equal(formatM2LXAddress(undefined), '');
 });
 
-test('formatLiveOperationURL round-trips with the parser', () => {
-  const url = formatLiveOperationURL(HOST, EVENT);
-  assert.equal(url, FULL);
-  assert.deepEqual(parseLiveOperationURL(url), { ok: true, host: HOST, eventId: EVENT });
+test('formatM2LXAddress takes the host ALONE — the event id parameter is gone', () => {
+  // Not merely ignored: gone. An ignored second parameter is an invitation to
+  // pass the event id again and expect it to show up, which is how the
+  // live-operation form got into the write path in the first place. The event
+  // id comes from the events API and lives on its own row; a preset never
+  // carries it.
+  assert.equal(formatM2LXAddress.length, 1, 'formatM2LXAddress has grown a second parameter again');
 });
 
-test('formatLiveOperationURL tolerates a host that was pasted with a scheme', () => {
-  assert.equal(formatLiveOperationURL(`https://${HOST}/`, EVENT), FULL);
+test('the round trip that must hold is on the HOST, not on the whole string', () => {
+  // The honest statement of it. format(parse(x)) === x was true while the
+  // formatter re-synthesised the long form, and it is NOT true now: a pasted
+  // live-operation URL parses into a host AND an event id, and only the host
+  // goes back into the box. What still has to hold — and what a Settings screen
+  // reporting an error against a value nobody typed would break — is that
+  // whatever this writes parses back to the same host, with no event id
+  // invented out of the address.
+  const pasted = parseM2LXAddress(FULL);
+  assert.deepEqual(pasted, { ok: true, host: HOST, eventId: EVENT });
+
+  const written = formatM2LXAddress(pasted.host);
+  assert.equal(written, `https://${HOST}`);
+  assert.deepEqual(parseM2LXAddress(written), { ok: true, host: HOST, eventId: '' });
+
+  // The event id is not lost by this — it is held in the form's own eventId
+  // field and shown by the event picker, which is where it belongs. Losing it
+  // would matter: before the first successful sign-in a pasted URL is the only
+  // source of an id there is.
+  assert.equal(pasted.eventId, EVENT);
 });
 
-test('formatLiveOperationURL returns nothing when either half is missing', () => {
-  assert.equal(formatLiveOperationURL('', EVENT), '');
-  assert.equal(formatLiveOperationURL(HOST, ''), '');
-  assert.equal(formatLiveOperationURL(undefined, undefined), '');
+test('the PARSER still accepts the full live-operation URL the app no longer writes', () => {
+  // Reading and writing are deliberately asymmetric. Operators have these URLs
+  // in their notes and in muscle memory, so a pasted one must go on filling
+  // both fields — this half is untouched by the formatter's change, and this
+  // test is what says so.
+  assert.deepEqual(parseLiveOperationURL(FULL), { ok: true, host: HOST, eventId: EVENT });
+  assert.deepEqual(parseM2LXAddress(FULL), { ok: true, host: HOST, eventId: EVENT });
 });
 
 // bareHost mirrors internal/config's hostOnly, which is what EffectiveSRTHost

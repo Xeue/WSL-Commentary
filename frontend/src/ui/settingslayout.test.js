@@ -307,3 +307,35 @@ test('the preset card has a home', () => {
     assert.ok(sheet.includes(selector), `main.css must declare ${selector} for the presets UI to land into`);
   }
 });
+
+test('the preset preview has a home, and every class settings.js adds is styled', () => {
+  // The CSS<->JS coupling the preview introduces. A class settings.js adds and
+  // main.css does not style is a preview that draws nothing — the picker would
+  // go back to doing nothing visible, which is the whole defect.
+  for (const selector of ['.field--preset-preview', '.preset-preview-note', '.preset-preview-summary']) {
+    assert.ok(sheet.includes(selector), `main.css must style ${selector}`);
+    assert.ok(js.includes(selector.replace(/^\./, '')), `settings.js must actually add ${selector}`);
+  }
+});
+
+test('the preview is marked by more than its colour', () => {
+  // Colour-blind operators, and a gallery projector that washes this screen
+  // out. The mark on a previewed control is a DASHED border — a shape — so the
+  // green is the fastest signal rather than the only one. The other two are the
+  // note's "was X → becomes Y" and the summary line, both in settings.js.
+  const marked = rule(sheet, '.field--preset-preview input[type=');
+  assert.ok(marked, 'main.css must style a previewed control');
+  assert.match(
+    marked,
+    /border:\s*1px dashed/,
+    'a colour-only mark is invisible to a colour-blind operator and to a washed-out projector',
+  );
+});
+
+test('the preview summary owns the whole row of the instance card', () => {
+  // It names every changed field, so at a 350px track it would wrap into a
+  // column two words wide. Full row via `1 / -1`, with the other composite
+  // items — never `span N`, for the reason the rule beside it records.
+  const fullRow = rule(sheet, '.settings-group > .preset-preview-summary');
+  assert.match(fullRow, /grid-column:\s*1 \/ -1/);
+});

@@ -11,13 +11,18 @@
 //
 // # What a preset is, in one paragraph
 //
-// One M2L-X deployment's coordinates — host, alias, event, ports, key lengths,
+// One M2L-X deployment's coordinates — host, alias, ports, key lengths,
 // statusKey, the measured tile and gain — saved as a file under
 // %APPDATA%\WSLComms\presets and applied onto the live config as a MERGE.
 // internal/presets owns the whitelist that makes "a preset cannot carry a
 // device id" true by construction; this file owns the wiring: which locks, in
 // which order, what is refused, and which Credential Manager scope the three
 // passwords are read from.
+//
+// A preset says WHICH VENUE and never which match: the event id is discovered
+// from the instance (App.ListEvents over internal/m2lx's GET
+// /api/events/overview), not remembered — see internal/presets.DiscoveredFields
+// for the reasoning and for what that means for the files already on disk.
 //
 // # The credential scope, and why it is a decorator rather than four edits
 //
@@ -289,6 +294,15 @@ func (a *App) SavePreset(name string) (presets.Summary, error) {
 // having the page ASSIGN it (`currentConfig = await backend.applyPreset(id)`)
 // is what removes that window; if this ever stops returning the config, that
 // bug comes straight back.
+//
+// It also makes the merge's OMISSIONS load-bearing, and eventId is the one that
+// matters: the page adopts this document wholesale, so a merged config with a
+// blank event id would blank the box and take the KVS monitor down for anyone
+// who applied a preset — the regression the operator would report as "picking
+// my venue killed the picture". It cannot happen, because the merge starts from
+// snapshotConfig() and presets.Apply only writes keys the preset actually
+// carries, and eventId is no longer one of them. Pinned by
+// TestApplyPresetKeepsTheEventIDTheMachineAlreadyHad.
 //
 // # The order of operations, and which lock is held where
 //

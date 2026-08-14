@@ -13,8 +13,10 @@
 // Each preset carries only the instance coordinates the operator specified: the
 // host, the sign-in name, and "commentary input number 4" expressed three ways
 // — statusKey cam4, the SRT contribution port 40004, and the SRT return port
-// 40504. The event id is deliberately NOT baked: it changes per live event and
-// is auto-selected after sign-in (see App.ListEvents and events.js). Everything
+// 40504. The event id is not baked, and could not be even if somebody wanted it
+// to be: it is a DISCOVERED field (internal/presets.DiscoveredFields), changes
+// per live event, and is auto-selected after sign-in (App.ListEvents and
+// events.js). A preset that named one would be stripped on load. Everything
 // else stays at config defaults, so applying a match changes only these five
 // fields and leaves an operator's other settings untouched.
 //

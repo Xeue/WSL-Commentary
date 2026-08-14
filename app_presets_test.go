@@ -81,8 +81,12 @@ func TestApplyPresetRefusedWhileSending(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A preset file as an older build wrote them, eventId and all: the refusal
+	// fires before any of it is read, so nothing about the file matters — which
+	// is the point of asserting the live eventId below is untouched.
 	savePresetFile(t, "twickenham", "Twickenham", "twickenham", map[string]json.RawMessage{
-		"eventId": json.RawMessage(`"dl9-twickenham"`),
+		"m2lxHost": json.RawMessage(`"twickenham.example.com"`),
+		"eventId":  json.RawMessage(`"dl9-twickenham"`),
 	})
 
 	if err := a.Start(); err != nil {
@@ -128,7 +132,7 @@ func TestApplyPresetLeavesDeviceIDsAlone(t *testing.T) {
 	// that, applied, would preroll and then fail asynchronously inside
 	// GStreamer while the sender blamed the network.
 	savePresetFile(t, "mailed", "Mailed From Elsewhere", "", map[string]json.RawMessage{
-		"eventId":       json.RawMessage(`"dl9-elsewhere"`),
+		"alias":         json.RawMessage(`"wsl-comms-elsewhere"`),
 		"audioDeviceId": json.RawMessage(`"` + renderGUID + `"`),
 	})
 
@@ -146,7 +150,7 @@ func TestApplyPresetLeavesDeviceIDsAlone(t *testing.T) {
 	if got := readConfigFromDisk(t).AudioDeviceID; got != captureGUID {
 		t.Errorf("config.json's audioDeviceId = %q, want %q byte-identical", got, captureGUID)
 	}
-	if merged.EventID != "dl9-elsewhere" {
+	if merged.Alias != "wsl-comms-elsewhere" {
 		t.Error("the whitelisted key travelling with the bad one must still apply")
 	}
 
@@ -171,7 +175,7 @@ func TestApplyPresetReturnsTheMergedConfig(t *testing.T) {
 	setConfig(a, quietConfig())
 
 	savePresetFile(t, "twickenham", "Twickenham", "twickenham", map[string]json.RawMessage{
-		"eventId":   json.RawMessage(`"dl9-twickenham"`),
+		"alias":     json.RawMessage(`"wsl-comms-tw"`),
 		"srtPort":   json.RawMessage(`40007`),
 		"statusKey": json.RawMessage(`""`),
 	})
@@ -191,8 +195,82 @@ func TestApplyPresetReturnsTheMergedConfig(t *testing.T) {
 	if !reflect.DeepEqual(merged, got) {
 		t.Errorf("ApplyPreset returned %+v but GetConfig() now says %+v; the page would cache a lie", merged, got)
 	}
-	if merged.EventID != "dl9-twickenham" || merged.SRTPort != 40007 {
+	if merged.Alias != "wsl-comms-tw" || merged.SRTPort != 40007 {
 		t.Errorf("the preset's fields did not apply: %+v", merged)
+	}
+}
+
+// TestApplyPresetKeepsTheEventIDTheMachineAlreadyHad is R2's regression guard,
+// and it guards the SECOND failure mode rather than the first. Dropping eventId
+// from the whitelist stops a preset from re-applying a stale match id; the risk
+// it creates is the mirror image — the page adopts ApplyPreset's return value
+// wholesale, so a merged document that had LOST the event id would blank the
+// Settings box and take the KVS monitor down for anybody who picked a venue.
+//
+// Both halves are exercised at once: a modern preset that never mentions the
+// key, and a legacy file that names a match from last season. Neither may move
+// the live value, on any of the three copies that must agree — the returned
+// document, the in-memory config and config.json.
+func TestApplyPresetKeepsTheEventIDTheMachineAlreadyHad(t *testing.T) {
+	const chosenHere = "dl9-running-right-now"
+
+	a, _ := newTestApp(t)
+	cfg := quietConfig()
+	cfg.EventID = chosenHere // as the events picker selected it after sign-in
+	setConfig(a, cfg)
+	if err := a.snapshotConfig().Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A preset this build wrote: no eventId anywhere in it.
+	savePresetFile(t, "wembley", "Wembley", "wembley", map[string]json.RawMessage{
+		"m2lxHost":  json.RawMessage(`"wembley.example.com"`),
+		"statusKey": json.RawMessage(`"cam4"`),
+	})
+	merged, err := a.ApplyPreset("wembley")
+	if err != nil {
+		t.Fatalf("ApplyPreset() error = %v", err)
+	}
+	if merged.EventID != chosenHere {
+		t.Errorf("the returned config's eventId = %q, want %q — a blank one is adopted by the page "+
+			"and the KVS monitor stops for everyone who applies a preset", merged.EventID, chosenHere)
+	}
+	if got := a.snapshotConfig().EventID; got != chosenHere {
+		t.Errorf("the live config's eventId = %q, want %q", got, chosenHere)
+	}
+	if got := readConfigFromDisk(t).EventID; got != chosenHere {
+		t.Errorf("config.json's eventId = %q, want %q", got, chosenHere)
+	}
+	if merged.M2LXHost != "wembley.example.com" {
+		t.Errorf("the preset's own fields did not apply: host = %q", merged.M2LXHost)
+	}
+
+	// A preset from before this change, carrying the match it was saved during.
+	// It must not be honoured — and it must not be complained about either: the
+	// operator never typed that key, this application's older builds wrote it
+	// into every file they saved, so a banner about it is crying wolf.
+	drainPump(a)
+	savePresetFile(t, "twickenham", "Twickenham", "twickenham", map[string]json.RawMessage{
+		"m2lxHost": json.RawMessage(`"twickenham.example.com"`),
+		"eventId":  json.RawMessage(`"dl9-last-season"`),
+	})
+	merged, err = a.ApplyPreset("twickenham")
+	if err != nil {
+		t.Fatalf("ApplyPreset() of a legacy preset error = %v; an old file must still apply", err)
+	}
+	if merged.EventID != chosenHere {
+		t.Errorf("a legacy preset's stale eventId was applied: %q, want %q untouched", merged.EventID, chosenHere)
+	}
+	if got := readConfigFromDisk(t).EventID; got != chosenHere {
+		t.Errorf("config.json's eventId after the legacy apply = %q, want %q", got, chosenHere)
+	}
+	for _, e := range drainPump(a) {
+		if e.name != EventError {
+			continue
+		}
+		if s, ok := e.data.(string); ok && strings.Contains(s, "eventId") {
+			t.Errorf("applying a legacy preset raised a banner about eventId: %q", s)
+		}
 	}
 }
 

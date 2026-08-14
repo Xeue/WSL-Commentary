@@ -1,6 +1,10 @@
 /**
  * Parsing the M2L-X address field into a host and — when the address happens to
- * carry one — an event ID.
+ * carry one — an event ID, and writing the field back.
+ *
+ * The two directions are deliberately NOT symmetrical, and formatM2LXAddress at
+ * the foot of this file records why: the app reads either form and writes only
+ * the base address.
  *
  * Owner: WP-5b. Pure — no DOM, no network.
  *
@@ -118,8 +122,7 @@ function splitAddress(input) {
  * when there is none. It is the inner parser — parseM2LXAddress is what the
  * Settings field uses — and it is kept strict because "this string names an
  * event" is a different question from "this string names an instance", and the
- * app has to be able to ask the first one on its own (formatLiveOperationURL
- * round-trips through it, and its tests are about that meaning).
+ * app has to be able to ask the first one on its own.
  *
  * It deliberately does NOT check that the host is plausible: it never did, this
  * path ships on air on Windows, and a live-operation URL always brings its host
@@ -172,8 +175,8 @@ export function parseLiveOperationURL(input) {
  */
 export function parseM2LXAddress(input) {
   // The strict parser is asked FIRST and is the only thing that decides whether
-  // an address names an event, so the two answers cannot drift apart: whatever
-  // formatLiveOperationURL round-trips through, this accepts identically.
+  // an address names an event, so the two answers cannot drift apart: a URL the
+  // strict parser accepts is accepted identically here, event id and all.
   const strict = parseLiveOperationURL(input);
   if (strict.ok) return strict;
 
@@ -318,40 +321,40 @@ export function bareHost(host) {
 }
 
 /**
- * formatLiveOperationURL rebuilds the canonical URL from a host and event ID,
- * so the Settings screen can show the operator what its two fields amount to
- * without them having to reassemble it in their head.
+ * formatM2LXAddress is what populate() puts INTO the address field: the
+ * instance's BASE address, and nothing else.
+ *
+ * ============ WHY THERE IS NO LONGER AN eventId PARAMETER ==================
+ *
+ * There used to be one, and this function asked formatLiveOperationURL first,
+ * so a config that had both halves drew "https://<host>/live-operation/<id>"
+ * in the box on every load. The operator's complaint was exactly that: they
+ * pasted an instance address and the app handed back a longer one, "writing
+ * URLs with extra parts". The long form is a page on the M2L-X GUI, not the
+ * address of the instance, and this box asks for the instance.
+ *
+ * The event id has no business here either way. It is discovered from
+ * GET /api/events/overview (internal/m2lx/events.go -> App.ListEvents ->
+ * refreshEvents), it is shown on its own row by the picker or the
+ * auto-selected note, and a preset never carries it — a preset is which venue,
+ * never which match. So the parameter is GONE rather than merely ignored: an
+ * ignored parameter is an invitation to pass the id again and expect it to
+ * appear, which is how the long form got into the write path the first time.
+ *
+ * READING is untouched. parseM2LXAddress still accepts a full live-operation
+ * URL and still fills both fields from it — operators have those URLs in their
+ * notes, and before the first successful sign-in the id in a pasted URL is the
+ * only source of one there is. This is only about what the app WRITES BACK.
+ * The consequence, deliberate: paste a long URL, and once the form is
+ * re-populated the box shows the base address while the event stays on its own
+ * row. The field's hint says so, because a box that silently shortens what was
+ * pasted into it otherwise reads as something being lost.
+ * ===========================================================================
  *
  * @param {string} host
- * @param {string} eventId
- * @returns {string} '' if either part is missing
- */
-export function formatLiveOperationURL(host, eventId) {
-  const h = typeof host === 'string' ? host.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '') : '';
-  const e = typeof eventId === 'string' ? eventId.trim() : '';
-  if (!h || !e) return '';
-  return `https://${h}/${LIVE_OPERATION_SEGMENT}/${e}`;
-}
-
-/**
- * formatM2LXAddress is what populate() puts INTO the address field, and it is
- * formatLiveOperationURL's counterpart now that the event id no longer has to
- * come from the URL.
- *
- * A configured host with no event id must still show the host: with
- * formatLiveOperationURL alone that config drew an EMPTY address box — the
- * screen claiming the instance was unset while the app was talking to it — and
- * an operator who then typed into the empty box would be starting from nothing.
- * The full URL is still preferred when both halves are known, so a screen an
- * operator already recognises does not change under them.
- *
- * @param {string} host
- * @param {string} eventId
  * @returns {string} '' only when there is no host
  */
-export function formatM2LXAddress(host, eventId) {
-  const full = formatLiveOperationURL(host, eventId);
-  if (full !== '') return full;
+export function formatM2LXAddress(host) {
   const h = typeof host === 'string' ? host.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '') : '';
   return h === '' ? '' : `https://${h}`;
 }

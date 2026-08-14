@@ -1,7 +1,7 @@
 // Package presets stores and applies M2L-X INSTANCE PRESETS: one deployment's
-// coordinates — host, event, ports, keys' lengths, the measured layout facts —
-// saved as a file of its own under %APPDATA%\WSLComms\presets and applied onto
-// the live configuration as a MERGE.
+// coordinates — host, ports, keys' lengths, the measured layout facts — saved
+// as a file of its own under %APPDATA%\WSLComms\presets and applied onto the
+// live configuration as a MERGE.
 //
 // Owner: presets work package. It deliberately lives outside internal/config,
 // which CONTRACT.md gives exclusively to WP-1: this package imports config and
@@ -9,8 +9,9 @@
 //
 // # The one guarantee everything here exists to make true by construction
 //
-// A preset never carries a device id, a filesystem path, or a live monitoring
-// choice. Not "should never" — CANNOT. Extract builds a preset's fields from
+// A preset never carries a device id, a filesystem path, a live monitoring
+// choice, or a value the app can discover from the instance itself (the event
+// id). Not "should never" — CANNOT. Extract builds a preset's fields from
 // the explicit InstanceFields whitelist below, Filter drops anything else from
 // a file that arrived by mail or by hand-editing, and Apply unmarshals the
 // surviving keys onto the EXISTING *config.Config, so a field a preset omits is
@@ -35,12 +36,14 @@ import (
 	"wslcomms/internal/config"
 )
 
-// Class is a config field's classification: which of the three tables its json
+// Class is a config field's classification: which of the four tables its json
 // tag appears in. The decision rule, stated once so future fields classify
-// themselves:
+// themselves — and note that the three "never travels" classes differ by WHO
+// the authority for the value is, not by how inconvenient it would be to get
+// wrong:
 //
-//   - INSTANCE — a property of the M2L-X deployment/event. The same for anyone
-//     who plugs into it; wrong on any other instance. Travels in a preset.
+//   - INSTANCE — a property of the M2L-X deployment. The same for anyone who
+//     plugs into it; wrong on any other instance. Travels in a preset.
 //   - MACHINE — names hardware or a filesystem path on THIS PC (or this
 //     WebView profile). Never travels; a MACHINE value from another machine is
 //     a fault that arrives by post.
@@ -48,14 +51,18 @@ import (
 //     Never travels, because a preset applied from a configuration screen must
 //     not change what is in a commentator's ears or on their screen as a side
 //     effect.
+//   - DISCOVERED — a value the application LEARNS from the instance at
+//     runtime. Never travels, because the instance is the authority and a
+//     remembered copy is a stale answer wearing a confident face.
 type Class string
 
-// The three classes. TestEveryConfigFieldIsClassified fails, by field name, on
+// The four classes. TestEveryConfigFieldIsClassified fails, by field name, on
 // any config.Config field that is in none of them — or in more than one.
 const (
-	ClassInstance Class = "instance"
-	ClassMachine  Class = "machine"
-	ClassUI       Class = "ui"
+	ClassInstance   Class = "instance"
+	ClassMachine    Class = "machine"
+	ClassUI         Class = "ui"
+	ClassDiscovered Class = "discovered"
 )
 
 // InstanceFields is the WHITELIST: the json tags of config.Config that a
@@ -70,8 +77,6 @@ var InstanceFields = []string{
 	"m2lxHost",
 	// The sign-in name on that deployment.
 	"alias",
-	// The KVS webrtc_info/webrtc_token event.
-	"eventId",
 	// That instance's commentary ingest port. (There is no srtHost field: the
 	// SRT host is always derived from m2lxHost — see config.EffectiveSRTHost.)
 	"srtPort",
@@ -133,11 +138,49 @@ var UIFields = []string{
 	"returnChannel",
 }
 
+// DiscoveredFields are the json tags of values the application LEARNS from the
+// instance at runtime, and which therefore must never be carried in a preset.
+// What separates this class from MACHINE and UI is where the authority for the
+// value lives: a machine field belongs to this PC, a UI field to the person at
+// the desk, and a discovered field to the M2L-X itself — so the only correct
+// way to hold one is to ask for it, and the only way to be wrong about one is
+// to remember it.
+//
+// eventId is the first member and the reason the class exists. A preset answers
+// WHICH VENUE; eventId names WHICH MATCH. Two fixtures at the same ground are
+// two event ids against one identical set of instance coordinates, so a preset
+// carrying it is right on the afternoon it was saved and quietly wrong every
+// time afterwards: the KVS monitor dials last week's signalling channel while
+// every field on the Settings screen reads exactly as the operator expects, and
+// the failure surfaces as "the picture never came up" rather than as a wrong
+// value anybody can see. Since internal/m2lx/events.go's ListEvents
+// (GET /api/events/overview) the application can simply ask a signed-in
+// instance for its events — auto-selecting when there is exactly one — so
+// remembering the id buys nothing and costs that.
+//
+// What would be WRONG to put here: this is not "fields the app happens to fetch
+// from somewhere", and it is emphatically not a bin for a field nobody wants to
+// classify. A tag belongs in this table only when the INSTANCE is the authority
+// for its value AND there is a live call that returns it; without the call,
+// "discovered" is a promise the app cannot keep and the field is really an
+// instance coordinate the operator must configure. statusKey is exactly that
+// case — per-instance, per-patch, and nothing in the API supplies it — which is
+// why it stays on the whitelist above.
+//
+// Listed LAST of the four on purpose: frontend/src/ui/presets.test.js reads
+// this file and takes the whitelist to be the text between "var InstanceFields"
+// and "// MachineFields", so a table wedged between those two markers would be
+// read as part of it.
+var DiscoveredFields = []string{
+	// The KVS webrtc_info/webrtc_token event — which MATCH, never which venue.
+	"eventId",
+}
+
 // classes is the lookup the public helpers answer from, built once. A tag in
 // two tables panics at init rather than silently answering with one of them —
 // a double classification is a bug in this file, not a runtime condition.
 var classes = func() map[string]Class {
-	m := make(map[string]Class, len(InstanceFields)+len(MachineFields)+len(UIFields))
+	m := make(map[string]Class, len(InstanceFields)+len(MachineFields)+len(UIFields)+len(DiscoveredFields))
 	add := func(tags []string, c Class) {
 		for _, t := range tags {
 			if prev, ok := m[t]; ok {
@@ -149,6 +192,7 @@ var classes = func() map[string]Class {
 	add(InstanceFields, ClassInstance)
 	add(MachineFields, ClassMachine)
 	add(UIFields, ClassUI)
+	add(DiscoveredFields, ClassDiscovered)
 	return m
 }()
 
@@ -165,6 +209,32 @@ func Classify(tag string) (Class, bool) {
 // may carry it.
 func IsInstanceField(tag string) bool {
 	return classes[tag] == ClassInstance
+}
+
+// dropDiscoveredFields deletes every DISCOVERED key from a preset's fields, in
+// place. It is what makes the preset files already on operators' machines
+// harmless: builds up to this one wrote eventId into every preset they saved,
+// so a working profile has several files carrying a match id from whenever they
+// were last saved.
+//
+// Dropping the key on LOAD rather than reporting it is the deliberate half.
+// Filter's ignored list is the "somebody hand-edited this / it came from a
+// different build" channel, and it reaches the operator as a banner; a key this
+// application's own previous version wrote into every file it saved does not
+// belong on that channel, or the first preset of every match day starts with a
+// warning about a key nobody typed. Silence is right here precisely because the
+// value is not being half-honoured — it is gone before Filter, before Apply and
+// before the Summary the picker diffs against, so no path can re-apply it.
+//
+// It is called from Load and mutates the map json.Unmarshal has just built for
+// that one Preset value, which is why mutating in place is safe: no caller has
+// seen the map yet, and nothing else shares it.
+func dropDiscoveredFields(fields map[string]json.RawMessage) {
+	for tag := range fields {
+		if classes[tag] == ClassDiscovered {
+			delete(fields, tag)
+		}
+	}
 }
 
 // Extract builds a preset's fields from the live configuration: marshal the
@@ -201,6 +271,13 @@ func Extract(cfg *config.Config) (map[string]json.RawMessage, error) {
 // such a file outright would punish the fields that are fine; silently
 // accepting it would deliver the phantom-endpoint fault this package exists to
 // prevent. Neutering the bad keys and naming them is the middle that serves.
+//
+// A DISCOVERED key that reaches here has bypassed Load — a Preset assembled in
+// memory rather than read from disk — and is treated like any other key off the
+// whitelist: dropped, and named. That is the honest answer for a caller who
+// built the map itself. The quiet path for the eventId already sitting in the
+// files on operators' machines is dropDiscoveredFields, which runs inside Load
+// and is documented there.
 func Filter(fields map[string]json.RawMessage) (kept map[string]json.RawMessage, ignored []string) {
 	kept = make(map[string]json.RawMessage, len(fields))
 	for k, v := range fields {
@@ -222,6 +299,11 @@ func Filter(fields map[string]json.RawMessage) (kept map[string]json.RawMessage,
 // overwrite anything, so the operator's audioDeviceId survives even if every
 // other defence failed, and a partial monitorTile merges field-by-field
 // exactly as config's TestLoad_PartialNestedTileMergesFieldByField documents.
+//
+// It is also what makes dropping eventId from the whitelist safe rather than
+// destructive: a preset that does not mention the field is incapable of
+// blanking it, so applying one keeps whichever event the operator (or the
+// events picker) has already chosen on this machine.
 func Apply(cfg *config.Config, fields map[string]json.RawMessage) (ignored []string, err error) {
 	kept, ignored := Filter(fields)
 	data, err := json.Marshal(kept)

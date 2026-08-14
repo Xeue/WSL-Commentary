@@ -60,6 +60,7 @@
 //	GetKVSCredentials()         kvs.Credentials            caller: WP-5a
 //	GetStatusKeyCandidates()    []m2lx.StatusKeyCandidate  caller: WP-5b
 //	ListEvents()                []m2lx.Event               caller: WP-5b
+//	CredentialStoreName()       string                     caller: WP-5b
 //
 // and the six added for the mixer drawer, which live in app_mixer.go:
 //
@@ -122,6 +123,19 @@
 // when there is a real choice, superseding the id an operator used to recover by
 // pasting a live-operation URL. Like GetStatusKeyCandidates it acts on nothing;
 // it hands the frontend a list to render.
+//
+// CredentialStoreName is the third of that kind and the smallest: it returns a
+// per-platform NAME — "Windows Credential Manager" or "the macOS login
+// Keychain" — so a dialog can say where the passwords it is about to delete
+// live. It was added with the macOS port and was, until now, the one exported
+// method with no row in remoteAllowlist and no row in app_test.go's frozen
+// list, which is why both drift guards were failing; classifying it is what
+// this line and those two rows are. It is NOT host-only, deliberately: a remote
+// seat renders the same delete-a-preset dialog, and refusing it there would
+// send that operator back to the fallback string — the Windows name on a Mac,
+// which is the exact defect the method exists to remove. It returns the name of
+// the store and never a credential, so the "no secret crosses this boundary
+// outbound" rule is untouched.
 //
 // The six mixer methods are the NINTH to FOURTEENTH, and the count was kept
 // down on purpose: they are the smallest set that lets the drawer read state,

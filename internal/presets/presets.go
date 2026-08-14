@@ -77,6 +77,11 @@ type Preset struct {
 	// config.json tags — see InstanceFields. RawMessage rather than a struct so
 	// that "absent" and "zero" stay distinguishable: a preset that never
 	// mentions srtLatencyMs must not blank an operator's value on apply.
+	//
+	// A file written by an older build may hold keys this build does not carry
+	// — eventId above all, which every build up to this one saved. Load drops
+	// the DISCOVERED ones before anybody sees the map, so what this field holds
+	// in memory is always what THIS build's rules allow, whatever is on disk.
 	Fields map[string]json.RawMessage `json:"fields"`
 }
 
@@ -325,6 +330,28 @@ func Save(p Preset) error {
 
 // Load reads one preset by id. A version this build does not know is refused
 // by name — see the Version constant for why silence would be worse.
+//
+// # The eventId already in the files on disk
+//
+// Every build before this one wrote eventId into every preset it saved, so a
+// working profile has several files carrying a match id from whenever they were
+// last saved. Two ways to deal with that were available, and the choice is
+// deliberate:
+//
+//   - IGNORE IT ON LOAD — what this does. Fields comes back without the key, so
+//     the stale match id is gone before Filter, before Apply, and before the
+//     Summary the picker diffs the live config against. No path can re-apply
+//     it, the file still loads, and nothing errors.
+//   - REWRITE THE FILE — rejected. Reading a preset must not write one: List
+//     loads every file in the directory (seven of them are the built-ins, on
+//     every launch), so a load-time rewrite turns opening the picker into a
+//     burst of disk writes that can fail on a read-only or roaming profile and
+//     would move SavedAt on files the operator never touched.
+//
+// The files do get clean, without a migration pass: the next SavePreset writes
+// only what Extract produces, and every other write goes through this Load
+// first — Rename is Load-then-Save — so a preset loses its eventId the next
+// time anything saves it, and simply carries a harmless ignored key until then.
 func Load(id string) (Preset, error) {
 	path, err := PathFor(id)
 	if err != nil {
@@ -346,6 +373,7 @@ func Load(id string) (Preset, error) {
 			"%w: %s says version %d and this build reads version %d — it was written by a different build of wslcomms",
 			ErrUnknownVersion, path, p.Version, Version)
 	}
+	dropDiscoveredFields(p.Fields)
 	return p, nil
 }
 

@@ -36,7 +36,13 @@
 export const INSTANCE_FIELD_LABELS = Object.freeze([
   Object.freeze({ tag: 'm2lxHost', label: 'M2L-X host' }),
   Object.freeze({ tag: 'alias', label: 'Alias' }),
-  Object.freeze({ tag: 'eventId', label: 'Event ID' }),
+  // NO eventId. A preset answers WHICH VENUE; the event id names WHICH MATCH,
+  // and the application asks the instance for it (GET /api/events/overview, via
+  // App.ListEvents and ui/events.js). It is classified DISCOVERED in
+  // internal/presets.DiscoveredFields, and the mirror test below is what keeps
+  // that decision from being quietly undone on this side: a tag listed here
+  // that Go no longer honours is a diff row — and now a green preview box — for
+  // a change the apply will not make.
   Object.freeze({ tag: 'srtPort', label: 'SRT port' }),
   Object.freeze({ tag: 'srtLatencyMs', label: 'SRT latency (ms)' }),
   Object.freeze({ tag: 'pbkeylen', label: 'Passphrase key length' }),

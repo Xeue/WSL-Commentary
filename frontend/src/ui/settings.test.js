@@ -842,6 +842,176 @@ test('collectConfig still restates every config.Config json tag and no preset ke
   );
 });
 
+// ---------------------------------------------------------------------------
+// The preset PREVIEW
+// ---------------------------------------------------------------------------
+//
+// Selecting a preset used to do nothing visible: the change was described only
+// inside the confirm() dialog, read once, in a hurry, with the form it
+// describes hidden behind the modal. It is drawn on the FORM now — the box
+// holds the value the preset would put there, the row says what it replaces.
+//
+// The decisions are pure and are driven for real in presetpreview.test.js. What
+// is asserted HERE is the form's half, which has no jsdom to drive it: that the
+// preview hangs off the SELECT event, that it is built from the existing diff
+// rather than a second comparison, that every route out of it puts the borrowed
+// controls back — and, the one with teeth, that a preview can never be SAVED.
+
+test('selecting a preset previews it — on the change event, not on Apply', () => {
+  const js = ui('settings.js');
+  assert.match(
+    js,
+    /presetSelect\.addEventListener\('change', \(\) => renderPresetPreview\(\)\)/,
+    'the preview must hang off the picker\'s selection; on the Apply button it would be no preview at all',
+  );
+
+  const render = js.slice(js.indexOf('function renderPresetPreview()'), js.indexOf("presetSelect.addEventListener('change'"));
+  assert.ok(render.length > 0, 'settings.js must define renderPresetPreview');
+  // Built from the diff the confirm dialog already uses. A second comparison
+  // written here could disagree with the one the operator confirms against.
+  assert.match(render, /diffPreset\(lastLoadedConfig, preset\.fields\)/);
+  assert.match(render, /planPresetPreview\(diff, preset\.fields, previewControls\(diff\)\)/);
+  // Redraw, never layer: switching the picker from one preset to another must
+  // not leave the first preset's notes under the second's.
+  assert.match(
+    render,
+    /function renderPresetPreview\(\) \{\s*clearPresetPreview\(\);/,
+    'the redraw must clear FIRST, or two selections in a row stack their notes',
+  );
+  // And the quiet case: the active preset, or one that differs in nothing,
+  // leaves the screen exactly as it was.
+  assert.match(
+    render,
+    /if \(rows\.length === 0\) return;/,
+    'a preset that changes nothing must draw nothing — not an empty flourish',
+  );
+});
+
+test('a preview is not an edit: it is withdrawn before anything reads the form', () => {
+  // THE ONE WITH TEETH. The preview writes into the REAL controls — a ghost
+  // drawn over a box is a second rendering that can disagree with the first,
+  // and a <select> has nowhere to draw one — so collectConfig would happily
+  // save the preset's values: a half-applied instance switch from a button that
+  // says "Save settings", with no confirmation, no credential scope and no
+  // monitor rebuild.
+  const js = ui('settings.js');
+  const save = js.slice(js.indexOf('async function handleSave()'), js.indexOf('const config = collectConfig()'));
+  assert.match(
+    save,
+    /clearPresetPreview\(\);/,
+    'handleSave must withdraw the preview BEFORE collectConfig reads the controls',
+  );
+
+  // populate() clears first as well, so a preview can never outlive the config
+  // it was diffed against — the stale baseline would be silent.
+  const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('lastLoadedConfig = config;'));
+  assert.match(populate, /clearPresetPreview\(\);/, 'populate must clear the preview before it rewrites the form');
+
+  // And typing into a previewed box hands that box back to the operator, on
+  // both events — a <select> announces itself with 'change' and never 'input'.
+  assert.match(js, /form\.addEventListener\('input', \(e\) => releasePreviewedControl\(e\.target\)\)/);
+  assert.match(js, /form\.addEventListener\('change', \(e\) => releasePreviewedControl\(e\.target\)\)/);
+});
+
+test('applying clears the preview and leaves the operator where they are', () => {
+  const js = ui('settings.js');
+  const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
+
+  // The values are the values now, so the green goes. Explicit rather than
+  // relying on populate() below it: a handler that returns nothing must still
+  // not leave green boxes claiming a change that has already happened.
+  assert.match(
+    handler,
+    /const merged = await handlers\.onApplyPreset\(preset\.id\);\s*(\/\/[^\n]*\n\s*)*clearPresetPreview\(\);/,
+    'the apply must clear the preview as soon as it has committed',
+  );
+
+  // SAME PAGE, SAME SCROLL POSITION. Clearing the preview removes its notes,
+  // the form gets shorter, and a scroll container whose content shrinks has its
+  // scrollTop clamped by the browser — the page moving under someone who only
+  // pressed a button. Disabling a focused button also blurs it.
+  assert.match(handler, /const scrollTop = form\.scrollTop;/);
+  assert.match(handler, /form\.scrollTop = scrollTop;/);
+  assert.match(handler, /const hadFocus = document\.activeElement === applyPresetBtn;/);
+  assert.match(handler, /if \(hadFocus && !applyPresetBtn\.disabled\) applyPresetBtn\.focus\(\);/);
+  for (const gone of ['scrollIntoView', 'window.scrollTo', 'handlers.onBack()']) {
+    assert.equal(
+      handler.includes(gone),
+      false,
+      `applying a preset must not ${gone}: the operator stays on this screen, where they were`,
+    );
+  }
+});
+
+test('the confirm dialog survives, but stops being the only place the diff is legible', () => {
+  // It EARNS its place: the last chance to back out of an action that restarts
+  // the KVS monitor, the SRT return and the picture. What it must not be is a
+  // thirteen-line list read in a modal with the form it describes hidden behind
+  // it — so when the preview is on screen the dialog states the size of the
+  // change, and when it is not (the picker was never touched this visit) it
+  // still lists every field, because then it is the only rendering there is.
+  const js = ui('settings.js');
+  const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
+  assert.match(handler, /window\.confirm\(/, 'apply must still be confirmed');
+  assert.match(
+    handler,
+    /const previewing = presetPreview !== null && presetPreview\.presetId === preset\.id;/,
+    'the dialog must know whether the change is already visible behind it',
+  );
+  assert.match(handler, /marked in green on the form behind this window/);
+  assert.match(handler, /`This changes:\\n\$\{changes\.map/, 'and keep the full list for when there is no preview');
+});
+
+test('the preview is readable without colour, and an emptied box still reads as a change', () => {
+  // Colour-blind operators, and a gallery projector that washes this screen
+  // out. The green is the fastest signal, never the only one: the note carries
+  // the from and the to in words, the row is marked with a class main.css draws
+  // as a DASHED border (a shape, not a colour), and a field the preset CLEARS —
+  // statusKey to blank takes the three lamps to NO STATUS — says so in the
+  // placeholder, because an empty box is otherwise indistinguishable from one
+  // the preset never mentioned.
+  const js = ui('settings.js');
+  assert.match(js, /const PREVIEW_CLEARED_PLACEHOLDER = 'cleared by this preset'/);
+  assert.match(js, /if \(row\.cleared\) target\.input\.placeholder = PREVIEW_CLEARED_PLACEHOLDER;/);
+  assert.match(js, /note\.textContent = row\.note;/, 'every changed row must carry its from/to in words');
+  assert.match(js, /const PREVIEW_CLASS = 'field--preset-preview'/);
+});
+
+test('the preview restores exactly what it borrowed', () => {
+  // It holds the operator's own value AND placeholder for every box it writes
+  // into. Restoring the value but not the placeholder would leave "cleared by
+  // this preset" under a field nobody is previewing.
+  const js = ui('settings.js');
+  const clear = js.slice(js.indexOf('function clearPresetPreview()'), js.indexOf('function releasePreviewedControl'));
+  assert.ok(clear.length > 0, 'settings.js must define clearPresetPreview');
+  assert.match(clear, /box\.input\.value = box\.value;/);
+  assert.match(clear, /box\.input\.placeholder = box\.placeholder;/);
+  assert.match(clear, /wrap\.classList\.remove\(PREVIEW_CLASS\)/);
+  assert.match(clear, /note\.remove\(\)/);
+  assert.match(clear, /presetPreview = null;/);
+});
+
+test('a field with no row of its own gets its preview where the operator can see it', () => {
+  // The same rule ERROR_SURROGATES follows, for the same reason: a decoration
+  // attached to a hidden input is a change the operator cannot see. m2lxHost's
+  // row IS the address box — and what goes in it is the BASE address, never the
+  // live-operation form the write path just stopped producing. monitorTile is
+  // one value across four boxes, so it takes a note under the grid rather than
+  // four numbers each claiming to be the change.
+  const js = ui('settings.js');
+  const surrogates = js.slice(js.indexOf('const PREVIEW_SURROGATES'), js.indexOf('function previewTargetFor'));
+  assert.match(surrogates, /m2lxHost: \(\) => \(\{ wrap: liveURLRow\.wrap, input: liveURLInput, format: formatM2LXAddress \}\)/);
+  assert.match(surrogates, /monitorTile: \(\) => \(\{ wrap: tileGrid, input: null \}\)/);
+  // And anything else without a row falls through to "named in the summary
+  // line, decorated nowhere" — which is why that line lists every changed field
+  // instead of counting them.
+  assert.match(
+    js,
+    /return field && field\.wrap \? \{ wrap: field\.wrap, input: field\.input \} : null;/,
+    'a field with no wrap must resolve to no target rather than to a guess at one',
+  );
+});
+
 test('the apply confirm is built from the pure model, before anything moves', () => {
   const js = ui('settings.js');
   const handler = js.slice(js.indexOf('async function handleApplyPreset()'), js.indexOf('async function handleSavePresetAs()'));
@@ -952,12 +1122,33 @@ test('a bare address sets the host and does not clear a known event id', () => {
   );
 });
 
-test('populate puts the host back in the box even when no event is chosen', () => {
-  // formatLiveOperationURL returns '' unless BOTH halves are known, so a config
-  // with a host and no event drew an empty address box: the screen reporting no
-  // instance while the application was signed in to one.
+test('populate puts the BASE address in the box, never a live-operation URL', () => {
+  // THE DEFECT THIS PINS, in the operator's words: "it seems to do some stuff
+  // where it is writing URLs with extra parts, not just pasting the whole URL
+  // in". This line used to pass config.eventId as well, and formatM2LXAddress
+  // then re-synthesised https://<host>/live-operation/<id> — so the box handed
+  // back a longer string than the one that was pasted into it, naming a page on
+  // the M2L-X GUI rather than the instance the field asks for.
+  //
+  // The event id is not lost by dropping it here: it lives in the hidden
+  // eventId field, on the derived line under the address, and on the event
+  // picker's own row. A config with a host and no event still shows the host,
+  // which is the older defect (an empty box on a signed-in app) that this must
+  // not reintroduce while fixing the newer one.
   const js = ui('settings.js');
-  assert.match(js, /liveURLInput\.value = formatM2LXAddress\(config\.m2lxHost, config\.eventId\)/);
+  assert.match(js, /liveURLInput\.value = formatM2LXAddress\(config\.m2lxHost\)/);
+  assert.equal(
+    /formatM2LXAddress\(config\.m2lxHost, config\.eventId\)/.test(js),
+    false,
+    'the address box is synthesising a live-operation URL again',
+  );
+  // And nothing may BUILD one any more, whatever it is handed. The parser still
+  // reads them — that half is load-bearing and is tested in liveurl.test.js.
+  assert.equal(
+    /function formatLiveOperationURL\b/.test(ui('liveurl.js')),
+    false,
+    'liveurl.js has a live-operation URL WRITER again; the display path is how the long form crept back last time',
+  );
 });
 
 test('the event listing is asked for on the address path and after a save', () => {

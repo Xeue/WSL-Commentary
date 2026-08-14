@@ -27,11 +27,21 @@ func configJSONTags(t *testing.T) []string {
 	return tags
 }
 
+// classificationTables is every table a config tag may be classified into, in
+// the order fields.go declares them. The reflection tests iterate THIS, so
+// adding a fifth class is one edit here rather than four scattered literals —
+// and, more to the point, a class added without touching this line leaves the
+// reflection test still demanding exactly one of the OLD tables, which is the
+// failure that tempts somebody to weaken the test instead of extending it.
+func classificationTables() [][]string {
+	return [][]string{InstanceFields, MachineFields, UIFields, DiscoveredFields}
+}
+
 // TestEveryConfigFieldIsClassified is the test that makes the classification
 // SURVIVE. Without it the next field added to config.Config is unclassified by
-// default, and whoever adds it never learns the question — instance, machine
-// or UI? — was ever asked. It fails WITH THE FIELD NAME, so the failure reads
-// as the question.
+// default, and whoever adds it never learns the question — instance, machine,
+// UI or discovered? — was ever asked. It fails WITH THE FIELD NAME, so the
+// failure reads as the question.
 func TestEveryConfigFieldIsClassified(t *testing.T) {
 	tags := configJSONTags(t)
 	if len(tags) == 0 {
@@ -40,7 +50,7 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 
 	for _, tag := range tags {
 		count := 0
-		for _, table := range [][]string{InstanceFields, MachineFields, UIFields} {
+		for _, table := range classificationTables() {
 			if slices.Contains(table, tag) {
 				count++
 			}
@@ -51,8 +61,10 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 		case 0:
 			t.Errorf("config.Config field %q is UNCLASSIFIED: add it to exactly one of "+
 				"InstanceFields (travels in a preset), MachineFields (this PC's hardware or "+
-				"filesystem, never travels) or UIFields (a live-operational choice, never travels) "+
-				"in internal/presets/fields.go — the decision rule is in that file's comments", tag)
+				"filesystem, never travels), UIFields (a live-operational choice, never travels) "+
+				"or DiscoveredFields (the app learns it from the instance, so a preset must not "+
+				"remember it) in internal/presets/fields.go — the decision rule is in that file's "+
+				"comments", tag)
 		default:
 			t.Errorf("config.Config field %q appears in %d classification tables; it must be in exactly one", tag, count)
 		}
@@ -60,7 +72,7 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 
 	// And the reverse: a classified tag that config no longer serialises is a
 	// stale row that would silently stop matching anything.
-	for _, table := range [][]string{InstanceFields, MachineFields, UIFields} {
+	for _, table := range classificationTables() {
 		for _, tag := range table {
 			if !slices.Contains(tags, tag) {
 				t.Errorf("classification table names %q, which is not a json tag of config.Config any more", tag)
@@ -69,18 +81,42 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 	}
 }
 
-// TestClassificationCounts pins the 13 + 4 + 2 = 19 split (srtHost was removed
-// — the SRT host is always derived from m2lxHost), so growth in any table is a
+// TestClassificationCounts pins the 12 + 4 + 2 + 1 = 19 split (srtHost was
+// removed — the SRT host is always derived from m2lxHost — and eventId moved
+// from the whitelist to DiscoveredFields), so growth in any table is a
 // deliberate, reviewed change.
 func TestClassificationCounts(t *testing.T) {
-	if got := len(InstanceFields); got != 13 {
-		t.Errorf("len(InstanceFields) = %d, want 13", got)
+	if got := len(InstanceFields); got != 12 {
+		t.Errorf("len(InstanceFields) = %d, want 12", got)
 	}
 	if got := len(MachineFields); got != 4 {
 		t.Errorf("len(MachineFields) = %d, want 4", got)
 	}
 	if got := len(UIFields); got != 2 {
 		t.Errorf("len(UIFields) = %d, want 2", got)
+	}
+	if got := len(DiscoveredFields); got != 1 {
+		t.Errorf("len(DiscoveredFields) = %d, want 1", got)
+	}
+}
+
+// TestEventIDIsDiscoveredAndNeverTravels states R2 as a table lookup: a preset
+// answers which venue, and the match id is asked for, not remembered.
+func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
+	if slices.Contains(InstanceFields, "eventId") {
+		t.Error("InstanceFields contains eventId: a preset carrying a match id is correct on the day " +
+			"it was saved and points the KVS monitor at a dead channel every day after")
+	}
+	if IsInstanceField("eventId") {
+		t.Error("IsInstanceField(\"eventId\") = true; it must never be whitelisted again")
+	}
+	if c, ok := Classify("eventId"); !ok || c != ClassDiscovered {
+		t.Errorf("Classify(\"eventId\") = (%q, %v), want (%q, true)", c, ok, ClassDiscovered)
+	}
+	if fields, err := Extract(fullConfig()); err != nil {
+		t.Fatalf("Extract() error = %v", err)
+	} else if _, ok := fields["eventId"]; ok {
+		t.Error("Extract() put eventId into a preset even though it is off the whitelist")
 	}
 }
 
@@ -115,6 +151,7 @@ func TestClassify(t *testing.T) {
 		{"slatePath", ClassMachine, true},
 		{"returnSource", ClassUI, true},
 		{"returnChannel", ClassUI, true},
+		{"eventId", ClassDiscovered, true},
 		{"pictureSource", "", false}, // frontend-only key with no Go field: unclassified on purpose
 		{"", "", false},
 	}
@@ -165,7 +202,11 @@ func TestExtractCarriesOnlyTheWhitelist(t *testing.T) {
 			t.Errorf("Extract() is missing whitelisted key %q", tag)
 		}
 	}
-	for _, tag := range append(append([]string{}, MachineFields...), UIFields...) {
+	var nonInstance []string
+	nonInstance = append(nonInstance, MachineFields...)
+	nonInstance = append(nonInstance, UIFields...)
+	nonInstance = append(nonInstance, DiscoveredFields...)
+	for _, tag := range nonInstance {
 		if _, ok := fields[tag]; ok {
 			t.Errorf("Extract() carried non-instance key %q", tag)
 		}
@@ -206,7 +247,7 @@ func TestApplyIsAMergeNotAReplace(t *testing.T) {
 
 	ignored, err := Apply(live, map[string]json.RawMessage{
 		"m2lxHost": json.RawMessage(`"twickenham.example.com"`),
-		"eventId":  json.RawMessage(`"dl9-twickenham"`),
+		"alias":    json.RawMessage(`"wsl-comms-tw"`),
 	})
 	if err != nil {
 		t.Fatalf("Apply() error = %v", err)
@@ -215,8 +256,8 @@ func TestApplyIsAMergeNotAReplace(t *testing.T) {
 		t.Fatalf("Apply() ignored %v; both keys are whitelisted", ignored)
 	}
 
-	if live.M2LXHost != "twickenham.example.com" || live.EventID != "dl9-twickenham" {
-		t.Fatalf("Apply() did not write the two preset fields: host=%q event=%q", live.M2LXHost, live.EventID)
+	if live.M2LXHost != "twickenham.example.com" || live.Alias != "wsl-comms-tw" {
+		t.Fatalf("Apply() did not write the two preset fields: host=%q alias=%q", live.M2LXHost, live.Alias)
 	}
 
 	// Every OTHER field byte-identical: write the two applied fields back to
@@ -224,7 +265,7 @@ func TestApplyIsAMergeNotAReplace(t *testing.T) {
 	// the 18 untouched fields fails without 18 assertions.
 	reference := fullConfig()
 	reference.M2LXHost = "twickenham.example.com"
-	reference.EventID = "dl9-twickenham"
+	reference.Alias = "wsl-comms-tw"
 	after, err := json.Marshal(live)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -281,6 +322,35 @@ func TestApplyDropsMachineKeysFromAHandEditedFile(t *testing.T) {
 	}
 	if live.M2LXHost != "twickenham.example.com" {
 		t.Error("the whitelisted key travelling WITH the bad ones must still apply")
+	}
+}
+
+// TestApplyNeverWritesTheEventID is the low-level half of R2. Load strips the
+// key before Apply ever sees it, so this exercises the OTHER door: a fields map
+// assembled in memory, or handed straight to Apply by a future caller. The
+// stale match id must not reach the config, and — unlike the load path, which
+// is deliberately quiet about a key this application's own older builds wrote —
+// a caller who built the map itself is told.
+func TestApplyNeverWritesTheEventID(t *testing.T) {
+	live := fullConfig() // EventID "dl9-wembley": the event chosen on this machine
+	const chosenHere = "dl9-wembley"
+
+	ignored, err := Apply(live, map[string]json.RawMessage{
+		"m2lxHost": json.RawMessage(`"twickenham.example.com"`),
+		"eventId":  json.RawMessage(`"dl9-last-season"`),
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if live.EventID != chosenHere {
+		t.Errorf("eventId = %q, want %q left alone — applying a venue must never re-point the KVS "+
+			"monitor at the match the preset was saved during", live.EventID, chosenHere)
+	}
+	if !slices.Equal(ignored, []string{"eventId"}) {
+		t.Errorf("Apply() ignored = %v, want [eventId]", ignored)
+	}
+	if live.M2LXHost != "twickenham.example.com" {
+		t.Error("the whitelisted key travelling with the discovered one must still apply")
 	}
 }
 

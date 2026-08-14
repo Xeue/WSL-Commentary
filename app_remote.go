@@ -160,10 +160,20 @@ type methodPolicy struct {
 // host-only) but carries no access meaning any more.
 var remoteAllowlist = map[string]methodPolicy{
 	// ---- reads and the always-safe DisarmMixer ----
+	//
+	// CredentialStoreName is a read too, and reachable rather than host-only on
+	// purpose. A remote seat draws the same delete-a-preset dialog the local one
+	// does, and refusing the method there would not hide the dialog — it would
+	// drop backend.js to its fallback string, which is the WINDOWS name. On a
+	// Mac host that sends a remote operator hunting for a control panel neither
+	// machine has, which is the exact fault the method was added to fix. It
+	// returns what the vault is CALLED and never anything in it, so the "no
+	// secret crosses this boundary outbound" rule is untouched.
 	"GetConfig":                 {},
 	"GetKVSCredentials":         {},
 	"GetStatusKeyCandidates":    {},
 	"ListEvents":                {},
+	"CredentialStoreName":       {},
 	"GetMixerSnapshot":          {},
 	"GetMixerGolden":            {},
 	"GetPictureState":           {},
@@ -300,6 +310,10 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetStatusKeyCandidates()
 	case "ListEvents":
 		return a.ListEvents()
+	// The only bound method that cannot fail, so it is the only case here with a
+	// literal nil error rather than a call that supplies one.
+	case "CredentialStoreName":
+		return a.CredentialStoreName(), nil
 	case "GetMixerSnapshot":
 		return a.GetMixerSnapshot()
 	case "GetMixerGolden":

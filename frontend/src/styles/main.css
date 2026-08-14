@@ -851,7 +851,8 @@ input[type='range'] {
 .settings-group > .suggestions,
 .settings-group > .secrets-hint,
 .settings-group > .tile-grid,
-.settings-group > .preset-picker {
+.settings-group > .preset-picker,
+.settings-group > .preset-preview-summary {
   grid-column: 1 / -1;
 }
 
@@ -1089,6 +1090,67 @@ input[type='range'] {
 /* .preset-scope and .preset-note are gone with the readout and the
    machine-fields note they styled — removed at the operator's request. The
    card is the picker and its buttons now. */
+
+/* THE PRESET PREVIEW. Selecting an instance in the picker shows what applying
+   it would do, on the form itself: the box holds the value the preset would put
+   there and the row states what it is replacing. settings.js adds
+   .field--preset-preview to the row and appends a .preset-preview-note under
+   it; the card carries one .preset-preview-summary line naming every field that
+   changed, because the form is two screenfuls deep and a green box below the
+   fold is only findable if something says to go and look.
+
+   GREEN IS NOT THE ONLY SIGNAL, and that is a requirement rather than a
+   flourish: a colour-blind operator, and a gallery projector that renders this
+   screen washed out, must both read it. So the change is carried three ways —
+   the DASHED border (a shape, not a colour), the note's "Preset preview: <old>
+   → <new>" in words, and the summary line naming every changed field — and the
+   colour is the fastest of the three rather than the only one.
+
+   Dashed also says the right thing about what a preview IS: an unfinished
+   edge, a value the form is holding rather than one it has. Pressing Apply
+   removes the class and the note, and the value stops being provisional. */
+.field--preset-preview input[type='text'],
+.field--preset-preview input[type='password'],
+.field--preset-preview input[type='number'],
+.field--preset-preview select {
+  border: 1px dashed var(--green);
+  color: var(--green);
+}
+
+/* The placeholder is doing real work in the one case the box itself cannot: a
+   preset that CLEARS a field (statusKey, say — three lamps to NO STATUS) leaves
+   an empty box, which is otherwise indistinguishable from a box the preset
+   never mentioned. It says "cleared by this preset" in settings.js. */
+.field--preset-preview input::placeholder {
+  color: var(--green);
+  opacity: 0.75;
+}
+
+.preset-preview-note {
+  color: var(--green);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* The monitor tile's note goes UNDER the four boxes, not into one of them: the
+   tile is a single config value spread across x/y/w/h, so its note describes
+   the grid rather than a cell of it. Without this it lands in a 5rem-9rem
+   track and wraps into a column two words wide. */
+.tile-grid > .preset-preview-note {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+/* Inside the instance card, above the fields it points at. Not a warning
+   colour: nothing has happened yet and nothing is wrong.
+
+   No max-width of its own — it is a .field-hint, and the 68ch measure the
+   settings hints already share is what keeps a twelve-field list from running
+   to lines nobody reaches the end of. */
+.preset-preview-summary {
+  margin: 0.2rem 0 0;
+  color: var(--green);
+}
 
 /* OPAQUE, never an rgba. mixer.css:407-421 records what happens otherwise:
    "A sticky element with a translucent background is not a header, it is a

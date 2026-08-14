@@ -55,7 +55,15 @@ function codeOnly(src) {
 /** The four MACHINE tags. Named HERE, in the test — the thing under test may not. */
 const MACHINE_TAGS = ['audioDeviceId', 'headphoneDeviceId', 'headphoneEndpointId', 'slatePath'];
 
-/** A full config in getConfig()'s shape, for diffing against. */
+/**
+ * A full config in getConfig()'s shape, for diffing against.
+ *
+ * It keeps its eventId, and that is the point rather than an oversight: a live
+ * configuration really does hold one — the events API chose it — and what the
+ * diff must do with it is NOTHING, because the tag is off the whitelist. A
+ * fixture that omitted the field could not tell "diffPreset ignores eventId"
+ * apart from "diffPreset never saw one".
+ */
 function liveConfig() {
   return {
     m2lxHost: 'wembley.example.com',
@@ -100,7 +108,11 @@ test('INSTANCE_FIELD_LABELS mirrors the Go whitelist exactly', () => {
     [...goTags].sort(),
     'presets.js INSTANCE_FIELD_LABELS and internal/presets.InstanceFields must list the same tags',
   );
-  assert.equal(jsTags.length, 13, 'the whitelist is 13 INSTANCE fields (srtHost was removed); growth is a reviewed decision');
+  // 12: srtHost went when the SRT host became derived from m2lxHost, and
+  // eventId went when it was reclassified DISCOVERED — a preset is which venue,
+  // never which match, and the instance can be asked which events it is running.
+  // Growth is a reviewed decision, in fields.go first and here second.
+  assert.equal(jsTags.length, 12, 'the whitelist is 12 INSTANCE fields; growth is a reviewed decision');
   for (const { label } of INSTANCE_FIELD_LABELS) {
     assert.ok(label && typeof label === 'string', 'every whitelisted tag needs a screen label');
   }
@@ -122,9 +134,14 @@ test('MACHINE_FIELD_LABELS has one label per machine field, and labels only', ()
 // ---------------------------------------------------------------------------
 
 test('diffPreset lists only the whitelisted keys that differ, in whitelist order', () => {
+  // No eventId key here any more, and not because it would fail: the backend
+  // cannot hand the page one. presets.Load drops every DISCOVERED tag out of
+  // Summary.Fields before ListPresets returns, so a fixture carrying one would
+  // be describing a shape production cannot produce — and it would exercise the
+  // "off the whitelist" branch while its comment claimed to be exercising the
+  // "equal, therefore skipped" one. srtPort below is what tests equal-skipping.
   const diff = diffPreset(liveConfig(), {
     m2lxHost: 'twickenham.example.com', // differs
-    eventId: 'dl9-wembley', // wait — differs from dl9-wembley? no: equal, skipped
     srtPort: 40005, // equal, skipped
     statusKey: 'cam9', // differs
   });

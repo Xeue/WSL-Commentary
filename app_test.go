@@ -902,6 +902,14 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // a credential EXISTS for the active preset scope — booleans, never values —
 // and app_presets.go carries the whole argument beside the type.
 //
+// CredentialStoreName arrived with the macOS port and is the one addition that
+// was NOT a decision when it landed — it was exported without a row here or in
+// remoteAllowlist, which is precisely the drift both guards exist to catch, and
+// they duly failed until it was classified. It returns what this platform's
+// credential vault is CALLED so a dialog can name it, which is a per-platform
+// constant and not a credential: the "no secret crosses this boundary outbound"
+// rule is untouched, and GetPresetCredentialStatus remains its only narrowing.
+//
 // The two remote-access methods are the last group, added with the LAN control
 // bridge and documented in app_remote.go. They are BOTH host-only — the remote
 // dispatcher refuses them from every connection — because they change WHETHER
@@ -927,6 +935,7 @@ func assertBoundSurface(t *testing.T) {
 		"GetKVSCredentials":      true,
 		"GetStatusKeyCandidates": true,
 		"ListEvents":             true,
+		"CredentialStoreName":    true,
 
 		"GetMixerSnapshot":  true,
 		"ArmMixer":          true,
