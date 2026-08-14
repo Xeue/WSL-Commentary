@@ -22,6 +22,52 @@ func resetLogger(t *testing.T) {
 	})
 }
 
+// TestDefaultDirIsNotSomewhereTheSystemMayDelete is the whole reason DefaultDir
+// is a platform twin rather than one function with a fallback.
+//
+// The Windows implementation resolves LOCALAPPDATA and falls back to
+// os.UserCacheDir, which on Windows is the same directory. On macOS
+// LOCALAPPDATA is always empty, so that fallback is not a fallback at all — it
+// is the answer, and it is ~/Library/Caches, which Apple documents as purgeable
+// and which the system may empty under disk pressure. The log file is the only
+// diagnosis a headless commentary position ever produces. Losing it
+// intermittently, on the machine that has been running hardest, is the exact
+// failure this package was written to prevent, wearing a different hat.
+//
+// The assertion is deliberately about what the path must NOT be. Pinning the
+// literal directory would be a change-detector; pinning "not a cache" is the
+// property that matters and the one somebody could plausibly undo while tidying
+// two similar-looking functions into one.
+func TestDefaultDirIsNotSomewhereTheSystemMayDelete(t *testing.T) {
+	dir, err := DefaultDir()
+	if err != nil {
+		t.Fatalf("DefaultDir() error = %v", err)
+	}
+	if dir == "" {
+		t.Fatal("DefaultDir() is empty")
+	}
+	if !filepath.IsAbs(dir) {
+		t.Errorf("DefaultDir() = %q is relative; the log must not follow the working directory", dir)
+	}
+	if !strings.Contains(dir, "WSLComms") {
+		t.Errorf("DefaultDir() = %q has no WSLComms component. On macOS the parent is "+
+			"~/Library/Logs, which is shared with every other application on the machine, and "+
+			"Prune walks whatever it is given", dir)
+	}
+
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("no user cache directory on this machine to compare against: %v", err)
+	}
+	if rel, err := filepath.Rel(cache, dir); err == nil && !strings.HasPrefix(rel, "..") {
+		t.Errorf("DefaultDir() = %q is inside the user cache directory %q. On macOS that is "+
+			"~/Library/Caches, which the operating system is entitled to delete without "+
+			"warning; the log belongs in ~/Library/Logs. internal/gst's registryFile makes the "+
+			"opposite choice on purpose — a purged plugin registry costs one rescan, a purged "+
+			"log costs the only evidence there was", dir, cache)
+	}
+}
+
 func TestOpen_WritesLogLinesToTheFile(t *testing.T) {
 	resetLogger(t)
 	dir := t.TempDir()

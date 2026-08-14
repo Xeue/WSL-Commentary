@@ -20,8 +20,12 @@
 //
 //	srtsrc uri=srt://<ip>:40501 mode=caller latency=<ms>
 //	  ! tsdemux
-//	  ! h265parse ! d3d11h265dec
-//	  ! d3d11videosink
+//	  ! h265parse ! <the platform's hardware H.265 decoder>
+//	  ! <the platform's video sink, rendering into the overlay surface>
+//
+// The two angled brackets are d3d11h265dec into d3d11videosink on Windows and
+// vtdec_hw into glimagesink on macOS. Nothing else in the pipeline changes, and
+// picture_cgo.go's header carries the table and the measurements for both.
 //
 // The audio pad from tsdemux gets a fakesink sync=false, for exactly the reason
 // return_cgo.go gives for the video pad: an unlinked src pad on a demuxer is not
@@ -57,15 +61,17 @@
 //
 // # No libav, ever
 //
-// The decoder is d3d11h265dec: Direct3D 11 / DXVA, part of gst-plugins-bad,
-// LGPL, wrapping a decoder that is in the GPU driver. avdec_h265 is present on
-// the developer machine at primary rank and MUST NOT be selected. gst-libav is
-// FFmpeg, which is the same commercial-shipping concern as x264enc, and
-// build/bundle-gst.ps1's forbidden list refuses to copy anything matching
-// *libav* or *avcodec* — so a build that selected it would work here and fail to
-// load a plugin on the installed machine. mfh265dec is absent on the target: the
-// Windows HEVC video extension is not installed, and requiring the operator to
-// buy it from the Microsoft Store is not a deployment step.
+// The decoder is the platform's own, part of gst-plugins-bad, LGPL, wrapping a
+// decoder that is in the GPU driver or in the operating system: d3d11h265dec
+// (Direct3D 11 / DXVA) on Windows, vtdec_hw (VideoToolbox) on macOS. avdec_h265
+// is present at primary rank on BOTH development machines and MUST NOT be
+// selected. gst-libav is FFmpeg, which is the same commercial-shipping concern
+// as x264enc, and both bundlers' forbidden lists refuse to copy anything
+// matching *libav* or *avcodec* — so a build that selected it would work on a
+// development machine and fail to load a plugin on the installed one. mfh265dec
+// is absent on the Windows target: the HEVC video extension is not installed,
+// and requiring the operator to buy it from the Microsoft Store is not a
+// deployment step.
 //
 // # Where the logic lives
 //
@@ -106,7 +112,7 @@ import (
 // matches the other two rather than guessing.
 const DefaultPictureLatencyMs = 120
 
-// pictureSinkSync is d3d11videosink's "sync" property, and it is FALSE.
+// pictureSinkSync is the video sink's "sync" property, and it is FALSE.
 //
 // It is a named constant rather than a literal at the call site for the reason
 // overlayExStyle is one: this is a property that reads like tidy-up-able default
@@ -161,7 +167,7 @@ const DefaultPictureLatencyMs = 120
 // warning for that failure other than this paragraph.
 const pictureSinkSync = false
 
-// pictureSinkQoS is d3d11videosink's "qos" property, and it is FALSE.
+// pictureSinkQoS is the video sink's "qos" property, and it is FALSE.
 //
 // The element's default is TRUE, so this is a change, and it is made together
 // with pictureSinkSync rather than left unexamined because the two interact.
@@ -206,11 +212,12 @@ const pictureSinkQoS = false
 // This path can be stricter than the audio return, and is. The return waits for
 // its audio pad to be LINKED, because linking is the last thing it can observe
 // cheaply. Here there is a decoder in the way, and a decoder is exactly the
-// component most likely to be the thing that is broken: the d3d11 plugin missing
-// from the bundle, a GPU that will not give out a DXVA context, an HEVC profile
-// the hardware refuses. Waiting for the first buffer out of d3d11h265dec covers
-// the socket, the PMT, the parser and the decoder with one wait, and a nil error
-// from Play then means what a commentator would mean by it: there are pictures.
+// component most likely to be the thing that is broken: the decoder's plugin
+// missing from the bundle, a GPU or a media engine that will not give out a
+// hardware context, an HEVC profile the hardware refuses. Waiting for the first
+// buffer out of the decoder covers the socket, the PMT, the parser and the
+// decoder with one wait, and a nil error from Play then means what a commentator
+// would mean by it: there are pictures.
 //
 // Ten seconds is far beyond a working stream — libsrt gives up on the connect at
 // 3 s, a PMT repeats several times a second, the measured SRT lock to this
@@ -273,7 +280,7 @@ const (
 	PictureStateConnecting PictureState = "connecting"
 
 	// PictureStateShowing means frames have been decoded and are being presented
-	// in the overlay. It is the ONLY state in which the overlay window may be
+	// in the overlay. It is the ONLY state in which the overlay surface may be
 	// visible, and app_picture.go enforces that rather than trusting it: an
 	// opaque black rectangle over the fallback mosaic is worse than the soft
 	// picture it is covering.
@@ -304,11 +311,18 @@ var ErrPictureNotStarted = errors.New("gst: picture monitor not started")
 // other thread — never runs over a thread that was killed mid-call. See
 // exit_windows.go.
 //
-// A step that RETURNS is scored as finished. overlay.Close is the first Close
-// in this application that returns on a hang instead of hanging, so it is the
-// first that can hand teardown a completed step with an abandoned thread behind
-// it — the exact shape the hard exit exists to catch, arriving through the one
-// door that did not look for it. errors.Is on this value is that door.
+// A step that RETURNS is scored as finished. overlay.Close on Windows is the
+// first Close in this application that returns on a hang instead of hanging, so
+// it is the first that can hand teardown a completed step with an abandoned
+// thread behind it — the exact shape the hard exit exists to catch, arriving
+// through the one door that did not look for it. errors.Is on this value is that
+// door.
+//
+// NOTHING ON macOS PRODUCES IT, and that is correct rather than an omission.
+// overlay_darwin.go owns no thread: its Close posts a block to AppKit's main
+// queue and returns, so there is never a thread of ours to abandon. Wrapping
+// this sentinel there would end every ordinary quit with the hard exit. The
+// reasoning is written out in that file's header.
 //
 // It is declared here, in the file with no build tag, rather than beside
 // ErrNoHostWindow in each of overlay_windows.go and overlay_other.go: package
@@ -324,8 +338,8 @@ var ErrAbandonedThread = errors.New("gst: an OS thread was abandoned rather than
 //
 // It carries no device selection and no channel selection, which is the whole
 // difference between it and ReturnOpts: there is one screen, the picture goes
-// where the operator's layout says it goes, and the destination is a window
-// handle rather than an endpoint the operator picks from a dropdown.
+// where the operator's layout says it goes, and the destination is a native
+// surface handle rather than an endpoint the operator picks from a dropdown.
 type PictureOpts struct {
 	// Host is the M2L-X host. It is a NAME here and is resolved to a literal
 	// before it reaches srtsrc; see the resolve step in Play and the hazard it
@@ -356,15 +370,19 @@ type PictureOpts struct {
 	// return paths.
 	PBKeyLen int
 
-	// WindowHandle is the HWND the decoded picture is presented into, as a
-	// uintptr, and it must be non-zero.
+	// WindowHandle is the native surface the decoded picture is presented into,
+	// as a uintptr, and it must be non-zero.
+	//
+	// It is an HWND on Windows and an NSView* on macOS. That is not a compromise
+	// in this struct: it is exactly what GstVideoOverlay's own guintptr means on
+	// each platform, and gst_video_overlay_set_window_handle takes it unchanged.
 	//
 	// It is a plain integer rather than an Overlay because internal/gst's
-	// pipeline half has no business owning a window: overlay_windows.go creates
-	// and moves the window, this path only renders into it, and keeping the
-	// dependency one-way means a wedged pipeline cannot hold a lock the window
-	// needs to be resized. It is the handle of a window this process owns and
-	// keeps alive for the whole session; see PictureOverlay.
+	// pipeline half has no business owning a window: overlay_windows.go and
+	// overlay_darwin.go create and move the surface, this path only renders into
+	// it, and keeping the dependency one-way means a wedged pipeline cannot hold
+	// a lock the surface needs to be resized. It is the handle of a surface this
+	// process owns and keeps alive for the whole session; see PictureOverlay.
 	WindowHandle uintptr
 }
 
@@ -438,13 +456,23 @@ func (o PictureOpts) endpointForLog() string {
 // PictureRect is where the picture sits, in PHYSICAL pixels, relative to the
 // top-left of the host window's CLIENT area.
 //
+// It is the SAME on both platforms, deliberately, and neither the frontend nor
+// this file knows which one it is talking to. On Windows a child HWND is
+// positioned in physical pixels, so the overlay uses these numbers as they
+// stand. On macOS an NSView's frame is in POINTS from the bottom left, so
+// overlay_darwin.go turns the y axis over and divides by the window's
+// backingScaleFactor — a conversion that is exact, because on macOS the page's
+// devicePixelRatio IS the backing scale times the page zoom. Keeping one
+// representation across the Wails boundary is what stops the frontend needing to
+// know the platform.
+//
 // # Why physical pixels, and why the conversion is not done here
 //
 // A native child window is positioned in physical pixels. The page that decides
 // where the picture goes lays out in CSS pixels. The factor between them is the
-// WebView's device pixel ratio, which is not a constant: the operator runs a
-// 3840x2088 window, Windows display scaling can be changed while the application
-// is running, and dragging the window to a second monitor changes it without any
+// web view's device pixel ratio, which is not a constant: the operator runs a
+// 3840x2088 window, display scaling can be changed while the application is
+// running, and dragging the window to a second monitor changes it without any
 // setting changing at all.
 //
 // So the frontend sends CSS pixels AND the window.devicePixelRatio it measured
@@ -520,12 +548,58 @@ func roundHalfAwayFromZero(v float64) int {
 	return int(v - 0.5)
 }
 
+// cocoaOverlayFrame turns a PictureRect into an AppKit frame.
+//
+// A PictureRect is TOP-LEFT origin and PHYSICAL PIXELS, because that is what a
+// child HWND wants and what the page measured. An NSView's frame is BOTTOM-LEFT
+// origin and POINTS, because the Wails contentView is not flipped and because
+// AppKit does not deal in pixels. This is both conversions, in that order:
+//
+//	x = X / scale
+//	y = containerHeight - Y/scale - H/scale
+//	w = W / scale
+//	h = H / scale
+//
+// containerHeight is the superview's height IN POINTS and scale is the host
+// window's backingScaleFactor, measured at 2.0 on the development machine.
+//
+// # Why this is here rather than only in the Objective-C
+//
+// Because a sign error in it is a picture in the wrong half of the window, and
+// nothing else in the process would ever notice. overlay_darwin.go does the real
+// conversion — it has to, on the main thread, against a superview height and a
+// backing scale that change when the operator drags the window to another
+// display — and this is the same expression in Go so that it can be exercised at
+// Gate A, on any platform, without a window, a display or cgo.
+// picture_test.go tests THIS against worked examples and then asserts that
+// overlay_darwin.go's C still spells the same thing, which is the only way to
+// keep two expressions of one formula honest.
+//
+// It lives in picture.go, which carries no build tag, for the same reason
+// ScaleRect does: it is arithmetic about a rectangle, it is the kind of thing
+// that has to be tested, and the test file has no build tag either.
+//
+// A scale that is not positive is treated as 1. It arrives from
+// -[NSWindow backingScaleFactor], which cannot sensibly be zero, and the
+// consequence of dividing by it if it ever were is not something to find out
+// during a match.
+func cocoaOverlayFrame(r PictureRect, containerHeight, scale float64) (x, y, w, h float64) {
+	if !(scale > 0) {
+		scale = 1
+	}
+	h = float64(r.H) / scale
+	return float64(r.X) / scale,
+		containerHeight - float64(r.Y)/scale - h,
+		float64(r.W) / scale,
+		h
+}
+
 // ---------------------------------------------------------------------------
 // The contract
 // ---------------------------------------------------------------------------
 
-// PictureMonitor receives the SRT programme feed and presents it in a window,
-// staying connected for as long as it is running.
+// PictureMonitor receives the SRT programme feed and presents it in the overlay
+// surface, staying connected for as long as it is running.
 //
 // A PictureMonitor is single-use: after Stop it cannot be restarted, because its
 // state channel is closed. Call NewPictureMonitor again. All methods are safe
@@ -535,9 +609,9 @@ type PictureMonitor interface {
 	// as the loop is running, NOT when pictures are on screen.
 	//
 	// A failure to CONNECT is not an error from Start: the monitor retries
-	// indefinitely, and the commentator may well open the window before the
+	// indefinitely, and the commentator may well open the picture before the
 	// M2L-X output has been enabled. A configuration that can never work — no
-	// host, a port out of range, a key length with no passphrase, no window to
+	// host, a port out of range, a key length with no passphrase, no surface to
 	// render into — IS an error from Start, and it names the field.
 	//
 	// It returns ErrPictureAlreadyStarted if the monitor is already running or
@@ -545,7 +619,7 @@ type PictureMonitor interface {
 	Start(opts PictureOpts) error
 
 	// Stop tears the session down: it ends the reconnect loop, takes the
-	// pipeline to NULL, releases the SRT socket and the DXVA decoder, emits
+	// pipeline to NULL, releases the SRT socket and the hardware decoder, emits
 	// PictureStateStopped and closes the channel returned by States.
 	//
 	// Stop blocks until all of that is done and must not be called from a UI
@@ -554,10 +628,10 @@ type PictureMonitor interface {
 	// waits for it. Everything this file contributes is prompt — the backoff
 	// wait is cancelled rather than served.
 	//
-	// It does NOT destroy the window. The window outlives the monitor, because
-	// the monitor is rebuilt whenever the endpoint changes and a window
-	// destroyed and recreated underneath a running WebView2 is a z-order fight
-	// nobody needs. See PictureOverlay.
+	// It does NOT destroy the overlay surface. The surface outlives the monitor,
+	// because the monitor is rebuilt whenever the endpoint changes and a native
+	// surface destroyed and recreated underneath a running web view is a z-order
+	// fight nobody needs. See PictureOverlay.
 	//
 	// It returns ErrPictureNotStarted if the monitor was never started.
 	Stop() error
@@ -584,8 +658,8 @@ type PictureMonitor interface {
 type picturePipe interface {
 	// Play builds the pipeline, takes it to PLAYING and waits for a decoded
 	// frame. It returns synchronously, and a nil error means the SRT caller
-	// handshake succeeded, the demuxer found H.265, and d3d11h265dec produced at
-	// least one frame.
+	// handshake succeeded, the demuxer found H.265, and the hardware decoder
+	// produced at least one frame.
 	//
 	// It is therefore slow — up to pictureFirstFrameTimeout on a dead endpoint,
 	// about two seconds on a live one — and Stop's worst case is one of these
@@ -746,7 +820,7 @@ func (m *pictureMonitor) Start(opts PictureOpts) error {
 // the time it returns the pipeline is at NULL, PictureStateStopped has been
 // emitted and the states channel is closed. Waiting is what lets a caller stop
 // the monitor and immediately build another one without two pipelines rendering
-// into the same window.
+// into the same surface.
 //
 // It is idempotent in effect: later calls close nothing, wait on an
 // already-closed loopDone and return the same error.
@@ -805,7 +879,7 @@ func (m *pictureMonitor) loop(opts PictureOpts) error {
 
 		pipe, err := m.newPipe()
 		if err != nil {
-			// The pipeline could not even be created — in practice the d3d11
+			// The pipeline could not even be created — in practice the decoder's
 			// plugin missing from the bundle. Retrying will not fix that, but it
 			// costs nothing and the alternative is a picture that is dead for the
 			// rest of the match because the bundle was repaired while it was
@@ -872,7 +946,7 @@ func (m *pictureMonitor) loop(opts PictureOpts) error {
 //
 // It always logs, and it logs the attempt count, because the pair is what
 // distinguishes a network blip from the case that matters: a fault that cannot
-// clear itself — the d3d11 plugin missing from the bundle, say, or an M2L-X
+// clear itself — the decoder's plugin missing from the bundle, say, or an M2L-X
 // output that has been switched off — where the attempt count climbs while the
 // reason never changes.
 func (m *pictureMonitor) report(err error, attempt int) {

@@ -85,6 +85,7 @@ import (
 
 	"wslcomms/internal/config"
 	"wslcomms/internal/mixer"
+	"wslcomms/internal/secrets"
 )
 
 const (
@@ -121,9 +122,15 @@ var errMixerNoControlPlane = errors.New(
 // errMixerNotSignedIn is returned when there is a client but no bearer token
 // yet. Both the status socket and the controller socket carry the token in
 // their URL, so neither can be opened without one.
-var errMixerNotSignedIn = errors.New(
-	"wslcomms: the mixer is unavailable: not signed in to M2L-X yet — " +
-		"check the alias and the password stored in Windows Credential Manager")
+//
+// The store is named through secrets.StoreName rather than spelled out, so the
+// operator is sent to a facility their machine actually has. It is a package
+// variable built at init rather than a constant because of that call, which is
+// the whole cost of the change: errors.Is still matches the same value, and
+// app_mixer_test.go compares against the variable rather than the text.
+var errMixerNotSignedIn = fmt.Errorf(
+	"wslcomms: the mixer is unavailable: not signed in to M2L-X yet — "+
+		"check the alias and the password stored in %s", secrets.StoreName())
 
 // MixerArmState is what ArmMixer reports back to the drawer.
 //

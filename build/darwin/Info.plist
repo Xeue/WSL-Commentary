@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Contents/Info.plist for WSL Commentary. Owner: WP-6 (macOS port).
+
+  This file REPLACES the one Wails would otherwise generate. Wails' packager
+  reads build/darwin/Info.plist from the project when it exists and only falls
+  back to its own embedded template when it does not (buildassets.ReadFile —
+  and note that the fallback WRITES the template here, so an accidental
+  deletion of this file looks like it worked and silently reintroduces every
+  problem below). It is still run through text/template with .Name, .Info and
+  .OutputFilename, so the values that belong to wails.json are still spelled
+  as placeholders and there is exactly one place to bump a version.
+
+  THREE THINGS THE STOCK TEMPLATE GETS WRONG FOR THIS APP, in order of how
+  expensive they are to find out the hard way:
+
+  1. NO NSMicrophoneUsageDescription. This is not a missing nicety. When a
+     process first touches CoreAudio input and TCC finds no usage string in
+     its bundle, macOS does not deny the request and it does not prompt — it
+     TERMINATES THE PROCESS. To the operator that is the app vanishing the
+     instant they press Start. It is also invisible in every test that stops
+     short of real capture, which is most of them.
+
+     It covers both users of the microphone in this app, which are not the
+     same code at all: osxaudiosrc in the GStreamer contribution pipeline, and
+     getUserMedia inside the WKWebView (frontend/src/ui/app.js — the silent
+     grant that makes enumerateDevices() return labelled devices). WKWebView
+     capture is attributed to the HOST bundle, so one string serves both.
+
+  2. CFBundleIdentifier is "com.wails." followed by the templated, sanitised
+     project name — i.e. "com.wails.wslcomms". (The template call itself is
+     described rather than quoted here: this file is still fed through
+     text/template, so writing it out in a comment would execute it.)
+     Wrong on two counts: it is a namespace this project
+     does not own, and it is derived from wails.json's "name", so renaming the
+     project would silently change the identity that TCC's microphone grant,
+     the keychain ACL and the notarisation ticket are all keyed on. An
+     operator who had already granted the microphone would be re-prompted, and
+     the stored credential would be unreachable.
+
+     So it is a LITERAL here, deliberately not a placeholder:
+     tv.wslstudios.commentary. That is the identifier the signed builds on
+     this machine already carry (codesign was being given -i to force it,
+     which fixed the signature and left the plist lying), so nothing about
+     existing grants changes. main.go's single-instance mutex uses a different
+     reverse-DNS string (uk.co.wslstudios.wslcomms) and that is not touched
+     from here — it is a flock name, not an OS-visible identity, and changing
+     it is internal/… territory rather than the packager's.
+
+  3. LSMinimumSystemVersion 10.13.0, which for this bundle is a lie by fifteen
+     major versions. MEASURED on the staged tree, not assumed: Homebrew builds
+     its bottles for the build machine's macOS major version, so every
+     vendored dylib carries LC_BUILD_VERSION minos 26.0 —
+
+       otool -l Contents/Frameworks/libgstreamer-1.0.0.dylib | grep -A1 minos
+         minos 26.0
+
+     — and dyld refuses to map them on anything older. The .app would install
+     happily on macOS 14 and then fail to launch with a dyld message no
+     operator can act on. build/bundle-gst-darwin.sh computes the real floor
+     across the whole staged payload and writes MINOS-FLOOR into the bundle
+     manifest; build/ship-darwin.sh refuses to ship when this key promises
+     support below it. Lowering the floor is a matter of building GStreamer
+     against an older SDK, not of editing this number.
+
+  DELIBERATELY ABSENT, so that nobody adds them back "for completeness":
+
+  * NSCameraUsageDescription — nothing in this product opens a camera. The two
+    getUserMedia call sites both ask for { audio: true } and the pipeline has
+    no video source at all: its video is a still PNG through
+    filesrc ! pngdec ! imagefreeze. A usage string for a device the app never
+    touches is a permission dialogue the operator has no way to interpret, and
+    it widens what a compromised WebView could ask the OS for.
+
+  * LSUIElement — this is an ordinary windowed application with a Dock icon.
+
+  * NSAppTransportSecurity — the WebView loads its assets from the wails://
+    scheme, not over the network. The remote-control listener is a SERVER this
+    app runs; ATS governs outgoing NSURLSession traffic and has nothing to say
+    about it.
+
+  * NSSupportsAutomaticGraphicsSwitching — arm64 only. There is no second GPU
+    to switch to.
+-->
+<plist version="1.0">
+    <dict>
+        <key>CFBundleDevelopmentRegion</key>
+        <string>en_GB</string>
+        <key>CFBundleInfoDictionaryVersion</key>
+        <string>6.0</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+
+        <key>CFBundleName</key>
+        <string>{{.Info.ProductName}}</string>
+        <key>CFBundleDisplayName</key>
+        <string>{{.Info.ProductName}}</string>
+        <key>CFBundleExecutable</key>
+        <string>{{.OutputFilename}}</string>
+
+        <!-- Literal, never derived. See note 2 above. -->
+        <key>CFBundleIdentifier</key>
+        <string>tv.wslstudios.commentary</string>
+
+        <!-- Both from wails.json's info.productVersion, so a release is one
+             edit. CFBundleVersion is the build identity Apple's notary service
+             and the updater compare; CFBundleShortVersionString is what the
+             About box shows. They are the same string here because this
+             product has no separate build number, and ship-darwin.sh requires
+             the version it was given to match this. -->
+        <key>CFBundleVersion</key>
+        <string>{{.Info.ProductVersion}}</string>
+        <key>CFBundleShortVersionString</key>
+        <string>{{.Info.ProductVersion}}</string>
+
+        <key>CFBundleGetInfoString</key>
+        <string>{{.Info.Comments}}</string>
+        <key>NSHumanReadableCopyright</key>
+        <string>{{.Info.Copyright}}</string>
+        <key>CFBundleIconFile</key>
+        <string>iconfile</string>
+
+        <!-- 26.0, and it is measured rather than chosen. See note 3 above. -->
+        <key>LSMinimumSystemVersion</key>
+        <string>26.0</string>
+        <key>LSApplicationCategoryType</key>
+        <string>public.app-category.video</string>
+
+        <key>NSHighResolutionCapable</key>
+        <true/>
+        <!-- Cocoa defaults to NSApplication when this is absent, which is why
+             the stock template gets away without it. Stated anyway: this app
+             creates an NSWindow, an NSView overlay sibling of the WKWebView,
+             and does Cocoa work on the main thread while GStreamer runs on its
+             own. None of that is safe under a different principal class, and
+             an implicit default is a poor place for that to be recorded. -->
+        <key>NSPrincipalClass</key>
+        <string>NSApplication</string>
+
+        <!-- MANDATORY. Its absence is a kill, not a denial. See note 1. -->
+        <key>NSMicrophoneUsageDescription</key>
+        <string>WSL Commentary needs the microphone to send your commentary to the production gallery.</string>
+
+        <!-- macOS 15 and later gate outbound connections to addresses on the
+             local network behind their own TCC prompt, and the prompt shows
+             this string. The app reaches an M2L-X over SRT, which is usually a
+             cloud host and would not trigger it — but a facility running the
+             switcher on-prem, or an operator pointed at a receiver in the same
+             truck, is exactly the case that does, and the failure without this
+             key is a connection that silently never establishes. Listening on
+             80/443 for the remote-control page does not trigger it; connecting
+             out does. -->
+        <key>NSLocalNetworkUsageDescription</key>
+        <string>WSL Commentary needs the local network to reach an M2L-X switcher or SRT receiver on the same site as you.</string>
+    </dict>
+</plist>

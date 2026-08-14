@@ -43,6 +43,14 @@ export const MonitorErrorCode = Object.freeze({
   AUTOPLAY_BLOCKED: 'AUTOPLAY_BLOCKED',
   /** This browser/WebView has no HTMLMediaElement.setSinkId. */
   SINK_ID_UNSUPPORTED: 'SINK_ID_UNSUPPORTED',
+  /**
+   * setSinkId was refused for want of a user gesture and has been queued for
+   * the next one. Distinct from SINK_ID_FAILED because it is temporary and
+   * self-healing: the commentator needs to click, not to change a setting.
+   * WKWebView on macOS does this to every config-apply path; WebView2 does not
+   * require the gesture at all, so this code never appears on Windows.
+   */
+  SINK_ID_DEFERRED: 'SINK_ID_DEFERRED',
   /** setSinkId rejected — usually the device vanished or permission was refused. */
   SINK_ID_FAILED: 'SINK_ID_FAILED',
   /** The Web Audio graph could not be built at all. */

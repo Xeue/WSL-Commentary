@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Contents/Info.plist for the `wails dev` bundle. Owner: WP-6 (macOS port).
+
+  Wails packages a SECOND bundle for `wails dev` and reads this file for it.
+  It exists for one reason: if it is absent, Wails writes its stock template
+  here on the first `wails dev` — which has no NSMicrophoneUsageDescription,
+  so the first time a developer exercises capture the OS kills the process,
+  and the resulting untracked file then sits in the tree looking deliberate.
+
+  It is a near-copy of Info.plist rather than a symlink because Wails resolves
+  the two names independently and a symlink in build/ is a thing that does not
+  survive a Windows checkout of this repo.
+
+  Two deliberate differences from the shipping Info.plist:
+
+  * The bundle identifier is the SAME (tv.wslstudios.commentary). A separate
+    dev identifier would give the dev build its own TCC record, which sounds
+    tidy and is not: microphone behaviour is one of the things being developed,
+    and testing it against a permission grant nobody in the field will have is
+    how you ship a bundle that gets killed on a customer's Mac.
+
+  * LSMinimumSystemVersion is absent. The dev bundle is never distributed and
+    the floor in Info.plist is a statement about the VENDORED GStreamer, which
+    a dev build does not contain — it loads Homebrew's.
+
+  And one thing that is NOT different, and matters more than either: a `dev`
+  build serves the frontend from a path relative to the CURRENT WORKING
+  DIRECTORY, not from the go:embed'd dist. A double-clicked dev .app exits 1.
+  Never judge bundle behaviour — layout, plugin resolution, signing, TCC — from
+  a dev-tag binary; use `build/ship-darwin.sh` or a `-tags production` build.
+-->
+<plist version="1.0">
+    <dict>
+        <key>CFBundleDevelopmentRegion</key>
+        <string>en_GB</string>
+        <key>CFBundleInfoDictionaryVersion</key>
+        <string>6.0</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+
+        <key>CFBundleName</key>
+        <string>{{.Info.ProductName}}</string>
+        <key>CFBundleDisplayName</key>
+        <string>{{.Info.ProductName}}</string>
+        <key>CFBundleExecutable</key>
+        <string>{{.OutputFilename}}</string>
+        <key>CFBundleIdentifier</key>
+        <string>tv.wslstudios.commentary</string>
+        <key>CFBundleVersion</key>
+        <string>{{.Info.ProductVersion}}</string>
+        <key>CFBundleShortVersionString</key>
+        <string>{{.Info.ProductVersion}}</string>
+        <key>CFBundleGetInfoString</key>
+        <string>{{.Info.Comments}}</string>
+        <key>NSHumanReadableCopyright</key>
+        <string>{{.Info.Copyright}}</string>
+        <key>CFBundleIconFile</key>
+        <string>iconfile</string>
+
+        <key>LSApplicationCategoryType</key>
+        <string>public.app-category.video</string>
+        <key>NSHighResolutionCapable</key>
+        <true/>
+        <key>NSPrincipalClass</key>
+        <string>NSApplication</string>
+
+        <key>NSMicrophoneUsageDescription</key>
+        <string>WSL Commentary needs the microphone to send your commentary to the production gallery.</string>
+        <key>NSLocalNetworkUsageDescription</key>
+        <string>WSL Commentary needs the local network to reach an M2L-X switcher or SRT receiver on the same site as you.</string>
+
+        <!-- Wails' own dev template carries this; keeping it means the dev
+             bundle behaves the way Wails expects when the asset server is
+             running on localhost over plain HTTP. -->
+        <key>NSAppTransportSecurity</key>
+        <dict>
+            <key>NSAllowsLocalNetworking</key>
+            <true/>
+        </dict>
+    </dict>
+</plist>

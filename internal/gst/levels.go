@@ -24,6 +24,18 @@ import "math"
 // digital-silence reading (frontend/src/ui/mixer/model.js measured -100.0 on an
 // idle strip), so both meters in this application say silence with the same
 // number.
+//
+// The clamp does real work on macOS and not only in the -inf case. Measured on
+// the port machine with the actual pipeline — osxaudiosrc ! audioconvert !
+// audioresample ! S16LE/48k/2ch ! level — the built-in microphone is a MONO
+// CoreAudio device, audioconvert widens it to the stereo the encoder is pinned
+// to, and the level element then reports the second channel as
+// -699.99999984363217 dBFS rather than -inf. That is not silence-as-infinity,
+// it is a very large finite negative number, and it would have gone through
+// encoding/json intact and rendered as a bar somewhere below the bottom of the
+// scale. The "below the floor clamps up" branch is what makes it read as
+// silence, which is what it is. A commentator on a mono microphone therefore
+// sees one live bar and one at the floor, correctly.
 const levelSilenceDB = -100
 
 // levelStubChannels is how many channels the stub twin synthesises and how many

@@ -1,14 +1,18 @@
 // Package config owns the application's JSON configuration file at
-// %APPDATA%\WSLComms\config.json, described in section 9 of the specification.
+// %APPDATA%\WSLComms\config.json on Windows and
+// ~/Library/Application Support/WSLComms/config.json on macOS, described in
+// section 9 of the specification.
 //
 // Owner: WP-1. No other work package writes files in this directory.
 //
 // The three secrets referenced by this configuration — the M2L-X password, the
 // SEND path's SRT passphrase and the RETURN path's SRT passphrase — are
-// deliberately NOT stored here. They live in Windows Credential Manager and are
-// reached through the internal/secrets package. What this file holds is the
-// non-secret half of each: which key LENGTH to negotiate (PBKeyLen for the
-// send path, SRTReturnPBKeyLen for the return), never the key itself.
+// deliberately NOT stored here. They live in the operating system's credential
+// store — Windows Credential Manager, or the login Keychain on macOS — and are
+// reached through the internal/secrets package, which is also where the store's
+// operator-facing name comes from. What this file holds is the non-secret half
+// of each: which key LENGTH to negotiate (PBKeyLen for the send path,
+// SRTReturnPBKeyLen for the return), never the key itself.
 //
 // WP-1 addition beyond the WP-0 contract: (*Config).Validate reports which
 // fields required for Start to succeed are missing or out of range. It is not
@@ -105,9 +109,18 @@ type Config struct {
 	// It is not interchangeable with HeadphoneEndpointID below. See that field.
 	HeadphoneDeviceID string `json:"headphoneDeviceId"`
 
-	// HeadphoneEndpointID is the WASAPI IMMDevice endpoint ID GUID of the same
-	// headphones, used by the SRT return path and passed to wasapi2sink's device
-	// property. Empty means the Windows default playback device.
+	// HeadphoneEndpointID is the operating system's own stable identity for the
+	// same headphones, used by the SRT return path. It is a WASAPI IMMDevice
+	// endpoint ID GUID on Windows and a CoreAudio device UID on macOS. Empty
+	// means this platform's default playback device.
+	//
+	// On macOS it is deliberately NOT the integer that osxaudiosink's own
+	// "device" property takes. That integer is an AudioDeviceID: a handle
+	// coreaudiod allocates per enumeration and reuses, so it does not survive a
+	// reboot or a replug and is not an identity at all. internal/gst resolves it
+	// from this string every time it opens a pipeline, and the integer never
+	// reaches this file, never crosses the Wails boundary, and appears in a log
+	// only as a diagnostic. See gst.ReturnOpts.OutputDeviceID.
 	//
 	// # Why there are two of these and why they must not be merged
 	//
@@ -115,16 +128,35 @@ type Config struct {
 	// identifier. HeadphoneDeviceID is a browser mediaDeviceId: a per-origin,
 	// per-session salted hash minted by the WebView, meaningful only to
 	// enumerateDevices and setSinkId, and regenerated when the browsing
-	// context's storage is cleared. HeadphoneEndpointID is an IMMDevice endpoint
-	// ID GUID, which is what WASAPI takes and what survives a device rename.
+	// context's storage is cleared. HeadphoneEndpointID is the OS's own identity
+	// for the device — an IMMDevice endpoint ID GUID, or a CoreAudio UID — which
+	// is what the platform's sink can be resolved from and what survives a device
+	// rename.
+	//
+	// That the native half is platform-dependent does not soften the rule by one
+	// inch. The browser id is not ANY operating system's identifier for a device;
+	// it is a per-origin salted token minted by one browsing context. There is no
+	// platform on which the two converge, so there is no platform on which
+	// merging them is closer to working than it is here.
 	//
 	// Neither can be converted into the other, and the failure of using one
 	// where the other belongs is silent in both directions: setSinkId rejects an
-	// endpoint GUID and keeps playing to the default device, and wasapi2sink
-	// does not recognise a mediaDeviceId and falls back to the default endpoint.
-	// In both cases the commentator gets audio, in the wrong ears, with nothing
-	// anywhere saying why. Two fields, two dropdowns, two enumerations —
+	// endpoint GUID and keeps playing to the default device, and the native sink
+	// does not recognise a mediaDeviceId. internal/gst now catches THAT half
+	// before the sink ever sees it and logs why — see gst.chooseOutputDevice —
+	// rather than leaving the commentator with audio in the wrong ears and
+	// nothing anywhere saying so. Two fields, two dropdowns, two enumerations;
 	// gst.ListOutputDevices fills this one.
+	//
+	// # A config.json carried between a Windows machine and a Mac
+	//
+	// This is the one field where that is not merely untidy: the value is a valid
+	// identity on the machine it was written on and meaningless on the other. It
+	// must fail SAFE, and it does. gst.chooseOutputDevice checks the saved id
+	// against what the machine is actually offering, falls back to the default
+	// playback device, and logs the id, the reason, and what IS on offer instead.
+	// A monitor in the wrong ears is diagnosable in a second; no monitor at all is
+	// a commentary position working blind.
 	HeadphoneEndpointID string `json:"headphoneEndpointId"`
 
 	// ReturnSource selects which return path feeds the headphones: "webrtc"
@@ -202,10 +234,12 @@ type Config struct {
 	//
 	// # THE PASSPHRASE IS NOT HERE
 	//
-	// It is in Windows Credential Manager under secrets.TargetSRTReturn
-	// ("WSLComms/srtreturn"), reached through internal/secrets, exactly as the
-	// M2L-X password and the send path's passphrase are. config.json is written
-	// to %APPDATA% in plain text, is hand-editable by design, and is the first
+	// It is in the OS credential store under secrets.TargetSRTReturn
+	// ("WSLComms/srtreturn") — the same target string on both platforms, in
+	// Credential Manager or the login Keychain — reached through
+	// internal/secrets, exactly as the M2L-X password and the send path's
+	// passphrase are. config.json is written to the per-user application data
+	// directory in plain text, is hand-editable by design, and is the first
 	// thing that gets pasted into a support ticket; a passphrase in it is a
 	// passphrase in every copy of that file that has ever been mailed. Save
 	// must never write one — TestSave_NeverWritesSecretFields enforces it — so

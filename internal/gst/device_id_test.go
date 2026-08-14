@@ -143,3 +143,51 @@ func TestClassificationIsCaseInsensitive(t *testing.T) {
 		t.Errorf("IsRenderEndpointID misses the lowercased DEVINTERFACE_AUDIO_RENDER GUID")
 	}
 }
+
+// coreAudioIDs are the REAL CoreAudio unique-ids measured with
+// gst-device-monitor-1.0 on the macOS port machine, one of each shape the
+// provider was seen to produce: a built-in device's symbolic name, an
+// aggregate/virtual device's name, and a driver-assigned UUID. The last one is
+// deliberately the shape closest to a Windows id, because a UUID with hyphens
+// is exactly what a careless prefix or "contains a GUID" test would trip over.
+var coreAudioIDs = []string{
+	"BuiltInMicrophoneDevice",
+	"BuiltInSpeakerDevice",
+	"NDIAudio",
+	"BF568F24-731B-41DB-932E-AC7E260BC71A",
+	"A33FF27F-E7F1-4055-ABC7-4C0C00000003",
+}
+
+// TestCoreAudioIDsAreInNeitherWindowsNamespace pins the property that makes it
+// SAFE to leave device_id.go untouched by the macOS port: the Windows
+// classifiers are inert on CoreAudio ids rather than wrong about them.
+//
+// Both halves matter and for different reasons.
+//
+// IsRenderEndpointID must be false, because refuseRenderEndpoint keys on it and
+// Start calls that on every platform. A CoreAudio id that classified as render
+// would make macOS unstartable with an error about WASAPI playback endpoints —
+// a refusal for a reason that does not exist on the machine.
+//
+// IsCaptureEndpointID must ALSO be false, and that is not a defect: it is the
+// asymmetric rule in the file comment working as designed. What follows from it
+// is that the "unrecognised shape" warning would fire for every macOS device on
+// every enumeration, which is why that warning now lives in the Windows device
+// provider rather than in the shared enumeration path.
+func TestCoreAudioIDsAreInNeitherWindowsNamespace(t *testing.T) {
+	for _, id := range coreAudioIDs {
+		if IsRenderEndpointID(id) {
+			t.Errorf("IsRenderEndpointID(%q) = true: a macOS device would be refused by "+
+				"refuseRenderEndpoint with an error about WASAPI render endpoints, on a machine "+
+				"that has no such thing", id)
+		}
+		if IsCaptureEndpointID(id) {
+			t.Errorf("IsCaptureEndpointID(%q) = true: a CoreAudio id is being positively identified "+
+				"as a WASAPI capture endpoint, which is a coincidence rather than a fact and would "+
+				"silence a warning that is meant to fire", id)
+		}
+		if err := refuseRenderEndpoint(id); err != nil {
+			t.Errorf("refuseRenderEndpoint(%q) = %v, want nil: the macOS pipeline would not start", id, err)
+		}
+	}
+}

@@ -14,12 +14,33 @@
 package gst
 
 import (
+	"bytes"
+	"go/ast"
+	"go/printer"
+	"go/token"
 	"strings"
 	"testing"
 )
 
 // pictureCgoSourceFile is the picture path's cgo half.
 const pictureCgoSourceFile = "picture_cgo.go"
+
+// pictureCgoCode renders the whole file's CODE, with every comment stripped.
+//
+// parseSource parses with mode 0, which does not attach comments to the tree, so
+// printing the file back gives the code alone. That is the property the guards
+// need: picture_cgo.go's header discusses avdec_h265 and decodebin at length,
+// precisely to say they must never be used, and a search over the raw bytes
+// would find those sentences and fail on the documentation that exists to
+// prevent the mistake.
+func pictureCgoCode(t *testing.T, fset *token.FileSet, file *ast.File) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, file); err != nil {
+		t.Fatalf("rendering %s: %v", pictureCgoSourceFile, err)
+	}
+	return buf.String()
+}
 
 // TestPictureSinkDoesNotSyncToTheClock is the guard on the second of latency
 // the operator reported, and it is written at two levels for the reason
@@ -94,6 +115,109 @@ func TestPictureSinkQoSIsDecidedAndNotInherited(t *testing.T) {
 		t.Fatal("buildLocked no longer sets \"qos\" on the video sink from pictureSinkQoS. " +
 			"The element default is true, so the pair (sync, qos) would be half decided and " +
 			"half inherited — which is the state this constant exists to end.")
+	}
+}
+
+// TestPictureNeverSelectsALibavDecoder is the licence guard, and it is the one
+// on this path with a commercial consequence rather than a technical one.
+//
+// avdec_h265 exists at PRIMARY rank on both development machines — the Windows
+// one and this Mac — so it is not an exotic mistake to make: it is what any
+// decodebin, and any "let GStreamer choose" refactor, would land on. gst-libav
+// is FFmpeg, which is the same concern as x264enc, and both bundlers refuse to
+// copy anything matching *libav* or *avcodec*, so a build that selected it would
+// work on the machine it was written on and fail to load a plugin on the
+// installed one.
+//
+// The candidate lists are therefore explicit factory names, and this asserts
+// that no forbidden one has been added and that the file has not started
+// delegating the choice.
+func TestPictureNeverSelectsALibavDecoder(t *testing.T) {
+	fset, file := parseSource(t, pictureCgoSourceFile)
+	src := pictureCgoCode(t, fset, file)
+
+	for _, forbidden := range []string{"avdec_", "libav", "decodebin", "playbin", "uridecodebin"} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("picture_cgo.go's code (not its comments) names %q. The decoder on this path "+
+				"is chosen by name for a licensing reason, and anything that lets GStreamer choose "+
+				"by rank will choose avdec_h265, which is FFmpeg and is not in the bundle", forbidden)
+		}
+	}
+}
+
+// TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform pins the two elements
+// that differ per platform.
+//
+// It is a source guard rather than a call to pictureDecoderCandidates() because
+// this test only builds at Gate A, where picture_cgo.go is not compiled at all —
+// the same limitation, and the same instrument, as the tests above.
+//
+// The ORDER inside each list is what is being protected. vtdec_hw before vtdec
+// is hardware before software; glimagesink before osxvideosink is the sink that
+// was driven in a real Wails window before the marginal-rank one that was not.
+// A list reordered by somebody tidying alphabetically would still work, on a
+// slower decoder and an unproven sink, with nothing anywhere saying so.
+func TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform(t *testing.T) {
+	fset, file := parseSource(t, pictureCgoSourceFile)
+
+	decoders := funcBody(t, fset, file, "", "pictureDecoderCandidates")
+	if !strings.Contains(decoders, `"d3d11h265dec"`) {
+		t.Error("pictureDecoderCandidates no longer offers d3d11h265dec, which is DXVA and is the " +
+			"only decoder on the Windows target: mfh265dec needs an HEVC extension the operator " +
+			"would have to buy from the Microsoft Store")
+	}
+	hw := strings.Index(decoders, `"vtdec_hw"`)
+	sw := strings.Index(decoders, `"vtdec"`)
+	if hw < 0 {
+		t.Error("pictureDecoderCandidates no longer offers vtdec_hw, the VideoToolbox hardware " +
+			"decoder at rank primary+1, which is the measured macOS answer")
+	}
+	if hw >= 0 && sw >= 0 && sw < hw {
+		t.Error("pictureDecoderCandidates offers vtdec before vtdec_hw. That is a software HEVC " +
+			"decode of 1080p50 on a machine that has a media engine sitting idle")
+	}
+
+	sinks := funcBody(t, fset, file, "", "pictureSinkCandidates")
+	if !strings.Contains(sinks, `"d3d11videosink"`) {
+		t.Error("pictureSinkCandidates no longer offers d3d11videosink")
+	}
+	gl := strings.Index(sinks, `"glimagesink"`)
+	osx := strings.Index(sinks, `"osxvideosink"`)
+	if gl < 0 {
+		t.Error("pictureSinkCandidates no longer offers glimagesink. It is the ONE macOS sink " +
+			"proven to take an NSView* through gst_video_overlay_set_window_handle in a real " +
+			"Wails window; caopengllayersink failed to link in the same harness")
+	}
+	if gl >= 0 && osx >= 0 && osx < gl {
+		t.Error("pictureSinkCandidates offers osxvideosink before glimagesink. osxvideosink is at " +
+			"MARGINAL rank, is the older NSOpenGL path, and has never been driven by this " +
+			"application")
+	}
+	if strings.Contains(sinks, "caopengllayersink") {
+		t.Error("pictureSinkCandidates offers caopengllayersink. It FAILED TO LINK in the " +
+			"proof-of-concept harness on the target machine")
+	}
+}
+
+// TestPictureBuildsTheChainItResolved guards the join between the candidate
+// lists and the pipeline.
+//
+// A list that is correct and a buildLocked that still hard-codes d3d11 would be
+// two things that each look right and a macOS build that cannot create an
+// element. The names must reach the factory call.
+func TestPictureBuildsTheChainItResolved(t *testing.T) {
+	fset, file := parseSource(t, pictureCgoSourceFile)
+	body := funcBody(t, fset, file, "picturePipeline", "buildLocked")
+
+	for _, want := range []string{
+		"p.chain.decoder.factory",
+		"p.chain.sink.factory",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("buildLocked does not create its element from %s. Either it has gone back to "+
+				"a hard-coded factory name — which cannot be right on both platforms — or the "+
+				"resolved chain is being computed and thrown away", want)
+		}
 	}
 }
 

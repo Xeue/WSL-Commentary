@@ -28,28 +28,74 @@
 // generated GstVideoOverlay interface has Expose, HandleEvents,
 // PrepareWindowHandle and SetRenderRectangle and stops there — girgen skips the
 // setter, presumably over the guintptr handle argument. There is no property
-// equivalent on d3d11videosink: it has render-rectangle and fullscreen, but the
-// window it renders INTO is only reachable through that one function.
+// equivalent on either sink: d3d11videosink has render-rectangle and fullscreen
+// and glimagesink has render-rectangle, but the window they render INTO is only
+// reachable through that one function.
 //
-// Without it d3d11videosink creates its OWN top-level window, which is a second
-// window the operator did not ask for, outside the layout, with its own title
-// bar and its own close button. So this file declares the function itself, in
-// the small cgo preamble below, and calls it on the raw GstElement pointer
-// go-gst will hand over through UnsafeElementToGlibNone.
+// Without it the sink creates its OWN top-level window, which is a second window
+// the operator did not ask for, outside the layout, with its own title bar and
+// its own close button. So this file declares the function itself, in the small
+// cgo preamble below, and calls it on the raw GstElement pointer go-gst will
+// hand over through UnsafeElementToGlibNone.
 //
-// That is the ONLY cgo in the application. It is four lines and it is here
-// rather than in a helper package because the alternative — vendoring a patched
-// go-gst — is a manifest change, and the manifests are frozen.
+// It was the only cgo in the application until the macOS port; overlay_darwin.go
+// is the other, and for a related reason — there is no way to reach AppKit from
+// Go either. Both are here in internal/gst, which is the one package CONTRACT.md
+// lets cgo into.
+//
+// # The two elements that differ per platform, and nothing else does
+//
+//	                Windows                 macOS
+//	decoder         d3d11h265dec (DXVA)     vtdec_hw (VideoToolbox)
+//	video sink      d3d11videosink (HWND)   glimagesink (NSView*)
+//
+// Everything else — srtsrc, tsdemux, the queue, h265parse, the fakesink on the
+// audio pad, every property in configureSrcLocked, the first-frame probe, the
+// reconnect discipline — is identical, under identical factory names, checked
+// against Homebrew's GStreamer 1.26.10 on macOS arm64 rather than assumed.
+//
+// The two are chosen at RUN TIME from the candidate lists below rather than by a
+// build-tagged twin file. That is a deliberate departure from the shape
+// elements_windows.go and elements_darwin.go use on the send path, and it is
+// justified by how little there is to choose: two factories, on a path where the
+// answer is a preference order with a fallback anyway, and where being able to
+// read both platforms' choices in one screen is worth more than the build tag.
+//
+// # The macOS sink was proven, and two plausible alternatives were not
+//
+// glimagesink is what a proof of concept drove in a REAL Wails window: the host
+// NSWindow was found through NSApp, an overlay NSView was added to the
+// contentView as a sibling of the WKWebView, gst_video_overlay_set_window_handle
+// was given that NSView*, the pipeline reached PLAYING, 400 buffers passed, and
+// a GstGLNSView appeared as a subview of ours. It was then repositioned
+// mid-playback with setFrame and kept going.
+//
+//	caopengllayersink FAILED TO LINK in that harness and is not an option.
+//	osxvideosink is present but at MARGINAL rank, is the older NSOpenGL path,
+//	and is kept below only as a fallback that says so in the log.
+//
+// Measured end to end on this machine over real SRT, with the exact chain this
+// file builds — srtsrc(caller) ! tsdemux ! queue ! h265parse ! vtdec_hw !
+// glimagesink sync=false qos=false — against a listener-first 720p25 H.265
+// transport: 584 frames rendered, 0 dropped, 0 warnings. h265parse handed the
+// decoder stream-format=hev1 codec_data, and vtdec_hw negotiated
+// video/x-raw(memory:GLMemory) NV12 straight into the sink's uploader.
 //
 // # No libav, ever
 //
-// The decoder is d3d11h265dec: DXVA, in the GPU driver, wrapped by
-// gst-plugins-bad under LGPL. avdec_h265 is present on the developer machine at
-// primary rank and must not be selected; gst-libav is FFmpeg, which is the same
-// commercial-shipping concern as x264enc, and build/bundle-gst.ps1 already
-// refuses to copy anything matching *libav* or *avcodec*. Selecting it here
-// would produce an application that works on this machine and fails to load a
-// plugin on the installed one.
+// The decoder is the platform's hardware one, wrapped by gst-plugins-bad under
+// LGPL: d3d11h265dec is DXVA in the GPU driver, vtdec_hw is VideoToolbox in the
+// operating system. avdec_h265 is present at PRIMARY rank on BOTH the Windows
+// developer machine and this Mac and must never be selected; gst-libav is
+// FFmpeg, which is the same commercial-shipping concern as x264enc, and both
+// bundlers already refuse to copy anything matching *libav* or *avcodec*.
+// Selecting it here would produce an application that works on a development
+// machine and fails to load a plugin on the installed one.
+//
+// That is also why the decoder is named rather than left to decodebin. A
+// decodebin on this stream would pick between vtdec_hw at primary+1 and
+// avdec_h265 at primary by rank, which is the right answer today and one
+// registry change away from being the wrong one, silently.
 package gst
 
 /*
@@ -73,6 +119,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,8 +138,8 @@ const (
 	namePicDemux    = "picdemux" // tsdemux
 	namePicQueue    = "picq"     // queue at the head of the video branch
 	namePicParse    = "picparse" // h265parse
-	namePicDecode   = "picdec"   // d3d11h265dec
-	namePicSink     = "picsink"  // d3d11videosink
+	namePicDecode   = "picdec"   // d3d11h265dec on Windows, vtdec_hw on macOS
+	namePicSink     = "picsink"  // d3d11videosink on Windows, glimagesink on macOS
 	namePicFakeSink = "picfake"  // fakesink for the audio pad
 )
 
@@ -101,15 +148,16 @@ const (
 //
 // Read the timeout commentary at the top of gst_cgo.go before relying on this:
 // it does NOT bound the synchronous part. gst_element_set_state takes no timeout
-// and runs every change_state function on the calling goroutine, so a D3D11
+// and runs every change_state function on the calling goroutine, so a graphics
 // device that will not come up hangs here for ever and no value written here
 // changes that. stateChangeWatchdog makes such a hang legible in the log; it
 // cannot cure it.
 //
 // What the number has to cover is srtsrc's caller connect, bounded by libsrt's
-// default SRTO_CONNTIMEO of 3 s, plus creating a D3D11 device and a DXGI
-// swapchain. Ten seconds is far beyond both and matches the other two paths so
-// that all three fail on the same scale.
+// default SRTO_CONNTIMEO of 3 s, plus bringing up the sink's graphics device: a
+// D3D11 device and a DXGI swapchain on Windows, an NSOpenGL context and a
+// GstGLNSView on macOS. Ten seconds is far beyond both and matches the other two
+// paths so that all three fail on the same scale.
 const pictureStateChangeTimeout = 10 * time.Second
 
 // pictureErrorBuffer is how many asynchronous errors are held before further
@@ -119,40 +167,166 @@ const pictureStateChangeTimeout = 10 * time.Second
 // a Go consumer.
 const pictureErrorBuffer = 8
 
+// pictureFactory is one element factory and the plugin from the bundler's
+// allowlist that provides it, so that a missing element can name the thing the
+// bundle is short of rather than only the thing the pipeline wanted.
+type pictureFactory struct{ factory, plugin string }
+
 // pictureRequiredElements is every element factory this pipeline cannot be built
-// without, mapped to the plugin from build/bundle-gst.ps1's allowlist that
-// provides it.
+// without AND that is the same on every platform.
 //
 // It is checked by newPicturePipe rather than by Init, for the reason
 // returnRequiredElements gives: Init's list is the CONTRIBUTION path's and a
 // failure there means the application cannot send and must say so at startup. A
-// missing d3d11 means the commentator has no high-resolution picture — bad, and
-// the fallback mosaic covers it — but it must not stop the feed going on air and
-// it must not make Init fail.
+// missing decoder means the commentator has no high-resolution picture — bad,
+// and the fallback mosaic covers it — but it must not stop the feed going on air
+// and it must not make Init fail.
 //
-// d3d11 is the entry that was not in the bundle before this work. It provides
-// BOTH the decoder and the sink, so a single missing plugin takes the whole
-// path; see the Why line on it in build/bundle-gst.ps1.
-var pictureRequiredElements = []struct{ factory, plugin string }{
+// All five exist under these exact names on Windows and on macOS; the two that
+// do not are the decoder and the sink, below.
+var pictureRequiredElements = []pictureFactory{
 	{"srtsrc", "srt"},
 	{"tsdemux", "mpegtsdemux"},
 	{"queue", "coreelements"},
 	{"fakesink", "coreelements"},
 	{"h265parse", "videoparsersbad"},
-	{"d3d11h265dec", "d3d11"},
-	{"d3d11videosink", "d3d11"},
 }
 
-// pictureMissingElements returns a description of every required factory the
-// registry does not have, or nil if the bundle is complete for this path.
-func pictureMissingElements() []string {
+// pictureDecoderCandidates is the H.265 decoder, in preference order.
+//
+// WINDOWS. d3d11h265dec only: DXVA, in the GPU driver, measured on the live
+// M2L-X output at 1178 frames over 25 s on an RTX 5070. mfh265dec is absent on
+// the target because the Windows HEVC video extension is not installed, and
+// requiring the operator to buy it from the Microsoft Store is not a deployment
+// step. There is deliberately no fallback: the only other decoder on that
+// machine is avdec_h265, which is FFmpeg and is forbidden.
+//
+// macOS. vtdec_hw first — VideoToolbox, hardware only, rank primary+1 (257),
+// from gst-plugins-bad's applemedia plugin, LGPL over a decoder that is part of
+// the operating system. Its sink template takes video/x-h265 in hev1 or hvc1
+// with alignment=au, which is exactly what h265parse produces from the
+// byte-stream on the wire, and it was driven end to end here.
+//
+// vtdec is the fallback and it is a REAL one rather than a courtesy: it is the
+// same element without the hardware-only flag, at secondary rank, so it can fall
+// back to VideoToolbox's software path on a Mac whose media engine will not take
+// this profile. It is still applemedia, still LGPL, still not FFmpeg. Falling
+// back is logged loudly, because a software HEVC decode of 1080p50 is a
+// different machine load from a hardware one and the operator should be able to
+// find out why the fans came on.
+//
+// avdec_h265 is present at PRIMARY rank on both platforms and appears in neither
+// list. See "No libav, ever" in the file header.
+func pictureDecoderCandidates() []pictureFactory {
+	switch runtime.GOOS {
+	case "windows":
+		return []pictureFactory{{"d3d11h265dec", "d3d11"}}
+	case "darwin":
+		return []pictureFactory{{"vtdec_hw", "applemedia"}, {"vtdec", "applemedia"}}
+	default:
+		return nil
+	}
+}
+
+// pictureSinkCandidates is the video sink, in preference order.
+//
+// WINDOWS. d3d11videosink only. It takes the decoder's D3D11Memory without a
+// copy, it implements GstVideoOverlay over an HWND, and it is the other half of
+// the same d3d11 plugin the decoder comes from.
+//
+// macOS. glimagesink first, and it is the one that was proven: caopengllayersink
+// FAILED TO LINK in the proof-of-concept harness on this machine, and
+// glimagesink drove a real Wails NSView to PLAYING with 400 buffers and
+// survived being moved mid-playback. It implements GstVideoOverlay, and on macOS
+// the guintptr handle that interface takes IS an NSView pointer.
+//
+// osxvideosink is the fallback and it is only that. It implements GstVideoOverlay
+// too, but it sits at MARGINAL rank (64), it is the older NSOpenGL path, and it
+// has NOT been driven by this application. It is here so that a bundle missing
+// the GL plugin still produces a picture rather than nothing, and choosing it is
+// logged as the compromise it is.
+func pictureSinkCandidates() []pictureFactory {
+	switch runtime.GOOS {
+	case "windows":
+		return []pictureFactory{{"d3d11videosink", "d3d11"}}
+	case "darwin":
+		return []pictureFactory{{"glimagesink", "opengl"}, {"osxvideosink", "osxvideo"}}
+	default:
+		return nil
+	}
+}
+
+// pictureBundler names the script whose allowlist a missing plugin has to be
+// added to. It is in the error message because a missing plugin in the field is
+// a bundling mistake and nothing else: every element in the lists above ships
+// with GStreamer and is present on any machine that has it installed.
+func pictureBundler() string {
+	if runtime.GOOS == "windows" {
+		return "build/bundle-gst.ps1"
+	}
+	return "build/bundle-gst-darwin.sh"
+}
+
+// pictureChain is the pair of platform-dependent elements one pipeline needs,
+// resolved against the registry that is actually loaded.
+//
+// It is resolved ONCE, in newPicturePipe, and carried on the pipeline rather
+// than looked up again in buildLocked, so that every attempt of one session uses
+// the same decoder and the same sink. A pipeline that silently changed decoder
+// between reconnects would be the hardest possible fault to read in a log.
+type pictureChain struct {
+	decoder pictureFactory
+	sink    pictureFactory
+}
+
+// choosePictureChain picks the decoder and the sink, and reports everything this
+// path needs that the registry does not have.
+//
+// The missing list is a description per requirement rather than per factory: a
+// platform with two candidates and neither present is ONE missing requirement,
+// and printing both candidates is what tells the reader which plugin to bundle.
+func choosePictureChain() (pictureChain, []string) {
+	var chain pictureChain
 	var missing []string
+
 	for _, req := range pictureRequiredElements {
 		if gogst.ElementFactoryFind(req.factory) == nil {
 			missing = append(missing, fmt.Sprintf("%s (plugin %s)", req.factory, req.plugin))
 		}
 	}
-	return missing
+
+	pick := func(what string, candidates []pictureFactory) (pictureFactory, bool) {
+		if len(candidates) == 0 {
+			missing = append(missing, fmt.Sprintf(
+				"an H.265 %s: this application has no %s answer for %s", what, what, runtime.GOOS))
+			return pictureFactory{}, false
+		}
+		for i, c := range candidates {
+			if gogst.ElementFactoryFind(c.factory) == nil {
+				continue
+			}
+			if i > 0 {
+				// A fallback was taken. It is a working picture and a worse one,
+				// and the only place that can ever be noticed is here.
+				log.Printf("gst: picture monitor: %s %s is not in this build's GStreamer; "+
+					"falling back to %s (plugin %s), which is a working picture but not the one "+
+					"this path was measured on",
+					what, candidates[0].factory, c.factory, c.plugin)
+			}
+			return c, true
+		}
+		names := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			names = append(names, fmt.Sprintf("%s (plugin %s)", c.factory, c.plugin))
+		}
+		missing = append(missing, fmt.Sprintf("an H.265 %s — none of %s",
+			what, strings.Join(names, " or ")))
+		return pictureFactory{}, false
+	}
+
+	chain.decoder, _ = pick("decoder", pictureDecoderCandidates())
+	chain.sink, _ = pick("video sink", pictureSinkCandidates())
+	return chain, missing
 }
 
 // picturePipeline is the go-gst backed picturePipe: one attempt's pipeline.
@@ -182,6 +356,10 @@ func pictureMissingElements() []string {
 // reachable: dropping a Go reference to a live GstElement would let go-gst's
 // finalizer unref it.
 type picturePipeline struct {
+	// chain is the decoder and the sink this pipeline will use. It is resolved
+	// once by newPicturePipe and never changes; see pictureChain.
+	chain pictureChain
+
 	// mu serialises Play and Close against each other.
 	mu     sync.Mutex
 	played bool
@@ -199,9 +377,10 @@ type picturePipeline struct {
 	sink      gogst.Element
 	fakeSinks []gogst.Element
 
-	// windowHandle is the HWND every attempt renders into, kept so the
-	// prepare-window-handle bus message can be answered from a streaming thread
-	// without reading PictureOpts, which lives on the caller's stack.
+	// windowHandle is the native surface every attempt renders into — an HWND on
+	// Windows, an NSView* on macOS — kept so the prepare-window-handle bus
+	// message can be answered from a streaming thread without reading
+	// PictureOpts, which lives on the caller's stack.
 	//
 	// It is an atomic because that answer happens on a streaming thread while
 	// Play holds mu.
@@ -260,21 +439,21 @@ var _ picturePipe = (*picturePipeline)(nil)
 //
 // It refuses early, with a message naming the missing plugin, rather than
 // letting the failure surface as a nil from gst_element_factory_make three
-// screens further down. The message names build/bundle-gst.ps1 because a missing
-// d3d11 in the field is a bundling mistake and nothing else: the plugin ships
-// with GStreamer and is present on every machine that has the GPU driver this
-// application requires anyway.
+// screens further down. The message names the platform's bundler because a
+// missing plugin in the field is a bundling mistake and nothing else: every
+// element this path uses ships with GStreamer.
 func newPicturePipe() (picturePipe, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: picture monitor: Init has not been called")
 	}
-	if missing := pictureMissingElements(); len(missing) > 0 {
+	chain, missing := choosePictureChain()
+	if len(missing) > 0 {
 		return nil, fmt.Errorf(
 			"gst: picture monitor: the bundled GStreamer is missing %s "+
-				"(add the plugin to the allowlist in build/bundle-gst.ps1 and re-run it)",
-			strings.Join(missing, ", "))
+				"(add the plugin to the allowlist in %s and re-run it)",
+			strings.Join(missing, ", "), pictureBundler())
 	}
-	return &picturePipeline{errs: make(chan error, pictureErrorBuffer)}, nil
+	return &picturePipeline{chain: chain, errs: make(chan error, pictureErrorBuffer)}, nil
 }
 
 // Play builds the pipeline and takes it to PLAYING. See picturePipe.
@@ -291,9 +470,10 @@ func (p *picturePipeline) Play(opts PictureOpts) error {
 	if opts.WindowHandle == 0 {
 		// PictureOpts.normalise already refuses this, and the monitor normalises
 		// before it ever reaches a pipe. It is restated because the consequence
-		// of getting here with a zero handle is d3d11videosink opening its own
-		// top-level window on the operator's screen, mid-match, which is a far
-		// worse outcome than an error.
+		// of getting here with a zero handle is the sink opening its own
+		// top-level window on the operator's screen, mid-match — a stray HWND or
+		// a stray NSWindow, depending on the platform — which is a far worse
+		// outcome than an error.
 		return errors.New("gst: picture monitor: no window handle; refusing to let the sink open its own window")
 	}
 	p.windowHandle.Store(opts.WindowHandle)
@@ -327,8 +507,8 @@ func (p *picturePipeline) Play(opts PictureOpts) error {
 	p.pipeline = pipeline
 
 	// From here on any failure must tear down what has been built, or the SRT
-	// socket and the D3D11 device stay open and the next attempt cannot have
-	// them.
+	// socket and the sink's graphics device stay open and the next attempt cannot
+	// have them.
 	abort := func(err error) error {
 		p.teardownLocked()
 		return err
@@ -429,7 +609,7 @@ func (p *picturePipeline) awaitFrame(where string) error {
 	case err, ok := <-p.errs:
 		// A bus error during the connect — in practice srtsrc's "Connection
 		// timeout (16)" when nothing is listening on the far end, or the decoder
-		// refusing to create a DXVA context. It is returned rather than left on
+		// refusing to give out a hardware context. It is returned rather than left on
 		// the channel because the caller is about to throw this whole pipeline
 		// away, and an error nobody reads is an outage with no explanation.
 		if !ok || err == nil {
@@ -545,13 +725,17 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		out     *gogst.Element
 	}
 	var parse gogst.Element
+	// The last two come from p.chain, which newPicturePipe resolved against the
+	// registry: d3d11h265dec into d3d11videosink on Windows, vtdec_hw into
+	// glimagesink on macOS. Everything above them is the same factory under the
+	// same name on both. See pictureDecoderCandidates and pictureSinkCandidates.
 	specs := []spec{
 		{"srtsrc", namePicSrc, &p.src},
 		{"tsdemux", namePicDemux, &p.demux},
 		{"queue", namePicQueue, &p.queue},
 		{"h265parse", namePicParse, &parse},
-		{"d3d11h265dec", namePicDecode, &p.decode},
-		{"d3d11videosink", namePicSink, &p.sink},
+		{p.chain.decoder.factory, namePicDecode, &p.decode},
+		{p.chain.sink.factory, namePicSink, &p.sink},
 	}
 	for _, s := range specs {
 		el := gogst.ElementFactoryMake(s.factory, s.name)
@@ -638,30 +822,42 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		p.sink.SetObjectProperty("force-aspect-ratio", true)
 	}
 
-	// enable-navigation-events off. The sink is inside a child window that sits
+	// Navigation events off. The sink draws inside a native surface that sits
 	// over the page; letting it turn mouse movement into upstream navigation
 	// events sends them to srtsrc, which has nothing to do with them, and it is
 	// one more reason for the sink to want the input focus it must never take
 	// from the page.
+	//
+	// The property has two names for the same idea, so both are tried:
+	// d3d11videosink calls it enable-navigation-events, and the GL and macOS
+	// sinks inherit handle-events from GstVideoOverlay's helpers. Neither is
+	// present on the other's element, which is exactly what the hasProperty
+	// guards are for here — unlike the sync and qos pair above, where a guard
+	// could only ever hide a regression.
 	if hasProperty(p.sink, "enable-navigation-events") {
 		p.sink.SetObjectProperty("enable-navigation-events", false)
 	}
+	if hasProperty(p.sink, "handle-events") {
+		p.sink.SetObjectProperty("handle-events", false)
+	}
 
 	// fullscreen-toggle-mode is left at "none", its default, and that is stated
-	// rather than assumed: the other values make the sink react to Alt+Enter and
-	// to double-clicks by taking the window full screen. On a commentary position
-	// with one window and no menu, a picture that silently goes full screen over
-	// the controls mid-match is unrecoverable without the keyboard shortcut
-	// nobody knows.
+	// rather than assumed: the other values make d3d11videosink react to
+	// Alt+Enter and to double-clicks by taking the window full screen. On a
+	// commentary position with one window and no menu, a picture that silently
+	// goes full screen over the controls mid-match is unrecoverable without the
+	// keyboard shortcut nobody knows. The property does not exist on the macOS
+	// sinks, which is why nothing is set here on either platform.
 
 	// The window handle, set BEFORE the sink is ever taken out of NULL.
 	//
-	// If it is not set by the time the sink needs somewhere to draw, gstd3d11
-	// creates its own top-level window — a second window, outside the layout,
-	// with its own title bar. Setting it here is the documented and
-	// well-travelled order; answering the prepare-window-handle message in
-	// onBusMessage is the belt to this pair of braces, and both are wired
-	// because the failure is not recoverable once it has happened.
+	// If it is not set by the time the sink needs somewhere to draw, it creates
+	// its own top-level window — a second window, outside the layout, with its
+	// own title bar — and that is true of gstd3d11 and of glimagesink alike.
+	// Setting it here is the documented and well-travelled order; answering the
+	// prepare-window-handle message in onBusMessage is the belt to this pair of
+	// braces, and both are wired because the failure is not recoverable once it
+	// has happened.
 	p.setWindowHandleLocked(p.sink, opts.WindowHandle)
 
 	// The pipeline and the queue's sink pad are captured HERE, into the closure,
@@ -674,13 +870,18 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 	return nil
 }
 
-// setWindowHandleLocked hands the HWND to a GstVideoOverlay.
+// setWindowHandleLocked hands the native surface to a GstVideoOverlay.
 //
-// This is the one cgo call in the application; see the file header for why it
-// cannot go through go-gst. UnsafeElementToGlibNone borrows the pointer without
-// touching the reference count, which is correct here because sink is held in a
-// field for the life of the pipeline and gst_video_overlay_set_window_handle
-// does not retain it — it stores the integer and returns.
+// The guintptr this takes is an HWND on Windows and an NSView* on macOS. Both
+// are what the platform's sink expects, and neither is interpreted here: the
+// handle is produced by overlay_windows.go or overlay_darwin.go and passed
+// through PictureOpts.WindowHandle without this file knowing which.
+//
+// See the file header for why it cannot go through go-gst.
+// UnsafeElementToGlibNone borrows the pointer without touching the reference
+// count, which is correct here because sink is held in a field for the life of
+// the pipeline and gst_video_overlay_set_window_handle does not retain it — it
+// stores the integer and returns.
 //
 // runtime.KeepAlive is not written out because sink is reachable through p.sink
 // for the whole call; the go-gst generated bindings write it for locals and this
@@ -766,8 +967,8 @@ func (p *picturePipeline) configureSrcLocked(opts PictureOpts, addr string) erro
 // gst_pad_push returns GST_FLOW_NOT_LINKED, mpegtsbase aggregates the flow
 // returns of its pads, and NOT_LINKED from one pad is tolerated only while
 // another is returning OK. The moment the video branch back-pressures — which it
-// will, because d3d11videosink is a clock-synced sink and the whole chain paces
-// to it — the aggregate becomes NOT_LINKED, the demuxer pauses its task and
+// will, because a video sink is the slowest thing in the chain and the whole
+// chain paces to it — the aggregate becomes NOT_LINKED, the demuxer pauses its task and
 // posts an error. The symptom is a picture that plays for a second or two and
 // then stops, which looks exactly like a network problem and is not. return.go
 // learned this on the other pad and the discipline is the same one.

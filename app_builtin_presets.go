@@ -22,10 +22,13 @@
 //
 // These are real credentials for the facility's own private instances, baked in
 // at the owner's explicit request. Each preset's M2L-X password is seeded into
-// Windows Credential Manager under that preset's OWN scope
+// the OS credential store — Windows Credential Manager, or the login Keychain on
+// macOS; internal/secrets picks — under that preset's OWN scope
 // (WSLComms/match<letter>/m2lx), exactly where the scoped credential path reads
 // it at sign-in — so applying "Match G" and pressing START just works. They are
-// per-instance and never collide.
+// per-instance and never collide. The target string is the same on both
+// platforms, so a preset seeded on one machine is looked for under the same name
+// on the other; only the vault it lands in differs.
 //
 // # Idempotency: "always present" without clobbering
 //

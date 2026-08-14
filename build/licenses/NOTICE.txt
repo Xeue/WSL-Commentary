@@ -1,4 +1,5 @@
-WSL STUDIOS COMMENTARY CONTRIBUTION (wslcomms.exe)
+WSL STUDIOS COMMENTARY CONTRIBUTION
+  Windows: wslcomms.exe        macOS: WSL Commentary.app
 THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
 ==================================================================
 
@@ -14,17 +15,38 @@ corresponding source code, and it is part of how this product complies with
 those licences.
 
 The GStreamer, GLib and related libraries listed under "A." below are shipped
-UNMODIFIED and are loaded as separate shared libraries (DLLs) at run time. No
-part of them is linked statically into wslcomms.exe. A user who wishes to run
-this product against a modified, interface-compatible build of any of them may
-replace the corresponding DLL in the program folder; the application loads them
-by name from that folder and will use the replacement.
+UNMODIFIED and are loaded as separate shared libraries at run time - .dll files
+on Windows and .dylib files on macOS. No part of them is linked statically into
+the application binary on either platform.
+
+A user who wishes to run this product against a modified, interface-compatible
+build of any of them may replace the corresponding shared library; the
+application loads them by name and will use the replacement. Where those
+libraries live differs by platform, and on macOS one further step is involved,
+so it is stated here rather than left for the reader to discover:
+
+  Windows   beside wslcomms.exe in the program folder, and the GStreamer
+            plugins in gst\lib\gstreamer-1.0\ under it. Replacing a DLL is the
+            whole operation.
+
+  macOS     inside the application bundle -
+              WSL Commentary.app/Contents/Frameworks/           core libraries
+              WSL Commentary.app/Contents/Resources/gstreamer-1.0/   plugins
+            The bundle is code-signed, so replacing a library invalidates the
+            signature of the component that changed. The replacement must
+            therefore be re-signed, or the bundle re-signed ad-hoc
+            (`codesign --force --deep --sign - "WSL Commentary.app"`), for
+            macOS to load it. That is a property of the operating system's code
+            signing and not a restriction imposed by this product: no technical
+            measure here prevents the substitution, and the application resolves
+            these libraries by name at run time exactly as it does on Windows.
 
 ------------------------------------------------------------------
-A. LGPL-2.1 COMPONENTS - shipped as DLLs, unmodified, dynamically linked
+A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
+   dynamically linked
 ------------------------------------------------------------------
 
-  GStreamer                       LGPL-2.1-or-later
+  GStreamer (Windows)             LGPL-2.1-or-later
     Version 1.28.5, mingw-x86_64 build, from the GStreamer project's official
     Windows installers. Includes the core library and the following libraries
     and plugins only: coreelements, typefindfunctions, videoconvertscale,
@@ -37,16 +59,44 @@ A. LGPL-2.1 COMPONENTS - shipped as DLLs, unmodified, dynamically linked
     The complete file list, with SHA-256 for every file, is in
     gst\BUNDLE-MANIFEST.txt in the program folder.
 
+  GStreamer (macOS)               LGPL-2.1-or-later
+    Version 1.26.10, arm64, from Homebrew's gstreamer formulae. A DIFFERENT
+    build from the Windows one above, and a different plugin set, because the
+    platform-specific halves have no overlap. Seventeen plugins:
+
+      coreelements typefindfunctions videoconvertscale audioconvert
+      audioresample imagefreeze png audioparsers videoparsersbad
+      mpegtsmux mpegtsdemux srt level          - the same twelve as Windows
+      osxaudio applemedia opengl osxvideo      - in place of wasapi2,
+                                                 mediafoundation and d3d11
+
+    osxaudio supplies osxaudiosrc, osxaudiosink, atenc and atdec; applemedia
+    supplies vtenc_h264, vtenc_h264_hw, vtdec_hw and vtdec. Both are thin
+    wrappers over macOS itself - see section F2.
+
+    Unlike the Windows bundle, which is copied from an explicit allowlist, the
+    macOS bundle is a COMPUTED transitive dependency closure: build/bundle-gst-
+    darwin.sh resolves each wanted element to its plugin and then walks
+    `otool -L` until the set stops growing. So the file list is derived rather
+    than declared, and the authoritative record of what a given build actually
+    shipped is
+      WSL Commentary.app/Contents/Resources/GST-BUNDLE-MANIFEST.txt
+    which carries a SHA-256 for every file, exactly as its Windows counterpart
+    does.
+
   GLib, GObject, GIO, GModule     LGPL-2.1-or-later
-    Version: UNVERIFIED - the exact GLib version is whatever the GStreamer
+    Windows: UNVERIFIED - the exact GLib version is whatever the GStreamer
     1.28.5 mingw-x86_64 build ships. Gate B must record it here, from
     `pkg-config --modversion glib-2.0` on the build host or from the DLL's
     version resource. Do not release with this line unresolved.
+    macOS: 2.88.2, read from `pkg-config --modversion glib-2.0` on the build
+    host.
 
   GNU gettext runtime (libintl)   LGPL-2.1-or-later
   GNU libiconv (libiconv)         LGPL-2.1-or-later
-    Present if the GStreamer build links them; see gst\BUNDLE-MANIFEST.txt for
-    whether they are in this particular build.
+    Present if the GStreamer build links them; see the bundle manifest for
+    whether they are in this particular build. On macOS libintl IS in the
+    closure - the application binary itself links it.
 
 ------------------------------------------------------------------
 B. OTHER RECIPROCAL LICENCES - shipped as DLLs, unmodified
@@ -156,40 +206,132 @@ F. MICROSOFT COMPONENTS
     third-party video or audio encoder is bundled.
 
 ------------------------------------------------------------------
+F2. APPLE COMPONENTS - the macOS equivalents of section F
+------------------------------------------------------------------
+
+  VideoToolbox, AudioToolbox, CoreAudio
+    Part of macOS. Not distributed by this product. This is the reason no
+    third-party video or audio encoder is bundled on macOS either, exactly as
+    on Windows:
+
+      H.264 encode   vtenc_h264 / vtenc_h264_hw   (libgstapplemedia.dylib)
+      H.265 decode   vtdec_hw / vtdec             (libgstapplemedia.dylib)
+      AAC encode     atenc                        (libgstosxaudio.dylib)
+      AAC decode     atdec                        (libgstosxaudio.dylib)
+      audio capture  osxaudiosrc                  (libgstosxaudio.dylib)
+      audio playback osxaudiosink                 (libgstosxaudio.dylib)
+
+    The GStreamer elements named in brackets are thin wrappers, are LGPL, and
+    ARE bundled - they are listed in section A along with the rest of the
+    GStreamer runtime. What they wrap is the operating system and is not.
+
+    This is the same arrangement as mfh264enc and mfaacenc on Windows, and it
+    is the reason section G's statement about AAC below is true on both
+    platforms rather than only on one.
+
+  WKWebView
+    Part of macOS, and the macOS counterpart of the WebView2 runtime above.
+    Not distributed by this product. Unlike WebView2 there is no bootstrapper
+    to embed, because WKWebView cannot be absent from a supported macOS.
+
+------------------------------------------------------------------
 G. DELIBERATE EXCLUSIONS - read this before adding anything to the bundle
 ------------------------------------------------------------------
 
-  x264 (libgstx264.dll, libx264)   GPL-2.0-or-later   *** EXCLUDED ***
+  x264 (libgstx264.dll, libgstx264.dylib, libx264)
+                                   GPL-2.0-or-later   *** EXCLUDED ***
 
     x264 is licensed under the GPL. Linking or distributing it with this
     product would place the entire combined work under the GPL, which is
     incompatible with a commercial deliverable. It is therefore excluded, and
     the exclusion is enforced mechanically rather than by convention:
 
+      - build\forbidden-names.ps1 is the single list of forbidden name
+        patterns. Both platforms' bundlers read that one file: the Windows
+        script dot-sources it, and build/bundle-gst-darwin.sh PARSES it (and
+        fails the build if the parse yields fewer patterns than expected,
+        rather than degrading to "allow everything").
       - build\bundle-gst.ps1 copies from an explicit file list of individual
         file names. It never copies a directory, so a GPL plugin sitting next
         to an allowlisted one cannot be swept up.
-      - That script refuses to run if any name in its file list matches
-        *x264*, refuses to copy any resolved file whose name matches, and
-        fails after copying if any file matching *x264* is present in the
-        staged output. There is no override switch.
+      - Each script applies the list at THREE points: it refuses to run if a
+        wanted name matches, refuses the file if a resolved one matches, and
+        fails after staging if a matching file is present in the output. There
+        is no override switch on either platform.
       - build\installer.iss refuses to compile unless gst\BUNDLE-MANIFEST.txt
-        is present, which only that script produces.
+        is present, which only bundle-gst.ps1 produces.
 
-    The H.264 encoder actually used is mfh264enc: a GStreamer (LGPL) wrapper
-    over the Media Foundation encoder already in Windows.
+    On macOS the darwin bundler's middle check is applied to a COMPUTED
+    dependency closure rather than to an explicit list, which makes it the
+    stronger of the two: a forbidden plugin dragged in as a dependency of an
+    allowed one is caught even though no list ever named it.
+
+    x264 is NOT hypothetical on macOS the way it is on Windows. x264enc is
+    present in a stock Homebrew GStreamer and ranks primary (256) - the same
+    rank as vtenc_h264 - so it is a live candidate that rank-based selection
+    could pick. internal/gst's encoder denylist refuses it at run time, but a
+    denylist in Go is not a licensing control over what gets signed and
+    notarised. The file gate above is.
+
+    The H.264 encoder actually used is mfh264enc on Windows and vtenc_h264 on
+    macOS: GStreamer (LGPL) wrappers over an encoder already in the operating
+    system. See sections F and F2.
 
   gst-libav / FFmpeg              EXCLUDED
     Licensing depends on how it was built and nothing here needs it. Blocked by
-    the same patterns.
+    the same patterns (*libav*, *ffmpeg*, *avcodec* and the rest). This is why
+    avenc_aac, avdec_aac and avdec_h265 appear in no candidate list in this
+    product even though all three are present and avdec_h265 ranks PRIMARY on
+    macOS.
 
   gst-plugins-ugly                EXCLUDED
     That plugin set exists because of licensing. Blocked by the same patterns.
 
-  fdkaac, faac, voaacenc          EXCLUDED
-    Not needed: AAC-LC encoding is done by mfaacenc, the Windows encoder, so no
+  fdkaac, faac, faad, voaacenc, gst-libav's avenc_aac / avdec_aac
+                                                     *** EXCLUDED ***
+
+    Not needed. AAC-LC encoding AND decoding are done by the operating system's
+    own codec on both platforms - mfaacenc / mfaacdec (Media Foundation, part
+    of Windows) and atenc / atdec (AudioToolbox, part of macOS) - so no
     third-party AAC implementation and no separate AAC patent licence is
     involved on our side.
+
+    fdkaacenc was measured against atenc before being excluded, and the two are
+    indistinguishable on rate: 131.4 kbit/s each against a 128 kbit/s target,
+    on identical S16LE/48kHz/2ch input. It is excluded on LICENCE, for zero
+    kbit/s of benefit, and the justification is spelled out here because two
+    commonly consulted sources contradict it:
+
+      - Homebrew's fdk-aac formula metadata says Apache-2.0.
+      - `gst-inspect-1.0 fdkaacenc` says LGPL.
+
+    Both are describing something other than the library. gst-inspect is
+    reporting the licence of the GSTREAMER WRAPPER plugin; `otool -L` on that
+    wrapper shows it linking libfdk-aac.2.dylib, which is the thing in
+    question. The actual terms, read from the NOTICE shipped with fdk-aac
+    2.0.3, are the "Software License for The Fraunhofer FDK AAC Codec Library
+    for Android". It requires complete source to be made available to
+    recipients of binaries, forbids charging copyright licence fees, and in
+    clause 3 grants NO PATENT LICENCE:
+
+      "NO EXPRESS OR IMPLIED LICENSES TO ANY PATENT CLAIMS ... ARE GRANTED BY
+       THIS SOFTWARE LICENSE ... You may use this FDK AAC Codec software or
+       modifications thereto only for purposes that are authorized by
+       appropriate patent licenses."
+
+    Shipping it would therefore mean acquiring an AAC patent licence
+    separately - which is precisely the obligation this section says the
+    product does not carry.
+
+    faac is a genuine third-party AAC implementation and reopens the same
+    question; it also overshot the target by nine per cent when measured
+    (139.3 kbit/s against 128). faad is the GPL AAC DECODER from
+    gst-plugins-bad - a different project from faac despite the one-letter
+    difference, and it was not on the forbidden list until the macOS return
+    path made an AAC decoder a live choice.
+
+    All of these are blocked by name in build\forbidden-names.ps1 and therefore
+    by both platforms' bundlers.
 
 ------------------------------------------------------------------
 H. PROVENANCE OF THE LICENCE TEXTS IN THIS FOLDER
@@ -239,12 +381,24 @@ present (Gate B closed). Each one is a fact that exists on the build host the
 moment GStreamer is installed. They must all be resolved before this product is
 given to anyone outside the project:
 
-  1. The exact GLib version.
-  2. Which of libiconv, OpenSSL and mbedTLS are actually bundled - read
-     gst\BUNDLE-MANIFEST.txt, which lists exactly what was shipped.
+  1. The exact GLib version ON WINDOWS. The macOS one is recorded (2.88.2).
+  2. Which of libiconv, OpenSSL and mbedTLS are actually bundled - read the
+     bundle manifest, which lists exactly what was shipped.
   3. The verbatim copyright notices for ORC, libpng, zlib and the MinGW-w64
      runtime.
   4. The identity and contact details in WRITTEN-OFFER.txt.
+  5. NEW WITH THE macOS BUILD, and it is a real gap rather than a formality:
+     sections B and C were written against the Windows closure and have not
+     been reconciled against the macOS one. The macOS bundle is a computed
+     closure of roughly fifty Mach-O files, and while every plugin in it is
+     accounted for in section A, the transitively pulled-in libraries are not
+     individually enumerated here the way the Windows ones are. Known to differ:
+     libgcc and libstdc++ are MinGW-only and are NOT in the macOS bundle (the
+     C++ runtime there is the operating system's libc++); libjpeg and several
+     X11 client libraries ARE in the macOS closure and appear nowhere above.
+     The manifest at Contents/Resources/GST-BUNDLE-MANIFEST.txt is the
+     authoritative list to work from. Do not release the macOS build to anyone
+     outside the project until each entry in it has a licence recorded here.
 
 This file is a factual notice, not legal advice. Have it and WRITTEN-OFFER.txt
 reviewed by whoever signs off the commercial deliverable.

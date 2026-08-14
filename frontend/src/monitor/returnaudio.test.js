@@ -10,7 +10,7 @@
  * what these two features are. Whether Chromium then produces sound belongs to
  * harness.html.
  *
- * The two properties under test are the two that fail silently:
+ * The three properties under test are the three that fail silently:
  *
  *   1. "Left only" must route the LEFT SOURCE channel to BOTH outputs. The
  *      wrong implementation — silencing one output — looks identical on a
@@ -21,6 +21,12 @@
  *      quiet: severed. A gain of zero is one ramp away from being a second copy
  *      of the programme, at a different offset, in the ears of somebody talking
  *      over it.
+ *
+ *   3. A setSinkId that WKWebView refuses for want of a user gesture must be
+ *      queued and retried, not dropped. Dropped, it is invisible: the operator
+ *      picks their headphones, every lamp stays green, and the return plays out
+ *      of the laptop speakers sitting in front of a live microphone. See note 4
+ *      at the top of audio.js.
  */
 
 import test from 'node:test';
@@ -133,6 +139,15 @@ class FakeMediaElement {
     this.playing = false;
     this.sinkId = null;
     this.attributes = {};
+    /**
+     * How many more setSinkId calls must reject with NotAllowedError before one
+     * is allowed through. This is WKWebView modelled: it refuses to change the
+     * audio output device unless the page has transient activation, and the
+     * refusal is a rejection, not a silent no-op. WebView2 has no such rule,
+     * which is exactly what leaving this at 0 represents.
+     */
+    this.sinkRefusals = 0;
+    this.sinkIdCalls = 0;
   }
   setAttribute(k, v) {
     this.attributes[k] = v;
@@ -147,30 +162,71 @@ class FakeMediaElement {
     this.playing = false;
   }
   setSinkId(id) {
+    this.sinkIdCalls += 1;
+    if (this.sinkRefusals > 0) {
+      this.sinkRefusals -= 1;
+      // The shape WebKit actually throws. audio.js branches on `name` and
+      // nothing else, so `name` is the part that has to be right.
+      const err = new Error('The request is not allowed by the user agent');
+      err.name = 'NotAllowedError';
+      return Promise.reject(err);
+    }
     this.sinkId = id;
     return Promise.resolve();
   }
 }
 
+/**
+ * FakeDocument records the one-shot gesture listeners audio.js arms, so a test
+ * can both see that one is armed and fire it. The real thing is
+ * document.addEventListener with {once, capture, passive}; only the type and
+ * the function matter here.
+ */
+class FakeDocument {
+  constructor() {
+    this.created = [];
+    /** @type {Map<string, Set<Function>>} */
+    this.listeners = new Map();
+  }
+  createElement() {
+    const el = new FakeMediaElement();
+    this.created.push(el);
+    return el;
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(fn);
+  }
+  removeEventListener(type, fn) {
+    this.listeners.get(type)?.delete(fn);
+  }
+  /** armed is true while a gesture retry is waiting for an interaction. */
+  get armed() {
+    return [...this.listeners.values()].some((s) => s.size > 0);
+  }
+  /**
+   * gesture dispatches one pointerdown and then waits a macrotask, which drains
+   * the whole microtask queue — every promise in these fakes is already
+   * resolved, so the retry audio.js kicks off has completely finished by the
+   * time this returns.
+   */
+  async gesture() {
+    for (const fn of [...(this.listeners.get('pointerdown') ?? [])]) fn({ type: 'pointerdown' });
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
 /** installEnvironment puts the globals audio.js reaches for in place. */
 function installEnvironment() {
-  const created = [];
   globalThis.AudioContext = FakeAudioContext;
   globalThis.MediaStream = class MediaStream {
     constructor(tracks) {
       this.tracks = tracks || [];
     }
   };
-  globalThis.document = {
-    createElement() {
-      const el = new FakeMediaElement();
-      created.push(el);
-      return el;
-    },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  return created;
+  const doc = new FakeDocument();
+  globalThis.document = doc;
+  return doc;
 }
 
 const audioTrack = () => ({ kind: 'audio', id: 'return-track' });
@@ -182,9 +238,13 @@ const audioTrack = () => ({ kind: 'audio', id: 'return-track' });
  *
  * The chain does not expose its nodes, so the AudioContext is captured by
  * subclassing the constructor for the duration of the build.
+ *
+ * `sinkRefusals` is not a createReturnAudio option — it is pulled out here and
+ * put on the fake element, because it has to be in place before attach() makes
+ * the first setSinkId call.
  */
-async function buildWithGraph(opts = {}) {
-  const createdElements = installEnvironment();
+async function buildWithGraph({ sinkRefusals = 0, ...opts } = {}) {
+  const doc = installEnvironment();
   /** @type {FakeAudioContext[]} */
   const contexts = [];
   globalThis.AudioContext = class extends FakeAudioContext {
@@ -194,6 +254,7 @@ async function buildWithGraph(opts = {}) {
     }
   };
   const audioEl = new FakeMediaElement();
+  audioEl.sinkRefusals = sinkRefusals;
   const errors = [];
   const ra = createReturnAudio({ audioEl, gainDb: 18, onError: (e) => errors.push(e), ...opts });
   await ra.attach(audioTrack());
@@ -203,7 +264,8 @@ async function buildWithGraph(opts = {}) {
     audioEl,
     errors,
     contexts,
-    createdElements,
+    doc,
+    createdElements: doc.created,
     ctx,
     splitter: ctx.find('splitter'),
     merger: ctx.find('merger'),
@@ -416,4 +478,109 @@ test('close() disconnects the splitter and merger as well as the gain', async ()
   assert.equal(g.merger.edges.length, 0);
   assert.equal(g.gain.edges.length, 0);
   assert.equal(g.ctx.closed, true, 'the AudioContext is closed — Chromium caps them at six');
+});
+
+// --------------------------------------------------------------------------
+// setSinkId and the user gesture (WKWebView)
+//
+// The refused-then-retried path is macOS-only in practice, but nothing in
+// audio.js tests the platform: it branches on the NotAllowedError WebKit
+// throws. That is what the last test here pins — with no refusal scripted, the
+// element is set once, nothing is armed, and nothing is reported, which is the
+// WebView2 behaviour this port is not allowed to change.
+// --------------------------------------------------------------------------
+
+test('a setSinkId refused for want of a gesture is queued, not lost', async () => {
+  // The config-apply paths in ui/app.js have no gesture behind them, so on
+  // WKWebView the operator's chosen headphones are refused the moment the
+  // configuration loads. Losing it there means the return plays on the system
+  // default — on a commentary laptop, the built-in speakers, next to a live
+  // microphone.
+  const g = await buildWithGraph({ sinkId: 'headphones-1', sinkRefusals: 1 });
+
+  assert.equal(g.audioEl.sinkId, null, 'the element was refused');
+  assert.equal(g.ra.getState().appliedSinkId, null);
+  assert.equal(g.ra.getState().sinkAwaitingGesture, true, 'and the retry is armed');
+  assert.ok(g.doc.armed, 'a gesture listener is waiting');
+
+  const deferred = g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED');
+  assert.equal(deferred.length, 1, 'the operator is told once, not per attempt');
+  assert.equal(
+    g.errors.filter((e) => e.code === 'SINK_ID_FAILED').length,
+    0,
+    'and not told it failed, because it has not',
+  );
+
+  await g.doc.gesture();
+
+  assert.equal(g.audioEl.sinkId, 'headphones-1', 'the next click applies it');
+  assert.equal(g.ra.getState().appliedSinkId, 'headphones-1');
+  assert.equal(g.ra.getState().sinkAwaitingGesture, false);
+  assert.ok(!g.doc.armed, 'and the one-shot listener is gone');
+});
+
+test('the queued sink is retried BEFORE playback, not after', async () => {
+  // Transient activation is a budget, not a flag: ctx.resume() and play() are
+  // awaited round trips, and spending the activation window on them first is
+  // how the headphone choice ends up needing a second click.
+  const g = await buildWithGraph({ sinkId: 'headphones-1', sinkRefusals: 1 });
+  const playsBefore = g.audioEl.playCalls;
+  g.audioEl.play = function play() {
+    this.playCalls += 1;
+    this.playing = true;
+    assert.equal(this.sinkId, 'headphones-1', 'the sink was applied before this play()');
+    return Promise.resolve();
+  };
+  await g.doc.gesture();
+  assert.ok(g.audioEl.playCalls > playsBefore, 'playback was still retried');
+});
+
+test('a device refused a second time from inside a gesture is reported as a failure', async () => {
+  // One retry, then the truth. A device that is never going to be permitted
+  // must not promise "on the next click" on every click for the rest of the
+  // match — that is the same silent-failure shape this whole change removes,
+  // wearing a friendlier message.
+  const g = await buildWithGraph({ sinkId: 'headphones-1', sinkRefusals: 2 });
+  assert.equal(g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED').length, 1);
+
+  await g.doc.gesture();
+
+  assert.equal(g.audioEl.sinkId, null, 'still refused');
+  assert.equal(
+    g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED').length,
+    1,
+    'no second promise of a click',
+  );
+  assert.equal(
+    g.errors.filter((e) => e.code === 'SINK_ID_FAILED').length,
+    1,
+    'the refusal is reported for what it is',
+  );
+  assert.equal(g.ra.getState().sinkAwaitingGesture, false);
+});
+
+test('choosing a different device gets a fresh retry', async () => {
+  // The one-shot budget stops one un-grantable device nagging forever. It must
+  // not stop the NEXT choice the commentator makes from being queued.
+  const g = await buildWithGraph({ sinkId: 'headphones-1', sinkRefusals: 2 });
+  await g.doc.gesture(); // spends the budget on headphones-1 and reports failure
+
+  g.audioEl.sinkRefusals = 1;
+  await g.ra.setSinkId('headphones-2');
+  assert.equal(g.ra.getState().sinkAwaitingGesture, true, 'the new device is queued');
+
+  await g.doc.gesture();
+  assert.equal(g.audioEl.sinkId, 'headphones-2');
+});
+
+test('with no gesture requirement nothing is armed and nothing is said', async () => {
+  // WebView2. This application is on air on Windows and this test is the reason
+  // the retry is keyed on the error rather than on the platform: if the browser
+  // never refuses, the whole mechanism is inert.
+  const g = await buildWithGraph({ sinkId: 'headphones-1' });
+  assert.equal(g.audioEl.sinkId, 'headphones-1');
+  assert.equal(g.audioEl.sinkIdCalls, 1, 'applied once, on attach');
+  assert.equal(g.ra.getState().sinkAwaitingGesture, false);
+  assert.ok(!g.doc.armed, 'no gesture listener exists to fire');
+  assert.deepEqual(g.errors, [], 'and no error was reported');
 });

@@ -52,6 +52,37 @@
 // endpoint. That opens the operator's own monitor mix as the commentary
 // source — echo and feedback on a live feed. These devices are refused, never
 // opened; TestLoopbackIsNeverSetInTheCgoSource pins it.
+//
+// # On macOS this file is INERT, and that is the correct answer
+//
+// Nothing here was changed for the macOS port, deliberately. It is correct,
+// tested Windows knowledge, and it degrades safely rather than wrongly:
+//
+//   - A CoreAudio unique-id is "BuiltInMicrophoneDevice", "NDIAudio" or a bare
+//     UUID such as "BF568F24-731B-41DB-932E-AC7E260BC71A". None of those can
+//     begin "{0.0.0.00000000}." or "{0.0.1.00000000}.", and none contains a
+//     DEVINTERFACE class GUID. So IsRenderEndpointID is false for every macOS
+//     device and refuseRenderEndpoint never fires — which is right, because
+//     CoreAudio has no loopback republication and therefore no way to offer a
+//     playback device as an input in the first place. device_id_test.go pins
+//     this with the real ids measured on the port machine.
+//   - IsCaptureEndpointID is false for them too. That is the asymmetric rule
+//     working as designed: false means "not positively identified", not
+//     "refuse".
+//
+// What was moved rather than changed is the WARNING. ListInputDevices used to
+// log "endpoint id of unrecognised shape" whenever IsCaptureEndpointID was
+// false, and on macOS that would have fired for every device on every
+// enumeration — a warning that always fires is a warning nobody reads, and it
+// would have buried the real ones. The check now lives in
+// deviceprovider_windows.go, where the ids it describes actually come from,
+// and deviceprovider_darwin.go does not consult it at all.
+//
+// The macOS equivalent of the render/capture distinction is not a string test
+// and could not be one: direction comes from the device CLASS that the monitor
+// filtered on, Audio/Source versus Audio/Sink. Names that look directional
+// ("BuiltInSpeakerDevice") are display conventions, not guarantees. That
+// classification lives in deviceprovider_darwin.go.
 package gst
 
 import (

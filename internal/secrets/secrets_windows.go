@@ -27,6 +27,17 @@ func New() Store {
 	return credManagerStore{}
 }
 
+// StoreName is what this platform's credential store is CALLED, for an operator
+// reading an error message. See the doc comment in secrets_darwin.go, which
+// carries the argument for why this lives here rather than in the app layer.
+//
+// It reads as the object of a preposition — "stored in Windows Credential
+// Manager under WSLComms/m2lx" — so it carries no leading article and none is
+// needed on this platform.
+func StoreName() string {
+	return "Windows Credential Manager"
+}
+
 // credManagerStore is the Store implementation backed by
 // github.com/danieljoos/wincred, i.e. the Win32 CredReadW / CredWriteW /
 // CredDeleteW APIs against the current user's local Credential Manager

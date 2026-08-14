@@ -74,6 +74,33 @@ func New() Store {
 	return keychainStore{}
 }
 
+// StoreName is what this platform's credential store is CALLED, for an operator
+// reading an error message.
+//
+// It is here rather than in the app layer because this package is the only thing
+// that KNOWS. Every one of the five call sites is a sentence told to somebody who
+// cannot sign in or cannot hear the return and is trying to fix it in the next
+// thirty seconds, and until this existed all five said "Windows Credential
+// Manager" — which on a Mac sends them hunting for a control panel that does not
+// exist, at the worst possible moment. The app layer's alternative was a switch
+// on runtime.GOOS, which is a second place that has to change if a third
+// platform or a different backing store ever appears, and which infers what this
+// file's build tag already states.
+//
+// "the macOS login Keychain", with the leading article, because it reads as the
+// object of a preposition at every call site — "stored in the macOS login
+// Keychain under WSLComms/m2lx". The Windows twin needs no article, which is
+// exactly why the whole phrase is returned rather than a bare noun the callers
+// would each have to dress differently.
+//
+// It names the LOGIN keychain specifically. That is where /usr/bin/security puts
+// a generic password with no -k, it is what the operator sees selected in
+// Keychain Access, and "the Keychain" alone would be ambiguous with the System
+// and iCloud keychains that this application never touches.
+func StoreName() string {
+	return "the macOS login Keychain"
+}
+
 // keychainStore is the Store implementation backed by the login Keychain via
 // /usr/bin/security. It carries no state: every call resolves the logical key
 // to a target name and talks to the Keychain directly, exactly as

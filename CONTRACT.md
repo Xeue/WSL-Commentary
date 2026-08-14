@@ -118,6 +118,22 @@ CGO_ENABLED=0 go vet ./...
 CGO_ENABLED=0 go test ./...
 ```
 
+**And on macOS, which is now a shipping platform, all three must pass there too, plus the Windows
+cross-check** — a change that builds on one and not the other is not done:
+
+```
+GOOS=windows CGO_ENABLED=0 go build ./...
+GOOS=windows CGO_ENABLED=0 go vet ./...
+GOOS=windows CGO_ENABLED=0 go vet -tags "bindings gststub" ./...
+```
+
+**`gofmt -l` must be empty over everything except `third_party/`.** That exclusion is not
+laziness. `third_party/wails-v2.13.0/` is upstream Wails v2.13.0 verbatim apart from one patch to
+two files, and the whole value of vendoring it that way is that `diff -r` against the module cache
+reports exactly those two files and no others. Nine upstream files are not gofmt-clean; running
+gofmt over them would destroy the audit property that is the entire reason the directory exists.
+See `third_party/README.md`.
+
 That property is what lets anyone pick this project up without a 2 GB install, and it is what
 keeps the cgo surface small enough to reason about. It is only possible because `internal/gst` is
 the **only** package that touches cgo, and each of its three pipelines has two implementations
@@ -128,7 +144,24 @@ selected by build tag:
 | `gst_cgo.go` | `gst_stub.go` | the contribution pipeline, `ListInputDevices` |
 | `picture_cgo.go` | `picture_stub.go` | `newPicturePipe` — one picture attempt |
 | `return_cgo.go` | `return_stub.go` | `newReturnPipe`, `ListOutputDevices` |
-| `overlay_windows.go` | `overlay_other.go` | the native child window |
+| `overlay_windows.go` | `overlay_darwin.go` / `overlay_other.go` | the native child window |
+
+Since the macOS port there is a **second** axis of build tags inside the cgo half, and it is a
+different axis: not cgo-versus-stub but Windows-versus-macOS. Everything true on every platform
+stays in the shared file, and each twin supplies only what genuinely differs:
+
+| shared | Windows twin | macOS twin | supplies |
+|---|---|---|---|
+| `gst_cgo.go` | `elements_windows.go` | `elements_darwin.go` | the factory names (capture source, AAC encoder, H.264 preference) |
+| `gst_cgo.go` | `deviceprovider_windows.go` | `deviceprovider_darwin.go` | which enumerated devices are offered, and how an id resolves |
+| `gst_cgo.go` | `gstpaths_windows.go` | `gstpaths_darwin.go` | where the bundled plugins are, and what else `gst_init` needs in the environment |
+| `return_cgo.go` | `return_cgo_windows.go` | `return_cgo_darwin.go` (+ `return_cgo_other.go`) | the return decoder, sink and its properties |
+
+The same idiom is used outside `internal/gst` wherever a platform genuinely differs —
+`secrets_windows.go`/`secrets_darwin.go`, `applog_windows.go`/`applog_darwin.go`,
+`exit_windows.go`/`exit_darwin.go`. **Prefer a build-tagged twin to a `runtime.GOOS` switch.** A
+switch compiles the other platform's answer into this platform's binary and invites a third branch
+nobody has measured; a twin cannot.
 
 The stubs are **real code and are meant to work** — plausible devices, and pipelines whose
 transitions are driven programmatically. They are what the unit tests drive, and rightly so: no
@@ -172,8 +205,19 @@ are contract rather than detail:
   `pictureLatencyMs` are deliberately not in it. Requiring `statusKey` in particular made the app
   unstartable until the operator had guessed a value nothing in the API can tell them.
 - **`headphoneDeviceId` and `headphoneEndpointId` are different kinds of identifier** — a browser
-  `mediaDeviceId` and a WASAPI IMMDevice GUID — and must never be merged. Using one where the other
-  belongs fails silently in both directions.
+  `mediaDeviceId` and the operating system's own device identity (a WASAPI IMMDevice GUID on
+  Windows, a CoreAudio device UID on macOS) — and must never be merged. Using one where the other
+  belongs fails silently in both directions. That the native half is platform-dependent does not
+  soften the rule by one inch: the browser id is not *any* operating system's identifier for a
+  device, it is a per-origin salted token minted by one browsing context, so there is no platform
+  on which the two converge. A `config.json` carried between the two machines must fail **safe** —
+  `gst.chooseOutputDevice` checks the saved id against what the machine is actually offering, falls
+  back to the default playback device, and logs the id, the reason and what is on offer instead.
+- **On macOS `headphoneEndpointId` is the CoreAudio UID and never the integer.** `osxaudiosink`'s
+  own `device` property is a gint `AudioDeviceID` that `coreaudiod` allocates per enumeration and
+  reuses, so it survives neither a reboot nor a replug. `internal/gst` resolves the integer from
+  the stored UID every time it opens a pipeline; the integer must never reach `config.json`, never
+  cross the Wails boundary, and never appear in a log except as a diagnostic.
 - **`Save` must never write a secret.** `TestSave_NeverWritesSecretFields` enforces it.
 
 ### `internal/secrets` — WP-1
@@ -265,12 +309,26 @@ Two contract points that are easy to get wrong and cost a day each:
 - **`Errors()` is closed by `Stop()`**, and implementations drop rather than block when it is
   full. Synchronous failures come back from the method that caused them and never appear there.
 
-The H.264 encoder is resolved at runtime **by preference, not by rank** — `mfh264enc`, then
-`qsvh264enc`, `nvh264enc`, `d3d11h264enc`, `amfh264enc`, with `x264enc` denylisted for its licence.
-Rank only excludes factories GStreamer has marked unusable and tie-breaks equals. Spec v3 §5.1 has
-the measured ranks and the argument; the short version is that rank picks whichever GPU vendor's
-element is installed, and the property set was written against `mfh264enc`. Also: **`mfh264enc` has
-no `bframes` property**, and `gst_parse_launch` rejects an unknown property outright.
+The H.264 encoder is resolved at runtime **by preference, not by rank** — on Windows `mfh264enc`,
+then `qsvh264enc`, `nvh264enc`, `d3d11h264enc`, `amfh264enc`; on macOS `vtenc_h264` then
+`vtenc_h264_hw` — with `x264enc` denylisted for its licence on both. Rank only excludes factories
+GStreamer has marked unusable and tie-breaks equals. Spec v3 §5.1 has the measured ranks and the
+argument; the short version is that rank picks whichever GPU vendor's element is installed, and the
+property set was written against `mfh264enc`. Also: **`mfh264enc` has no `bframes` property**, and
+`gst_parse_launch` rejects an unknown property outright.
+
+The other two platform-dependent factories are the **AAC encoder** (`mfaacenc` / `atenc`) and the
+**capture source** (`wasapi2src` / `osxaudiosrc`). All three seams live in `elements_windows.go`
+and `elements_darwin.go`, pinned by `TestPlatformElementContractIsPinned`; every other factory in
+the send pipeline is identical on both platforms under the same name.
+
+**`x264enc` is a live candidate on macOS, not a theoretical one.** It is present in a stock
+Homebrew GStreamer and ranks primary (256) — the same rank as `vtenc_h264` — so the denylist in
+`gst_cgo.go` is load-bearing there in a way it never was on Windows. That denylist is a run-time
+control and not a licensing one; what keeps GPL code out of the shipped artefact is
+`build/forbidden-names.ps1`, which is now applied at three points by
+`build/bundle-gst-darwin.sh` (wanted list, computed closure, staged tree) exactly as
+`build/bundle-gst.ps1` applies it on Windows.
 
 ### `internal/gst` — the SRT picture — WP-P
 `PictureMonitor` with `Start(PictureOpts)` / `Stop()` / `States()`, `NewPictureMonitor()`,

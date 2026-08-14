@@ -31,7 +31,7 @@
  * offset in somebody's ears mid-match. There is no volume control in this
  * application that can undo a disconnected edge.
  *
- * Three things in here are not obvious and each of them fails *silently* — the
+ * Four things in here are not obvious and each of them fails *silently* — the
  * commentator hears nothing, every lamp is green, and there is nothing in the
  * console. They are the reason this file is as long as it is.
  *
@@ -58,6 +58,28 @@
  *    are handled: an AUTOPLAY_BLOCKED error is emitted so the UI can say so, and
  *    a one-shot listener retries on the next click or keypress anywhere in the
  *    document.
+ *
+ * 4. setSinkId NEEDS A USER GESTURE — on WKWebView, and only there. WebKit
+ *    treats choosing an audio output device as something a page may only do
+ *    while it has transient activation, so setSinkId rejects with
+ *    NotAllowedError from any path that is not directly downstream of a click.
+ *    Two of this application's three call sites are exactly that: WP-5b applies
+ *    the saved headphone id when the configuration loads and again when a
+ *    remote seat pushes a new one (frontend/src/ui/app.js), and neither has a
+ *    gesture behind it. Left alone the commentator's chosen headphones are
+ *    silently ignored and the return plays on whatever the system default is —
+ *    on a commentary position that is usually the laptop speakers, sitting
+ *    open in front of a live microphone.
+ *
+ *    So the gesture listener from note 3 does double duty: a setSinkId refused
+ *    for want of activation arms it and is retried on the next interaction. It
+ *    is armed by an actual NotAllowedError and nothing else, which is why there
+ *    is no platform test anywhere in this file: WebView2 has no such
+ *    requirement, never throws it, and therefore never arms anything. The retry
+ *    is allowed ONE attempt per requested device — a second NotAllowedError
+ *    from inside a genuine gesture is not a missing gesture, it is a refusal,
+ *    and it is reported as SINK_ID_FAILED rather than promising a click that
+ *    will never help.
  */
 
 import { computeGain, clampGainDb, clampLevel, GAIN_RAMP_SECONDS } from './gain.js';
@@ -110,6 +132,15 @@ export function createReturnAudio({
   let currentMuted = !!muted;
   /** The sink actually applied to the element; '' means the system default. */
   let appliedSinkId = null;
+  /** True while a setSinkId is queued behind the gesture listener. See note 4. */
+  let sinkAwaitingGesture = false;
+  /**
+   * True once the gesture retry has been spent on the current requestedSinkId.
+   * Reset when a different device is asked for, and when one is successfully
+   * applied. Without it a device that will never be permitted would promise
+   * "on the next click" on every click, forever, and never say what is wrong.
+   */
+  let sinkGestureSpent = false;
 
   /** @type {AudioContext|null} */
   let ctx = null;
@@ -305,8 +336,34 @@ export function createReturnAudio({
       // '' is the documented way to ask for the default device.
       await audioEl.setSinkId(requestedSinkId || '');
       appliedSinkId = requestedSinkId;
+      sinkAwaitingGesture = false;
+      sinkGestureSpent = false;
+      return;
     } catch (err) {
       appliedSinkId = null;
+
+      // Note 4: WKWebView refuses this without transient activation. Queue it
+      // behind the same one-shot listener autoplay uses and say so, once. The
+      // condition is the error alone — WebView2 does not impose the
+      // requirement, so on Windows this branch is unreachable and the Windows
+      // behaviour is byte-for-byte what it was.
+      if (!closed && err && err.name === 'NotAllowedError' && !sinkGestureSpent) {
+        sinkGestureSpent = true;
+        sinkAwaitingGesture = true;
+        report(
+          new MonitorError(
+            MonitorErrorCode.SINK_ID_DEFERRED,
+            'the browser will not change the audio output device until someone ' +
+              'interacts with the window — the chosen headphone output will be ' +
+              'applied on the next click',
+            err,
+          ),
+        );
+        hookGesture();
+        return;
+      }
+
+      sinkAwaitingGesture = false;
       report(
         toMonitorError(
           MonitorErrorCode.SINK_ID_FAILED,
@@ -318,9 +375,13 @@ export function createReturnAudio({
   }
 
   /**
-   * hookGesture installs a one-shot listener that retries playback on the next
-   * user interaction. Removed as soon as it fires or the module closes, so a
-   * long match does not accumulate listeners.
+   * hookGesture installs a one-shot listener that retries, on the next user
+   * interaction, everything the browser refused for want of one: playback
+   * (note 3) and the output-device choice (note 4). Removed as soon as it fires
+   * or the module closes, so a long match does not accumulate listeners.
+   *
+   * Calling it twice is a no-op rather than a second listener, which matters
+   * because both notes can be waiting on the same click.
    */
   function hookGesture() {
     if (gestureHandler || closed || typeof document === 'undefined') return;
@@ -402,10 +463,23 @@ export function createReturnAudio({
    */
   async function resume() {
     if (closed || !ctx) return;
+
+    // THE SINK GOES FIRST WHEN THE SINK IS WHAT IS WAITING. Transient
+    // activation is spent, not held: WebKit gives a page roughly five seconds
+    // from the gesture, and ctx.resume() and play() are both awaited round
+    // trips into the audio engine on a thread we do not control. Retrying the
+    // refused setSinkId before spending any of that budget is the difference
+    // between the commentator's headphone choice landing on this click and
+    // landing on the one after it. When nothing is queued the order is the
+    // original one, playback first, because that is the one an AUTOPLAY_BLOCKED
+    // banner is asking about.
+    const sinkFirst = sinkAwaitingGesture;
+    if (sinkFirst) await applySinkId(true);
+
     // A muted path has nothing to resume. Retrying playback on it would be the
     // one place a "silenced" WebRTC return could start making noise again.
     if (!currentMuted) await startPlayback();
-    await applySinkId(true);
+    if (!sinkFirst) await applySinkId(true);
     applyGain();
   }
 
@@ -547,7 +621,12 @@ export function createReturnAudio({
      * @returns {Promise<void>}
      */
     async setSinkId(deviceId) {
-      requestedSinkId = typeof deviceId === 'string' ? deviceId : '';
+      const next = typeof deviceId === 'string' ? deviceId : '';
+      // A NEW device gets a fresh gesture retry. The one-shot budget in note 4
+      // exists to stop one un-grantable device nagging forever, not to punish
+      // the next choice the commentator makes.
+      if (next !== requestedSinkId) sinkGestureSpent = false;
+      requestedSinkId = next;
       await applySinkId(true);
     },
 
@@ -563,6 +642,11 @@ export function createReturnAudio({
         linearGain: computeGain(currentGainDb, currentLevel),
         requestedSinkId,
         appliedSinkId,
+        // requestedSinkId set, appliedSinkId null and this true is the WKWebView
+        // signature of note 4, and the one thing that tells a support log
+        // "the operator picked headphones and nobody has clicked yet" apart from
+        // "the device is gone".
+        sinkAwaitingGesture,
         routed: !!source,
         channelMode: currentChannelMode,
         channelRouting: describeChannelMode(currentChannelMode),
@@ -632,6 +716,8 @@ export function createReturnAudio({
         }
       }
       appliedSinkId = null;
+      sinkAwaitingGesture = false;
+      sinkGestureSpent = false;
     },
   };
 }

@@ -45,7 +45,8 @@
 //     the stream of toasts the paragraph above rules out. See returnDiagnostic.
 //
 //     The last part of that used to be missing. libsrt names the two ways
-//     encryption goes wrong — ERROR:BADSECRET and ERROR:UNSECURE — and this
+//     encryption goes wrong — BADSECRET and UNSECURE, in whichever words the
+//     installed GStreamer spells them; see srtRejectBadSecret — and this
 //     file could only guess between them, because gst.ReturnOpts had no
 //     callback to carry the reason out of internal/gst. It has one now
 //     (gst.ReturnOpts.OnConnectError), so the message says what libsrt said
@@ -143,15 +144,43 @@ func (r *returnReason) get() error {
 // ---------------------------------------------------------------------------
 
 // ListOutputDevices returns the audio PLAYBACK endpoints for the headphone
-// dropdown on the SRT return path. Device.ID is the WASAPI IMMDevice endpoint
-// GUID and is what SaveConfig must be given as headphoneEndpointId;
-// Device.Name is for display only.
+// dropdown on the SRT return path. Device.ID is what SaveConfig must be given as
+// headphoneEndpointId; Device.Name is for display only.
 //
-// This is NOT the identifier the WebRTC return path uses. That one is a browser
-// mediaDeviceId, obtained from enumerateDevices in JavaScript and stored as
-// headphoneDeviceId, and the two cannot be substituted for one another in either
-// direction. See config.Config.HeadphoneEndpointID for what goes wrong when they
-// are, which is nothing visible — audio in the wrong ears and no diagnostic.
+// # What Device.ID IS depends on the machine, and the frontend must not care
+//
+// It is the operating system's own stable identity for the device: a WASAPI
+// IMMDevice endpoint GUID on Windows, a CoreAudio device UID on macOS. The
+// frontend has no business knowing which, and deliberately has no way to tell —
+// it receives an opaque string from this method and hands the same string back
+// in SaveConfig. gst.ReturnOpts.OutputDeviceID carries the full account of both
+// shapes, including why macOS persists the UID rather than the AudioDeviceID
+// integer that osxaudiosink's property actually takes.
+//
+// # It is NOT the identifier the WebRTC return path uses, on any platform
+//
+// That one is a browser mediaDeviceId, obtained from enumerateDevices in
+// JavaScript and stored as headphoneDeviceId. The two cannot be substituted for
+// one another in either direction, and CONTRACT.md forbids merging them. Making
+// the native half platform-dependent does not soften that by one inch, and it is
+// worth saying why plainly: the browser id is not any operating system's
+// identifier for a device. It is a per-origin salted token minted by one
+// browsing context, meaningless to WASAPI and to CoreAudio alike, and it changes
+// when that context's storage is cleared. There is no platform on which the two
+// converge.
+//
+// See config.Config.HeadphoneEndpointID for what goes wrong when they are
+// conflated, which is nothing visible — audio in the wrong ears and no
+// diagnostic.
+//
+// # A config.json carried between the two machines
+//
+// It fails SAFE rather than confusingly: internal/gst checks the saved id
+// against what this machine is actually offering before any sink is given it,
+// falls back to the default playback device, and logs the id, the reason and the
+// devices that ARE on offer. On a Mac it goes further and says outright that a
+// WASAPI endpoint id means the settings file was written on Windows. See
+// gst.chooseOutputDevice.
 func (a *App) ListOutputDevices() ([]gst.Device, error) {
 	if a.gstInitErr != nil {
 		return nil, a.gstInitErr
@@ -404,10 +433,10 @@ func (a *App) returnPassphrase(cfg *config.Config) (string, error) {
 			return "", fmt.Errorf(
 				"wslcomms: cannot start the SRT return: srtReturnPBKeyLen is %d, which asks for an "+
 					"encrypted session with the M2L-X output on port %d, but no return passphrase is "+
-					"stored in Windows Credential Manager under %q — enter it on the Settings screen, "+
+					"stored in %s under %q — enter it on the Settings screen, "+
 					"or set the return key length to 0 if that output is not encrypted. "+
 					"This is a different passphrase from the one the contribution feed uses",
-				cfg.SRTReturnPBKeyLen, cfg.EffectiveSRTReturnPort(), secrets.TargetSRTReturn)
+				cfg.SRTReturnPBKeyLen, cfg.EffectiveSRTReturnPort(), secrets.StoreName(), secrets.TargetSRTReturn)
 		}
 		return "", nil
 	case err != nil:
@@ -421,22 +450,57 @@ func (a *App) returnPassphrase(cfg *config.Config) (string, error) {
 // Saying why the return will not connect
 // ---------------------------------------------------------------------------
 
-// The two libsrt rejection tokens this file can turn into an instruction.
+// The libsrt rejections this file can turn into an instruction. There are two
+// FAULTS and four spellings of them, because the wording is a GStreamer version's
+// and not a protocol constant.
 //
-// They are matched case-insensitively as SUBSTRINGS, and they are matched at
-// all only because they were measured against this instance — the encryption
-// trials recorded in docs/architecture.md produced clean ERROR:UNSECURE and
-// ERROR:BADSECRET rejections. gst.ReturnOpts.OnConnectError's documentation is
-// explicit that the reason text is not a stable interface: it is a GStreamer
-// message wrapped round libsrt's own wording and it changes between versions.
+// # The prediction in the old comment came true within one release
 //
-// That is survivable precisely because nothing here depends on a match. A
-// reason that matches neither is quoted verbatim, which is the honest answer
-// and is also what a future rename degrades to, rather than a wrong one.
-const (
-	srtRejectBadSecret = "BADSECRET"
-	srtRejectUnsecure  = "UNSECURE"
+// This used to be two strings, BADSECRET and UNSECURE, matched because the
+// encryption trials recorded in docs/architecture.md produced exactly those
+// tokens against the live instance. gst.ReturnOpts.OnConnectError's
+// documentation warned in the same breath that the text is NOT a stable
+// interface — a GStreamer message wrapped round libsrt's own wording, liable to
+// change between versions — and that is precisely what the macOS port found.
+// Measured on GStreamer 1.26.10 over an encrypted SRT loopback, gstsrtsrc.c:206
+// renders the reject reason through srt_rejectreason_str() instead, so the two
+// faults arrive as:
+//
+//	wrong passphrase   "Failed to authenticate: Incorrect passphrase (10)"
+//	none offered       "Failed to authenticate: Password required or unexpected (11)"
+//
+// The parenthesised numbers are libsrt's own SRT_REJ_BADSECRET and
+// SRT_REJ_UNSECURE, which is what makes these the same two faults and not new
+// ones. Both spellings are matched, because the application has to run against
+// whichever GStreamer the machine it is installed on carries, and because a
+// build that recognised only its own platform's phrasing would give the operator
+// a worse message on the other one for no reason.
+//
+// The design is what made this a two-line repair rather than a bug: nothing here
+// DEPENDS on a match. A reason matching none of these is quoted verbatim, which
+// is the honest answer and is also what the next rename degrades to.
+var (
+	// srtRejectBadSecret: a passphrase was offered and the far end has a
+	// different one.
+	srtRejectBadSecret = []string{"BADSECRET", "INCORRECT PASSPHRASE"}
+
+	// srtRejectUnsecure: the two ends disagree about whether there should be a
+	// passphrase at all.
+	srtRejectUnsecure = []string{"UNSECURE", "PASSWORD REQUIRED OR UNEXPECTED"}
 )
+
+// matchesAnySRTReject reports whether an upper-cased reason contains any of the
+// spellings of one fault. The tokens are already upper case; upper is the
+// caller's ToUpper of the reason, so the match is case-insensitive without this
+// function having to know how the reason was cased.
+func matchesAnySRTReject(upper string, tokens []string) bool {
+	for _, tok := range tokens {
+		if strings.Contains(upper, tok) {
+			return true
+		}
+	}
+	return false
+}
 
 // returnDiagnostic renders the one message emitted after returnDiagnoseAfter
 // consecutive failed attempts: what is being dialled, with what encryption, and
@@ -499,12 +563,15 @@ func returnDiagnostic(opts gst.ReturnOpts, reason error) string {
 //
 // # The three shapes
 //
-// ERROR:BADSECRET and ERROR:UNSECURE are the two libsrt names an operator can
-// be given an instruction for, and the instruction differs by what WE offered,
-// which this process does know:
+// BADSECRET and UNSECURE are the two libsrt rejections an operator can be given
+// an instruction for, and the instruction differs by what WE offered, which this
+// process does know. They are matched through srtRejectBadSecret and
+// srtRejectUnsecure rather than as literals, because the WORDING differs between
+// GStreamer versions while the fault does not:
 //
-//   - BADSECRET means a passphrase was offered and the far end is configured
-//     with a different one. There is exactly one fix and it is a field on the
+//   - BADSECRET — however this GStreamer spells it; see srtRejectBadSecret —
+//     means a passphrase was offered and the far end is configured with a
+//     different one. There is exactly one fix and it is a field on the
 //     Settings screen.
 //   - UNSECURE means the two ends disagree about whether the session is
 //     encrypted at all. Which end is wrong is not in the reason — but combined
@@ -548,17 +615,17 @@ func returnReasonText(opts gst.ReturnOpts, reason error) string {
 	quoted := " The reason, exactly as it arrived: " + text
 
 	switch {
-	case strings.Contains(upper, srtRejectBadSecret):
-		return "libsrt refused the handshake with ERROR:BADSECRET, which means the passphrase offered " +
-			"does not match the one that M2L-X output is configured with. " + settings + quoted
+	case matchesAnySRTReject(upper, srtRejectBadSecret):
+		return "libsrt refused the handshake with a BADSECRET rejection, which means the passphrase " +
+			"offered does not match the one that M2L-X output is configured with. " + settings + quoted
 
-	case strings.Contains(upper, srtRejectUnsecure):
+	case matchesAnySRTReject(upper, srtRejectUnsecure):
 		if opts.Passphrase == "" {
-			return "libsrt refused the handshake with ERROR:UNSECURE, which means that M2L-X output " +
+			return "libsrt refused the handshake with an UNSECURE rejection, which means that M2L-X output " +
 				"requires encryption and this return offered none. Set the SRT return passphrase " +
 				"and key length on the Settings screen. " + settings + quoted
 		}
-		return "libsrt refused the handshake with ERROR:UNSECURE, which means the two ends disagree " +
+		return "libsrt refused the handshake with an UNSECURE rejection, which means the two ends disagree " +
 			"about whether this session is encrypted: a passphrase was offered and that M2L-X " +
 			"output is not encrypted at all. Set the SRT return key length to 0 and clear the " +
 			"return passphrase. " + settings + quoted

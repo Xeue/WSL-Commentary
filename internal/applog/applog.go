@@ -15,16 +15,47 @@
 // elsewhere, a config that looked right, and no way to see the diagnosis the
 // app had already written. This package is the fix. main() calls Open before
 // anything logs, and from then on the log goes to a dated file under
-// %LOCALAPPDATA%\WSLComms\logs as well as stderr — so a console run (or a
-// 2> redirect) behaves exactly as before, and a double-clicked one finally
-// leaves evidence.
+// DefaultDir as well as stderr — so a console run (or a 2> redirect) behaves
+// exactly as before, and a double-clicked one finally leaves evidence.
 //
-// # Why %LOCALAPPDATA% and not %APPDATA%
+// The same argument applies unchanged on macOS, which needs it just as much:
+// a .app launched from the Finder inherits no terminal either, so its stderr
+// goes to the unified log at best and nowhere at all in practice.
+//
+// # Why %LOCALAPPDATA% and not %APPDATA% (Windows)
 //
 // Logs are machine-local diagnostic state, like the GStreamer registry already
 // kept at %LOCALAPPDATA%\WSLComms\registry.bin. On a roaming profile, %APPDATA%
 // follows the user between machines — and a log from another machine mixed into
 // this one's is precisely the confusion a support bundle does not need.
+//
+// # Why ~/Library/Logs and not ~/Library/Caches (macOS)
+//
+// Because the whole point of this package is that the file is STILL THERE
+// tomorrow. os.UserCacheDir on macOS is ~/Library/Caches, which Apple documents
+// as purgeable and which the system may delete under disk pressure — and the
+// machine most likely to be short of disk is the one that has been running all
+// day at an outside broadcast. Storing the only diagnosis a headless commentary
+// position produces somewhere the OS is entitled to delete would reintroduce
+// exactly the failure this package was written to fix, and it would do it
+// intermittently, which is worse.
+//
+// ~/Library/Logs is the macOS convention for precisely this file, it is what
+// Console.app shows under "Log Reports", and it is where anybody asked to send
+// their logs will already be looking.
+//
+// Note that internal/gst's registryFile makes the OPPOSITE choice, on the same
+// facts: the GStreamer registry is a genuine cache, and a purged one costs one
+// plugin rescan. Same fallback, two different right answers, decided per caller
+// rather than by a rule about os.UserCacheDir.
+//
+// DefaultDir is declared per platform, in applog_windows.go and
+// applog_darwin.go, because the two answers differ in SHAPE and not only in
+// their base directory: Windows appends a "logs" subdirectory to a general-
+// purpose data root, and macOS must not, because ~/Library/Logs already is one.
+// There is deliberately no third file — internal/secrets has no third
+// implementation either, so this module does not build on any other GOOS
+// regardless.
 package applog
 
 import (
@@ -38,7 +69,13 @@ import (
 )
 
 // filePrefix begins every file this package creates, and is what Prune matches.
-// Nothing else in %LOCALAPPDATA%\WSLComms\logs is ever touched.
+// Nothing else in DefaultDir is ever touched.
+//
+// DefaultDir is a WSLComms directory of our own on both platforms, so the prefix
+// is belt and braces there — but it is what makes Prune safe if this package is
+// ever pointed at a shared directory. On macOS that is one step away:
+// ~/Library/Logs itself is shared with every other application on the machine,
+// and only the WSLComms component of the path keeps us out of their files.
 const filePrefix = "wslcomms-"
 
 // keepFiles is how many log files Prune leaves behind, newest first. Each run
@@ -47,21 +84,12 @@ const filePrefix = "wslcomms-"
 // the folder never becomes a surprise on disk.
 const keepFiles = 12
 
-// DefaultDir returns %LOCALAPPDATA%\WSLComms\logs, resolved the same way
-// internal/gst resolves the registry's home: LOCALAPPDATA first, and
-// os.UserCacheDir as the fallback that reaches the same place by another route.
-// The two files should always be neighbours — they are the same kind of state.
-func DefaultDir() (string, error) {
-	base := os.Getenv("LOCALAPPDATA")
-	if base == "" {
-		var err error
-		base, err = os.UserCacheDir()
-		if err != nil {
-			return "", fmt.Errorf("applog: neither LOCALAPPDATA nor a user cache directory is available: %w", err)
-		}
-	}
-	return filepath.Join(base, "WSLComms", "logs"), nil
-}
+// DefaultDir returns the directory this run's log files belong in:
+// %LOCALAPPDATA%\WSLComms\logs on Windows and ~/Library/Logs/WSLComms on macOS.
+// It is declared per platform, in applog_windows.go and applog_darwin.go. The
+// package doc carries the argument for each.
+//
+// It does not create the directory. Open does.
 
 // A Sink is one run's open log file.
 type Sink struct {

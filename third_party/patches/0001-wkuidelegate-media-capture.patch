@@ -1,0 +1,92 @@
+--- a/internal/frontend/desktop/darwin/WailsContext.h
++++ b/internal/frontend/desktop/darwin/WailsContext.h
+@@ -119,6 +119,29 @@
+ - (void) SetAbout :(NSString*)title :(NSString*)description :(void*)imagedata :(int)datalen;
+ - (void) dealloc;
+ 
++// WSLCOMMS PATCH — see third_party/README.md.
++//
++// WKUIDelegate's media-capture callback. Upstream v2.13.0 declares WKUIDelegate
++// above but implements only runOpenPanelWithParameters, and with no
++// implementation of this method WebKit never answers the permission request:
++// getUserMedia does not reject, it HANGS forever, which takes the whole
++// headphone-device dropdown down with it. Declared here as well as defined in
++// the .m purely so the next person reading the header can see that this class
++// has been changed.
++//
++// Guarded on the SDK, not the deployment target: WKMediaCaptureType and
++// WKPermissionDecision arrived in the macOS 12 SDK and we still build with
++// -mmacosx-version-min=10.13. API_AVAILABLE keeps the compiler quiet about
++// that; the method is simply never called on anything older.
++#if defined(MAC_OS_VERSION_12_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_12_0
++- (void)webView:(WKWebView *)webView
++    requestMediaCapturePermissionForOrigin:(WKSecurityOrigin *)origin
++                          initiatedByFrame:(WKFrameInfo *)frame
++                                      type:(WKMediaCaptureType)type
++                           decisionHandler:(void (^)(WKPermissionDecision decision))decisionHandler
++    API_AVAILABLE(macos(12.0));
++#endif
++
+ @end
+ 
+ 
+--- a/internal/frontend/desktop/darwin/WailsContext.m
++++ b/internal/frontend/desktop/darwin/WailsContext.m
+@@ -487,6 +487,57 @@
+         }];
+ }
+ 
++// WSLCOMMS PATCH — the whole reason this copy of Wails exists. See
++// third_party/README.md for the upstream version, the diff and how to re-apply
++// it on upgrade.
++//
++// WKUIDelegate's media-capture callback. Upstream v2.13.0 has NO implementation
++// of it, and the failure mode is the nastiest kind: WebKit asks the delegate for
++// a decision, nobody answers, and the promise returned by
++// navigator.mediaDevices.getUserMedia NEVER SETTLES. It does not reject — it
++// hangs. Every `await getUserMedia(...)` inside a try/catch therefore sits there
++// forever and the catch never runs, so the frontend cannot even detect it: in
++// this app that meant loadHeadphoneDevices (frontend/src/ui/app.js) never
++// reached enumerateDevices and the operator's headphone dropdown was
++// permanently empty, with no error anywhere. Two otherwise identical WKWebView
++// harnesses differing only in this method proved it — with the method present,
++// getUserMedia resolves in 75 ms and three real audiooutput devices appear with
++// labels.
++//
++// MICROPHONE ONLY, DELIBERATELY. This is a commentary contribution client: it
++// captures a commentator's microphone and nothing else, and there is no code
++// path in it that opens a camera. Granting WKMediaCaptureTypeCamera (or
++// ...CameraAndMicrophone) would hand a blanket camera grant to any page the
++// WebView is ever pointed at for the sake of a feature we do not have, and on a
++// bundle that would then also need NSCameraUsageDescription in its Info.plist to
++// avoid being killed outright by TCC. Deny is the honest answer for anything
++// that is not the microphone: it rejects promptly, which is a diagnosable
++// failure, unlike the hang this method exists to remove.
++//
++// Grant, not WKPermissionDecisionPrompt: the grant here is only WebKit's own
++// gate. The real consent is macOS's, and TCC still shows the system microphone
++// prompt the first time capture actually starts (which is why the bundle needs
++// NSMicrophoneUsageDescription — without it TCC terminates the process rather
++// than denying). Adding a second, WebKit-drawn prompt on top of the OS one for a
++// local file:// UI the operator has already launched buys nothing and costs a
++// dialog in the middle of a match.
++#if defined(MAC_OS_VERSION_12_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_12_0
++- (void)webView:(WKWebView *)webView
++    requestMediaCapturePermissionForOrigin:(WKSecurityOrigin *)origin
++                          initiatedByFrame:(WKFrameInfo *)frame
++                                      type:(WKMediaCaptureType)type
++                           decisionHandler:(void (^)(WKPermissionDecision decision))decisionHandler
++    API_AVAILABLE(macos(12.0)) {
++    if (type == WKMediaCaptureTypeMicrophone) {
++        decisionHandler(WKPermissionDecisionGrant);
++        return;
++    }
++    // Camera and camera+microphone. The decision handler MUST still be called;
++    // dropping it here would reproduce exactly the hang described above.
++    decisionHandler(WKPermissionDecisionDeny);
++}
++#endif
++
+ - (void)webView:(nonnull WKWebView *)webView startURLSchemeTask:(nonnull id<WKURLSchemeTask>)urlSchemeTask {
+     // This callback is run with an autorelease pool
+     processURLRequest(self, urlSchemeTask);

@@ -57,3 +57,22 @@ require (
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
+
+// WKWEBVIEW MEDIA CAPTURE — see third_party/README.md.
+//
+// Wails v2.13.0 declares WKUIDelegate but never implements its media-capture
+// callback, so on macOS WebKit decides what to do about getUserMedia on its own:
+// measured, that means it hands the page the CAMERA this application has no use
+// for, and on the harnesses this was first found with it meant getUserMedia
+// hanging rather than settling, which took the headphone-device dropdown with
+// it. Both readings of "whatever WebKit felt like" are unacceptable in a
+// commentary client. Wails exposes no hook for the delegate, so the fix has to
+// be in its Objective-C. third_party/wails-v2.13.0
+// is upstream v2.13.0 verbatim (minus pkg/templates, which is `wails init`
+// scaffolding we never import) plus that one patch, kept as
+// third_party/patches/0001-wkuidelegate-media-capture.patch so it can be
+// re-applied mechanically on upgrade.
+//
+// The version in the path is load-bearing: it is the upstream release this copy
+// is a patch against, and it must match the require line above.
+replace github.com/wailsapp/wails/v2 => ./third_party/wails-v2.13.0

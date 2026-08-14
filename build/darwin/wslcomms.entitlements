@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for WSL Commentary.app under the hardened runtime.
+  Owner: WP-6 (macOS port). Applied by build/ship-darwin.sh to the OUTER
+  BUNDLE only — the vendored dylibs, the plugins and the three helper tools in
+  Contents/MacOS are signed with the hardened runtime and NO entitlements.
+
+  Notarisation requires the hardened runtime (codesign's runtime option), and
+  the hardened runtime is a set of restrictions that are ON by default. Every
+  key below is a hole in it, so each one has to earn its place from something
+  this app actually does, and the ones that were considered and rejected are
+  written down too — an absent key with no explanation gets added back by the
+  next person who hits a wall.
+
+  A TRAP, before anything else, because this file is a comment-heavy XML
+  document and it caught this one on its first run: an XML comment may not
+  contain a double hyphen, so no codesign flag can be written out longhand
+  anywhere in here. codesign does not ignore it — it refuses the whole file
+  with "Failed to parse entitlements: AMFIUnserializeXML: syntax error near
+  line 9" and exits non-zero, which at least fails the build rather than
+  embedding a blob AMFI would silently disregard at launch. Say "codesign's
+  runtime option" and "the entitlements-dump flag", never the flags themselves.
+
+  ── TAKEN ───────────────────────────────────────────────────────────────────
+
+  com.apple.security.device.audio-input
+
+    This app's entire purpose is to capture a commentator's microphone and send
+    it to a switcher. Two separate code paths touch the microphone: GStreamer's
+    osxaudiosrc in the contribution pipeline, and getUserMedia inside the
+    WKWebView. It is the one Resource Access key Apple documents for that.
+
+    HONEST ABOUT WHAT WAS MEASURED, because the obvious experiment does not
+    prove what it looks like it proves. Signing the bundle's own gst-launch
+    with the hardened runtime and running
+
+      osxaudiosrc num-buffers=20 ! fakesink
+
+    reached EOS with the key AND without it. That is not evidence the key is
+    unnecessary: a command-line process's TCC decision is attributed to the
+    RESPONSIBLE process, which for anything started from a shell is the
+    terminal, and the terminal already holds a microphone grant. A
+    double-clicked .app is its own responsible process and gets no such loan.
+    Proving the difference properly needs a TCC reset and a GUI capture cycle.
+
+    So the key is taken on the evidence that is available: Apple documents it
+    as the microphone entitlement for the hardened runtime, and all three
+    notarised, non-sandboxed capture applications installed on the build box
+    carry it (dumped with codesign's entitlements-dump flag on 2026-08-14 —
+    OBS.app, zoom.us.app and Google Chrome.app; the flag is described rather
+    than written out because an XML comment may not contain a double hyphen,
+    and codesign fails the build with "AMFIUnserializeXML: syntax error" rather
+    than embedding a blob AMFI would ignore).
+
+    What actually produces the microphone PROMPT is the Info.plist string, not
+    this key. Without NSMicrophoneUsageDescription the process is killed
+    outright; see build/darwin/Info.plist note 1.
+
+  ── CONSIDERED AND DELIBERATELY NOT TAKEN ───────────────────────────────────
+
+  com.apple.security.cs.disable-library-validation
+
+    The obvious candidate, and the one an app that dlopens a directory full of
+    third-party plugins usually ends up needing. MEASURED on this bundle,
+    2026-08-14, and the answer is NO — with the control experiment, because
+    "it worked" on its own would not have told us library validation was even
+    switched on.
+
+    Test. The whole bundle signed inside-out with the real Developer ID and
+    the hardened runtime, entitlements exactly as in this file. Then, with
+    `env -i` and every GST_* pointed inside the .app, the bundle's own
+    hardened-runtime gst-inspect asked for osxaudiosrc:
+
+      Factory Details:
+        Rank                     primary (256)
+        Long-name                Audio Source (macOS)
+
+    — libgstosxaudio.dylib dlopened out of Contents/Resources/gstreamer-1.0
+    into a hardened-runtime process with no library-validation waiver at all.
+
+    Control. One plugin, libgstlevel.dylib, re-signed ad-hoc so that it carried
+    a different team from the process loading it, everything else untouched:
+
+      module_open failed: dlopen(.../libgstlevel.dylib, 0x0006): code signature
+      not valid for use in process: mapping process and mapped file
+      (non-platform) have different Team IDs
+      No such element or plugin 'level'
+
+    So library validation is enforced, and what satisfies it is that
+    build/ship-darwin.sh signs EVERY Mach-O in the bundle — 49 of them — with
+    the same Developer ID team as the app. Same-team signatures pass unaided.
+    Taking the waiver instead would let any dylib from any signer be loaded
+    into this process for the life of the product, to buy nothing.
+
+    This is therefore a load-bearing dependency between two files: if
+    ship-darwin.sh ever stops signing part of the payload, the app stops
+    loading that part, and the fix is to sign it — not to add this key here.
+
+  com.apple.security.cs.allow-jit
+  com.apple.security.cs.allow-unsigned-executable-memory
+
+    The interesting one, and the one this file was WRONG about until the first
+    end-to-end run of a real notarised bundle contradicted it.
+
+    The easy half is still true: WKWebView runs its JavaScript out of process,
+    in Apple's own com.apple.WebKit.WebContent, which carries its own
+    entitlements and is not part of this bundle. That is why this app can hold
+    a tighter set than a Chromium-embedding one, and it is not why these keys
+    are absent.
+
+    The half that was wrong was "nothing in GStreamer generates code at run
+    time". liborc does — it is GStreamer's SIMD code generator and it is what
+    videoconvert, videoscale, audioconvert and audioresample use for their
+    inner loops. Running the real shipped pipeline out of the mounted disk
+    image, with the hardened runtime and no JIT entitlement:
+
+      ORC: ERROR: ../orc/orccodemem.c(345): orc_code_region_allocate_codemem():
+      Failed to create write and exec mmap regions. This is probably because
+      the Hardened Runtime is enabled without the
+      com.apple.security.cs.allow-jit entitlement.
+
+    The obvious reading of that message is "take the entitlement". MEASURED,
+    2026-08-14, and the obvious reading is wrong twice over:
+
+      1. THE ENTITLEMENT DOES NOT FIX IT. The same binary re-signed with
+         allow-jit printed the identical error, and so did the same binary
+         re-signed with allow-jit AND allow-unsigned-executable-memory. orc's
+         message names allow-jit because that is the usual cause on x86_64; on
+         Apple silicon a simultaneously writable and executable mapping cannot
+         be obtained at all, entitlement or not — MAP_JIT with
+         pthread_jit_write_protect_np is the only route and this build of orc
+         does not take it. Taking the keys would have widened the runtime for
+         a fault they do not repair.
+
+      2. IT COSTS NOTHING. orc falls back to its C backup functions, and the
+         pipeline runs to EOS either way. 300 buffers of
+         png ! imagefreeze ! videoconvert ! videoscale ! I420 1280x720,
+         four configurations, user CPU seconds:
+
+           no entitlement                        1.64  1.62
+           allow-jit                             1.65  1.62
+           allow-jit + unsigned-exec-memory      1.62  1.65
+           no entitlement, ORC_CODE=backup       1.63
+
+         Indistinguishable. Whatever orc's JIT is worth on this workload, it is
+         inside the noise of the encoder and the colour conversion around it.
+
+    So neither key is taken. What IS done about it is a one-line environment
+    change in internal/gst rather than an entitlement: ORC_CODE=backup before
+    gst_init tells orc not to attempt the mapping in the first place, which
+    silences an ERROR-level line that would otherwise appear in every log this
+    product ever produces and send whoever reads it hunting for a fault that is
+    not there. Same numbers, no message, no hole in the runtime.
+
+    If a future GStreamer or orc adopts MAP_JIT properly, revisit this — with
+    the benchmark above, not with the error message.
+
+  com.apple.security.cs.allow-dyld-environment-variables
+
+    internal/gst sets GST_PLUGIN_SYSTEM_PATH_1_0, GST_PLUGIN_PATH_1_0,
+    GST_PLUGIN_SCANNER_1_0, GST_REGISTRY_1_0 and GIO_MODULE_DIR before
+    gst_init. None of those is a DYLD_ variable, and the hardened runtime only
+    strips the DYLD_ family. The bundle deliberately resolves every library
+    through @loader_path/@executable_path rewrites precisely so that no
+    DYLD_LIBRARY_PATH or DYLD_FALLBACK_LIBRARY_PATH is needed — if anyone ever
+    finds themselves wanting this key, the actual bug is a load command that
+    build/bundle-gst-darwin.sh should have rewritten.
+
+  com.apple.security.network.client
+  com.apple.security.network.server
+
+    This app is both — SRT out to the M2L-X, HTTP and HTTPS in on 80/443 for
+    the remote-control page. Neither key is taken because neither does
+    anything here: they are App Sandbox keys, and nothing in this bundle is
+    sandboxed. Under the hardened runtime alone, sockets are not gated.
+
+  com.apple.security.device.camera
+
+    No camera. See build/darwin/Info.plist for the longer version; the short
+    one is that the pipeline's video is a still PNG and both getUserMedia call
+    sites ask for audio only.
+
+  com.apple.security.app-sandbox
+
+    Not sandboxed, and not casually addable. The app writes to
+    ~/Library/Application Support/WSLComms and ~/Library/Caches/WSLComms,
+    binds privileged-looking low ports for the remote listener, opens arbitrary
+    CoreAudio devices and reads an operator-chosen slate PNG from anywhere on
+    disk. Sandboxing it is a design change with its own work package, not an
+    entitlement.
+
+  com.apple.security.automation.apple-events
+
+    Nothing here scripts another application.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key><true/>
+</dict>
+</plist>

@@ -28,6 +28,33 @@
 // return_stub.go) is in the render namespace ({0.0.0.00000000}.), and
 // gst_stub_test.go asserts both against the classifier in device_id.go.
 //
+// # This stub is platform-neutral, and there are things it therefore cannot model
+//
+// It has no build tag beyond !cgo, it runs at Gate A on Windows and on macOS
+// alike, and it stays that way deliberately: it exists to let internal/sender
+// and the Wails layer be exercised without a toolchain, and giving it a GOOS
+// split would put platform knowledge in the one file in this package that has
+// none. So the fake device ids stay WINDOWS-SHAPED on every host. That is not
+// an oversight — those ids are what makes the render-endpoint refusal testable
+// at all, and macOS-shaped fixtures would exercise a classifier that is inert
+// on them (device_id.go's "On macOS" section says why that is the right
+// answer). SetStubDevices takes any ids a test wants, including CoreAudio ones,
+// for the cases that care.
+//
+// What is consequently NOT covered at Gate A, and must be held in mind when
+// reading a green test run on a Mac:
+//
+//   - The macOS unique-id → AudioDeviceID resolution. That is the single most
+//     important structural difference in the port, it is the difference between
+//     capturing the operator's chosen microphone and silently capturing the
+//     system default, and NOTHING in this file or its tests touches it. It is
+//     covered by a source guard over deviceprovider_darwin.go
+//     (TestDarwinCaptureIDsAreResolvedNotPersisted) and by nothing else until
+//     Gate B.
+//   - Which capture source and AAC encoder the real pipeline actually uses.
+//     Same answer: a source guard (TestPlatformElementContractIsPinned), because
+//     a stub has no encoder to be wrong about.
+//
 // # What this stub models about the input meters
 //
 // While started with PipelineOpts.OnLevels set, the stub emits SYNTHETIC
@@ -81,6 +108,10 @@ const (
 // decoration: these must pass IsCaptureEndpointID so that a Gate A caller
 // wiring the dropdown to Start never trips the render-endpoint refusal on the
 // stub's own data. gst_stub_test.go asserts it.
+//
+// They stay Windows-shaped when Gate A runs on a Mac. See the file comment: a
+// CoreAudio unique-id classifies as neither namespace, so a macOS-shaped
+// fixture here would silently stop testing the refusal these ids exist to test.
 var defaultStubDevices = []Device{
 	{
 		ID:   "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",

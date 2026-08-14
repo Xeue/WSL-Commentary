@@ -1127,6 +1127,68 @@ func TestTheDiagnosticSaysWhatLibsrtSaid(t *testing.T) {
 			},
 			wantAbsent: []string{"Set the SRT return passphrase and key length on the Settings screen"},
 		},
+
+		// The same two faults IN THE OTHER WORDING, which is the half of
+		// srtRejectBadSecret/srtRejectUnsecure that nothing exercised until the
+		// macOS port measured it.
+		//
+		// The three cases above are how GStreamer 1.28 renders a libsrt
+		// rejection. GStreamer 1.26.10 — the Homebrew build the macOS work is
+		// done against — does NOT emit "ERROR:BADSECRET" or "ERROR:UNSECURE" at
+		// all. It runs the reject reason through srt_rejectreason_str() and hands
+		// over English. Measured, against a real srtsink listener:
+		//
+		//	wrong passphrase  ->  Failed to authenticate: Incorrect passphrase (10)
+		//	none offered      ->  Failed to authenticate: Password required or unexpected (11)
+		//
+		// 10 and 11 are libsrt's own SRT_REJ_BADSECRET and SRT_REJ_UNSECURE, so
+		// these are the same two faults under different names rather than new
+		// ones. That is exactly why the token lists exist and why the classifier
+		// has to reach the same two branches from either spelling.
+		//
+		// Without these rows, a matcher that silently handled only one wording
+		// would pass this file and leave every macOS operator with the generic
+		// "no reason was reported" text on the one failure this product can
+		// diagnose precisely — which is the failure that cost an afternoon and
+		// the reason returnDiagnostic exists.
+		{
+			name: "badsecret in GStreamer 1.26's wording",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k", PBKeyLen: 32},
+			reason: errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+				"(Failed to authenticate: Incorrect passphrase (10))"),
+			want: []string{
+				"AES-256",
+				"does not match",
+				"Settings",
+				"Incorrect passphrase (10)",
+			},
+			wantAbsent: []string{"No reason was reported"},
+		},
+		{
+			name: "unsecure in GStreamer 1.26's wording, nothing offered",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503},
+			reason: errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+				"(Failed to authenticate: Password required or unexpected (11))"),
+			want: []string{
+				"NO encryption",
+				"requires encryption",
+				"Set the SRT return passphrase",
+				"Password required or unexpected (11)",
+			},
+			wantAbsent: []string{"No reason was reported"},
+		},
+		{
+			name: "unsecure in GStreamer 1.26's wording, a passphrase offered",
+			opts: gst.ReturnOpts{Host: "m2lx.example.com", Port: 40503, Passphrase: "k", PBKeyLen: 16},
+			reason: errors.New("gst: return monitor: retsrc: Could not read from resource. " +
+				"(Failed to authenticate: Password required or unexpected (11))"),
+			want: []string{
+				"AES-128",
+				"not encrypted at all",
+				"key length to 0",
+			},
+			wantAbsent: []string{"Set the SRT return passphrase and key length on the Settings screen"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

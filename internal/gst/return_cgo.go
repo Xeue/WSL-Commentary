@@ -7,6 +7,29 @@
 // machine and the reasoning for all three. This file builds one attempt's
 // pipeline and nothing else.
 //
+// # What is here and what is on the platform twins
+//
+// Everything in this file is true of the return path on EVERY platform: the
+// transport, the demuxer, the dynamic-pad handling, the bus, the teardown and
+// the whole threading model. It names no operating system.
+//
+// The three things that cannot be common live in return_cgo_windows.go and
+// return_cgo_darwin.go, with return_cgo_other.go as the honest refusal for
+// anything else:
+//
+//	returnDecodeSpecs           what turns aacparse's output into raw audio
+//	returnRenderSpecs           what goes between the mix matrix and the sink
+//	returnSinkFactory           the playback sink
+//	configureReturnSinkLocked   how that sink is told which device to open
+//	playbackDeviceID            what a device id IS in the enumeration
+//
+// They are files rather than GOOS tests inside these functions for the reason
+// overlay_windows.go and overlay_other.go are: a branch that mentions both
+// platforms compiles on both, so neither platform's compiler ever tells you it
+// is wrong about the other. The cost is that the two lists have to be kept in
+// step by hand when the COMMON part changes, which return_cgo_guard_test.go
+// checks what it can of.
+//
 // # It shares a package with the send path and nothing else
 //
 // It reuses four helpers from gst_cgo.go — resolveSinkHost, stateChangeOK,
@@ -45,8 +68,8 @@
 //     GST_FLOW_NOT_LINKED, and mpegtsbase aggregates the flow returns of its
 //     pads: NOT_LINKED from one pad is tolerated only while ANOTHER pad is
 //     returning OK, and the moment the audio branch back-pressures — which it
-//     will, because wasapi2sink is a clock-synced sink and the whole chain
-//     paces to the sound card — the aggregate becomes NOT_LINKED, the demuxer
+//     will, because the playback sink is clock-synced on both platforms and the
+//     whole chain paces to the sound card — the aggregate becomes NOT_LINKED, the demuxer
 //     pauses its task and posts an error. The symptom is a return that plays for
 //     a second or two and then stops, which is exactly the kind of fault that
 //     looks like a network problem and is not.
@@ -68,19 +91,24 @@
 //
 // # No libav, ever
 //
-// The AAC decoder is mfaacdec: Media Foundation, part of Windows, an LGPL
-// wrapper over an OS codec. avdec_aac is present on this machine at primary rank
-// and must not be used. gst-libav is FFmpeg, which is the same
-// commercial-shipping concern as x264enc, and build/bundle-gst.ps1's forbidden
-// list already refuses to copy anything matching *libav* or *avcodec*. Selecting
-// it here would produce an application that works on the developer's machine and
-// fails to load a plugin on the installed one.
+// The AAC decoder is an LGPL wrapper over a codec that is PART OF THE OPERATING
+// SYSTEM, on both platforms: mfaacdec over Media Foundation on Windows, atdec
+// over AudioToolbox on macOS. avdec_aac is present at primary rank on both dev
+// machines and must not be used on either. gst-libav is FFmpeg, which is the
+// same commercial-shipping concern as x264enc, and build/bundle-gst.ps1's
+// forbidden list already refuses to copy anything matching *libav* or *avcodec*.
+// Selecting it here would produce an application that works on the developer's
+// machine and fails to load a plugin on the installed one.
+//
+// The rule survived the macOS port intact, and it cost one capsfilter to keep;
+// see returnAACRawCaps in return_cgo_darwin.go.
 package gst
 
 import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,18 +121,52 @@ import (
 // the source of a bus message, so they are chosen to be legible in a field log
 // and to be impossible to confuse with the send path's — nothing here collides
 // with mux, srtq, slate, asrc, venc, vscale or srtout-N.
+//
+// The platform twins add names of their own for the elements only they have;
+// those live on the twin, so that this list stays the list of elements every
+// build has.
 const (
 	nameReturnPipeline = "wslcomms-return"
 	nameReturnSrc      = "retsrc"   // srtsrc
 	nameReturnDemux    = "retdemux" // tsdemux
 	nameReturnQueue    = "retq"     // queue at the head of the audio branch
 	nameReturnParse    = "retparse" // aacparse
-	nameReturnDecode   = "retdec"   // mfaacdec
+	nameReturnDecode   = "retdec"   // the AAC decoder: mfaacdec or atdec
 	nameReturnConvert  = "retconv"  // audioconvert, carrying the mix matrix
 	nameReturnResample = "retres"   // audioresample
-	nameReturnSink     = "retsink"  // wasapi2sink
+	nameReturnSink     = "retsink"  // the playback sink: wasapi2sink or osxaudiosink
 	nameReturnFakeSink = "retfake"  // fakesink for the video pad
 )
+
+// returnElementSpec is one element of the audio branch: what to make it from,
+// what to call it, and optionally what caps to pin on it.
+//
+// It exists so that the platform twins can hand back a LIST rather than being
+// asked a question per element. A twin that had to answer "is there a capsfilter
+// before the decoder?" would be a twin that could only ever differ in the ways
+// somebody had already thought to ask about; a list can differ in shape.
+type returnElementSpec struct {
+	// factory is the element factory name, e.g. "audioresample".
+	factory string
+
+	// name is the element's name in the bin, and is what appears as the source
+	// of a bus message. Every name in one pipeline must be distinct or
+	// gst_bin_add refuses the second one.
+	name string
+
+	// caps, when non-empty, is set on this element's caps property. Only
+	// capsfilter has one, and only the macOS chain uses any. It is parsed with
+	// gst_caps_from_string and REFUSED if that fails, rather than being set with
+	// gst_util_set_object_arg — measured, an unparseable string through the
+	// latter leaves the filter at ANY and the pipeline runs on, which for
+	// returnAACRawCaps would mean digital silence with no error anywhere.
+	caps string
+
+	// out, when non-nil, receives the created element so the caller can keep a
+	// reference to it. Elements without one stay alive because the bin holds a
+	// ref; the field is for the ones this file has to talk to again.
+	out *gogst.Element
+}
 
 // returnStateChangeTimeout bounds the asynchronous tail of the return
 // pipeline's NULL to PLAYING transition.
@@ -112,12 +174,13 @@ const (
 // Read the timeout commentary at the top of gst_cgo.go before relying on this:
 // it does NOT bound the synchronous part. gst_element_set_state takes no timeout
 // and runs every change_state function on the calling goroutine, so a wedged
-// WASAPI endpoint hangs here forever and no value written here changes that.
-// stateChangeWatchdog makes such a hang legible in the log; it cannot cure it.
+// playback endpoint — a WASAPI one or a CoreAudio one — hangs here forever and
+// no value written here changes that. stateChangeWatchdog makes such a hang
+// legible in the log; it cannot cure it.
 //
 // What the number has to cover is srtsrc's caller connect, which libsrt bounds
-// at its default SRTO_CONNTIMEO of 3 s, plus opening a WASAPI playback endpoint.
-// Ten seconds is far beyond both, and matches the send path's
+// at its default SRTO_CONNTIMEO of 3 s, plus opening a playback endpoint. Ten
+// seconds is far beyond both, and matches the send path's
 // sinkStateChangeTimeout so that the two paths fail on the same scale.
 const returnStateChangeTimeout = 10 * time.Second
 
@@ -128,33 +191,17 @@ const returnStateChangeTimeout = 10 * time.Second
 // streaming thread and must never wait on a Go consumer.
 const returnErrorBuffer = 8
 
-// returnRequiredElements is every element factory this pipeline cannot be built
-// without, mapped to the plugin from build/bundle-gst.ps1's allowlist that
-// provides it.
-//
-// It is checked by newReturnPipe rather than by Init, and that is deliberate.
-// Init's requiredElements is the CONTRIBUTION path's list, and a failure there
-// means the application cannot send and must say so at startup. A missing
-// mpegtsdemux means the commentator has no monitor — bad, but it must not stop
-// the feed going on air, and it must not make Init fail. So it is checked at the
-// point of use and reported through the return monitor's own error path.
-//
-// mpegtsdemux is the entry that was not in the bundle before this work; see the
-// Why line on it in build/bundle-gst.ps1.
-var returnRequiredElements = []struct{ factory, plugin string }{
-	{"srtsrc", "srt"},
-	{"tsdemux", "mpegtsdemux"},
-	{"queue", "coreelements"},
-	{"fakesink", "coreelements"},
-	{"aacparse", "audioparsers"},
-	{"mfaacdec", "mediafoundation"},
-	{"audioconvert", "audioconvert"},
-	{"audioresample", "audioresample"},
-	{"wasapi2sink", "wasapi2"},
-}
-
 // returnMissingElements returns a description of every required factory the
 // registry does not have, or nil if the bundle is complete for this path.
+//
+// returnRequiredElements is the PLATFORM twin's list, because the factories
+// differ and so do the plugins that carry them. It is checked by newReturnPipe
+// rather than by Init, and that is deliberate. Init's requiredElements is the
+// CONTRIBUTION path's list, and a failure there means the application cannot
+// send and must say so at startup. A missing mpegtsdemux means the commentator
+// has no monitor — bad, but it must not stop the feed going on air, and it must
+// not make Init fail. So it is checked at the point of use and reported through
+// the return monitor's own error path.
 func returnMissingElements() []string {
 	var missing []string
 	for _, req := range returnRequiredElements {
@@ -169,51 +216,49 @@ func returnMissingElements() []string {
 // headphone dropdown, for the SRT return path.
 //
 // It mirrors ListInputDevices: a GstDeviceMonitor filtered to Audio/Sink,
-// keeping only devices whose provider reports device.api = "wasapi2", reporting
-// display-name as Device.Name and the IMMDevice endpoint ID as Device.ID.
+// reporting display-name as Device.Name and this platform's stable device
+// identity as Device.ID.
+//
+// # What counts as a device, and what counts as its id, is per-platform
+//
+// playbackDeviceID is the seam, and it is a PREDICATE rather than a
+// provider name on purpose. The obvious shape — accept device.api == "wasapi2"
+// or device.api == "osxaudio" — is wrong twice over: osxaudiodeviceprovider does
+// not publish device.api at all, so the macOS half would silently match nothing
+// and the dropdown would be empty, which is exactly the bug on the capture side
+// that started the macOS port. Each twin therefore tests what its own platform
+// actually publishes; see the two implementations.
 //
 // # This is not the same identifier the browser uses, and they must not be mixed
 //
 // The WebRTC return path selects headphones with a browser mediaDeviceId and
 // HTMLMediaElement.setSinkId. That ID is a per-origin, per-session salted hash
-// generated by the WebView; it is meaningless to WASAPI and it changes when the
-// browsing context's storage is cleared. Device.ID here is the IMMDevice
-// endpoint ID GUID, which is what wasapi2sink's device property takes and what
-// survives a rename of the device.
+// generated by the WebView; it is meaningless to WASAPI and to CoreAudio alike,
+// and it changes when the browsing context's storage is cleared. Device.ID here
+// is the operating system's own stable identity — an IMMDevice endpoint ID GUID
+// on Windows, a CoreAudio UID on macOS — which is what survives a rename of the
+// device and what ReturnOpts.OutputDeviceID documents in full.
 //
-// They identify the same pair of headphones and are not interchangeable in
-// either direction. Config keeps both, as headphoneDeviceId and
-// headphoneEndpointId, and the failure mode of conflating them is silent — the
-// device property is set to a string wasapi2sink does not recognise, and the
-// element falls back to the system default playback endpoint. The commentator
-// gets audio, in the wrong ears, and nothing anywhere says why.
+// That the native half is platform-dependent changes NOTHING about the
+// separation. The browser id is not any operating system's identifier for a
+// device; it is a token minted by one browsing context. They identify the same
+// pair of headphones and are not interchangeable in either direction. Config
+// keeps both, as headphoneDeviceId and headphoneEndpointId, and the failure mode
+// of conflating them is silent on Windows — wasapi2sink ignores a device string
+// it does not recognise and opens the default endpoint, so the commentator gets
+// audio in the wrong ears and nothing says why. chooseOutputDevice in return.go
+// is what now says why, on both platforms.
 func ListOutputDevices() ([]Device, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: ListOutputDevices: Init has not been called")
 	}
 
-	monitor := gogst.NewDeviceMonitor()
-	if monitor == nil {
-		return nil, errors.New("gst: ListOutputDevices: gst_device_monitor_new returned nil")
-	}
-
-	// Audio/Sink is the class every audio playback provider advertises. As in
-	// ListInputDevices, a zero return means the filter was not installed and
-	// every device is re-checked below in any case — without the per-device
-	// check a microphone would appear in the headphone dropdown.
-	if monitor.AddFilter("Audio/Sink", nil) == 0 {
-		log.Printf("gst: ListOutputDevices: gst_device_monitor_add_filter(Audio/Sink) returned 0; " +
-			"relying on the per-device class check")
-	}
-
-	started := monitor.Start()
-	if !started {
-		log.Printf("gst: ListOutputDevices: gst_device_monitor_start failed; falling back to a one-shot probe")
-	}
-	devices := monitor.GetDevices()
-	if started {
-		monitor.Stop()
-	}
+	// Audio/Sink is the class every audio playback provider advertises. Every
+	// device is re-checked against it below in any case: without that check a
+	// microphone can appear in the headphone dropdown, and on Windows that is
+	// not hypothetical — wasapi2 republishes render endpoints into Audio/Source
+	// and the two id sets overlap byte for byte.
+	devices := enumerateDevices("Audio/Sink")
 
 	out := make([]Device, 0, len(devices))
 	for _, dev := range devices {
@@ -225,42 +270,26 @@ func ListOutputDevices() ([]Device, error) {
 		}
 		props := dev.GetProperties()
 		if props == nil {
+			// gst_device_get_properties is nullable. Without properties the
+			// provider cannot be identified and no id can be recovered, so the
+			// device cannot safely be offered.
 			log.Printf("gst: ListOutputDevices: skipping %q: it publishes no device properties",
 				dev.GetDisplayName())
 			continue
 		}
-		if api := props.GetString("device.api"); api != "wasapi2" {
-			continue
-		}
-		// endpointID is gst_cgo.go's, and it is the right function for both
-		// directions: it reads the same provider property keys and falls back to
-		// gst_device_create_element, which for a sink device returns a
-		// wasapi2sink with its device property already set. That fallback is
-		// authoritative by construction — it is literally the value the element
-		// will be given.
-		id := endpointID(dev, props)
-		if id == "" {
-			log.Printf("gst: ListOutputDevices: skipping %q: no endpoint ID; device properties are %s",
-				dev.GetDisplayName(), structureFieldNames(props))
-			continue
-		}
-		// The mirror of ListInputDevices' namespace check: a POSITIVELY
-		// identified CAPTURE endpoint has no business in the headphone
-		// dropdown. This is not hypothetical — measured on the dev machine,
-		// the Audio/Sink id set was a byte-exact subset of Audio/Source, so
-		// without this the two dropdowns can offer the same string and a
-		// microphone can be persisted as headphones. The asymmetry holds in
-		// this direction too: only a positive capture identification skips;
-		// an unrecognised shape is offered, because refusing unknown shapes
-		// would empty the dropdown on a future id-shape change.
-		if IsCaptureEndpointID(id) {
-			log.Printf("gst: ListOutputDevices: skipping %q (%s): its endpoint id is in the CAPTURE "+
-				"namespace (%s...) — a capture device cannot be the commentator's headphones",
-				dev.GetDisplayName(), id, CaptureEndpointPrefix)
+		// The platform seam, and the mirror of ListInputDevices' captureDeviceID.
+		// It answers two things about one device: does it belong to the provider
+		// this build drives, and if so what is the string to persist for it. Every
+		// rejection is logged by the twin with its own reason, because a device
+		// missing from the dropdown is otherwise indistinguishable from a device
+		// that is not plugged in.
+		id, ok := playbackDeviceID(dev, props)
+		if !ok {
 			continue
 		}
 		out = append(out, Device{ID: id, Name: dev.GetDisplayName()})
 	}
+	log.Printf("gst: ListOutputDevices: offering %d of %d Audio/Sink devices", len(out), len(devices))
 	return out, nil
 }
 
@@ -362,6 +391,14 @@ var _ returnPipe = (*returnPipeline)(nil)
 func newReturnPipe() (returnPipe, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: return monitor: Init has not been called")
+	}
+	if !returnPlatformSupported {
+		// return_cgo_other.go. The application ships on Windows and macOS; this
+		// is the one clear sentence somebody building for a third platform gets,
+		// instead of a pipeline made of empty factory names.
+		return nil, fmt.Errorf(
+			"gst: return monitor: the SRT return is implemented for Windows and macOS only, "+
+				"and this is %s", runtime.GOOS)
 	}
 	if missing := returnMissingElements(); len(missing) > 0 {
 		return nil, fmt.Errorf(
@@ -632,32 +669,61 @@ func (r *returnPipeline) drainErrors() {
 // callback is legal but is the part of the dynamic-pad idiom that goes wrong,
 // and the audio branch does not need it.
 func (r *returnPipeline) buildLocked(opts ReturnOpts, matrixArg string) error {
-	type spec struct {
-		factory string
-		name    string
-		out     *gogst.Element
+	// The transport head. Identical everywhere.
+	head := []returnElementSpec{
+		{factory: "srtsrc", name: nameReturnSrc, out: &r.src},
+		{factory: "tsdemux", name: nameReturnDemux, out: &r.demux},
 	}
-	var parse, decode, resample gogst.Element
-	specs := []spec{
-		{"srtsrc", nameReturnSrc, &r.src},
-		{"tsdemux", nameReturnDemux, &r.demux},
-		{"queue", nameReturnQueue, &r.queue},
-		{"aacparse", nameReturnParse, &parse},
-		{"mfaacdec", nameReturnDecode, &decode},
-		{"audioconvert", nameReturnConvert, &r.convert},
-		{"audioresample", nameReturnResample, &resample},
-		{"wasapi2sink", nameReturnSink, &r.sink},
+
+	// The audio branch, in pipeline order, with the two platform-supplied
+	// stretches spliced into the middle of it.
+	//
+	// The queue, the parser and the mix-matrix audioconvert are common because
+	// they are about the TRANSPORT and about the operator's channel selection,
+	// neither of which is an operating system's business. Everything either side
+	// of the audioconvert comes from the twin, because a decoder and a sink are
+	// exactly an operating system's business.
+	branch := []returnElementSpec{
+		{factory: "queue", name: nameReturnQueue, out: &r.queue},
+		{factory: "aacparse", name: nameReturnParse},
 	}
-	for _, s := range specs {
+	branch = append(branch, returnDecodeSpecs()...)
+	branch = append(branch, returnElementSpec{
+		factory: "audioconvert", name: nameReturnConvert, out: &r.convert})
+	branch = append(branch, returnRenderSpecs()...)
+	branch = append(branch, returnElementSpec{
+		factory: returnSinkFactory, name: nameReturnSink, out: &r.sink})
+
+	built := make([]gogst.Element, 0, len(branch))
+	for _, s := range append(append([]returnElementSpec(nil), head...), branch...) {
 		el := gogst.ElementFactoryMake(s.factory, s.name)
 		if el == nil {
 			return fmt.Errorf("gst: return monitor: could not create %s", s.factory)
 		}
+		if s.caps != "" {
+			// Parsed rather than handed to gst_util_set_object_arg, because that
+			// function returns void and simply does nothing with a string it
+			// cannot deserialise — leaving the filter at ANY, which for the ADTS
+			// filter on macOS means a monitor that plays digital silence with no
+			// error anywhere. A caps string this file got wrong must be a refusal
+			// to build, not a quiet pass-through.
+			caps := gogst.CapsFromString(s.caps)
+			if caps == nil {
+				return fmt.Errorf("gst: return monitor: %s is not a parseable caps string for %s",
+					s.caps, s.name)
+			}
+			el.SetObjectProperty("caps", caps)
+		}
 		if !r.pipeline.Add(el) {
 			return fmt.Errorf("gst: return monitor: could not add %s to the pipeline", s.name)
 		}
-		*s.out = el
+		if s.out != nil {
+			*s.out = el
+		}
+		built = append(built, el)
 	}
+	// Everything after the head is the audio branch, in order.
+	audio := built[len(head):]
 
 	// srtsrc to tsdemux is a static link on both sides and is made here. Every
 	// link from the demuxer onwards is dynamic; see onPadAdded.
@@ -666,10 +732,10 @@ func (r *returnPipeline) buildLocked(opts ReturnOpts, matrixArg string) error {
 	}
 
 	// The audio branch, in order. All static pads.
-	audio := []gogst.Element{r.queue, parse, decode, r.convert, resample, r.sink}
 	for i := 0; i+1 < len(audio); i++ {
 		if !audio[i].Link(audio[i+1]) {
-			return fmt.Errorf("gst: return monitor: could not link the audio branch at element %d", i)
+			return fmt.Errorf("gst: return monitor: could not link the audio branch: %s would not "+
+				"link to %s", audio[i].GetName(), audio[i+1].GetName())
 		}
 	}
 
@@ -709,20 +775,21 @@ func (r *returnPipeline) buildLocked(opts ReturnOpts, matrixArg string) error {
 		gogst.UtilSetObjectArg(r.convert, "mix-matrix", matrixArg)
 	}
 
-	if opts.OutputDeviceID != "" {
-		// A device ID that wasapi2sink does not recognise makes it fall back to
-		// the system default endpoint, silently. Refusing to set a property the
-		// element does not have at least distinguishes "the element changed" from
-		// "the ID was wrong".
-		if err := setStringProperty(r.sink, "device", opts.OutputDeviceID); err != nil {
-			return fmt.Errorf("gst: return monitor: %w", err)
-		}
-	} else {
-		log.Printf("gst: return monitor: no headphone endpoint configured; " +
-			"using the Windows default playback device")
-	}
-	if hasProperty(r.sink, "low-latency") {
-		r.sink.SetObjectProperty("low-latency", true)
+	// The headphone endpoint, in two steps that are deliberately separate.
+	//
+	// vetOutputDeviceID (return.go) decides WHETHER the configured id can be
+	// used, against the devices this machine is actually offering, and logs the
+	// reason if it cannot. It is platform-neutral, because "the operator's saved
+	// device is not here" is the same situation everywhere and the two platforms
+	// must not answer it differently — a config.json carried between them is a
+	// thing that happens, and before this it failed silently on Windows and
+	// unstartably on macOS.
+	//
+	// configureReturnSinkLocked then decides HOW to say it to this platform's
+	// sink, which is where the two genuinely differ: a string endpoint id for
+	// wasapi2sink, an integer resolved from a CoreAudio UID for osxaudiosink.
+	if err := configureReturnSinkLocked(r.sink, vetOutputDeviceID(opts.OutputDeviceID)); err != nil {
+		return err
 	}
 
 	// The pipeline and the queue's sink pad are captured HERE, into the closure,

@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,14 +102,50 @@ func validConfig() *config.Config {
 	return c
 }
 
-// newTestApp builds an App wired to fakes, with %APPDATA% redirected at a temp
-// directory so config.Save cannot touch the developer's real config.json.
+// redirectAppDataForTest points the per-user application data directory at a
+// fresh temp directory, so that nothing in this package can read or write the
+// developer's real config.json, presets, mixer golden or remote settings.
+//
+// WHICH environment variable does that is per-GOOS, and getting it wrong is not
+// a no-op — it is a test that silently runs against the machine's own state.
+// os.UserConfigDir reads %APPDATA% on Windows and $HOME/Library/Application
+// Support on darwin, so t.Setenv("APPDATA", ...) alone — which is what every
+// caller here used to do — redirected nothing at all on a Mac. Nine tests in
+// this package failed because of it, and every one of them failed for a
+// DIFFERENT and entirely misleading reason: seven built-in presets became ten
+// because the developer had three of their own, GetMixerGolden reported the real
+// mixer-golden.json as corrupt, the first preset adopted a scope of "wembley"
+// from a real active.json, and TestStartupWithNoM2LXHostBuildsNoControlPlane
+// built a control plane because the real config.json has an M2L-X host in it.
+// None of those points at the cause, and on a machine with an empty profile they
+// would all have passed.
+//
+// internal/config's withAppData already had this fix, for exactly the same
+// reason; this is the same helper in the package that also needed it. Setting
+// HOME on darwin additionally redirects applog.DefaultDir, which is wanted:
+// nothing under test should be writing into ~/Library/Logs either.
+func redirectAppDataForTest(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("APPDATA", home)
+	case "darwin":
+		t.Setenv("HOME", home)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", home)
+	}
+}
+
+// newTestApp builds an App wired to fakes, with the per-user application data
+// directory redirected at a temp directory so config.Save cannot touch the
+// developer's real config.json.
 //
 // It deliberately does not call startup: the tests that want the startup path
 // call it themselves.
 func newTestApp(t *testing.T) (*App, *fakeStore) {
 	t.Helper()
-	t.Setenv("APPDATA", t.TempDir())
+	redirectAppDataForTest(t)
 	// The LAN listener is ON by default and would bind 0.0.0.0:80/443 (or the
 	// 8080/8443 fallback) the moment a test calls startup()/startRemote() — a real
 	// listener and a firewall prompt mid-test. Turn it OFF for the redirected
@@ -244,8 +281,29 @@ func TestControlPlaneChanged(t *testing.T) {
 }
 
 func TestSlatePath(t *testing.T) {
+	// Both fixtures are per-GOOS, because what "absolute" MEANS is per-GOOS and
+	// this test is about exactly that distinction.
+	//
+	// "D:/slates/wsl-2026.png" is an absolute path on Windows and a RELATIVE one
+	// on darwin — filepath.IsAbs says so, correctly, because a drive letter is
+	// not a rooted path anywhere else — so slatePath joined it onto appDir and
+	// the subtest failed with
+	//
+	//	got "C:/Program Files/WSLComms/D:/slates/wsl-2026.png"
+	//
+	// which is slatePath behaving exactly as documented against a fixture that
+	// had stopped meaning what it was written to mean. The same redirection was
+	// already done for the %APPDATA% helpers; see withAppData in
+	// internal/config/config_test.go, which carries the argument.
+	//
+	// slatePath's body is untouched by the port and needs no platform knowledge:
+	// filepath.IsAbs already has it.
 	appDir := filepath.FromSlash("C:/Program Files/WSLComms")
 	absolute := filepath.FromSlash("D:/slates/wsl-2026.png")
+	if runtime.GOOS != "windows" {
+		appDir = filepath.FromSlash("/Applications/WSL Commentary.app/Contents/MacOS")
+		absolute = filepath.FromSlash("/Users/commentary/slates/wsl-2026.png")
+	}
 
 	tests := []struct {
 		name  string
@@ -514,7 +572,7 @@ func TestStartupEmitsNothingUntilDomReady(t *testing.T) {
 	// OnStartup before the page exists, so an event emitted there reaches a page
 	// with no listeners and is lost — and the events startup produces are the
 	// first-run ones that matter most.
-	t.Setenv("APPDATA", t.TempDir())
+	redirectAppDataForTest(t)
 	disableRemoteListenerForTest(t) // startup() calls startRemote; keep it off real ports
 
 	a := NewApp(t.TempDir(), errors.New("GStreamer bundle is missing libsrt"))
@@ -548,7 +606,7 @@ func TestStartupEmitsNothingUntilDomReady(t *testing.T) {
 func TestStartupWithNoM2LXHostBuildsNoControlPlane(t *testing.T) {
 	// First run: nothing is configured. This must not be treated as an error and
 	// must not open a socket to a host that does not exist.
-	t.Setenv("APPDATA", t.TempDir())
+	redirectAppDataForTest(t)
 	disableRemoteListenerForTest(t) // startup() calls startRemote; keep it off real ports
 
 	a := NewApp(t.TempDir(), nil)

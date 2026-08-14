@@ -26,7 +26,19 @@ $ForbiddenPatterns = @(
     '*swscale*'     # FFmpeg component.
     '*swresample*'  # FFmpeg component.
     '*ugly*'        # gst-plugins-ugly: the set exists precisely because of licensing.
-    '*faac*'        # patent-encumbered AAC encoder. We use mfaacenc (the OS).
+    '*faac*'        # patent-encumbered AAC encoder. We use the OS: mfaacenc / atenc.
+    '*faad*'        # GPL AAC DECODER (gst-plugins-bad). Not a typo for faac above:
+                    # different project, different licence, one letter apart, and
+                    # only the encoder was on this list until macOS arrived. The
+                    # decoder is atdec there and mfaacdec on Windows - both OS.
+    '*fdkaac*'      # Fraunhofer FDK AAC. Measured indistinguishable from atenc on
+                    # rate (131.4 vs 131.4 kbit/s against a 128k target) and excluded
+                    # anyway, on licence. Two commonly consulted sources are WRONG
+                    # about it: Homebrew's formula metadata says Apache-2.0 and
+                    # gst-inspect says LGPL - the latter describing the GStreamer
+                    # wrapper, not the libfdk-aac it links. The real terms grant NO
+                    # PATENT LICENCE (clause 3) and require source availability for
+                    # binary redistribution. See NOTICE.txt section G.
     '*lame*'        # LGPL but patent-encumbered MP3; nothing here needs MP3.
     '*mpeg2enc*'    # GPL.
     '*a52dec*'      # GPL.

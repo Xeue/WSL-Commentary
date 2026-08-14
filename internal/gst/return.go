@@ -20,12 +20,26 @@
 //
 // # The pipeline
 //
+// The head of it is the same everywhere. The tail — the decoder and the
+// playback sink — is the operating system's, and the two are not
+// interchangeable, so they live behind a build-tagged seam rather than in an
+// if:
+//
 //	srtsrc uri=srt://<host>:<port> mode=caller latency=<ms>
 //	  ! tsdemux
-//	  ! aacparse ! mfaacdec
+//	  ! queue ! aacparse
+//	  ! <decoder>                          Windows: mfaacdec
+//	                                       macOS:   capsfilter stream-format=raw ! atdec
 //	  ! audioconvert mix-matrix=<see MixMatrix>
-//	  ! audioresample
-//	  ! wasapi2sink device=<IMMDevice endpoint id>
+//	  ! <render tail>                      Windows: audioresample
+//	                                       macOS:   capsfilter channels=2 ! audioresample ! audioconvert
+//	  ! <sink>                             Windows: wasapi2sink device=<IMMDevice endpoint id>
+//	                                       macOS:   osxaudiosink device=<AudioDeviceID>
+//
+// return_cgo.go builds the common part; return_cgo_windows.go and
+// return_cgo_darwin.go supply the two tails and nothing else. The reasoning for
+// each extra element is on the platform file that adds it, because the reason is
+// a fact about that platform's decoder and sink rather than about this path.
 //
 // Audio only. The picture on Output 3 is H.265 and there is no HEVC decoder on
 // the target machine — mfh265dec is missing because the Windows HEVC extension
@@ -57,18 +71,26 @@
 //
 // This file carries no build tag and no cgo. Everything that can be tested
 // without GStreamer is here: the mix matrix, the option validation, the backoff
-// ladder and the whole reconnect state machine. The two build-tagged twins,
-// return_cgo.go and return_stub.go, supply exactly one thing between them —
-// newReturnPipe, which builds one attempt's pipeline — plus ListOutputDevices.
-// That is the same seam gst.go draws, for the same reason: Gate A must be able
-// to build and test the application on a machine with no MinGW and no
-// GStreamer.
+// ladder, the headphone-endpoint vetting and the whole reconnect state machine.
+// The two build-tagged twins, return_cgo.go and return_stub.go, supply exactly
+// one thing between them — newReturnPipe, which builds one attempt's pipeline —
+// plus ListOutputDevices. That is the same seam gst.go draws, for the same
+// reason: Gate A must be able to build and test the application on a machine
+// with no MinGW and no GStreamer.
+//
+// There is a SECOND seam, cutting the other way: the platform one. It exists
+// only inside the cgo half, because it is only the real pipeline that has to
+// name wasapi2sink or osxaudiosink, and it is drawn as build-tagged files rather
+// than as GOOS tests inside a function for the same reason overlay_windows.go
+// and overlay_other.go are — an if that mentions two platforms compiles on both
+// and is therefore never told it is wrong about either.
 package gst
 
 import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -270,16 +292,59 @@ type ReturnOpts struct {
 	// means DefaultReturnChannel.
 	Channel ReturnChannel
 
-	// OutputDeviceID is the WASAPI IMMDevice endpoint ID passed to
-	// wasapi2sink's device property.
+	// OutputDeviceID is the STABLE NATIVE identity of the headphone endpoint:
+	// the string ListOutputDevices reports as Device.ID and config.json persists
+	// as headphoneEndpointId. Empty means the platform's default playback
+	// device.
 	//
-	// It is NOT the browser mediaDeviceId the WebRTC return path uses. They are
-	// two different identifiers for the same pair of headphones and are not
-	// interchangeable in either direction: mediaDeviceId is a per-origin salted
-	// hash that means nothing outside the WebView, and the IMMDevice endpoint ID
-	// means nothing to setSinkId. Config keeps both, under two names, for
-	// exactly this reason. Empty means wasapi2sink's default endpoint, which is
-	// whatever Windows currently calls the default playback device.
+	// # It is one field, and it holds two different kinds of string
+	//
+	// That is deliberate. What the platform's sink can be given differs, but
+	// what the OPERATOR chose does not, and a second field would be a second
+	// thing to migrate, validate and get wrong:
+	//
+	//	Windows  the WASAPI IMMDevice endpoint ID GUID, e.g.
+	//	         "{0.0.0.00000000}.{7a2f4b90-...}". wasapi2sink's device
+	//	         property is a STRING and takes this value directly.
+	//
+	//	macOS    the CoreAudio device UID, e.g. "BuiltInSpeakerDevice" or
+	//	         "NDIAudio", which is what osxaudiodeviceprovider publishes as
+	//	         unique-id.
+	//
+	// The macOS half needs one more sentence, because it is the thing most
+	// likely to be "simplified" into a bug. osxaudiosink's device property is
+	// NOT this string: it is a gint AudioDeviceID — measured on the dev Mac as
+	// 81 for the built-in speakers and 92 for NDI Audio — and coreaudiod
+	// allocates those per enumeration. They do not survive a reboot or a
+	// replug, so an integer is a runtime handle and not an identity. The
+	// integer is resolved from this string every time a pipeline is opened. It
+	// must never reach config.json, never cross the Wails boundary, and never
+	// appear anywhere but a diagnostic. See return_cgo_darwin.go.
+	//
+	// # It is NOT the browser mediaDeviceId, on any platform
+	//
+	// The WebRTC return picks headphones with a browser mediaDeviceId and
+	// setSinkId. That is a per-origin salted hash generated by the WebView; it
+	// means nothing to WASAPI or CoreAudio, and neither of the native ids above
+	// means anything to setSinkId. They identify the same pair of headphones and
+	// are not interchangeable in either direction. Config keeps both, under two
+	// names — headphoneDeviceId and headphoneEndpointId — and merging them is
+	// forbidden by CONTRACT.md for the reason that the failure is silent.
+	//
+	// Making the native half platform-dependent does not weaken that
+	// separation by one inch, and the port is a good moment to say why: the
+	// browser id is not the OS's identifier for a device at all, on any
+	// platform. It is a token minted by, and only meaningful to, one browsing
+	// context. That is true on Windows, it is true on macOS, and no future
+	// platform changes it.
+	//
+	// # A config.json carried between platforms fails SAFE
+	//
+	// The two shapes cannot be confused for one another by accident — a
+	// CoreAudio UID is never a GUID in braces — but a config.json can and will
+	// be carried across, because operators copy their settings. See
+	// chooseOutputDevice, which is where that is handled and where the log line
+	// that explains it is composed.
 	OutputDeviceID string
 
 	// OnConnectError, if set, is called with the reason every failed attempt
@@ -551,6 +616,150 @@ func MixMatrixString(m [][]float32) string {
 	}
 	b.WriteByte('>')
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Vetting the headphone endpoint before the sink is given it
+// ---------------------------------------------------------------------------
+
+// chooseOutputDevice decides which headphone endpoint id the playback sink is
+// actually given, and returns the reason whenever that is not the one the
+// operator configured.
+//
+// It returns the id to use — the empty string meaning "this platform's default
+// playback device" — and a diagnostic. An empty diagnostic means the configured
+// id was used unchanged and there is nothing to say.
+//
+// # Why the return path needs this and the send path does not
+//
+// The send path already refuses a wrong device loudly, because device_id.go can
+// tell a Windows capture id from a render one by looking at it and
+// refuseRenderEndpoint says so at Start. This path has no such luxury. A
+// headphone endpoint that is simply ABSENT — unplugged, renamed by its driver,
+// or named in a config.json written on the other operating system — is not a
+// malformed string. It is a perfectly well-formed identifier for a device that
+// is not here, and until this function existed the two platforms disagreed about
+// what happened next, both of them unhelpfully:
+//
+//   - wasapi2sink is given an id it does not recognise, ignores it, and opens
+//     the system default endpoint. The commentator gets audio in the wrong ears,
+//     the RETURN lamp goes green, and nothing anywhere says why.
+//
+//   - osxaudiosink is given an integer, and a stale integer is worse: measured
+//     with device=9999 it fails the NULL to PAUSED transition outright —
+//     "gst_osx_audio_ring_buffer_open_device ... pipeline doesn't want to
+//     preroll" — so the monitor never starts at all and the reason is a
+//     CoreAudio error the operator cannot act on.
+//
+// Neither is acceptable and they are not even the same kind of wrong. So the
+// decision is made HERE, once, in the build-tag-free half, before either sink
+// sees anything: an id the platform is not currently offering is not passed on.
+// The sink is left at its default, the monitor works, and the log says exactly
+// what happened and what is on offer instead.
+//
+// # Why falling back rather than refusing
+//
+// Refusing would be defensible and it is the wrong trade for a MONITOR. The
+// commentator can hear whether the return is in the right ears within a second
+// of it starting; they cannot do anything at all with a monitor that refuses to
+// start twenty minutes before kick-off because a USB interface enumerated in a
+// different order this morning. A wrong-device monitor is a nuisance the
+// operator can diagnose from the log line below and fix in the dropdown; no
+// monitor is a commentary position working blind. So this falls back, loudly.
+//
+// # An enumeration that FAILS is not an enumeration that found nothing
+//
+// listErr non-nil means the device monitor could not be run at all. The
+// configured id is then passed through unchanged, because "we could not check"
+// must never be read as "it is not there" — that would take a perfectly good
+// headphone endpoint away from the operator over a transient failure to probe.
+func chooseOutputDevice(configured string, available []Device, listErr error) (id, why string) {
+	if configured == "" {
+		// Nothing configured. The caller says so itself, in the words of its own
+		// platform, because "the default device" is a different sentence on each.
+		return "", ""
+	}
+	if listErr != nil {
+		return configured, fmt.Sprintf(
+			"gst: return monitor: could not enumerate the playback devices to check the configured "+
+				"headphone endpoint %q (%v); using it anyway — a failure to probe must not cost the "+
+				"operator a device that is present",
+			configured, listErr)
+	}
+	for _, dev := range available {
+		if dev.ID == configured {
+			return configured, ""
+		}
+	}
+
+	// Not offered. Say what kind of wrong this is, as precisely as it can be
+	// said, because the three cases have three different fixes.
+	//
+	// device_id.go's classifiers are the sharpest tool available here and they
+	// work in BOTH directions without knowing anything about macOS: they are
+	// POSITIVE identifications of a Windows namespace, and no CoreAudio UID
+	// matches either prefix, so a hit on a machine that is not Windows means the
+	// configuration was written on one. That is a real diagnosis, not a guess,
+	// and it is worth the two lines it costs.
+	var kind string
+	switch {
+	case IsRenderEndpointID(configured):
+		kind = fmt.Sprintf(
+			" That id is a Windows WASAPI RENDER (playback) endpoint, and this is %s — "+
+				"the config.json holding it was written on Windows and carried across. "+
+				"Pick the headphones again on the Settings screen; the value is not portable.",
+			runtime.GOOS)
+	case IsCaptureEndpointID(configured):
+		kind = fmt.Sprintf(
+			" That id is a Windows WASAPI CAPTURE endpoint — a microphone, which cannot be the "+
+				"commentator's headphones — and this is %s. Pick the headphones again on the "+
+				"Settings screen.", runtime.GOOS)
+	default:
+		kind = " It may have been unplugged, renamed by its driver, or saved on another machine."
+	}
+
+	return "", fmt.Sprintf(
+		"gst: return monitor: the configured headphone endpoint %q is not among the playback "+
+			"devices this machine is offering, so the return is being played to the DEFAULT "+
+			"playback device instead.%s On offer: %s",
+		configured, kind, describeDevices(available))
+}
+
+// describeDevices renders a device list for the diagnostic above: names for the
+// operator, ids for whoever has to compare one against config.json.
+//
+// It renders both because either alone is useless in the situation this is
+// printed in. A name cannot be matched against the file, and an id cannot be
+// matched against the dropdown the operator is looking at.
+func describeDevices(devices []Device) string {
+	if len(devices) == 0 {
+		return "nothing at all — this machine is reporting no playback devices, which is itself " +
+			"worth investigating"
+	}
+	parts := make([]string, 0, len(devices))
+	for _, dev := range devices {
+		parts = append(parts, fmt.Sprintf("%q (%s)", dev.Name, dev.ID))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// vetOutputDeviceID runs chooseOutputDevice against the live device list and
+// logs the reason if there is one.
+//
+// It lives here, in the build-tag-free half, rather than in either cgo platform
+// twin, so that the two platforms cannot drift on what happens to a config.json
+// that names a device this machine has not got. The twins differ in what a
+// device id IS; they must not differ in what is done about one that is missing.
+//
+// ListOutputDevices is supplied by whichever twin is compiled, so at Gate A this
+// vets against the stub list and at Gate B against the real device monitor.
+func vetOutputDeviceID(configured string) string {
+	devices, err := ListOutputDevices()
+	id, why := chooseOutputDevice(configured, devices, err)
+	if why != "" {
+		log.Print(why)
+	}
+	return id
 }
 
 // ---------------------------------------------------------------------------

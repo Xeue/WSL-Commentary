@@ -5,6 +5,13 @@
 This is the whole path from a bare Windows 11 x64 machine to `wslcomms-setup.exe`.
 Follow it top to bottom. It assumes nothing is installed except Windows.
 
+**This document is now the WINDOWS half.** The macOS release — `.app` + `.dmg`,
+signed, notarised, stapled — is `README-darwin.md`, and it is a genuinely
+different shape: no installer, no allowlist of DLL names, and a GStreamer
+bundle that is computed rather than enumerated. The two halves share exactly one
+file, `forbidden-names.ps1`, which is the licensing control and is deliberately
+not duplicated. Nothing below changes.
+
 > ## Read this before you trust anything below
 >
 > Everything in `build/` was written on a machine with **no MinGW gcc, no

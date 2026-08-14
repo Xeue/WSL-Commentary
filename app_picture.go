@@ -1,13 +1,21 @@
 //go:build dev || production || bindings
 
 // app_picture.go is the SRT PICTURE path's half of the bound surface: five
-// methods, one event, the lazily created native overlay window and the goroutine
-// that forwards the monitor's states to the page.
+// methods, one event, the lazily created native overlay surface and the
+// goroutine that forwards the monitor's states to the page.
 //
 // Owner: WP-P. It is behind the same build tags as app.go, for the same reason,
 // and it does not require cgo: at Gate A it drives internal/gst's picture stub
-// and the overlay simply fails to find a host window, which is a state the
-// frontend already has to handle.
+// and the overlay simply fails to be created, which is a state the frontend
+// already has to handle.
+//
+// It is written against gst.PictureOverlay and NOT against either
+// implementation. There are two — a child HWND painted by d3d11videosink on
+// Windows, an NSView painted by glimagesink on macOS — and nothing in this file
+// knows which one it has. The one place the difference is unavoidable is the
+// teardown ordering, and it is argued for both platforms at
+// stopPictureForTeardown rather than left as Windows prose describing macOS
+// behaviour.
 //
 // # What this is for, stated plainly because it has been got wrong once
 //
@@ -16,8 +24,8 @@
 // The picture used to be the KVS multiviewer mosaic: a 2240x1440 track,
 // CSS-cropped to a 640x360 tile and scaled up, which is why it looked soft. This
 // path replaces it with the M2L-X programme output itself — H.265, 1920x1080 at
-// 50p, 15000 kbps — decoded on the GPU and presented in a native window over the
-// page. The mosaic stays as the FALLBACK, because a soft picture beats no
+// 50p, 15000 kbps — decoded in hardware and presented in a native surface over
+// the page. The mosaic stays as the FALLBACK, because a soft picture beats no
 // picture and a commentator must never be looking at black.
 //
 // The audio is not touched by any of this. It is the Kinesis/WebRTC peer
@@ -37,13 +45,18 @@
 //     the state forwarder taking the same lock StopPicture holds across the join
 //     of that very forwarder — is what this file did on the first draft.
 //
-//  2. NOTHING HERE BLOCKS A WAILS MESSAGE HANDLER ON THE OVERLAY'S THREAD. Every
-//     window operation is a record-and-post; see overlay_windows.go's header for
-//     why that is load-bearing rather than tidy.
+//  2. NOTHING HERE BLOCKS A WAILS MESSAGE HANDLER ON THE THREAD THAT OWNS THE
+//     OVERLAY. Every surface operation is a record-and-post: a PostMessage to
+//     this application's own pump thread on Windows, a dispatch_async to
+//     AppKit's main queue on macOS. See overlay_windows.go's and
+//     overlay_darwin.go's headers for why that is load-bearing rather than
+//     tidy — on both platforms the alternative is a bound method that can be
+//     made to wait on the graphics stack.
 //
-//  3. THE OVERLAY IS OPAQUE AND ALWAYS ON TOP OF ITS RECTANGLE. It is shown only
-//     when the frontend has asked for it AND there are pictures to put in it.
-//     Both halves are needed: a black rectangle over the fallback mosaic is
+//  3. THE OVERLAY IS OPAQUE AND ALWAYS ON TOP OF ITS RECTANGLE — a child HWND
+//     above the WebView2 on Windows, an NSView above the WKWebView on macOS. It
+//     is shown only when the frontend has asked for it AND there are pictures to
+//     put in it. Both halves are needed: a black rectangle over the fallback mosaic is
 //     worse than the mosaic, and a picture over an open Settings screen is worse
 //     than either. The frontend says which it wants; this file refuses to show
 //     an empty one.
@@ -137,8 +150,9 @@ func (a *App) StartPicture() error {
 
 	if a.closing.Load() {
 		// The window is going away. Building a pipeline now would open an SRT
-		// socket and a D3D11 device that teardown has already walked past, and
-		// the process would exit still holding them. Same reasoning as
+		// socket and a graphics device — a D3D11 device, or an NSOpenGL context
+		// and a GstGLNSView — that teardown has already walked past, and the
+		// process would exit still holding them. Same reasoning as
 		// startSession and StartReturn; see step 0 of the shutdown order in
 		// app.go's header.
 		return errShuttingDown
@@ -237,10 +251,10 @@ func (a *App) StartPicture() error {
 // lock-order comment on App.picViewMu, which records that this was written the
 // wrong way round first and hung.
 //
-// It does NOT destroy the overlay window. The window outlives the monitor: the
+// It does NOT destroy the overlay surface. The surface outlives the monitor: the
 // monitor is rebuilt whenever the configuration changes, and destroying and
-// recreating a native child underneath a running WebView2 is a z-order fight
-// with nothing to gain. Only teardown destroys it.
+// recreating a native child underneath a running web view is a z-order fight
+// with nothing to gain on either platform. Only teardown destroys it.
 //
 // It returns errPictureNotRunning when nothing was running, which is what lets
 // teardown call it unconditionally.
@@ -452,10 +466,10 @@ func (a *App) newPictureOverlay() (gst.PictureOverlay, error) {
 //
 //	the page asked for it       or a picture covers the Settings screen
 //	the monitor is SHOWING      or a black rectangle covers the fallback mosaic
-//	the rectangle has area      or gstd3d11 resizes a swapchain to nothing
+//	the rectangle has area      or the sink resizes its surface to nothing
 //
-// It never blocks: gst.PictureOverlay.SetVisible records and posts. See
-// overlay_windows.go's header.
+// It never blocks: gst.PictureOverlay.SetVisible records and posts, on both
+// platforms. See overlay_windows.go's and overlay_darwin.go's headers.
 func (a *App) applyPictureVisibilityViewLocked() {
 	if a.picOverlay == nil {
 		return
@@ -505,7 +519,7 @@ func (a *App) pictureOverlay() (gst.PictureOverlay, error) {
 }
 
 // pictureOpts builds the monitor's options from a configuration snapshot, the
-// passphrase already read from Credential Manager, and the window handle.
+// passphrase already read from the credential store, and the overlay handle.
 //
 // It is separate from StartPicture so that what the monitor is actually given can
 // be asserted without running one.
@@ -547,8 +561,14 @@ func (a *App) pictureOpts(cfg *config.Config, passphrase string, handle uintptr)
 	}
 }
 
-// picturePassphrase reads the SRT passphrase for the programme output from
-// Credential Manager and checks it against the configured key length.
+// picturePassphrase reads the SRT passphrase for the programme output from the
+// operating system's credential store and checks it against the configured key
+// length.
+//
+// WHICH store is internal/secrets' business and not this file's: Windows
+// Credential Manager on one platform, the login keychain on the other, behind
+// one Store interface. The message below therefore names both rather than
+// naming the wrong one to whichever operator is reading it.
 //
 // It reads secrets.KeySRTReturn — the same entry the audio return used — because
 // it is the same M2L-X OUTPUT, and encryption on M2L-X is set per output. It is
@@ -575,9 +595,9 @@ func (a *App) picturePassphrase(cfg *config.Config) (string, error) {
 			return "", fmt.Errorf(
 				"wslcomms: cannot start the picture: srtReturnPBKeyLen is %d, which asks for an "+
 					"encrypted session with the M2L-X output on port %d, but no passphrase is stored "+
-					"in Windows Credential Manager under %q — enter it on the Settings screen, or set "+
-					"the key length to 0 if that output is not encrypted",
-				cfg.SRTReturnPBKeyLen, cfg.EffectiveSRTReturnPort(), secrets.TargetSRTReturn)
+					"in %s under %q — enter it on the Settings screen, or set the key "+
+					"length to 0 if that output is not encrypted",
+				cfg.SRTReturnPBKeyLen, cfg.EffectiveSRTReturnPort(), secrets.StoreName(), secrets.TargetSRTReturn)
 		}
 		return "", nil
 	case err != nil:
@@ -688,18 +708,64 @@ func (a *App) forwardPictureStates(states <-chan gst.PictureState, diag string) 
 }
 
 // stopPictureForTeardown is the picture's step of the ordered shutdown: stop the
-// monitor, then destroy the window.
+// monitor, then take the overlay surface away.
 //
-// The order is fixed and is the only order that works. The monitor's pipeline is
-// rendering into the window; destroying the window first would leave
-// d3d11videosink presenting to a handle that no longer names anything, which is a
-// driver-dependent outcome and not one to find out about during a match.
+// # The order is fixed, and each platform has a different reason for it
 //
-// Both halves are individually bounded — gst.PictureMonitor.Stop by the GStreamer
-// timeouts in picture_cgo.go, gst.PictureOverlay.Close by its own
-// overlayCloseBudget — and this whole function runs inside app.go's
-// teardownStep, which abandons it if it overruns and force-exits the process. See
-// App.teardown and exit_windows.go.
+// It is the same order on both, which is why one function can do it, but a
+// reader who knows only one of the reasons will eventually decide the order is
+// arbitrary and swap it. Both are written out here.
+//
+// THE SHARED REASON. The monitor's pipeline is rendering into the surface. Take
+// the surface away first and the video sink is presenting into a handle that no
+// longer names anything.
+//
+// ON WINDOWS that means gstd3d11 presenting to a destroyed HWND. gstd3d11
+// SUBCLASSES the window it is given — SetWindowLongPtr(GWLP_WNDPROC) — and
+// restores the previous procedure on teardown, so a DestroyWindow that races its
+// subclass restore runs a window procedure that has been unloaded. The
+// consequence is driver-dependent, it happens under the loader lock during
+// process exit, and it is not something to find out about during a match. See
+// exit_windows.go, which exists for that whole family of hazard.
+//
+// ON macOS THE HAZARD IS DIFFERENT AND THERE ARE TWO OF THEM, so the Windows
+// prose above must not be read as describing this platform:
+//
+//  1. THE SURFACE IS AN NSView THE SINK HAS PUT ITS OWN VIEW INSIDE. glimagesink
+//     adds a GstGLNSView as a subview of the overlay view and holds a reference
+//     to the NSOpenGL context bound to it. Releasing the overlay view while the
+//     sink is still rendering pulls the superview out from under a live GL
+//     surface on a thread that is not the main one. Stopping the monitor first
+//     makes the sink remove and release its own view before ours goes anywhere,
+//     which is the only ordering in which nothing is holding anything.
+//
+//  2. THE MAIN RUN LOOP IS ALREADY DEAD BY THE TIME EITHER HALF RUNS. Wails
+//     calls OnShutdown AFTER -[NSApplication run] has RETURNED, and App.teardown
+//     then runs its steps on a goroutine while the main thread is parked waiting
+//     for them. Nothing services the main queue from that moment on. So there is
+//     NO main-thread work available to either half of this function, and both
+//     are written not to need any: gst.PictureOverlay.Close on macOS posts the
+//     removal and returns immediately rather than waiting for it. A Close that
+//     waited — or worse, dispatch_sync'd — would hang the whole shutdown here,
+//     every single time, on an ordinary quit with nothing wrong anywhere. That
+//     is the macOS shape of the trap WS_EX_NOPARENTNOTIFY defuses on Windows,
+//     and it is defused by the same principle: never block on the host
+//     framework's thread during teardown.
+//
+// # Bounding
+//
+// Both halves are individually bounded. gst.PictureMonitor.Stop is bounded by
+// the GStreamer timeouts in picture_cgo.go on either platform.
+// gst.PictureOverlay.Close is bounded by overlayCloseBudget on Windows, where
+// there is a message-pump thread of ours to join, and is unconditionally prompt
+// on macOS, where there is no thread of ours at all. This whole function then
+// runs inside app.go's teardownStep, which abandons it if it overruns and
+// force-exits the process. See App.teardown.
+//
+// Only the Windows overlay can therefore report gst.ErrAbandonedThread, and that
+// is correct rather than an asymmetry to be tidied away: on macOS there is
+// nothing to abandon, and wrapping the sentinel would end every ordinary quit
+// with a hard exit.
 func (a *App) stopPictureForTeardown() error {
 	var problems []error
 

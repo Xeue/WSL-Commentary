@@ -9,10 +9,21 @@
 // the Wails CLI sets, which is what stops a stray `go build .` reaching the
 // modal build-tag dialog Wails pops when they are absent. main_nocgo.go supplies
 // an inert main for every other build. The constraint deliberately does NOT
-// require cgo: Wails on Windows is pure Go, so this file compiles and its tests
-// run at Gate A with CGO_ENABLED=0 against the internal/gst stub. Run them with
+// require cgo, though what that buys differs by platform. Wails on Windows is
+// pure Go, so this file compiles and its tests run at Gate A with CGO_ENABLED=0
+// against the internal/gst stub:
 //
 //	go test -tags dev . -count=1
+//
+// Wails on macOS is not pure Go — its whole darwin frontend reaches Cocoa and
+// WKWebView through Objective-C — so with CGO_ENABLED=0 the tagged build fails
+// inside Wails rather than here, and the same tests need
+//
+//	CGO_ENABLED=1 go test -tags dev . -count=1
+//
+// which still runs against the internal/gst stub and still touches no device.
+// Gate A itself is untagged, reaches main_nocgo.go instead of this file, and is
+// unaffected on both platforms.
 //
 // The hazard that requiring cgo used to prevent as a side effect — a production
 // build silently backed by the stub — is prevented on purpose in
@@ -68,7 +79,7 @@
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
 // and not merely by habit. There is deliberately no getter for a secret — a
-// secret goes into Credential Manager and never comes back out across this
+// secret goes into the OS credential store and never comes back out across this
 // boundary. GetPresetCredentialStatus is the one recorded, deliberate
 // narrowing of that rule: it reports whether a credential EXISTS for the
 // active preset scope — three booleans, never a value — because after applying
@@ -141,11 +152,19 @@
 // reason each connection attempt failed. See connectErrorReporter.
 //
 // Headphone enumeration and selection for the WEBRTC return are JavaScript-side
-// only, through enumerateDevices and setSinkId. The SRT return needs a WASAPI
-// IMMDevice endpoint ID instead, which no browser API can produce, so
+// only, through enumerateDevices and setSinkId. The SRT return needs a
+// PLATFORM device identity instead — a WASAPI IMMDevice endpoint ID on Windows,
+// a CoreAudio device UID on macOS — which no browser API can produce, so
 // ListOutputDevices enumerates those on the Go side and config keeps both
 // identifiers under two names. They are not interchangeable; see
 // config.Config.HeadphoneEndpointID.
+//
+// The macOS half is a string for a reason worth stating where somebody will
+// read it. osxaudiosink's own "device" property is an integer AudioDeviceID
+// allocated by coreaudiod at enumeration time and NOT stable across a reboot or
+// a replug, so what is stored and what crosses this boundary is the stable UID
+// ("BuiltInSpeakerDevice", "NDIAudio", a UUID); internal/gst resolves it to the
+// integer when it opens the pipeline. An integer must never reach config.json.
 //
 // # Lifecycle: one context tree, one shutdown order
 //
@@ -163,10 +182,10 @@
 //     every context-bound piece of work in the process at once: the mixer
 //     drawer's in-flight GetMixerSnapshot dials, a KVS credential fetch, the
 //     control plane generation whose context derives from it, the event pump;
-//  2. the sender  — Stop blocks until the pipeline is at NULL, so the WASAPI
-//     endpoint and the SRT socket are released before anything else moves;
+//  2. the sender  — Stop blocks until the pipeline is at NULL, so the audio
+//     capture device and the SRT socket are released before anything else moves;
 //  3. the return monitor — same reason, and deliberately AFTER the sender: both
-//     release a WASAPI endpoint and an SRT socket, and if the whole sequence
+//     release an audio device and an SRT socket, and if the whole sequence
 //     overruns shutdownTimeout the process exits regardless, so the one that
 //     must already have finished is the contribution path;
 //  4. the mixer write path — it is closed BEFORE the control plane, because a
@@ -187,8 +206,8 @@
 // # EVERY STEP HAS ITS OWN BOUND, AND THAT IS THE POINT
 //
 // The order above used to be a plain sequence inside one overall timeout. That
-// is not the same thing, and the difference is what put a wslcomms.exe in Task
-// Manager after a match: the timeout bounded the WAIT, not the WORK, so the
+// is not the same thing, and the difference is what left a wslcomms running in
+// Task Manager after a match: the timeout bounded the WAIT, not the WORK, so the
 // first step that would not return took the whole budget and EVERY STEP BEHIND
 // IT WAS SIMPLY NEVER RUN. Measured, with a return monitor that could not be
 // stopped: after the twenty seconds were up the mixer's write socket was still
@@ -206,8 +225,9 @@
 //
 // Only ever a GStreamer state change that will not complete. gst_element_set_state
 // takes no timeout and runs on the calling goroutine inside cgo, so when it
-// wedges — a WASAPI endpoint that will not release, an SRT socket mid-handshake
-// — there is no Go-side context, deadline or cancellation that can reach it.
+// wedges — an audio endpoint that will not release, whether that is a WASAPI
+// endpoint or a CoreAudio device, or an SRT socket mid-handshake — there is no
+// Go-side context, deadline or cancellation that can reach it.
 // internal/gst says so at length; see the timeout constants there.
 //
 // Abandoning it costs nothing that process exit does not already recover. The
@@ -227,14 +247,33 @@
 //
 // A teardown that abandoned something has deliberately stopped being able to
 // account for a thread. Returning normally hands that thread to the Go runtime's
-// exit path, which on Windows means ExitProcess: it kills the other threads
-// first and then runs the detach handler of every loaded DLL under the loader
-// lock, and GStreamer, WASAPI and COM are all in that set. Whether that hangs
-// cannot be determined from here — it needs a wedged endpoint on the machine
-// that has one — but there is no way to make it safe either, and its failure
-// mode is precisely the one being fixed: a window that has gone and a process
-// that has not. So when something has been abandoned the teardown does not
-// return and hope; it terminates the process itself. See hardExit.
+// ordinary exit path, and on BOTH supported platforms that path runs code
+// belonging to the media libraries the abandoned thread is still inside. The
+// mechanisms have nothing in common; the outcome does.
+//
+// On Windows the ordinary exit is ExitProcess: it kills the other threads first
+// and then runs the detach handler of every loaded DLL under the loader lock,
+// and GStreamer, WASAPI, D3D11 and COM are all in that set. A detach handler
+// that takes a lock the killed thread was holding deadlocks, and the process
+// never dies.
+//
+// On macOS the ordinary exit is exit(3), which runs the atexit handlers and the
+// C++ static destructors — MEASURED, on os.Exit and on syscall.Exit alike, and
+// measured also to run them while every other thread is STILL RUNNING rather
+// than after killing them as Windows does. The hooks are not hypothetical: with
+// atexit interposed, creating srtsink registers libsrt's global destructors,
+// among them srt::CUDTUnited::~CUDTUnited tearing down the global socket table
+// and destroying the mutex that guards it. So the macOS shape is a race against
+// a live abandoned thread rather than a deadlock against a dead one — and it was
+// measured that a termination hook which blocks hangs the exit for ever, with no
+// timeout and nothing on the Go side able to reach it. exit_darwin.go carries
+// the full measurement.
+//
+// Neither can be made safe from here, and both fail in precisely the way being
+// fixed: a window that has gone and a process that has not. So when something
+// has been abandoned the teardown does not return and hope; it ends the process
+// itself, by the one call the OS in question cannot refuse. See hardExit,
+// exit_windows.go and exit_darwin.go.
 //
 // A process that will not exit is a support call, so a wedged pipeline loses the
 // race rather than the window.
@@ -350,8 +389,9 @@ const (
 	// case; the sender emits three states per failed reconnect cycle and the
 	// shortest cycle is bounded below by the seven second first rung of
 	// sender.BackoffLadder. Sixty-four is therefore about a minute of the worst
-	// combined rate, and can only fill if the WebView2 renderer has stopped
-	// reading entirely — which is exactly the case the discarding is for.
+	// combined rate, and can only fill if the webview renderer — WebView2 on
+	// Windows, WKWebView on macOS — has stopped reading entirely, which is
+	// exactly the case the discarding is for.
 	eventQueueDepth = 64
 
 	// shutdownTimeout bounds the whole ordered teardown, and the four constants
@@ -394,14 +434,15 @@ const (
 	// without making a closed window hang for the best part of a minute.
 	//
 	// That is an accepted loss, not an oversight. The window has already gone; a
-	// wslcomms.exe left in Task Manager after a match is a support call. What is
+	// wslcomms left running after a match — in Task Manager, or in Activity
+	// Monitor with its icon still in the Dock — is a support call. What is
 	// abandoned is a headphone endpoint and an SRT socket, and process exit
 	// releases both — including the M2L-X fan-out slot, which goes when the
 	// socket closes whether or not GStreamer was asked politely.
 	//
 	// None of these figures bounds the SYNCHRONOUS half of a GStreamer state
 	// change: gst_element_set_state takes no timeout and runs on the calling
-	// goroutine, so a wedged WASAPI endpoint hangs past any of this. That is what
+	// goroutine, so a wedged audio endpoint hangs past any of this. That is what
 	// the abandonment is for, and why a teardown that abandons anything ends the
 	// process itself rather than returning into an exit path that would have to
 	// step over the wedged thread. See teardown.
@@ -486,8 +527,9 @@ const (
 	//
 	// It is derived from the producer's rate. sender.BackoffCap is thirty
 	// seconds and there is no attempt limit, so a fault that cannot clear itself
-	// — the commentator's Dante endpoint unplugged, which errors wasapi2src and
-	// makes every subsequent ReplaceSink fail immediately — calls
+	// — the commentator's Dante endpoint unplugged, which errors the capture
+	// source (wasapi2src, or osxaudiosrc on macOS) and makes every subsequent
+	// ReplaceSink fail immediately — calls
 	// Opts.OnConnectError twice a minute for the rest of the match. Forwarding
 	// every one of those would put forty identical lines on the screen in the
 	// twenty minutes of a second half and bury everything else, which is the same
@@ -558,8 +600,10 @@ var errShuttingDown = errors.New("wslcomms: the application is shutting down")
 // App is the object bound to the frontend. One instance exists for the life of
 // the process.
 type App struct {
-	// appDir is the directory holding wslcomms.exe, already symlink-resolved by
-	// main. It is where the bundled GStreamer and the default slate.png live.
+	// appDir is the directory holding the executable, already symlink-resolved by
+	// main: the installation directory on Windows, and Contents/MacOS inside the
+	// .app on macOS. It is where the bundled GStreamer and the default slate.png
+	// live.
 	appDir string
 
 	// gstInitErr is the error from gst.Init, or nil.
@@ -577,8 +621,10 @@ type App struct {
 	//
 	// It is atomic because it is written on one goroutine and read on another:
 	// Wails calls OnStartup on the main thread, and calls
-	// OnSecondInstanceLaunch on the goroutine serving the single-instance named
-	// pipe. Those are unordered with respect to each other — a second launch
+	// OnSecondInstanceLaunch off the single-instance handover — the goroutine
+	// serving the named pipe on Windows, and on macOS a goroutine draining the
+	// buffer an NSDistributedNotificationCenter observer writes to. Those are
+	// unordered with respect to each other on both platforms — a second launch
 	// during startup is unlikely but entirely possible — so a plain field would
 	// be a data race, and one the race detector cannot catch here because it
 	// needs cgo (Gate B).
@@ -593,7 +639,8 @@ type App struct {
 	// events decouples both event producers from the renderer.
 	events *eventPump
 
-	// store is Windows Credential Manager, wrapped by app_presets.go's
+	// store is the OS credential store — Windows Credential Manager, or the login
+	// Keychain on macOS; internal/secrets picks — wrapped by app_presets.go's
 	// scopedStore so that every read and write resolves through the ACTIVE
 	// credential scope. It is stateless and needs no shutdown.
 	store secrets.Store
@@ -639,7 +686,7 @@ type App struct {
 
 	// sessMu guards session and is held for the whole of Start and Stop, so a
 	// Start cannot begin while a Stop is still taking the previous pipeline to
-	// NULL. Two pipelines contending for one WASAPI endpoint is the failure
+	// NULL. Two pipelines contending for one capture device is the failure
 	// that would cause.
 	sessMu  sync.Mutex
 	session *session
@@ -673,7 +720,7 @@ type App struct {
 	// mixMu alongside mixCtl. It is the arm-OWNERSHIP gate: a SendMixerCommands
 	// from any other seat is refused with mixer.ErrDisarmed, so with two
 	// controllers one operator's arm cannot silently authorise the other's write
-	// to the live clean feed. The local WebView2 seat arms as localClientID; a
+	// to the live clean feed. The local webview seat arms as localClientID; a
 	// remote seat arms as its per-connection id. Empty when nothing is armed;
 	// cleared by closeMixerController. See app_mixer.go and app_remote.go.
 	mixArmedBy string
@@ -721,7 +768,7 @@ type App struct {
 	// It is a THIRD subsystem lock, not a reuse of retMu, for the reason that
 	// made retMu a second lock rather than a reuse of sessMu: the picture and the
 	// audio return reach different hardware — a GPU decoder and a window against
-	// a WASAPI endpoint — and either can wedge without the other. One lock over
+	// an audio endpoint — and either can wedge without the other. One lock over
 	// both would mean a StartPicture waiting on a wedged headphone endpoint.
 	picMu sync.Mutex
 
@@ -741,13 +788,15 @@ type App struct {
 	//
 	// Nothing held under it may block. Every gst.PictureOverlay method records
 	// and posts; see overlay_windows.go's header for why that is the property the
-	// whole design rests on.
+	// whole design rests on, and overlay_darwin.go for the same property upheld
+	// by a different rule — every Cocoa call must be made on the main thread, so
+	// the darwin overlay dispatches rather than blocking here too.
 	picViewMu sync.Mutex
 
 	// picOverlay is the native child window the picture is rendered into, or nil
 	// before the first layout call. It OUTLIVES pic: the monitor is rebuilt
 	// whenever the configuration changes, and a window destroyed and recreated
-	// underneath a running WebView2 is a z-order fight with nothing to gain. Only
+	// underneath a running webview is a z-order fight with nothing to gain. Only
 	// teardown destroys it.
 	picOverlay gst.PictureOverlay
 
@@ -838,18 +887,32 @@ type App struct {
 // forceExit ends this process immediately, and is the one thing in the
 // application that is allowed to.
 //
-// The default is os.Exit, which is what any Go program does when main returns.
-// exit_windows.go replaces it with TerminateProcess on the platform this
-// application actually ships on, and the difference is the whole reason this is
-// a variable: os.Exit is ExitProcess, which terminates the other threads and
-// then runs the detach handler of every loaded DLL under the loader lock. This
-// is only ever reached with a GStreamer thread abandoned mid-state-change, and
-// GStreamer, WASAPI and COM are all in that set of DLLs. TerminateProcess runs
-// none of it and cannot be blocked by any of it.
+// The value here is the FALLBACK, not the shipped behaviour. os.Exit is what any
+// Go program does when main returns, and it is exactly what must not happen on
+// either platform this application ships on: it is the exit that the media
+// libraries get to run code inside, and this variable is only ever called with a
+// GStreamer thread abandoned mid-state-change. Each shipping platform replaces
+// it in an init:
+//
+//	exit_windows.go   TerminateProcess, which skips DLL_PROCESS_DETACH
+//	exit_darwin.go    SIGKILL to self, which skips atexit and static destructors
+//
+// Both files carry the reasoning and, for macOS, the measurements. A variable
+// rather than a build-tagged function so that a test can watch the decision
+// being made without the test binary being the thing that dies.
+//
+// It stays os.Exit on any other platform, which today means a developer's Linux
+// checkout and nothing that ships. That is the honest default: os.Exit at least
+// ends the process in every case the hard exit is NOT for, and inventing an
+// exit_other.go to look symmetrical would be asserting knowledge about a
+// platform nobody has measured this on.
 //
 // The status is zero because the operator asked the application to close and it
 // closed. What could not be stopped on the way out is a log line, not a failed
 // run — and a GUI process's exit status is not read by anything here anyway.
+// (On macOS not even that survives: SIGKILL means the process is reported as
+// signalled rather than as having exited zero. exit_darwin.go says why that is
+// an acceptable price and why it produces no crash report.)
 var forceExit = func() { os.Exit(0) }
 
 // hardExit ends the process. See forceExit and teardown.
@@ -888,7 +951,7 @@ func NewApp(appDir string, gstInitErr error) *App {
 		lastPicture: gst.PictureStateStopped,
 		exitProcess: forceExit,
 	}
-	// Credential Manager is reached ONLY through the scope decorator, installed
+	// The credential store is reached ONLY through the scope decorator, installed
 	// once, here — never at the call sites. That is what keeps the four
 	// credential read sites (two of them in WP-P's and WP-R's files) untouched
 	// by the instance-preset feature: they keep passing the three bare keys,
@@ -945,7 +1008,7 @@ func (a *App) startup(ctx context.Context) {
 	// on this launch, and a fresh machine must find all seven in the picker.
 	a.seedBuiltinPresets()
 
-	// The active-preset record decides WHICH Credential Manager entries the
+	// The active-preset record decides WHICH credential-store entries the
 	// control plane signs in with, so it must be read BEFORE startControlPlane
 	// — the sign-in loop reads the M2L-X password immediately, and a scope set
 	// late means the first sign-in of every launch consults the wrong vault
@@ -1026,9 +1089,20 @@ func (a *App) domReady(ctx context.Context) {
 // the session: the feed this process is carrying is the one on air, and a second
 // launch is not a request to interrupt it.
 //
+// Both calls do the right thing on macOS as well as on Windows, which is not
+// something to take on trust from the names: Wails' darwin Show is
+// makeKeyAndOrderFront followed by activateIgnoringOtherApps:YES, so the app is
+// raised above whatever the commentator had in front of it rather than merely
+// unhidden behind it. What differs is the ROUTE here. On Windows this callback
+// arrives on the goroutine serving the single-instance named pipe; on macOS the
+// second process posts an NSDistributedNotification, which the first process's
+// AppDelegate receives on the Cocoa main thread and hands to Go. Either way it
+// is unordered with respect to startup, which is what the a.ctx atomic and the
+// !ok branch below are for.
+//
 // The launch arguments are ignored. wslcomms takes none — it is started from a
-// desktop shortcut with no parameters (specification section 1) — so there is
-// nothing in them to act on.
+// desktop shortcut or from the Dock with no parameters (specification section 1)
+// — so there is nothing in them to act on.
 func (a *App) secondInstanceLaunched(_ options.SecondInstanceData) {
 	ctx, ok := a.runtimeContext()
 	if !ok {
@@ -1074,8 +1148,8 @@ func (a *App) shutdown(_ context.Context) {
 // of the shutdown; shutdownTimeout is the backstop over the lot.
 //
 // If anything WAS abandoned, this does not return. The window has already gone,
-// a thread is unaccounted for, and a wslcomms.exe left in Task Manager after a
-// match is a support call — so the process is ended here rather than handed to
+// a thread is unaccounted for, and a wslcomms left running after a match is a
+// support call — so the process is ended here rather than handed to
 // an exit path that would have to step over that thread. See the file comment
 // and hardExit.
 func (a *App) teardown() {
@@ -1140,7 +1214,7 @@ func (a *App) teardownOrdered() int {
 	})
 
 	// The return monitor after the sender, never before it. Both release a
-	// WASAPI endpoint and an SRT socket, and if the whole sequence overruns the
+	// audio endpoint and an SRT socket, and if the whole sequence overruns the
 	// process exits regardless — so the one that must already have finished is
 	// the contribution path.
 	step("the return monitor", returnStopBudget, func() error {
@@ -1202,12 +1276,15 @@ func (a *App) teardownOrdered() int {
 // gst.PictureOverlay.Close is bounded: at gst's overlayCloseBudget it stops
 // waiting for its message thread, says so, and RETURNS. Scoring that as a
 // finished step is how the abandoned-thread count stays at zero, hardExit is
-// never called, and the process leaves through ExitProcess — which terminates
-// that thread wherever it is (inside user32!DestroyWindow, or gstd3d11's
-// subclass procedure) and then runs DLL_PROCESS_DETACH over the wreckage under
-// the loader lock with GStreamer, WASAPI, D3D11 and COM all loaded. That is the
-// shutdown hang exit_windows.go exists to prevent, arriving through the one
-// door that used to be unwatched.
+// never called, and the process leaves through the ordinary exit with a thread
+// still unaccounted for — which on Windows means ExitProcess terminating that
+// thread wherever it is (inside user32!DestroyWindow, or gstd3d11's subclass
+// procedure) and then running DLL_PROCESS_DETACH over the wreckage under the
+// loader lock with GStreamer, WASAPI, D3D11 and COM all loaded, and on macOS
+// means exit(3) running libsrt's and GObject's atexit handlers ALONGSIDE that
+// still-running thread. Those are the two shutdown hangs exit_windows.go and
+// exit_darwin.go exist to prevent, arriving through the one door that used to be
+// unwatched.
 //
 // So a step that comes back wrapping gst.ErrAbandonedThread is NOT finished.
 // The picture is the first subsystem whose Close returns on a hang rather than
@@ -1227,8 +1304,8 @@ func teardownStep(what string, budget time.Duration, stop func() error) (finishe
 		}
 		if errors.Is(err, gst.ErrAbandonedThread) {
 			log.Printf("wslcomms: %s returned, but it ABANDONED a thread rather than joining it. "+
-				"Counting the step as unfinished: the process must end by TerminateProcess rather "+
-				"than run a DLL detach over a thread that was killed mid-call", what)
+				"Counting the step as unfinished: the process must end by the hard exit rather than "+
+				"run the media libraries' own termination hooks over a thread it cannot account for", what)
 			return false
 		}
 		return true
@@ -1244,8 +1321,18 @@ func teardownStep(what string, budget time.Duration, stop func() error) (finishe
 // ---------------------------------------------------------------------------
 
 // ListInputDevices returns the audio capture endpoints for the commentary input
-// dropdown. Device.ID is the IMMDevice endpoint GUID and is what SaveConfig must
-// be given; Device.Name is for display only.
+// dropdown. Device.ID is what SaveConfig must be given; Device.Name is for
+// display only.
+//
+// Device.ID is an OPAQUE STRING to everything above internal/gst, and that is
+// the contract rather than an implementation detail, because what is in it
+// differs by platform: a WASAPI IMMDevice endpoint GUID on Windows, a CoreAudio
+// device UID on macOS. Both are stable across reboots and replugs, which is the
+// only property config.json depends on. Nothing here, in the frontend, or in
+// config may parse it, pattern-match it or assume a shape — preflightAudioDevice
+// is the single place that inspects one, it does so through internal/gst's own
+// classifiers rather than by reading the string, and its comment sets out which
+// half of that knowledge is Windows-only and why it stays.
 func (a *App) ListInputDevices() ([]gst.Device, error) {
 	if a.gstInitErr != nil {
 		return nil, a.gstInitErr
@@ -1317,10 +1404,10 @@ type configEvent struct {
 	Origin string         `json:"origin"`
 }
 
-// SetSecret writes one of the three Credential Manager secrets from the
+// SetSecret writes one of the three OS credential-store secrets from the
 // Settings screen. key is secrets.KeyM2LX, secrets.KeySRT (the SEND path's SRT
 // passphrase) or secrets.KeySRTReturn (the RETURN path's). There is deliberately
-// no getter: a secret goes into Credential Manager and never comes back out
+// no getter: a secret goes into the credential store and never comes back out
 // across this boundary.
 //
 // The two SRT passphrases are separate keys because encryption on M2L-X is set
@@ -1382,7 +1469,7 @@ func (a *App) startSession() error {
 	defer a.sessMu.Unlock()
 
 	if a.closing.Load() {
-		// The window is going away. Building a pipeline now would open the WASAPI
+		// The window is going away. Building a pipeline now would open the audio
 		// endpoint and an SRT socket that teardown has already walked past, and
 		// the process would exit still holding them.
 		return errShuttingDown
@@ -1499,7 +1586,7 @@ func (a *App) startSession() error {
 //
 // It holds sessMu for its whole duration, including the blocking wait inside
 // sender.Stop, so that a Start racing it cannot open a second pipeline on the
-// same WASAPI endpoint. By the time it returns, the pipeline is at NULL,
+// same capture device. By the time it returns, the pipeline is at NULL,
 // sender.StateStopped has been emitted and the forwarding goroutine has exited.
 //
 // A Stop that lands after the sender stopped ITSELF — gst.ErrPipelineFatal,
@@ -1555,8 +1642,8 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 	if client.Token() == "" {
 		return kvs.Credentials{}, fmt.Errorf(
 			"wslcomms: cannot fetch monitor credentials: not signed in to M2L-X at %q yet — "+
-				"check the alias and the password stored in Windows Credential Manager under %q",
-			cfg.M2LXHost, secrets.TargetM2LX)
+				"check the alias and the password stored in %s under %q",
+			cfg.M2LXHost, secrets.StoreName(), secrets.TargetM2LX)
 	}
 
 	ctx, cancel := context.WithTimeout(a.rootCtx, kvsFetchTimeout)
@@ -1581,7 +1668,7 @@ func (a *App) GetKVSCredentials() (kvs.Credentials, error) {
 //     Settings field, since nothing downstream can be tried until it is set.
 //   - a client with no bearer token means sign-in has not succeeded (wrong
 //     alias, wrong password, or the instance unreachable at start-up); point at
-//     the alias and the password in Credential Manager under secrets.TargetM2LX,
+//     the alias and the password in the credential store under secrets.TargetM2LX,
 //     the same place GetKVSCredentials points, because it is the same fix.
 //
 // The call is bounded by kvsFetchTimeout off a.rootCtx — the events overview is
@@ -1602,8 +1689,8 @@ func (a *App) ListEvents() ([]m2lx.Event, error) {
 	if client.Token() == "" {
 		return nil, fmt.Errorf(
 			"wslcomms: cannot list events: not signed in to M2L-X at %q yet — "+
-				"check the alias and the password stored in Windows Credential Manager under %q",
-			cfg.M2LXHost, secrets.TargetM2LX)
+				"check the alias and the password stored in %s under %q",
+			cfg.M2LXHost, secrets.StoreName(), secrets.TargetM2LX)
 	}
 
 	ctx, cancel := context.WithTimeout(a.rootCtx, kvsFetchTimeout)
@@ -1671,6 +1758,26 @@ func (a *App) newSender(pipe gst.Pipeline) sender.Sender {
 // NDI endpoints come and go with their sources, and a config.json copied from
 // another machine carries ids that were never here at all.
 //
+// # WHICH HALF OF THIS IS WINDOWS KNOWLEDGE, AND WHY IT STILL EARNS ITS PLACE
+//
+// Check (i) is Windows-only in effect and that is by design rather than by
+// omission. gst.IsRenderEndpointID classifies WASAPI endpoint GUIDs by their
+// namespace prefix, and no CoreAudio identity — "BuiltInMicrophoneDevice", a
+// UUID, an NDI name — matches either prefix, so on macOS the classifier simply
+// returns false and this branch never fires. That degrades safely: the check
+// asserts POSITIVE knowledge and macOS gives it none, so it stands aside rather
+// than guessing. It is deliberately NOT deleted, for two reasons. It is correct,
+// tested knowledge about the platform this application still ships on; and a
+// config.json copied from a commentator's Windows machine to a Mac carries
+// exactly those GUIDs, so the branch fires on macOS precisely when the message
+// it prints — "this is a Windows PLAYBACK endpoint" — is the literal truth about
+// what is in the file.
+//
+// Check (ii) needs no platform knowledge at all: it asks ListInputDevices what
+// is actually here. That is what catches a Windows id on a Mac, a Mac UID on a
+// Windows box, and a device that has been unplugged, in one test on both
+// platforms.
+//
 // # Why enumeration failure does NOT refuse
 //
 // Step (ii) is advisory: if ListInputDevices errors, or returns nothing, the
@@ -1685,12 +1792,23 @@ func (a *App) newSender(pipe gst.Pipeline) sender.Sender {
 // The presence test compares ids case-insensitively, matching the classifiers
 // in internal/gst/device_id.go: GUID casing is not stable across the APIs that
 // print these ids, and refusing a working device over casing would be this
-// function causing the outage it exists to prevent.
+// function causing the outage it exists to prevent. That reasoning is a Windows
+// one and the comparison stays case-insensitive on macOS anyway, which is a
+// judgement rather than a measurement: a CoreAudio UID is case-SENSITIVE in
+// principle, so two devices whose UIDs differed only in case would fold
+// together here. Against that, the cost of being wrong in the other direction is
+// a commentator who cannot start. Two CoreAudio UIDs differing only in case has
+// never been observed; a saved id that will not match is an outage.
 func (a *App) preflightAudioDevice(id string) error {
 	if gst.IsRenderEndpointID(id) {
 		// Positively a playback endpoint. Refused, never opened, and never
 		// "made to work" via wasapi2's loopback mode — loopback would put the
 		// operator's own monitor mix on air (echo and feedback on a live feed).
+		//
+		// Reachable on macOS, and the message stays literally true when it is:
+		// the only way a CoreAudio machine gets here is a config.json carried
+		// over from Windows, in which case the saved id really is a Windows
+		// playback endpoint and saying so is the fastest route to the fix.
 		return fmt.Errorf(
 			"wslcomms: cannot start: the saved commentary input %s is a Windows PLAYBACK endpoint, "+
 				"not a microphone — capture endpoints begin %s and this one begins %s. Choose a device "+
@@ -1725,7 +1843,7 @@ func (a *App) preflightAudioDevice(id string) error {
 }
 
 // senderOpts builds the options for one session from a configuration snapshot
-// and the passphrase already read from Credential Manager.
+// and the passphrase already read from the credential store.
 //
 // It is separate from Start so that what the sender is actually given can be
 // asserted without running a session — including the one field with behaviour
@@ -1782,10 +1900,10 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 // The sender retries forever by design, and without this the reason each
 // attempt failed is discarded. That is fine for a peer that has gone away for
 // ten seconds and comes back. It is not fine for a fault that cannot clear
-// itself:
-// unplug the commentator's Dante endpoint and wasapi2src errors, every
-// subsequent gst.Pipeline.ReplaceSink fails immediately, and the operator has an
-// amber SENDING lamp and nothing else for the rest of the match. The lamp says
+// itself: unplug the commentator's Dante endpoint and the capture source errors
+// — wasapi2src on Windows, osxaudiosrc on macOS — every subsequent
+// gst.Pipeline.ReplaceSink fails immediately, and the operator has an amber
+// SENDING lamp and nothing else for the rest of the match. The lamp says
 // "connecting" when the truthful answer is "your audio device is gone".
 //
 // # The terminal branch: gst.ErrPipelineFatal
@@ -1971,9 +2089,12 @@ func controlPlaneChanged(previous, next *config.Config) bool {
 //
 // The documented default is the bare filename slate.png
 // (config.DefaultSlateFilename), which the installer lays down beside
-// wslcomms.exe (specification section 11). An absolute path is taken as given,
-// so an operator can point the app at a different slate without moving it into
-// Program Files.
+// wslcomms.exe on Windows (specification section 11) and which the bundle
+// carries in Contents/MacOS on macOS. An absolute path is taken as given, so an
+// operator can point the app at a different slate without writing inside
+// Program Files or inside a signed .app — and on macOS writing inside the bundle
+// would break its signature and its notarisation, so the absolute path is the
+// only way there.
 func (a *App) slatePath(cfg *config.Config) string {
 	p := cfg.SlatePath
 	if p == "" {
@@ -1985,8 +2106,8 @@ func (a *App) slatePath(cfg *config.Config) string {
 	return filepath.Join(a.appDir, p)
 }
 
-// srtPassphrase reads the SRT passphrase from Credential Manager and checks it
-// against the configured pbkeylen.
+// srtPassphrase reads the SRT passphrase from the OS credential store and checks
+// it against the configured pbkeylen.
 //
 // A missing passphrase is a normal first-run condition and means an unencrypted
 // session — which is legitimate, because whether M2L-X's commentary input has a
@@ -2006,9 +2127,9 @@ func (a *App) srtPassphrase(cfg *config.Config) (string, error) {
 		if cfg.PBKeyLen != 0 {
 			return "", fmt.Errorf(
 				"wslcomms: cannot start: pbkeylen is %d, which asks for an encrypted SRT session, "+
-					"but no passphrase is stored in Windows Credential Manager under %q — "+
+					"but no passphrase is stored in %s under %q — "+
 					"enter it on the Settings screen, or set pbkeylen to 0 for an unencrypted session",
-				cfg.PBKeyLen, secrets.TargetSRT)
+				cfg.PBKeyLen, secrets.StoreName(), secrets.TargetSRT)
 		}
 		return "", nil
 	case err != nil:
@@ -2257,8 +2378,8 @@ func (a *App) signInLoop(ctx context.Context, client m2lx.Client, alias string) 
 	switch {
 	case errors.Is(err, secrets.ErrNotFound):
 		a.emitError(fmt.Errorf(
-			"wslcomms: no M2L-X password is stored in Windows Credential Manager under %q — "+
-				"enter it on the Settings screen", secrets.TargetM2LX))
+			"wslcomms: no M2L-X password is stored in %s under %q — "+
+				"enter it on the Settings screen", secrets.StoreName(), secrets.TargetM2LX))
 		return
 	case err != nil:
 		a.emitError(fmt.Errorf("wslcomms: reading the M2L-X password from %q: %w", secrets.TargetM2LX, err))
@@ -2410,7 +2531,7 @@ func (a *App) forwardSenderStates(states <-chan sender.State) {
 // Callers must be sure err carries no secret. Nothing that reaches here does:
 // internal/m2lx keeps the password and bearer token out of its error strings by
 // construction, internal/secrets reports only target names, and srtPassphrase
-// names the Credential Manager target rather than its contents.
+// names the credential-store target rather than its contents.
 func (a *App) emitError(err error) {
 	if err == nil {
 		return
@@ -2429,7 +2550,7 @@ type pumpEvent struct {
 	data any
 }
 
-// eventPump carries events from their producers to the WebView2 renderer
+// eventPump carries events from their producers to the webview renderer
 // without ever letting the renderer stall a producer.
 //
 // Both producers are on paths that must not be blocked. The status watcher
@@ -2448,7 +2569,7 @@ type eventPump struct {
 
 	// startOnce keeps there being exactly one consumer of ch. OnDomReady fires
 	// again after a page reload — routine under `wails dev`, and reachable in
-	// production through the WebView2 keyboard shortcuts — and two consumers
+	// production through the webview's own keyboard shortcuts — and two consumers
 	// would split the queue between them, so each event would reach the page
 	// once but the ordering between them would no longer hold.
 	startOnce sync.Once

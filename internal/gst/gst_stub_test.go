@@ -498,6 +498,24 @@ const cgoSourceFile = "gst_cgo.go"
 // contractSourceFile is the frozen interface file the guards check against.
 const contractSourceFile = "gst.go"
 
+// The per-platform halves of gst_cgo.go, added by the macOS port.
+//
+// Reading them here is not optional politeness. Several of the guards below
+// were written when all of this knowledge lived in one file, and the code they
+// guard has MOVED — the wasapi2 loopback filter and the endpoint-id namespace
+// checks now sit in deviceprovider_windows.go, and the capture source and AAC
+// encoder factory names in elements_windows.go / elements_darwin.go. A guard
+// that kept reading only gst_cgo.go would have gone quietly green while
+// checking nothing at all, which is the one failure mode a source guard must
+// not have. Parsing is by filename and ignores build tags, so every guard below
+// checks BOTH ports from whichever host Gate A runs on.
+const (
+	windowsProviderSourceFile = "deviceprovider_windows.go"
+	darwinProviderSourceFile  = "deviceprovider_darwin.go"
+	windowsElementsSourceFile = "elements_windows.go"
+	darwinElementsSourceFile  = "elements_darwin.go"
+)
+
 // parseSource parses one file of this package WITHOUT comments, so that the
 // rendered function bodies the guards search contain code only. A comment that
 // discusses `p.route.Store(nil)` must not be able to satisfy a guard looking
@@ -838,21 +856,175 @@ func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
 // and an operator selected one. The fix is two checks, and both must stay:
 // the loopback property (read through the propLoopback const) and the
 // endpoint-id namespace classifier in device_id.go.
+//
+// THE ASSERTIONS ARE UNCHANGED; ONLY THE FUNCTION THEY READ HAS MOVED, and that
+// move is the whole macOS port in miniature. The three checks are Windows
+// knowledge — macOS publishes no device.api, has no loopback republication, and
+// has no id namespaces — so applying them on macOS skipped every device and
+// returned an EMPTY dropdown, which is the bug the port started from. They now
+// live in captureDeviceID in deviceprovider_windows.go, which ListInputDevices
+// calls; the guard follows them there rather than being weakened to match a
+// function that no longer contains them.
 func TestListInputDevicesFiltersLoopbackAndRenderIDs(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "ListInputDevices")
+	fset, file := parseSource(t, windowsProviderSourceFile)
+	body := funcBody(t, fset, file, "", "captureDeviceID")
 
 	if !strings.Contains(body, "propLoopback") {
-		t.Error("ListInputDevices no longer reads the wasapi2.device.loopback property; " +
+		t.Error("the Windows captureDeviceID no longer reads the wasapi2.device.loopback property; " +
 			"every playback endpoint's loopback republication is back in the input dropdown")
 	}
 	if !strings.Contains(body, "IsRenderEndpointID(") {
-		t.Error("ListInputDevices no longer refuses render-namespace endpoint ids; a playback " +
-			"endpoint that loses its loopback marker would be offered as a commentary input")
+		t.Error("the Windows captureDeviceID no longer refuses render-namespace endpoint ids; a " +
+			"playback endpoint that loses its loopback marker would be offered as a commentary input")
 	}
 	if !strings.Contains(body, "IsCaptureEndpointID(") {
-		t.Error("ListInputDevices no longer consults IsCaptureEndpointID; the warning for " +
-			"unrecognised id shapes — the asymmetry's other half — has been lost")
+		t.Error("the Windows captureDeviceID no longer consults IsCaptureEndpointID; the warning " +
+			"for unrecognised id shapes — the asymmetry's other half — has been lost")
+	}
+	if !strings.Contains(body, `props.GetString("device.api")`) {
+		t.Error("the Windows captureDeviceID no longer checks device.api; devices from another " +
+			"provider would be offered under ids wasapi2src cannot open")
+	}
+
+	// The other half of the same statement: ListInputDevices must be the
+	// platform-NEUTRAL caller. If any of this leaks back into it, macOS breaks
+	// again in exactly the original way.
+	fset, file = parseSource(t, cgoSourceFile)
+	shared := funcBody(t, fset, file, "", "ListInputDevices")
+	if !strings.Contains(shared, "captureDeviceID(") {
+		t.Fatal("ListInputDevices no longer goes through the captureDeviceID seam")
+	}
+	for _, leaked := range []string{"propLoopback", "device.api", "IsRenderEndpointID(", "IsCaptureEndpointID("} {
+		if strings.Contains(shared, leaked) {
+			t.Errorf("ListInputDevices names %s directly. That is Windows knowledge in the shared "+
+				"enumeration path: on macOS there is no device.api property, no loopback "+
+				"republication and no id namespace, so this is how the dropdown came to be empty "+
+				"there in the first place", leaked)
+		}
+	}
+}
+
+// TestDarwinCaptureIDsAreResolvedNotPersisted is the guard on the single most
+// important structural difference in the macOS port, and the one thing in it a
+// well-meaning future reader is most likely to "simplify" away.
+//
+// The persisted id and the id the element accepts are DIFFERENT THINGS on
+// macOS. CoreAudio's unique-id ("BuiltInMicrophoneDevice") is a stable identity
+// and is what reaches config.json. osxaudiosrc's device property is a gint
+// AudioDeviceID — a runtime handle coreaudiod reassigns on every enumeration,
+// on every reboot, on every replug. Storing the integer works perfectly until
+// the operator restarts their Mac, after which the saved number names a
+// different device, or nothing — and osxaudiosrc's default of 0 means "the
+// system default input". The feed then carries the wrong microphone with every
+// indicator green and no error anywhere. So:
+//
+//   - captureDeviceID must return the unique-id PROPERTY and must not go
+//     anywhere near CreateElement, which is where the integer comes from;
+//   - configureCaptureSource must resolve, and must set the property with the
+//     typed integer setter rather than the string one.
+func TestDarwinCaptureIDsAreResolvedNotPersisted(t *testing.T) {
+	fset, file := parseSource(t, darwinProviderSourceFile)
+
+	enumerate := funcBody(t, fset, file, "", "captureDeviceID")
+	if !strings.Contains(enumerate, "propUniqueID") {
+		t.Error("the darwin captureDeviceID no longer reads the unique-id property; there is " +
+			"nothing else on a macOS device that is stable enough to persist")
+	}
+	if strings.Contains(enumerate, "CreateElement(") {
+		t.Fatal("the darwin captureDeviceID calls CreateElement, which is where the gint " +
+			"AudioDeviceID comes from. If that integer is what reaches Device.ID then it is what " +
+			"reaches config.json, and after the operator's next reboot it names a different device " +
+			"— or nothing, in which case osxaudiosrc falls back to the system default input and " +
+			"the commentary feed is silently the wrong microphone")
+	}
+
+	configure := funcBody(t, fset, file, "", "configureCaptureSource")
+	if !strings.Contains(configure, "resolveCaptureDeviceIndex(") {
+		t.Fatal("configureCaptureSource no longer resolves the unique-id to the current " +
+			"AudioDeviceID against a fresh enumeration; see the file comment in " +
+			darwinProviderSourceFile)
+	}
+	if !strings.Contains(configure, `setIntProperty(src, "device"`) {
+		t.Error(`configureCaptureSource does not set device with setIntProperty. osxaudiosrc's ` +
+			`device property is a gint; setStringProperty would emit a GLib CRITICAL nobody reads ` +
+			`and leave the property at 0, which CoreAudio reads as "the system default input"`)
+	}
+
+	// The resolution must fail rather than fall back. A default-device fallback
+	// is the silent wrong-device failure by another name.
+	resolve := funcBody(t, fset, file, "", "resolveCoreAudioDeviceIndex")
+	if !strings.Contains(resolve, "enumerateDevices(") {
+		t.Error("resolveCoreAudioDeviceIndex does not re-enumerate; a cached AudioDeviceID is " +
+			"exactly the stale handle this whole mechanism exists to avoid")
+	}
+	if !strings.Contains(resolve, "return 0, fmt.Errorf(") {
+		t.Error("resolveCoreAudioDeviceIndex never returns an error. A device that has gone away " +
+			"must be a hard, loud failure — falling back to the default device is how a match is " +
+			"commentated down the wrong microphone")
+	}
+}
+
+// TestPlatformElementContractIsPinned checks the two factory names that the
+// send pipeline swaps per platform, in both files, by exact value.
+//
+// pipelineDescription builds the audio branch out of captureSourceFactory and
+// aacEncoderFactory rather than literals, which makes the ordering guards below
+// portable — and makes it possible to repoint either port at a different
+// element by editing one const, with nothing else in the package noticing. This
+// is what stops that being a silent change.
+//
+// aacEncoderFactory is the one that carries a licence consequence.
+// build/licenses/NOTICE.txt section G says this product ships no third-party
+// AAC implementation because AAC-LC encoding is done by the operating system's
+// own encoder. mfaacenc (Media Foundation) and atenc (AudioToolbox) are both
+// exactly that. fdkaacenc, faac, voaacenc and avenc_aac are not, and any of
+// them appearing here would make that sentence false without anybody noticing
+// until a licence review.
+func TestPlatformElementContractIsPinned(t *testing.T) {
+	want := map[string]map[string]string{
+		windowsElementsSourceFile: {
+			"captureSourceFactory": "wasapi2src",
+			"aacEncoderFactory":    "mfaacenc",
+		},
+		darwinElementsSourceFile: {
+			"captureSourceFactory": "osxaudiosrc",
+			"aacEncoderFactory":    "atenc",
+		},
+	}
+	for filename, consts := range want {
+		_, file := parseSource(t, filename)
+		found := map[string]string{}
+		ast.Inspect(file, func(n ast.Node) bool {
+			spec, ok := n.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			for i, name := range spec.Names {
+				if _, wanted := consts[name.Name]; !wanted || i >= len(spec.Values) {
+					continue
+				}
+				if lit, ok := spec.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					found[name.Name] = strings.Trim(lit.Value, `"`)
+				}
+			}
+			return true
+		})
+		for name, value := range consts {
+			if found[name] != value {
+				t.Errorf("%s: %s = %q, want %q", filename, name, found[name], value)
+			}
+		}
+	}
+
+	// And the pipeline string must actually be built from them, or pinning the
+	// consts pins nothing.
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "pipelineDescription")
+	for _, want := range []string{"captureSourceFactory", "aacEncoderFactory"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("pipelineDescription no longer uses %s; the audio branch has been hardcoded "+
+				"to one platform's element again", want)
+		}
 	}
 }
 
@@ -863,13 +1035,16 @@ func TestListInputDevicesFiltersLoopbackAndRenderIDs(t *testing.T) {
 // endpoint succeeds. It would succeed — at putting the operator's own monitor
 // mix on air, as echo or feedback on a live feed. The property must be READ
 // during enumeration (to skip the republications) and never SET anywhere.
+// The scan now covers the Windows device provider as well as gst_cgo.go, because
+// that is where the const and the only legitimate read of it moved to. Scanning
+// only the old file would have left the setter rule unenforced in precisely the
+// file most likely to break it.
 func TestLoopbackIsNeverSetInTheCgoSource(t *testing.T) {
-	_, file := parseSource(t, cgoSourceFile)
-
 	// The const must exist with the exact provider key, or the enumeration
 	// read is silently checking nothing.
+	_, provider := parseSource(t, windowsProviderSourceFile)
 	constOK := false
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(provider, func(n ast.Node) bool {
 		spec, ok := n.(*ast.ValueSpec)
 		if !ok {
 			return true
@@ -885,35 +1060,39 @@ func TestLoopbackIsNeverSetInTheCgoSource(t *testing.T) {
 		return true
 	})
 	if !constOK {
-		t.Error(`gst_cgo.go has no const propLoopback = "wasapi2.device.loopback"`)
+		t.Errorf(`%s has no const propLoopback = "wasapi2.device.loopback"`, windowsProviderSourceFile)
 	}
 
-	// No setter call anywhere in the file may name loopback, whether as a
-	// string literal or through the const.
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		callee := calleeName(call)
-		if !strings.Contains(callee, "Set") && callee != "UtilSetObjectArg" {
-			return true
-		}
-		for _, arg := range call.Args {
-			switch a := arg.(type) {
-			case *ast.BasicLit:
-				if a.Kind == token.STRING && strings.Contains(strings.ToLower(a.Value), "loopback") {
-					t.Errorf("%s is passed a loopback property name: the operator's monitor mix "+
-						"would go on air", callee)
-				}
-			case *ast.Ident:
-				if a.Name == "propLoopback" {
-					t.Errorf("%s is passed propLoopback: the property is read-only by design", callee)
+	// No setter call in any of the real build's source may name loopback,
+	// whether as a string literal or through the const.
+	for _, name := range []string{cgoSourceFile, windowsProviderSourceFile, darwinProviderSourceFile} {
+		_, file := parseSource(t, name)
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee := calleeName(call)
+			if !strings.Contains(callee, "Set") && callee != "UtilSetObjectArg" {
+				return true
+			}
+			for _, arg := range call.Args {
+				switch a := arg.(type) {
+				case *ast.BasicLit:
+					if a.Kind == token.STRING && strings.Contains(strings.ToLower(a.Value), "loopback") {
+						t.Errorf("%s: %s is passed a loopback property name: the operator's monitor "+
+							"mix would go on air", name, callee)
+					}
+				case *ast.Ident:
+					if a.Name == "propLoopback" {
+						t.Errorf("%s: %s is passed propLoopback: the property is read-only by design",
+							name, callee)
+					}
 				}
 			}
-		}
-		return true
-	})
+			return true
+		})
+	}
 }
 
 // calleeName returns the rightmost identifier of a call's function expression:
@@ -1062,6 +1241,62 @@ func TestInitPointsEveryPluginPathAtTheBundle(t *testing.T) {
 		if !strings.Contains(body, name) {
 			t.Errorf("doInit never sets %s; a machine-wide GStreamer install can outrank the bundle", name)
 		}
+	}
+}
+
+// TestInitResolvesTheBundleThroughThePlatformSeam pins the two questions doInit
+// must not answer for itself.
+//
+// Both were literals in doInit until the macOS port, and both are wrong on one
+// of the two platforms if they stay literals. The plugin directory is
+// <appDir>\gst\lib\gstreamer-1.0 on Windows and <App>.app/Contents/Resources/
+// gstreamer-1.0 on macOS — different not by taste but because codesign refuses
+// to sign an .app with a plain directory under Contents/Frameworks. And macOS
+// needs four more environment variables that Windows needs none of, all four
+// neutralising Homebrew paths compiled into the vendored dylibs as C strings
+// that install_name_tool cannot reach.
+//
+// The failure this guards is the quiet one. Hardcode the Windows path again and
+// macOS does not silently misbehave, it fails at Init with every element
+// missing — loud, and somebody would fix it. Drop extraInitEnv and macOS starts
+// perfectly, scans its plugins in process because the compiled-in scanner path
+// does not exist, and works right up until a plugin faults on load. That is the
+// one worth a test.
+//
+// It asserts the CALLS rather than the paths, because the paths belong to
+// gstpaths_windows.go and gstpaths_darwin.go and only one of those two files is
+// in any given build. This test runs at Gate A on both platforms and can see
+// neither of them, which is exactly why it checks the seam and not the answer.
+func TestInitResolvesTheBundleThroughThePlatformSeam(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "doInit")
+
+	if !strings.Contains(body, "bundlePluginDir(") {
+		t.Error("doInit no longer calls bundlePluginDir. If the plugin directory is spelled " +
+			"inline it is spelled for one platform, and on the other one Init reports every " +
+			"element missing")
+	}
+	if strings.Contains(body, `"gst", "lib", "gstreamer-1.0"`) {
+		t.Error(`doInit contains the literal Windows plugin path again. It belongs in ` +
+			`gstpaths_windows.go, where the macOS build cannot see it`)
+	}
+	if !strings.Contains(body, "extraInitEnv(") {
+		t.Fatal("doInit no longer calls extraInitEnv. On macOS that means GST_PLUGIN_SCANNER " +
+			"still points into /opt/homebrew, and GStreamer will scan plugins IN PROCESS with " +
+			"one warning rather than failing — measured: the registry still built, 17 plugins, " +
+			"291 features, every element resolved. It ships unnoticed and faults later")
+	}
+
+	// Order, which is the part that would be got wrong by somebody tidying up.
+	// Two of the macOS variables are read DURING the registry rebuild that
+	// gst_init performs, so setting them afterwards sets them for the next run of
+	// the application and not this one.
+	initAt := strings.Index(body, "gogst.Init()")
+	envAt := strings.Index(body, "extraInitEnv(")
+	if initAt >= 0 && envAt >= 0 && envAt > initAt {
+		t.Error("doInit calls extraInitEnv AFTER gogst.Init(). The scanner path and " +
+			"GIO_MODULE_DIR are read during the registry rebuild gst_init performs, so setting " +
+			"them afterwards configures the next run of the application rather than this one")
 	}
 }
 
@@ -1293,13 +1528,17 @@ func TestPipelineDescriptionMetersWhatIsEncoded(t *testing.T) {
 			"nothing to measure and the levels event will never fire on a real build")
 	}
 	resample := strings.Index(body, "audioconvert ! audioresample")
-	enc := strings.Index(body, "mfaacenc bitrate=")
+	// The encoder is named through aacEncoderFactory rather than as a literal
+	// since the macOS port — mfaacenc on Windows, atenc on macOS. The ORDER is
+	// what this guard is about and it is unaffected;
+	// TestPlatformElementContractIsPinned checks the two values themselves.
+	enc := strings.Index(body, `aacEncoderFactory + " bitrate="`)
 	if resample < 0 || enc < 0 {
 		t.Fatal("the audio branch has been restructured; re-derive this guard from the new shape")
 	}
 	if !(resample < level && level < enc) {
-		t.Error("the level element must sit AFTER audioresample and BEFORE mfaacenc: it exists " +
-			"to measure the exact signal that enters the encoder, not the endpoint's raw format")
+		t.Error("the level element must sit AFTER audioresample and BEFORE the AAC encoder: it " +
+			"exists to measure the exact signal that enters the encoder, not the endpoint's raw format")
 	}
 	if !strings.Contains(body, "interval=50000000") {
 		t.Error("the level interval is no longer 50 ms (50000000 ns); the app-side throttle and " +

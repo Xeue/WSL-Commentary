@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -60,6 +61,54 @@ func TestTargetNames(t *testing.T) {
 	}
 	if TargetSRTReturn != "WSLComms/srtreturn" {
 		t.Errorf("TargetSRTReturn = %q, want %q", TargetSRTReturn, "WSLComms/srtreturn")
+	}
+}
+
+// TestStoreNameNamesThisPlatformsStore pins the phrase five operator-facing
+// error messages are built from.
+//
+// It asserts the SHAPE rather than the exact wording, deliberately. The wording
+// may want improving; what may not change is that it is non-empty, that it does
+// not name the OTHER platform's facility, and that it reads as the object of a
+// preposition, because every call site says "stored in %s under %q". A store
+// name that arrives with a trailing full stop or a capital that starts a
+// sentence turns five error messages into nonsense at once, and no call site
+// would notice.
+func TestStoreNameNamesThisPlatformsStore(t *testing.T) {
+	name := StoreName()
+	if name == "" {
+		t.Fatal("StoreName() is empty: five error messages would tell the operator to look " +
+			"in nothing at all for their password")
+	}
+	if strings.TrimSpace(name) != name {
+		t.Errorf("StoreName() = %q has surrounding whitespace; it is interpolated into "+
+			`"stored in %%s under %%q"`, name)
+	}
+	if strings.HasSuffix(name, ".") {
+		t.Errorf("StoreName() = %q ends in a full stop; it is a noun phrase in the middle of a "+
+			"sentence, not a sentence", name)
+	}
+
+	// The half that actually catches the bug this exists for: a copy-paste
+	// between the two platform files. Whichever build this is, exactly one of
+	// the two facilities may be named.
+	windows := strings.Contains(name, "Credential Manager")
+	macOS := strings.Contains(name, "Keychain")
+	if windows == macOS {
+		t.Fatalf("StoreName() = %q names neither exactly one of Credential Manager and "+
+			"Keychain. On %s it must name that platform's store and no other: an operator "+
+			"sent to the wrong control panel is worse off than one sent nowhere",
+			name, runtime.GOOS)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		if !windows {
+			t.Errorf("StoreName() = %q on windows; want Windows Credential Manager", name)
+		}
+	case "darwin":
+		if !macOS {
+			t.Errorf("StoreName() = %q on darwin; want the macOS login Keychain", name)
+		}
 	}
 }
 

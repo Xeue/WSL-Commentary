@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1297,5 +1298,162 @@ func TestReturnOnConnectErrorNeverCarriesThePassphrase(t *testing.T) {
 	// different faults with different fixes.
 	if !strings.Contains(text, "aes-256") {
 		t.Fatalf("the log does not say the session was encrypted at all:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Vetting the headphone endpoint — the cross-platform config.json
+// ---------------------------------------------------------------------------
+//
+// chooseOutputDevice is where a settings file written on one operating system
+// and opened on the other is made to fail SAFE. It is pure and carries no build
+// tag, so these run in both builds and on either machine, which matters: the
+// situation they describe is by definition one where the developer is not on the
+// platform that wrote the file.
+
+// macOSHeadphones and windowsHeadphones are the two id shapes, for readability
+// below. They are written out rather than taken from a stub list because half
+// the point is that a Windows id can arrive on a Mac and the reverse.
+const (
+	macOSHeadphones   = "BuiltInSpeakerDevice"
+	windowsHeadphones = "{0.0.0.00000000}.{7a2f4b90-3d55-4c11-8f2e-9b04c7d61f83}"
+	windowsMicrophone = "{0.0.1.00000000}.{1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9}"
+)
+
+func TestChooseOutputDeviceKeepsAnIDThatIsOnOffer(t *testing.T) {
+	available := []Device{
+		{ID: macOSHeadphones, Name: "MacBook Pro Speakers"},
+		{ID: "NDIAudio", Name: "NDI Audio"},
+	}
+	id, why := chooseOutputDevice(macOSHeadphones, available, nil)
+	if id != macOSHeadphones {
+		t.Fatalf("chooseOutputDevice dropped a device that is present: got %q", id)
+	}
+	if why != "" {
+		t.Fatalf("a device that is present must produce no diagnostic, got:\n%s", why)
+	}
+}
+
+func TestChooseOutputDeviceSaysNothingWhenNothingIsConfigured(t *testing.T) {
+	// The twins each phrase "using the default device" in their own platform's
+	// words, so this function must not also say it — the operator would get the
+	// same fact twice, in two wordings, one of which mentions the wrong OS.
+	id, why := chooseOutputDevice("", []Device{{ID: macOSHeadphones}}, nil)
+	if id != "" || why != "" {
+		t.Fatalf("chooseOutputDevice(\"\") = %q, %q; want both empty", id, why)
+	}
+}
+
+// TestChooseOutputDeviceFallsBackWhenTheDeviceIsGone is the fail-safe itself.
+//
+// Not returning an error, and not passing the id through: the sink is given
+// nothing, which on both platforms means the system default, and the operator
+// gets a line that says what happened and what is on offer instead.
+func TestChooseOutputDeviceFallsBackWhenTheDeviceIsGone(t *testing.T) {
+	available := []Device{{ID: "NDIAudio", Name: "NDI Audio"}}
+	id, why := chooseOutputDevice(macOSHeadphones, available, nil)
+	if id != "" {
+		t.Fatalf("a device that is not present must not be passed to the sink; got %q", id)
+	}
+	if why == "" {
+		t.Fatal("falling back to the default device silently is the failure this exists to remove")
+	}
+	// The three things the line has to carry: what was asked for, what is there,
+	// and what is being done about it. Anything less and the operator is looking
+	// at a monitor in the wrong ears with no way to tell why.
+	for _, want := range []string{macOSHeadphones, "NDIAudio", "NDI Audio", "DEFAULT"} {
+		if !strings.Contains(why, want) {
+			t.Errorf("the diagnostic does not mention %q:\n%s", want, why)
+		}
+	}
+}
+
+// TestChooseOutputDeviceNamesAWindowsIDOnANonWindowsMachine is what turns
+// device_id.go's inertness on macOS into a diagnosis.
+//
+// No CoreAudio UID matches either Windows namespace, so a POSITIVE hit on a
+// machine that is not Windows is not a guess: that config.json was written on
+// Windows and carried across. Saying so is the difference between "your
+// headphones are not here" and "your settings file is from the other machine".
+func TestChooseOutputDeviceNamesAWindowsIDOnANonWindowsMachine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("on Windows a render-namespace id is an ordinary local id, not evidence of a " +
+			"config.json written elsewhere")
+	}
+	available := []Device{{ID: macOSHeadphones, Name: "MacBook Pro Speakers"}}
+
+	_, why := chooseOutputDevice(windowsHeadphones, available, nil)
+	if !strings.Contains(why, "Windows") {
+		t.Errorf("a Windows RENDER endpoint id on %s is not identified as one:\n%s", runtime.GOOS, why)
+	}
+
+	_, why = chooseOutputDevice(windowsMicrophone, available, nil)
+	if !strings.Contains(why, "CAPTURE") {
+		t.Errorf("a Windows CAPTURE endpoint id offered as headphones is not identified as one:\n%s", why)
+	}
+}
+
+// TestChooseOutputDeviceKeepsTheIDWhenEnumerationFAILED is the distinction that
+// is easy to lose and expensive to lose.
+//
+// "We could not check" is not "it is not there". Reading the first as the second
+// takes a working pair of headphones away from the operator over a transient
+// failure to run the device monitor — and the device monitor is exactly the
+// thing that fails transiently when an audio driver is restarting.
+func TestChooseOutputDeviceKeepsTheIDWhenEnumerationFAILED(t *testing.T) {
+	boom := errors.New("gst_device_monitor_new returned nil")
+	id, why := chooseOutputDevice(macOSHeadphones, nil, boom)
+	if id != macOSHeadphones {
+		t.Fatalf("an enumeration FAILURE dropped the configured device: got %q", id)
+	}
+	if !strings.Contains(why, boom.Error()) {
+		t.Errorf("the diagnostic does not carry the enumeration failure verbatim:\n%s", why)
+	}
+}
+
+// TestChooseOutputDeviceSurvivesAMachineWithNoPlaybackDevices covers the empty
+// list, which is a different sentence from "your device is missing" and is worth
+// its own wording: it is itself a fault.
+func TestChooseOutputDeviceSurvivesAMachineWithNoPlaybackDevices(t *testing.T) {
+	id, why := chooseOutputDevice(macOSHeadphones, nil, nil)
+	if id != "" {
+		t.Fatalf("id = %q, want the default device", id)
+	}
+	if !strings.Contains(why, "nothing at all") {
+		t.Errorf("a machine reporting no playback devices is not called out as such:\n%s", why)
+	}
+}
+
+// TestDescribeDevicesRendersNamesAndIDs pins both halves of the list.
+//
+// A name alone cannot be matched against config.json and an id alone cannot be
+// matched against the dropdown the operator is looking at, so the line has to
+// carry both or it helps with neither of the two things it is read for.
+func TestDescribeDevicesRendersNamesAndIDs(t *testing.T) {
+	got := describeDevices([]Device{{ID: "NDIAudio", Name: "NDI Audio"}})
+	if !strings.Contains(got, "NDIAudio") || !strings.Contains(got, "NDI Audio") {
+		t.Fatalf("describeDevices = %q; it must carry both the id and the display name", got)
+	}
+}
+
+// TestVetOutputDeviceIDGoesThroughTheLiveDeviceList checks the wiring rather
+// than the rule: that the vet actually consults ListOutputDevices, and that an
+// id the enumeration does offer survives it.
+//
+// It takes the first offered device rather than a literal, so it is true of the
+// stub list at Gate A and of a real machine's at Gate B. A machine offering no
+// playback devices at all — or one where Init has not been called, which is
+// every Gate B unit test — has nothing to prove here and skips.
+func TestVetOutputDeviceIDGoesThroughTheLiveDeviceList(t *testing.T) {
+	devices, err := ListOutputDevices()
+	if err != nil || len(devices) == 0 {
+		t.Skip("no playback devices are enumerable in this build; nothing to vet against")
+	}
+	if got := vetOutputDeviceID(devices[0].ID); got != devices[0].ID {
+		t.Fatalf("vetOutputDeviceID dropped %q, which the enumeration is offering", devices[0].ID)
+	}
+	if got := vetOutputDeviceID("wslcomms-no-such-device"); got != "" {
+		t.Fatalf("vetOutputDeviceID passed an absent device through as %q; the sink must be left "+
+			"on the platform default instead", got)
 	}
 }

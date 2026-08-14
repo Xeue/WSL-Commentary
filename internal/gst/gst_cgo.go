@@ -277,7 +277,7 @@ const (
 	nameMux        = "mux"    // mpegtsmux
 	nameSRTQueue   = "srtq"   // the leaky queue whose src pad feeds the sink
 	nameSlateSrc   = "slate"  // filesrc reading the slate PNG
-	nameAudioSrc   = "asrc"   // wasapi2src
+	nameAudioSrc   = "asrc"   // the platform capture source: captureSourceFactory
 	nameVideoEncod = "venc"   // the H.264 encoder chosen at runtime
 	nameVideoScale = "vscale" // videoscale, so a slate that is not 1920x1080 still starts
 )
@@ -319,16 +319,31 @@ var (
 	savedBase   = gogst.ClockTimeNone
 )
 
-// requiredElements is the set of element factories the specification's pipeline
-// cannot be built without, mapped to the plugin from the allowlist that
-// provides each. Init checks all of them and reports every one that is missing.
+// requiredElement is one entry in the bundle contract: a factory the pipeline
+// cannot be built without, and the plugin from the allowlist that provides it.
+//
+// It is a named type rather than the anonymous struct it used to be so that
+// the platform halves of the list — platformRequiredElements in
+// elements_windows.go and elements_darwin.go — can be declared in their own
+// files and appended here.
+type requiredElement struct{ factory, plugin string }
+
+// requiredElements is the set of element factories the pipeline cannot be
+// built without. Init checks all of them and reports every one that is missing.
 //
 // This check is the difference between "the app will not start, and here is the
 // plugin that is missing from the bundle" and "the app starts, the user presses
 // Start twenty minutes before kick-off, and gst_parse_launch says no such
 // element". The H.264 encoder is deliberately absent from this list because it
 // is resolved by rank at runtime (specification open question 3).
-var requiredElements = []struct{ factory, plugin string }{
+//
+// The fourteen entries below are the ones that are the SAME on every platform,
+// under identical factory AND plugin names — verified against Homebrew's
+// GStreamer 1.26.10 on macOS arm64 on 2026-08-14, factory by factory, because
+// "it is probably called the same thing" is how a bundle ships without a
+// resampler. The capture source and the AAC encoder are not among them and
+// come from platformRequiredElements, which is where the two ports disagree.
+var requiredElements = append([]requiredElement{
 	{"filesrc", "coreelements"},
 	{"queue", "coreelements"},
 	{"capsfilter", "coreelements"},
@@ -340,30 +355,48 @@ var requiredElements = []struct{ factory, plugin string }{
 	{"audioresample", "audioresample"},
 	{"h264parse", "videoparsersbad"},
 	{"aacparse", "audioparsers"},
-	{"wasapi2src", "wasapi2"},
 	{"level", "level"},
-	{"mfaacenc", "mediafoundation"},
 	{"mpegtsmux", "mpegtsmux"},
 	{"srtsink", "srt"},
-}
+}, platformRequiredElements...)
+
+// initEnvVar is one environment variable that has to be in place before
+// gst_init, as a name and a value.
+//
+// It is a named type for the same reason requiredElement is: the platform halves
+// of the list — extraInitEnv in gstpaths_windows.go and gstpaths_darwin.go —
+// are declared in their own files and consumed here, so doInit needs no
+// runtime.GOOS branch and neither platform's answer is expressed in the other's
+// vocabulary.
+type initEnvVar struct{ name, value string }
 
 // Init prepares the bundled GStreamer for use and calls gst_init.
 //
-// appDir is the directory holding wslcomms.exe. Before gst_init, Init sets all
-// four of these to the bundled plugin directory <appDir>\gst\lib\gstreamer-1.0,
-// plus a per-user registry:
+// appDir is the directory holding the executable: the directory holding
+// wslcomms.exe on Windows, and <App>.app/Contents/MacOS on macOS. Before
+// gst_init, Init sets all four of these to the bundled plugin directory —
+// <appDir>\gst\lib\gstreamer-1.0 on Windows, <App>.app/Contents/Resources/
+// gstreamer-1.0 on macOS, see bundlePluginDir — plus a per-user registry:
 //
 //	GST_PLUGIN_SYSTEM_PATH_1_0 = <pluginDir>
 //	GST_PLUGIN_SYSTEM_PATH     = <pluginDir>
 //	GST_PLUGIN_PATH_1_0        = <pluginDir>
-//	GST_REGISTRY_1_0           = %LOCALAPPDATA%\WSLComms\registry.bin
+//	GST_REGISTRY_1_0           = <per-user cache>\WSLComms\registry.bin
 //
-// Go's os.Setenv calls SetEnvironmentVariableW, which is what GLib reads, so
-// this crosses the cgo boundary cleanly. The effect is that any GStreamer
-// installed elsewhere on the machine is invisible to this process, and this
-// process's bundle is invisible to it. Getting this wrong does not fail loudly:
-// the app silently loads some other GStreamer, which is why Init verifies the
-// bundle afterwards by looking up every element the pipeline needs.
+// and then whatever extraInitEnv adds, which on Windows is nothing and on macOS
+// is four more: both spellings of GST_PLUGIN_SCANNER, GIO_MODULE_DIR and
+// ORC_CODE. Those four exist because Homebrew paths are compiled into the
+// vendored dylibs as C strings that install_name_tool cannot rewrite; the
+// reasoning is in gstpaths_darwin.go, where a reader will meet it next to the
+// paths themselves.
+//
+// Go's os.Setenv calls SetEnvironmentVariableW on Windows and setenv(3) on
+// macOS, both of which are what GLib reads, so this crosses the cgo boundary
+// cleanly on both. The effect is that any GStreamer installed elsewhere on the
+// machine is invisible to this process, and this process's bundle is invisible
+// to it. Getting this wrong does not fail loudly: the app silently loads some
+// other GStreamer, which is why Init verifies the bundle afterwards by looking
+// up every element the pipeline needs.
 //
 // Init must be called exactly once, before New or ListInputDevices. It is
 // idempotent: subsequent calls return the first call's result and do not
@@ -389,7 +422,7 @@ func doInit(appDir string) error {
 		return fmt.Errorf("gst: Init: resolving appDir %q: %w", appDir, err)
 	}
 
-	pluginDir := filepath.Join(abs, "gst", "lib", "gstreamer-1.0")
+	pluginDir := bundlePluginDir(abs)
 	if fi, err := os.Stat(pluginDir); err != nil {
 		return fmt.Errorf("gst: Init: bundled plugin directory %q is not readable: %w", pluginDir, err)
 	} else if !fi.IsDir() {
@@ -462,12 +495,36 @@ func doInit(appDir string) error {
 		return fmt.Errorf("gst: Init: setting GST_REGISTRY_1_0: %w", err)
 	}
 
+	// The platform's own additions, AFTER the shared four and BEFORE gst_init,
+	// because two of the macOS ones (the scanner path and GIO_MODULE_DIR) are
+	// read during the registry rebuild that gst_init performs. Setting them
+	// afterwards would set them for the second run of the application and not
+	// this one, which is the shape of bug that reproduces only on a clean
+	// machine.
+	extra, err := extraInitEnv(abs)
+	if err != nil {
+		return err
+	}
+	// Logged by NAME AND VALUE as they are set, and BEFORE gst_init rather than
+	// after a successful one, because the failure they prevent is silent by
+	// construction: a wrong scanner path makes GStreamer fall back to in-process
+	// scanning with a warning nobody reads, and a foreign GIO module directory
+	// produces no message at all. Logging here means the lines are present even
+	// when the run that follows them fails, which is the run somebody will be
+	// reading the log of.
+	for _, v := range extra {
+		if err := os.Setenv(v.name, v.value); err != nil {
+			return fmt.Errorf("gst: Init: setting %s: %w", v.name, err)
+		}
+		log.Printf("gst: %s=%q", v.name, v.value)
+	}
+
 	gogst.Init()
 
 	if missing := missingElements(); len(missing) > 0 {
 		return fmt.Errorf(
 			"gst: Init: the bundled GStreamer in %q is incomplete: %s "+
-				"(check the DLL allowlist and that the registry at %q was rebuilt)",
+				"(check the plugin allowlist and that the registry at %q was rebuilt)",
 			pluginDir, strings.Join(missing, ", "), registryPath)
 	}
 
@@ -475,17 +532,33 @@ func doInit(appDir string) error {
 	return nil
 }
 
-// registryFile returns %LOCALAPPDATA%\WSLComms\registry.bin.
+// registryFile returns the per-user GStreamer registry cache:
+// %LOCALAPPDATA%\WSLComms\registry.bin on Windows, and
+// ~/Library/Caches/WSLComms/registry.bin on macOS.
 //
 // The registry is a cache of the plugin scan and must be per-user and writable;
 // putting it next to the executable would fail under a per-machine install
 // running as a standard user, and sharing the default location would let a
 // system-wide GStreamer's registry and ours overwrite each other.
+//
+// It needs no platform twin, and that is deliberate rather than an oversight.
+// LOCALAPPDATA is empty on macOS, so the fallback below is what answers there,
+// and os.UserCacheDir returns ~/Library/Caches — which is the RIGHT place for
+// this file on that platform, not merely a place that happens to work. macOS
+// documents Caches as purgeable, and a purged GStreamer registry costs one plugin
+// rescan on the next start and nothing else. A signed .app is not writable, so
+// beside the executable is not available even in principle.
+//
+// Note that internal/applog deliberately does NOT share this reasoning: the log
+// file is the only diagnosis a commentary position ever produces and must not
+// live somewhere the operating system is entitled to delete. Same fallback, two
+// different right answers, which is why the choice is made per caller.
 func registryFile() (string, error) {
 	base := os.Getenv("LOCALAPPDATA")
 	if base == "" {
-		// os.UserCacheDir returns %LocalAppData% on Windows, so this is the
-		// same directory by a different route rather than a different policy.
+		// os.UserCacheDir returns %LocalAppData% on Windows, so on that platform
+		// this is the same directory by a different route rather than a different
+		// policy. On macOS it is ~/Library/Caches, which is the intended answer.
 		dir, err := os.UserCacheDir()
 		if err != nil {
 			return "", fmt.Errorf("gst: Init: neither LOCALAPPDATA nor a user cache directory is available: %w", err)
@@ -507,74 +580,105 @@ func missingElements() []string {
 	return missing
 }
 
-// ListInputDevices returns the audio capture endpoints offered in the
-// commentary input dropdown.
+// enumerateDevices runs a one-shot GstDeviceMonitor probe for one device class
+// and returns whatever it found.
 //
-// It runs a GstDeviceMonitor filtered to Audio/Source, keeps only the devices
-// whose provider reports device.api = "wasapi2", and for each one reports
-// display-name as Device.Name and the IMMDevice endpoint ID as Device.ID.
+// It exists because three callers need the same eleven lines: ListInputDevices
+// below, and — on darwin — resolveCaptureDeviceIndex, which has to re-enumerate
+// at pipeline-open time to turn a persisted CoreAudio unique-id back into the
+// integer osxaudiosrc wants. Factoring it out is what keeps those two from
+// drifting apart, which would show up as "the device is in the dropdown but
+// Start says it has gone away".
 //
-// The filter is applied after enumeration rather than before because
-// GstDeviceMonitor filters by device class and caps only — it has no API for
-// restricting the providers it uses. Devices from any other provider that might
-// end up in the bundle are discarded rather than offered, because Device.ID is
-// passed verbatim to wasapi2src and only wasapi2's IDs are meaningful there.
-//
-// # Audio/Source is not enough, and this function used to be wrong about it
-//
-// wasapi2's device provider republishes every RENDER (playback) endpoint as an
-// Audio/Source "loopback" device carrying wasapi2.device.loopback=true, so the
-// class check alone offered playback endpoints as commentary inputs — measured:
-// 11 of 25 entries on the dev machine, and an operator on another machine
-// selected one. The pipeline prerolled, wasapi2's rbuf failed ASYNCHRONOUSLY
-// with "Failed to open device {0.0.0.00000000}.{8678ce58-...}", and the sender
-// retried the SRT link forever over a local device fault. So two more filters
-// run below: the loopback property, and the endpoint-id namespace classifier
-// in device_id.go. Loopback devices are refused, never opened — setting
-// loopback=true to "make them work" would put the operator's own monitor mix
-// on air, which is the deliberate non-goal recorded in device_id.go.
-func ListInputDevices() ([]Device, error) {
-	if !inited.Load() {
-		return nil, errors.New("gst: ListInputDevices: Init has not been called")
-	}
-
+// The class filter is applied to the monitor AND re-checked per device by the
+// callers. GstDeviceMonitor filters by device class and caps only — it has no
+// API for restricting which providers it consults — so the provider question is
+// always answered afterwards, by captureDeviceID.
+func enumerateDevices(class string) []gogst.Device {
 	monitor := gogst.NewDeviceMonitor()
 	if monitor == nil {
-		return nil, errors.New("gst: ListInputDevices: gst_device_monitor_new returned nil")
+		log.Printf("gst: enumerateDevices(%s): gst_device_monitor_new returned nil", class)
+		return nil
 	}
 
-	// A nil caps filter means "any caps of this class". Audio/Source is the
-	// class every audio capture provider advertises. A zero return means the
+	// A nil caps filter means "any caps of this class". A zero return means the
 	// filter was not installed, which matters: without it the monitor also
 	// reports Audio/Sink devices, and headphones would appear in the commentary
-	// input dropdown. Every device is re-checked below in any case.
-	if monitor.AddFilter("Audio/Source", nil) == 0 {
-		log.Printf("gst: ListInputDevices: gst_device_monitor_add_filter(Audio/Source) returned 0; " +
-			"relying on the per-device class check")
+	// input dropdown. Every device is re-checked by the caller in any case.
+	if monitor.AddFilter(class, nil) == 0 {
+		log.Printf("gst: enumerateDevices: gst_device_monitor_add_filter(%s) returned 0; "+
+			"relying on the per-device class check", class)
 	}
 
 	// Starting the monitor makes the providers probe and keeps them hot for
 	// hot-plug messages. gst_device_monitor_get_devices also works on a stopped
 	// monitor by doing a one-shot probe, so a failure to start is not fatal —
-	// it just means no hot-plug bus, which this function does not use anyway.
+	// it just means no hot-plug bus, which nothing here uses anyway.
 	started := monitor.Start()
 	if !started {
-		log.Printf("gst: ListInputDevices: gst_device_monitor_start failed; falling back to a one-shot probe")
+		log.Printf("gst: enumerateDevices(%s): gst_device_monitor_start failed; "+
+			"falling back to a one-shot probe", class)
 	}
 	devices := monitor.GetDevices()
 	if started {
 		monitor.Stop()
 	}
+	return devices
+}
+
+// ListInputDevices returns the audio capture endpoints offered in the
+// commentary input dropdown.
+//
+// It runs a GstDeviceMonitor filtered to Audio/Source and asks captureDeviceID
+// — the per-platform seam in deviceprovider_windows.go and
+// deviceprovider_darwin.go — two things about each device: does it belong to
+// the provider this build drives, and if so what is the string to persist for
+// it. Everything in this function is platform-neutral by construction; there is
+// deliberately no runtime.GOOS anywhere in it.
+//
+// # Why the provider question cannot be asked here
+//
+// This function used to answer it inline, with device.api == "wasapi2" followed
+// by wasapi2's loopback filter and the endpoint-id namespace classifiers. Every
+// one of those is Windows knowledge:
+//
+//   - macOS devices publish NO device.api property at all. The literal symptom
+//     that started the port was this function returning an EMPTY list on macOS,
+//     so the operator's microphone never appeared in the dropdown.
+//   - There is no loopback republication on CoreAudio to filter out, and
+//     nothing that could carry the marker.
+//   - A CoreAudio unique-id ("BuiltInMicrophoneDevice") is in neither Windows
+//     namespace, so the classifier's "unrecognised shape" warning would fire
+//     for every device on every enumeration — a warning that always fires is a
+//     warning nobody reads.
+//
+// Replacing that with an 'api == "osxaudio"' branch would have failed in
+// exactly the same way, because the property is not published under any name.
+// The per-platform question is a PREDICATE over what the provider actually
+// exposes, not a string comparison, which is why the seam is a function.
+//
+// # What is unchanged
+//
+// The de-duplication, the display-name handling and the summary log line are
+// shared: they are about the dropdown, not about the platform. Every skip is
+// logged by captureDeviceID with the reason, because a device missing from the
+// dropdown is otherwise indistinguishable from a device that is not plugged in.
+func ListInputDevices() ([]Device, error) {
+	if !inited.Load() {
+		return nil, errors.New("gst: ListInputDevices: Init has not been called")
+	}
+
+	devices := enumerateDevices("Audio/Source")
 
 	out := make([]Device, 0, len(devices))
-	// byID de-duplicates the offered list. With endpointID preferring
-	// device.actual-id, the "Default Audio Capture Device" pseudo entry
-	// resolves to the same endpoint id as the real device it currently points
-	// at, and offering both would let the operator persist two names for one
-	// endpoint. First entry with a real display name wins.
+	// byID de-duplicates the offered list. On Windows, with endpointID
+	// preferring device.actual-id, the "Default Audio Capture Device" pseudo
+	// entry resolves to the same endpoint id as the real device it currently
+	// points at, and offering both would let the operator persist two names for
+	// one endpoint. First entry with a real display name wins.
 	byID := make(map[string]int, len(devices))
 	audioSources := 0 // everything with the Audio/Source class, any provider
-	loopbacks := 0    // wasapi2 loopback republications of playback endpoints
+	skipped := 0      // Audio/Source devices captureDeviceID refused to offer
 	for _, dev := range devices {
 		if dev == nil {
 			continue
@@ -590,54 +694,20 @@ func ListInputDevices() ([]Device, error) {
 		props := dev.GetProperties()
 		if props == nil {
 			// gst_device_get_properties is nullable. Without properties the
-			// provider cannot be identified, and Device.ID is only meaningful
-			// for wasapi2, so this device cannot safely be offered.
+			// device cannot be identified at all — neither provider nor id —
+			// and Device.ID has to be something the capture source will accept,
+			// so this device cannot safely be offered.
 			log.Printf("gst: ListInputDevices: skipping %q: it publishes no device properties",
 				dev.GetDisplayName())
+			skipped++
 			continue
 		}
-		if api := props.GetString("device.api"); api != "wasapi2" {
+		id, offer := captureDeviceID(dev, props)
+		if !offer {
+			// captureDeviceID has already logged the reason, in the platform's
+			// own vocabulary. Adding a second line here would double every skip.
+			skipped++
 			continue
-		}
-		// The loopback filter. GetBoolean fails unless the field exists AND is
-		// G_TYPE_BOOLEAN, which is how gstwasapi2device.c publishes it; if a
-		// future GStreamer changes the type this check silently passes and the
-		// namespace check below catches the device anyway, because a loopback
-		// republication always carries the render-namespace id of the playback
-		// endpoint it mirrors. Checked before endpointID so a device being
-		// skipped never costs the CreateElement fallback.
-		if loop, ok := props.GetBoolean(propLoopback); ok && loop {
-			loopbacks++
-			log.Printf("gst: ListInputDevices: skipping %q (%s): %s=true — it is wasapi2's loopback "+
-				"republication of a playback endpoint, and opening it would put the operator's own "+
-				"monitor mix on air", dev.GetDisplayName(), props.GetString("device.id"), propLoopback)
-			continue
-		}
-		id := endpointID(dev, props)
-		if id == "" {
-			// A wasapi2 device with no recoverable endpoint ID cannot be
-			// persisted or passed to wasapi2src, so offering it in the dropdown
-			// would produce a selection that silently fails at Start. Log the
-			// property names available so that Gate B has something to work
-			// with if the provider's key ever changes.
-			log.Printf("gst: ListInputDevices: skipping %q: no endpoint ID; device properties are %s",
-				dev.GetDisplayName(), structureFieldNames(props))
-			continue
-		}
-		// The namespace classifier, device_id.go. Only a POSITIVELY identified
-		// render id is refused; an unrecognised shape is offered with a warning,
-		// because refusing unknown shapes would turn a future Windows or
-		// GStreamer id-shape change into an empty dropdown at a facility.
-		if IsRenderEndpointID(id) {
-			log.Printf("gst: ListInputDevices: skipping %q (%s): its endpoint id is in the RENDER "+
-				"namespace (%s...) — a playback device that cannot be a commentary input",
-				dev.GetDisplayName(), id, RenderEndpointPrefix)
-			continue
-		}
-		if !IsCaptureEndpointID(id) {
-			log.Printf("gst: ListInputDevices: WARNING: %q (%s) has an endpoint id of unrecognised "+
-				"shape — offering it anyway (capture ids begin %s); if Start later fails to open it, "+
-				"this line is the diagnosis", dev.GetDisplayName(), id, CaptureEndpointPrefix)
 		}
 		name := dev.GetDisplayName()
 		if i, dup := byID[id]; dup {
@@ -648,80 +718,16 @@ func ListInputDevices() ([]Device, error) {
 			if out[i].Name == "" && name != "" {
 				out[i].Name = name
 			}
-			log.Printf("gst: ListInputDevices: %q duplicates the endpoint id of %q (%s); keeping the first",
+			log.Printf("gst: ListInputDevices: %q duplicates the device id of %q (%s); keeping the first",
 				name, kept, id)
 			continue
 		}
 		byID[id] = len(out)
 		out = append(out, Device{ID: id, Name: name})
 	}
-	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices; %d were WASAPI loopback "+
-		"republications of playback endpoints", len(out), audioSources, loopbacks)
+	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped",
+		len(out), audioSources, captureSourceFactory, skipped)
 	return out, nil
-}
-
-// propLoopback is the GstStructure key under which wasapi2's device provider
-// marks an Audio/Source entry as its loopback republication of a RENDER
-// (playback) endpoint. ListInputDevices READS it to skip those entries; it is
-// never SET on wasapi2src, because loopback capture of the operator's own
-// monitor mix on a live commentary feed is the deliberate non-goal recorded in
-// device_id.go, and TestLoopbackIsNeverSetInTheCgoSource pins that.
-const propLoopback = "wasapi2.device.loopback"
-
-// endpointIDKeys are the GstStructure keys under which a wasapi2 device might
-// publish its IMMDevice endpoint ID, most preferred first.
-//
-// device.actual-id leads deliberately: the provider's two default-device
-// pseudo entries ("Default Audio Capture/Render Device") carry a DEVINTERFACE
-// class GUID as device.id but publish the REAL endpoint currently behind the
-// default as device.actual-id — preferring it resolves the pseudo entry to a
-// concrete endpoint that survives the default changing, and lets the de-dup
-// in ListInputDevices fold it onto the real entry it mirrors.
-//
-// UNVERIFIED: gstwasapi2device.c is believed to publish "device.id"; neither
-// that nor the others has been read against 1.28.5 on the target machine. The
-// fallback below does not depend on any of these names being right.
-var endpointIDKeys = []string{"device.actual-id", "device.id", "device.strid", "device.path"}
-
-// endpointID extracts the IMMDevice endpoint ID GUID for one device.
-//
-// It tries the property keys above first because that is cheap. If none of them
-// is present it falls back to gst_device_create_element, which returns a
-// wasapi2src with its device property already set to whatever the provider
-// considers the device's identity. That fallback is authoritative by
-// construction — it is literally the value wasapi2src will be given — and it is
-// what makes this function robust against the property key having been renamed.
-// It costs one element instantiation per device; no audio endpoint is opened,
-// because the element stays in NULL.
-func endpointID(dev gogst.Device, props *gogst.Structure) string {
-	for _, key := range endpointIDKeys {
-		if props.HasField(key) {
-			if v := props.GetString(key); v != "" {
-				return v
-			}
-		}
-	}
-
-	// The fallback actually running means the provider's property keys have
-	// changed. Say so: at Gate B this line plus structureFieldNames in the
-	// caller's skip message is the whole diagnosis, and without it the only
-	// symptom is enumeration quietly costing an element instantiation per
-	// device.
-	log.Printf("gst: endpointID: %q publishes none of %v; falling back to gst_device_create_element",
-		dev.GetDisplayName(), endpointIDKeys)
-
-	el := dev.CreateElement("")
-	if el == nil {
-		return ""
-	}
-	if !hasProperty(el, "device") {
-		return ""
-	}
-	v, ok := el.ObjectProperty("device").(string)
-	if !ok {
-		return ""
-	}
-	return v
 }
 
 // structureFieldNames renders a structure's field names for a diagnostic
@@ -758,123 +764,38 @@ const (
 // directory copy. It cannot reach the bundle, but a machine with a system-wide
 // GStreamer and a mis-set GST_PLUGIN_PATH_1_0 could still surface it, and
 // x264enc outranks nothing here worth the licence risk.
+//
+// The list is deliberately NOT per-platform. x264enc is GPL on macOS too, it is
+// present in a stock Homebrew GStreamer, and it is ranked primary (256) there —
+// so on the developer's own machine it is a live candidate that the factory
+// query would otherwise return. Splitting this per platform would have meant
+// two places to forget.
 var h264EncoderDenylist = map[string]bool{
 	"x264enc": true,
 }
 
-// h264EncoderPreference is the order encoders are chosen in, lower index
-// winning, REGARDLESS of rank. Rank is used only to exclude factories GStreamer
-// has marked unusable.
+// encoderProp is one encoder setting, as a string for gst_util_set_object_arg.
 //
-// # This reverses specification open question 3, on measurement
-//
-// OQ3 asked "is the highest-ranked H.264 encoder called mfh264enc on the target
-// machine?" and instructed resolving by rank rather than hardcoding the name.
-// That was the right instinct before anyone could measure it. Measured at Gate B
-// on 2026-07-30, on a machine with an RTX 5070, GStreamer 1.28.5 ranks them:
-//
-//	nvh264enc    primary + 1 (257)
-//	x264enc      primary (256)      <- denylisted, GPL
-//	amfh264enc   primary (256)
-//	mfh264enc    secondary (128)
-//	openh264enc  marginal (64)
-//
-// So the answer to OQ3 is no: mfh264enc is NOT the highest-ranked encoder, and
-// resolving by rank selects whichever GPU vendor's element happens to be
-// installed. Three consequences make that the wrong choice here:
-//
-//  1. The property set in h264EncoderProps was written against mfh264enc, and
-//     the values are applied only where the chosen factory has a property of
-//     that name. On nvh264enc most of them are silently skipped, so the
-//     deliberate CBR-not-QVBR decision — taken because a static slate under
-//     variable rate collapses to 200-350 kbps and makes "is it flowing" hard to
-//     observe — quietly does not happen.
-//  2. It makes behaviour depend on the graphics card. Two commentary positions
-//     running the same build would encode differently, and a fault reproducible
-//     at one would not reproduce at the other. For a contribution path that has
-//     to behave identically everywhere, that is a bad trade for encoder
-//     efficiency that a 1920x1080 still frame cannot use.
-//  3. mfh264enc is Media Foundation, which is part of Windows. It is present on
-//     every target machine by definition, so preferring it costs no
-//     availability.
-//
-// The hardware encoders stay in the list below mfh264enc, so a machine whose
-// Media Foundation H.264 MFT is missing or broken still has somewhere to go
-// rather than failing to start twenty minutes before kick-off.
-var h264EncoderPreference = []string{
-	"mfh264enc",
-	"qsvh264enc",
-	"nvh264enc",
-	"d3d11h264enc",
-	"amfh264enc",
-}
+// Strings rather than typed values because gst_util_set_object_arg deserialises
+// into whatever GType the property is — enum nick, gint or guint — and encoders
+// disagree about which of those they use even for identically named properties.
+// The lists live in elements_windows.go and elements_darwin.go, because the two
+// platforms' encoders spell the same four intentions differently.
+type encoderProp struct{ name, value string }
 
-// h264EncoderFallbacks are tried by name, in this order, if the factory-list
-// query returns nothing usable. This is belt and braces against
-// factoryTypeMediaVideo being wrong.
-var h264EncoderFallbacks = []string{
-	"mfh264enc",
-	"qsvh264enc",
-	"nvh264enc",
-	"d3d11h264enc",
-	"amfh264enc",
-	"openh264enc",
-}
-
-// h264EncoderProps are the specification section 5 encoder settings other than
-// bitrate, as strings for gst_util_set_object_arg.
-//
-// They are applied one at a time, and only to properties the chosen factory
-// actually has, because the encoder is resolved by rank and a different vendor's
-// element will not have mfh264enc's property names. Strings rather than typed
-// values because gst_util_set_object_arg deserialises into whatever GType the
-// property is — enum nick, gint or guint — and encoders disagree about which of
-// those they use even for identically named properties.
-//
-// Why these values (specification section 5): rc-mode=cbr rather than
-// quality-targeted, because a static slate under QVBR collapses to 200-350 kbps
-// which is cheaper but bursty at every IDR and makes "is it flowing" harder to
-// observe. gop-size=100 is a 2 s GOP at 50p, matching the profile M2L-X locked
-// cleanly. low-latency=true because there is nothing to gain from reordering a
-// slate.
-//
-// # bframes is deliberately absent, and the specification is wrong about it
-//
-// Specification section 5 sets bframes=0. Verified at Gate B on 2026-07-30:
-// mfh264enc in GStreamer 1.28.5 HAS NO bframes PROPERTY. Its full property set
-// is adapter-luid, bitrate, cabac, d3d11-aware, gop-size, low-latency,
-// max-bitrate, max-qp, min-qp, qos, qp, qp-b, qp-i, qp-p, quality-vs-speed,
-// rc-mode, ref and vbv-buffer-size.
-//
-// Listing it here would have been harmless — the apply loop skips properties
-// the factory does not have — but it would have logged a warning on every
-// single start, and a warning that always fires is one nobody reads. The
-// specification's pipeline string is a real defect rather than a cosmetic one,
-// because gst_parse_launch rejects an unknown property outright:
-//
-//	ERROR: no property "bframes" in element "mfh264enc"
-//
-// That is a parse failure, not a warning, so anyone pasting section 5 into
-// gst-launch-1.0 to reproduce a fault gets nothing at all. It is corrected in
-// the specification and in this package's doc comment.
-//
-// The intent behind bframes=0 still holds, and low-latency=true delivers it:
-// Media Foundation's H.264 MFT does not emit B-frames in low-latency mode, so
-// there is no reordering to remove.
-var h264EncoderProps = []struct{ name, value string }{
-	{"rc-mode", "cbr"},
-	{"gop-size", "100"},
-	{"low-latency", "true"},
-	{"cabac", "true"},
-}
-
-// selectH264Encoder returns the factory name of the highest-ranked H.264
-// encoder present in the registry.
+// selectH264Encoder returns the factory name of the best H.264 encoder present
+// in the registry: the first entry of h264EncoderPreference that is installed
+// and usable, with rank as a tie-break only.
 //
 // Specification open question 3: "Is the highest-ranked H.264 encoder called
 // mfh264enc on the target machine? Resolve the element by rank at runtime
 // rather than hardcoding the name." This does that, and logs what it chose so
 // that the answer is in the field log rather than in someone's memory.
+//
+// The function itself is platform-neutral. The three lists it consults —
+// h264EncoderPreference, h264EncoderFallbacks and h264EncoderProps — are
+// declared per platform in elements_windows.go and elements_darwin.go, along
+// with the measurements that put them in that order.
 func selectH264Encoder() (string, error) {
 	caps := gogst.CapsFromString("video/x-h264")
 	if caps == nil {
@@ -1222,22 +1143,25 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if asrc == nil {
 		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioSrc))
 	}
-	// The id is logged VERBATIM immediately before it is handed to wasapi2src,
-	// because wasapi2src echoes the requested id verbatim in its asynchronous
-	// error 1551 (proved by probe — no substitution, no default fallback). With
-	// this line in the log, a "Failed to open device {...}" later is matched to
-	// what was actually requested rather than argued about.
-	log.Printf("gst: Start: wasapi2src capture endpoint id: %s", opts.AudioDeviceID)
-	if err := setStringProperty(asrc, "device", opts.AudioDeviceID); err != nil {
+	// The id is logged VERBATIM immediately before it is handed to the capture
+	// source, and this line stays wherever the port goes.
+	//
+	// On Windows wasapi2src echoes the requested id verbatim in its
+	// asynchronous error 1551 (proved by probe — no substitution, no default
+	// fallback), so a "Failed to open device {...}" later is matched to what
+	// was actually requested rather than argued about. On macOS the id is a
+	// CoreAudio unique-id that has to be resolved to an integer before
+	// osxaudiosrc will accept it, and this line is what says which id the
+	// resolution was asked to find. In both cases it is the only record of the
+	// value that came out of config.json.
+	log.Printf("gst: Start: %s capture device id: %s", captureSourceFactory, opts.AudioDeviceID)
+	// Everything below the log line about WHICH element gets WHAT is platform
+	// knowledge and lives in deviceprovider_windows.go / deviceprovider_darwin.go:
+	// the two platforms do not even agree on the TYPE of the device property.
+	// See the darwin file — this is the single most important structural
+	// difference in the port.
+	if err := configureCaptureSource(asrc, opts.AudioDeviceID); err != nil {
 		return abort(err)
-	}
-	// low-latency is a nice-to-have on wasapi2src, not a requirement. If a
-	// future GStreamer renames it, running at the default latency is better
-	// than refusing to start a commentary position.
-	if hasProperty(asrc, "low-latency") {
-		asrc.SetObjectProperty("low-latency", true)
-	} else {
-		log.Printf("gst: %s has no low-latency property; using the default capture latency", nameAudioSrc)
 	}
 
 	p.encoder = pipeline.GetByName(nameVideoEncod)
@@ -1337,8 +1261,8 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	// measured bug: audio DTS jumping backwards by exactly the previous run's
 	// uptime, 1,523 non-monotonic errors downstream, every indicator green.
 
-	stopWatchdog := stateChangeWatchdog("pipeline NULL to PLAYING (opening the WASAPI endpoint " +
-		"and initialising the encoder MFTs)")
+	stopWatchdog := stateChangeWatchdog("pipeline NULL to PLAYING (opening the capture endpoint " +
+		"and initialising the encoders)")
 	ret := pipeline.BlockSetState(gogst.StatePlaying, gogst.ClockTime(pipelineStartTimeout))
 	stopWatchdog()
 	if !stateChangeOK(ret) {
@@ -1357,6 +1281,10 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	// pipeline whose capture chain is dead, and the caller connects a sink
 	// that will never carry media. ReplaceSink double-checks fatal before
 	// promising success for exactly the same reason; this mirrors it.
+	//
+	// osxaudiosrc opens its device inside the state change rather than on its
+	// own thread, so on macOS the failure is more likely to come back through
+	// BlockSetState above. The re-check costs nothing and covers both.
 	if err := p.fatalError(); err != nil {
 		return abort(err)
 	}
@@ -1389,12 +1317,34 @@ func (p *cgoPipeline) drainStartupError() error {
 // Two things are deliberately not in it. The srtsink is absent because Start
 // installs no sink — the first ReplaceSink installs the first one, which is
 // what lets the chain stay in PLAYING for the life of the process. The slate
-// path and the audio device GUID are absent because they are user-supplied
+// path and the audio device id are absent because they are user-supplied
 // strings and the parser's escaping rules are not something to trust a Windows
 // path or a GUID to; they are set with g_object_set afterwards.
 //
-// encoderName is the factory resolved by rank. audioBitrateBps is mfaacenc's
-// bitrate property, in bits per second.
+// encoderName is the H.264 factory resolved at runtime. audioBitrateBps is the
+// AAC encoder's bitrate property, in bits per second — the same unit on
+// mfaacenc and on atenc, which is the one piece of luck in this port.
+//
+// # Exactly two element names in it are per-platform
+//
+// captureSourceFactory (wasapi2src / osxaudiosrc) and aacEncoderFactory
+// (mfaacenc / atenc), both from elements_windows.go and elements_darwin.go.
+// EVERYTHING ELSE — the caps chain, the level element and its 50 ms interval,
+// mpegtsmux alignment=7 pcr-interval=3600, both queues, the leaky srtq — is
+// byte-identical on both platforms, and that is a deliberate and load-bearing
+// property, not an accident of the port. The whole reason internal/sender and
+// the timestamp discipline in this file can be trusted on macOS is that the
+// graph they reason about is the same graph. A future change that makes any
+// other part of this string conditional is a change to that promise and needs
+// to be argued for on its own terms.
+//
+// The full send path was proven end to end over real SRT on macOS on
+// 2026-08-14, receiver first: 16.2 s of media reached a listener-first
+// srtsrc, the received transport stream carried PID 0x41 video (91.2 %) and
+// PID 0x42 audio (7.4 %), gst-discoverer reported "H.264 (High Profile)
+// 1920x1080", and the audio decoded to 48 kHz stereo with real room tone on it
+// (peak -36.0 dBFS, RMS -59.2 dBFS) rather than the digital silence a
+// mis-negotiated AAC path produces.
 func pipelineDescription(encoderName string, audioBitrateBps int) string {
 	// alignment=7 gives 7 x 188 = 1316-byte buffers, exactly one SRT payload,
 	// so nothing fragments. pcr-interval=3600 is the specification's value.
@@ -1417,16 +1367,21 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 	// element costs nothing and does nothing at all when the slate is the right
 	// size.
 	//
-	// There is deliberately NO capsfilter between wasapi2src and audioconvert.
-	// One used to sit there pinning rate=48000,channels=2, upstream of the
-	// resampler that exists to produce exactly that — where it could not help,
-	// only refuse. wasapi2src in shared mode can only ever produce its
-	// endpoint's mix format, and Dante Virtual Soundcard is commonly configured
-	// at 44.1 or 96 kHz, so on a DVS endpoint that is not at 48 k the caps
-	// filter fails negotiation at Start, twenty minutes before kick-off, with
-	// an error naming neither the sample rate nor the device. audioconvert and
-	// audioresample convert whatever the endpoint gives us; the capsfilter that
-	// actually matters is the one below them, pinning what enters mfaacenc.
+	// There is deliberately NO capsfilter between the capture source and
+	// audioconvert. One used to sit there pinning rate=48000,channels=2,
+	// upstream of the resampler that exists to produce exactly that — where it
+	// could not help, only refuse. wasapi2src in shared mode can only ever
+	// produce its endpoint's mix format, and Dante Virtual Soundcard is
+	// commonly configured at 44.1 or 96 kHz, so on a DVS endpoint that is not
+	// at 48 k the caps filter fails negotiation at Start, twenty minutes before
+	// kick-off, with an error naming neither the sample rate nor the device.
+	//
+	// macOS makes the same point louder rather than differently: measured on
+	// this machine, the built-in microphone offers 48 kHz but the NDI Audio
+	// device offers 44100 ONLY, and osxaudiosrc is likewise bound to whatever
+	// the CoreAudio device is configured for. audioconvert and audioresample
+	// convert whatever the endpoint gives us; the capsfilter that actually
+	// matters is the one below them, pinning what enters the AAC encoder.
 	return "" +
 		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
 		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
@@ -1447,15 +1402,15 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 		// The level element sits AFTER audioconvert/audioresample and their
 		// capsfilter, IMMEDIATELY BEFORE the encoder, and that placement is the
 		// point: it measures the exact S16LE 48 kHz stereo signal that enters
-		// mfaacenc, so the input meters show what is ACTUALLY being encoded and
-		// sent — wrong device, dead Dante endpoint, muted desk send and all.
-		// Measuring upstream of the resample (or worse, in the browser) would
-		// keep a meter moving while the on-air signal was silence, which is a
-		// reassurance the operator must never be given. interval=50000000 is
-		// 50 ms in nanoseconds — twenty element messages a second, which the
-		// app throttles rather than trusts — and post-messages defaults to
-		// true so it is not set here. The element passes buffers through
-		// untouched; it adds measurement, not latency.
+		// the AAC encoder, so the input meters show what is ACTUALLY being
+		// encoded and sent — wrong device, dead Dante endpoint, muted desk send
+		// and all. Measuring upstream of the resample (or worse, in the
+		// browser) would keep a meter moving while the on-air signal was
+		// silence, which is a reassurance the operator must never be given.
+		// interval=50000000 is 50 ms in nanoseconds — twenty element messages a
+		// second, which the app throttles rather than trusts — and
+		// post-messages defaults to true so it is not set here. The element
+		// passes buffers through untouched; it adds measurement, not latency.
 		//
 		// alevel is a literal rather than an entry in the element-name const
 		// block, deliberately: those consts exist because GetByName is called
@@ -1463,22 +1418,35 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 		// arrives as bus messages matched on the STRUCTURE name. The literal
 		// is also what lets the Gate A source guard
 		// (TestPipelineDescriptionMetersWhatIsEncoded) assert the exact text.
-		"wasapi2src name=" + nameAudioSrc +
+		//
+		// The two factory names below are consts rather than literals for one
+		// reason and it is not brevity: it makes the Gate A guard able to check
+		// BOTH ports at once — it asserts the order of the elements here and
+		// the exact value of each const in elements_windows.go and
+		// elements_darwin.go, so neither port can be silently repointed at a
+		// different encoder.
+		captureSourceFactory + " name=" + nameAudioSrc +
 		" ! audioconvert ! audioresample" +
 		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
 		" ! level name=alevel interval=50000000" +
-		" ! mfaacenc bitrate=" + strconv.Itoa(audioBitrateBps) +
+		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "."
 }
 
-// applyEncoderProperties sets the specification's encoder settings on whichever
+// applyEncoderProperties sets the platform's encoder settings on whichever
 // H.264 encoder was chosen, skipping any property that encoder does not have.
 //
-// A missing property is logged, not fatal. The encoder is resolved by rank, so
-// on a machine where the top-ranked encoder is not mfh264enc most of these will
-// be absent; running that encoder at its own defaults and telling the log which
-// settings did not apply is better than refusing to send commentary.
+// A missing property is logged, not fatal. The encoder is resolved at runtime,
+// so on a machine where the preferred encoder is absent most of these will be
+// absent too; running that encoder at its own defaults and telling the log
+// which settings did not apply is better than refusing to send commentary.
+//
+// bitrate is deliberately handled here rather than in h264EncoderProps, because
+// it is the one setting that comes from PipelineOpts. Its UNIT is kilobits per
+// second on mfh264enc and on vtenc_h264 alike — checked on both, because a
+// factor-of-1000 disagreement here is a 2 kbit/s or a 2 Gbit/s feed, and
+// neither fails loudly.
 func applyEncoderProperties(enc gogst.Element, factoryName string, bitrateKbps int) {
 	applied := make([]string, 0, len(h264EncoderProps)+1)
 	skipped := make([]string, 0, len(h264EncoderProps)+1)
@@ -1496,8 +1464,10 @@ func applyEncoderProperties(enc gogst.Element, factoryName string, bitrateKbps i
 		applied = append(applied, name+"="+value)
 	}
 
-	// bitrate is in KILOBITS per second on mfh264enc, which is the unit
-	// DefaultVideoBitrateKbps and PipelineOpts.VideoBitrateKbps use.
+	// bitrate is in KILOBITS per second on mfh264enc ("Bitrate in kbit/sec")
+	// and on vtenc_h264 ("Target video bitrate in kbps"), which is the unit
+	// DefaultVideoBitrateKbps and PipelineOpts.VideoBitrateKbps use. Measured
+	// on macOS: bitrate=2000 produced a 2.05 Mbit/s video PID.
 	set("bitrate", strconv.Itoa(bitrateKbps))
 	for _, prop := range h264EncoderProps {
 		set(prop.name, prop.value)
@@ -2881,24 +2851,64 @@ func stateChangeWatchdog(what string) (stop func()) {
 	}
 }
 
-// hasProperty reports whether a GObject has an installed property of this name.
+// propertyType returns the GType of an installed property, or TypeInvalid if
+// the object has no property of that name.
 //
 // go-glib exposes PropertyType on gobject.ObjectInstance, which every gst
 // element embeds, but does not list it in the gobject.Object interface — hence
 // the type assertion. If this ever fails at Gate B, the assertion is the thing
 // to look at, not the callers.
-func hasProperty(obj gobject.Object, name string) bool {
+func propertyType(obj gobject.Object, name string) gobject.Type {
 	pt, ok := obj.(interface {
 		PropertyType(string) gobject.Type
 	})
 	if !ok {
-		return false
+		return gobject.TypeInvalid
 	}
-	return pt.PropertyType(name) != gobject.TypeInvalid
+	return pt.PropertyType(name)
 }
 
-// setStringProperty sets a string property, failing loudly if the element does
-// not have it.
+// hasProperty reports whether a GObject has an installed property of this name.
+func hasProperty(obj gobject.Object, name string) bool {
+	return propertyType(obj, name) != gobject.TypeInvalid
+}
+
+// setTypedProperty sets a property after checking BOTH that it exists and that
+// it has the GType being handed to it.
+//
+// # The type half of that check is not defensive programming, it is a measured bug
+//
+// The original setter checked existence only, and that was enough for as long
+// as the product was Windows-only, because every property this package sets by
+// name happens to be a string there. It is not enough on macOS.
+// osxaudiosink's "device" property is a gint CoreAudio AudioDeviceID, not a
+// string, and the existence-only guard passes it: g_object_set_property emits a
+// GLib CRITICAL to stderr where nobody is looking, the setter returns nil, the
+// property keeps its default of 0, and CoreAudio helpfully interprets 0 as "the
+// system default device". The return-audio monitor then plays out of the wrong
+// device with a GREEN lamp and no diagnosis anywhere. osxaudiosrc's "device" is
+// the same gint on the capture side.
+//
+// Comparing the GType turns that entire class of failure — every future
+// property whose type differs between the platforms' elements — into a loud
+// error naming the property and the type it actually wanted. It costs one
+// comparison at pipeline-open time.
+func setTypedProperty(obj gobject.Object, name string, want gobject.Type, value any) error {
+	got := propertyType(obj, name)
+	if got == gobject.TypeInvalid {
+		return fmt.Errorf("gst: element has no %s property", name)
+	}
+	if got != want {
+		return fmt.Errorf("gst: element's %s property is a %s, not a %s: setting it would emit a "+
+			"GLib CRITICAL and leave the property at its default, which is how a pipeline ends up "+
+			"quietly using the wrong device", name, got.Name(), want.Name())
+	}
+	obj.SetObjectProperty(name, value)
+	return nil
+}
+
+// setStringProperty sets a G_TYPE_STRING property, failing loudly if the
+// element does not have it or if it is not a string.
 //
 // The explicit check exists because the alternatives are silent:
 // g_object_set_property on an unknown property emits a GLib warning to stderr
@@ -2906,9 +2916,18 @@ func hasProperty(obj gobject.Object, name string) bool {
 // starts with no slate path or no capture device set is a pipeline that sends
 // nothing while looking healthy.
 func setStringProperty(obj gobject.Object, name, value string) error {
-	if !hasProperty(obj, name) {
-		return fmt.Errorf("gst: element has no %s property", name)
-	}
-	obj.SetObjectProperty(name, value)
-	return nil
+	return setTypedProperty(obj, name, gobject.TypeString, value)
+}
+
+// setIntProperty sets a G_TYPE_INT property, failing loudly if the element does
+// not have it or if it is not a gint.
+//
+// int32 rather than int in the signature is not incidental: go-glib maps a Go
+// int32 to G_TYPE_INT and has no mapping at all for a plain int, so passing one
+// through SetObjectProperty would arrive as G_TYPE_INVALID. The one thing a
+// caller must not do is pass a value it has not resolved from a stable
+// identifier first — see deviceprovider_darwin.go for why every gint device id
+// on macOS is a runtime handle rather than an identity.
+func setIntProperty(obj gobject.Object, name string, value int32) error {
+	return setTypedProperty(obj, name, gobject.TypeInt, value)
 }

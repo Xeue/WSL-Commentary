@@ -10,15 +10,24 @@
 // so much was kept out of it.
 //
 // WHAT THESE TESTS CANNOT REACH is stated here rather than left to be
-// discovered: nothing below creates a window, hands a handle to
-// d3d11videosink, or decodes a frame. The overlay in overlay_windows.go is
-// exercised only through its interface, by the fake in app_picture_test.go. See
-// the report for what is therefore still unproven.
+// discovered: nothing below creates a window or an NSView, hands a handle to a
+// video sink, or decodes a frame. The overlays in overlay_windows.go and
+// overlay_darwin.go are exercised only through their interface, by the fake in
+// app_picture_test.go. See the report for what is therefore still unproven.
+//
+// The one exception is the macOS coordinate conversion, which IS reached here
+// and deliberately so. It is arithmetic that cannot be seen to be wrong from
+// anywhere else — a sign error puts the picture in the wrong half of a window on
+// a machine nobody is standing at — so cocoaOverlayFrame in picture.go carries
+// it in pure Go, the cases below pin it against worked examples, and
+// TestOverlayDarwinStillSpellsTheConversionTheSameWay reads the Objective-C that
+// actually performs it and asserts the two have not drifted apart.
 package gst
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -187,6 +196,177 @@ func TestPictureRectEmptyIsAHideNotAnError(t *testing.T) {
 	}
 	if (PictureRect{W: 1, H: 1}).Empty() {
 		t.Error("a one-pixel rectangle is not empty")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The macOS coordinate conversion
+// ---------------------------------------------------------------------------
+
+func TestCocoaOverlayFrameTurnsTheYAxisOver(t *testing.T) {
+	// AppKit's origin is the BOTTOM left of the superview; the page's is the TOP
+	// left. Getting the flip wrong does not fail, log, or look like an error — it
+	// puts the picture in the wrong half of the window, mirrored about the
+	// middle, on a machine nobody is standing at.
+	//
+	// The worked example is the proof of concept's, reproduced exactly: a
+	// 560 pt tall content view, a rectangle 60 pt down from the top and 360 pt
+	// tall, giving a frame origin of 560 - 60 - 360 = 140. At scale 1 the
+	// physical pixels and the points are the same number, which is what makes it
+	// readable as a flip test rather than a scale test.
+	const containerHeight = 560
+	x, y, w, h := cocoaOverlayFrame(PictureRect{X: 40, Y: 60, W: 640, H: 360}, containerHeight, 1)
+	if x != 40 || w != 640 || h != 360 {
+		t.Fatalf("cocoaOverlayFrame x,w,h = %v,%v,%v, want 40,640,360; only y should change", x, w, h)
+	}
+	if y != 140 {
+		t.Fatalf("cocoaOverlayFrame y = %v, want 140 (= %d - 60 - 360). The picture is %v points "+
+			"from where the page put it, mirrored about the middle of the window",
+			y, containerHeight, 140-y)
+	}
+}
+
+func TestCocoaOverlayFrameDividesPhysicalPixelsByTheBackingScale(t *testing.T) {
+	// PictureRect is PHYSICAL PIXELS and an NSView frame is POINTS. The measured
+	// backingScaleFactor on the development machine is 2.0, so a rectangle the
+	// page laid out at 320x180 CSS pixels arrives here as 640x360 physical and
+	// must go back to 320x180 points — otherwise the picture is twice the size
+	// of the hole the page left for it and covers the controls beside it.
+	//
+	// The content view is 560 points tall, which is a POINT height: it comes from
+	// -[NSView bounds], not from a pixel count. Mixing the two units in this one
+	// expression is the mistake this case exists to catch, and it would show up
+	// as the y being 280 points out.
+	x, y, w, h := cocoaOverlayFrame(PictureRect{X: 80, Y: 120, W: 640, H: 360}, 560, 2)
+	if x != 40 || w != 320 || h != 180 {
+		t.Fatalf("cocoaOverlayFrame x,w,h = %v,%v,%v, want 40,320,180 points at scale 2", x, w, h)
+	}
+	if y != 560-60-180 {
+		t.Fatalf("cocoaOverlayFrame y = %v, want %v: the flip must happen in POINTS, after the "+
+			"division, because the container height is a point height", y, float64(560-60-180))
+	}
+}
+
+func TestCocoaOverlayFrameKeepsAbuttingRectanglesAbutting(t *testing.T) {
+	// The seam test again, on the other side of the boundary. ScaleRect protects
+	// the seam in physical pixels; this protects it through the conversion, which
+	// divides and then subtracts. A conversion that rounded to whole points would
+	// reintroduce exactly the one-pixel line ScaleRect exists to remove.
+	const containerHeight, scale = 600.0, 2.0
+	top := PictureRect{X: 0, Y: 0, W: 400, H: 451}
+	below := PictureRect{X: 0, Y: 451, W: 400, H: 200}
+
+	_, topY, _, _ := cocoaOverlayFrame(top, containerHeight, scale)
+	_, belowY, _, belowH := cocoaOverlayFrame(below, containerHeight, scale)
+
+	// In AppKit the lower rectangle has the SMALLER y, so "abutting" is the
+	// lower one's top edge meeting the upper one's bottom edge.
+	if belowY+belowH != topY {
+		t.Fatalf("the rectangles do not abut after conversion: the lower one ends at %v and the "+
+			"upper one starts at %v, a %v point seam", belowY+belowH, topY, topY-(belowY+belowH))
+	}
+}
+
+func TestCocoaOverlayFrameSurvivesANonsenseBackingScale(t *testing.T) {
+	// The scale comes from -[NSWindow backingScaleFactor] on the main thread. It
+	// cannot sensibly be zero or negative, and dividing by it if it ever were is
+	// not a thing to discover during a match: a picture at the wrong scale can be
+	// seen and reported, an infinity cannot.
+	for _, scale := range []float64{0, -2} {
+		x, y, w, h := cocoaOverlayFrame(PictureRect{X: 10, Y: 20, W: 100, H: 50}, 500, scale)
+		if x != 10 || w != 100 || h != 50 || y != 500-20-50 {
+			t.Fatalf("cocoaOverlayFrame at scale %v = %v,%v %vx%v, want the rectangle treated as "+
+				"points (scale 1)", scale, x, y, w, h)
+		}
+	}
+}
+
+func TestOverlayDarwinStillSpellsTheConversionTheSameWay(t *testing.T) {
+	// cocoaOverlayFrame is the reference implementation and the tests above are
+	// its proof, but the expression that actually moves the picture is the
+	// Objective-C one in overlay_darwin.go: the conversion HAS to happen on the
+	// main thread, against a superview height and a backing scale that change
+	// when the operator drags the window to a second display, so it cannot be
+	// called across the cgo boundary from Go on every apply.
+	//
+	// Two expressions of one formula drift. This is the seam that stops them: it
+	// reads the C source and asserts the flip is still spelled the same way. It
+	// runs on every platform and at Gate A, because it is a file read and not a
+	// build.
+	//
+	// If this fails because the C was legitimately rewritten, change BOTH, and
+	// change the worked examples above with them.
+	src, err := os.ReadFile("overlay_darwin.go")
+	if err != nil {
+		t.Fatalf("reading overlay_darwin.go: %v", err)
+	}
+	text := string(src)
+
+	const flip = `[sup bounds].size.height - ((CGFloat)y / scale) - ph`
+	if !strings.Contains(text, flip) {
+		t.Fatalf("overlay_darwin.go no longer contains the y flip %q. Either the picture is now "+
+			"placed from the top left — which AppKit does not do on an unflipped superview — or "+
+			"the formula has moved and cocoaOverlayFrame is no longer a description of anything",
+			flip)
+	}
+	// The divisions are the scale half. All four edges have to be divided, and
+	// the one that gets forgotten is the origin, because a picture at the right
+	// size in the wrong place still looks like a layout bug rather than a unit
+	// bug.
+	for _, want := range []string{
+		`(CGFloat)h / scale`,
+		`(CGFloat)x / scale`,
+		`(CGFloat)w / scale`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("overlay_darwin.go does not contain %q: the rectangle arrives in PHYSICAL "+
+				"PIXELS and -[NSView setFrame:] wants POINTS", want)
+		}
+	}
+
+	// And the main-thread rule, which is the other way this file kills the
+	// application. Every AppKit call has to be inside a block on the main queue;
+	// the only synchronous one is construction, and it is only safe because it
+	// tests [NSThread isMainThread] first.
+	if !strings.Contains(text, "dispatch_get_main_queue()") {
+		t.Fatal("overlay_darwin.go no longer dispatches to the main queue. AppKit called from a " +
+			"GStreamer streaming thread is undefined behaviour, and the symptom is a crash in " +
+			"the window server with no Go stack in it")
+	}
+	if strings.Count(text, "dispatch_sync(") != 1 {
+		t.Errorf("overlay_darwin.go has %d dispatch_sync calls, want exactly 1 (construction, "+
+			"which is the only call that has to return a value). A dispatch_sync anywhere else "+
+			"deadlocks the moment the main thread is waiting on Go, which is what App.teardown "+
+			"does on every quit", strings.Count(text, "dispatch_sync("))
+	}
+	if !strings.Contains(text, "[NSThread isMainThread]") {
+		t.Error("overlay_darwin.go no longer checks [NSThread isMainThread]. dispatch_sync onto " +
+			"the queue you are already running on deadlocks unconditionally")
+	}
+
+	// And the OTHER half of that rule, which is the one that was actually got
+	// wrong. [NSThread isMainThread] answers "am I the main thread"; it does not
+	// answer "is anybody DRAINING the main queue", and only the second question
+	// makes a dispatch_sync bounded. Under `go test` there is no NSApplication
+	// and nothing drains, so the dispatch_sync waited until the ten-minute test
+	// timeout killed the binary — which silently skipped every test declared
+	// after the one that triggered it.
+	//
+	// This is asserted from a test on purpose, even though the hang it prevents
+	// cannot itself be reproduced from a test: reaching NewPictureOverlay under
+	// `go test` IS the fault. So the guard is a source read, like the conversion
+	// above, and it is the only thing standing between a tidy-up and a suite that
+	// silently stops running half of itself.
+	if !strings.Contains(text, "[NSApp isRunning]") {
+		t.Error("overlay_darwin.go no longer tests [NSApp isRunning] before its dispatch_sync. " +
+			"Without it, any caller reached from a process with no running NSApplication — every " +
+			"`go test` binary on this platform — blocks for ever on a main queue nobody services")
+	}
+	if !strings.Contains(text, "WSLCOMMS_OVERLAY_NO_MAIN_LOOP") {
+		t.Error("overlay_darwin.go no longer distinguishes 'no main loop' from 'no window'. The " +
+			"caller has to be told ErrNoHostWindow either way so SetPictureRect keeps treating it " +
+			"as 'not yet', but the sentence a reader sees must not claim we looked for a window " +
+			"when we never got far enough to look")
 	}
 }
 

@@ -22,9 +22,27 @@
 // Each file provides Init, ListInputDevices and New. Everything above this seam
 // is identical in both builds.
 //
+// # And, inside the real build, two platforms
+//
+// gst_cgo.go is itself platform-neutral. What differs between Windows and macOS
+// is confined to two pairs of files, on this codebase's usual per-file
+// build-tag idiom:
+//
+//   - elements_windows.go / elements_darwin.go — the ELEMENT contract: the
+//     capture source and AAC encoder factory names, the platform half of the
+//     bundle's required-element list, and the H.264 encoder preference and
+//     settings.
+//   - deviceprovider_windows.go / deviceprovider_darwin.go — the DEVICE seam:
+//     which enumerated devices this build can offer, what string is persisted
+//     for each, and how that string is turned back into whatever the capture
+//     element will actually accept.
+//
+// There is deliberately no runtime.GOOS anywhere in this package.
+//
 // # The pipeline this package builds
 //
-// Specification section 5, as one gst_parse_launch string:
+// Specification section 5, as one gst_parse_launch string. EXACTLY TWO element
+// names vary by platform; nothing else in the graph does.
 //
 //	mpegtsmux name=mux alignment=7 pcr-interval=3600
 //	  ! queue name=srtq leaky=downstream max-size-buffers=4000
@@ -37,6 +55,16 @@
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true
 //	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
 //	  ! mfaacenc bitrate=128000
+//	  ! aacparse ! queue ! mux.
+//
+// On macOS the same graph reads:
+//
+//	  ! vtenc_h264 name=venc bitrate=2000 rate-control=cbr
+//	    max-keyframe-interval=100 realtime=true allow-frame-reordering=false
+//	  ! h264parse config-interval=-1 ! queue ! mux.
+//	osxaudiosrc name=asrc device=<AudioDeviceID resolved at Start>
+//	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
+//	  ! atenc bitrate=128000
 //	  ! aacparse ! queue ! mux.
 //
 // srtsink's own auto-reconnect is set to false and must stay false: on a write
@@ -88,11 +116,31 @@ const (
 // Device is one audio capture endpoint offered in the commentary input
 // dropdown.
 type Device struct {
-	// ID is the WASAPI IMMDevice endpoint ID GUID, e.g.
-	// "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}". This is what is
-	// persisted to config.json and passed to wasapi2src's device property. It
-	// survives a rename and sidesteps the double space in
-	// "DVS Receive  1-2 (Dante Virtual Soundcard)" entirely.
+	// ID is the operating system's own STABLE identity for the endpoint. It is
+	// what is persisted to config.json, and it survives a rename — which is why
+	// it, rather than Name, is the thing stored. It sidesteps the double space
+	// in "DVS Receive  1-2 (Dante Virtual Soundcard)" entirely.
+	//
+	// The shape and the meaning are per-platform, and the difference is bigger
+	// than it looks:
+	//
+	//	Windows  a WASAPI IMMDevice endpoint ID GUID, e.g.
+	//	         "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}".
+	//	         It is passed to wasapi2src's device property UNCHANGED.
+	//	macOS    a CoreAudio unique-id, e.g. "BuiltInMicrophoneDevice" or
+	//	         "BF568F24-731B-41DB-932E-AC7E260BC71A". It is NOT what
+	//	         osxaudiosrc accepts — that property is a gint AudioDeviceID,
+	//	         a runtime handle that coreaudiod reassigns on every
+	//	         enumeration — so it is resolved to the current integer at
+	//	         pipeline-open time. See deviceprovider_darwin.go; storing the
+	//	         integer instead is a silent wrong-device failure after the
+	//	         operator's next reboot.
+	//
+	// What is true on both, and is the contract callers may rely on: this value
+	// is stable across restarts, it is the only thing that should ever be
+	// persisted, and it is meaningless to the browser (whose mediaDeviceId is a
+	// per-origin salted hash and identifies nothing at the operating-system
+	// level).
 	ID string `json:"id"`
 
 	// Name is the endpoint's display-name, shown in the dropdown and never
@@ -107,16 +155,20 @@ type PipelineOpts struct {
 	// SlatePath is the PNG fed to filesrc ! pngdec ! imagefreeze. Required.
 	SlatePath string
 
-	// AudioDeviceID is the IMMDevice endpoint ID GUID passed to wasapi2src's
-	// device property. Required; it is Device.ID, never Device.Name.
+	// AudioDeviceID is the capture endpoint to open. Required; it is Device.ID,
+	// never Device.Name, and the whole of what that means — including the fact
+	// that macOS has to resolve it before the element will take it — is
+	// documented on Device.ID.
 	AudioDeviceID string
 
-	// VideoBitrateKbps is mfh264enc's bitrate in kilobits per second. Zero means
-	// DefaultVideoBitrateKbps.
+	// VideoBitrateKbps is the H.264 encoder's bitrate in kilobits per second.
+	// Zero means DefaultVideoBitrateKbps. Kilobits is the unit on mfh264enc and
+	// on vtenc_h264 alike.
 	VideoBitrateKbps int
 
-	// AudioBitrateBps is mfaacenc's bitrate in bits per second. Zero means
-	// DefaultAudioBitrateBps.
+	// AudioBitrateBps is the AAC encoder's bitrate in bits per second. Zero
+	// means DefaultAudioBitrateBps. Bits is the unit on mfaacenc and on atenc
+	// alike.
 	AudioBitrateBps int
 
 	// OnLevels, if set, is called with the audio level of the commentary being

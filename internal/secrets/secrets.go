@@ -1,8 +1,15 @@
-// Package secrets is the application's only route to Windows Credential
-// Manager. It holds exactly three values: the M2L-X sign-in password, the SRT
-// passphrase for the SEND path, and the SRT passphrase for the RETURN path.
-// None of them ever appears in config.json, in a log line, or in a GStreamer
-// URI.
+// Package secrets is the application's only route to the operating system's
+// credential store — Windows Credential Manager on Windows (secrets_windows.go)
+// and the login Keychain on macOS (secrets_darwin.go). It holds exactly three
+// values: the M2L-X sign-in password, the SRT passphrase for the SEND path, and
+// the SRT passphrase for the RETURN path. None of them ever appears in
+// config.json, in a log line, or in a GStreamer URI.
+//
+// Everything below this line is the half that is the same on both platforms:
+// the key names, the target names, ScopedKey, validateScope and targetFor. The
+// two platform files supply New, the Store implementation, and StoreName — which
+// is what the store is CALLED, and lives here rather than in the app layer
+// because this package is the only thing that knows for certain.
 //
 // Owner: WP-1. No other work package writes files in this directory.
 //
@@ -107,6 +114,27 @@ type Store interface {
 // (secrets_darwin.go). Both are declared to never fail — the vault is always
 // present — so any per-call problem surfaces from Get or Set instead, and
 // app.go's wire-up is identical on both platforms.
+
+// StoreName returns what that vault is CALLED, for an operator reading an error
+// message: "Windows Credential Manager" or "the macOS login Keychain". It is
+// declared per platform beside New, for the same reason New is.
+//
+// Five error strings across app.go, app_mixer.go, app_return.go and
+// app_picture.go tell somebody where to go and put a password. Every one of them
+// is read by a person who cannot sign in, or cannot hear the return, and has
+// perhaps thirty seconds. Naming the wrong operating system's facility there is
+// not a cosmetic fault; it sends them looking for a control panel their machine
+// does not have.
+//
+// The whole PHRASE is returned, article included, because it is always the
+// object of a preposition — "stored in %s under %q" — and the two platforms want
+// different articles. A bare noun would make each call site dress it, which is
+// five places to get it wrong instead of one.
+//
+// Note what is NOT platform-dependent: the TARGET NAME. targetFor maps
+// "WSLComms/m2lx" to a Credential Manager target and to a Keychain service
+// alike, so the %q in those messages is correct on both platforms and
+// TestTargetNames pins it.
 
 // ScopedKey builds the key for a PER-INSTANCE-PRESET credential: scope "wembley"
 // and base KeyM2LX become "wembley/m2lx", which targetFor resolves to the
