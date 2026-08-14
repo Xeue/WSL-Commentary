@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -519,14 +520,33 @@ func TestDiffRender_SatisfiesStringer(t *testing.T) {
 // Golden persistence
 // ---------------------------------------------------------------------------
 
-// withAppData points %APPDATA% at a fresh temp directory for the duration of
-// the test, matching internal/config's own test helper, so GoldenPath/
-// SaveGolden/LoadGolden exercise a real filesystem without touching the
-// developer's actual %APPDATA%\WSLComms.
+// withAppData points the user config directory at a fresh temp directory for
+// the duration of the test, matching internal/config's own test helper, so
+// GoldenPath/SaveGolden/LoadGolden exercise a real filesystem without touching
+// the developer's actual profile. It returns the directory GoldenPath joins
+// onto.
+//
+// GoldenPath resolves os.UserConfigDir, and which environment variable that
+// reads is per-GOOS — see the long note on internal/config's copy of this
+// helper for why setting APPDATA alone made this package fail on darwin.
 func withAppData(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	home := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("APPDATA", home)
+	case "darwin":
+		t.Setenv("HOME", home)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", home)
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("resolving the redirected user config directory: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating the redirected user config directory: %v", err)
+	}
 	return dir
 }
 

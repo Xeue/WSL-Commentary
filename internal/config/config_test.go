@@ -4,17 +4,44 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
-// withAppData points %APPDATA% at a fresh temp directory for the duration of
-// the test, so Path/Load/Save exercise a real filesystem without touching
-// the developer's actual %APPDATA%\WSLComms.
+// withAppData points the user config directory at a fresh temp directory for
+// the duration of the test, so Path/Load/Save exercise a real filesystem
+// without touching the developer's actual profile. It returns that directory —
+// the one Path() joins AppDataDirName onto.
+//
+// Path() resolves os.UserConfigDir, and WHICH environment variable that reads
+// is per-GOOS: %APPDATA% on Windows, $HOME/Library/Application Support on
+// darwin, $XDG_CONFIG_HOME (or $HOME/.config) elsewhere. Setting APPDATA
+// unconditionally — which this helper used to do — is therefore a no-op
+// anywhere but Windows: every test here then ran against the developer's REAL
+// config.json, passing or failing on whatever happened to be in it. That is
+// why the whole package failed on darwin while passing on Windows.
+//
+// The directory is created because the old helper returned t.TempDir(), which
+// always exists, and callers rely on that.
 func withAppData(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	home := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("APPDATA", home)
+	case "darwin":
+		t.Setenv("HOME", home)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", home)
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("resolving the redirected user config directory: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating the redirected user config directory: %v", err)
+	}
 	return dir
 }
 

@@ -5,17 +5,37 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-// tempAppData points %APPDATA% at a temp directory, exactly as config's and
-// app.go's tests do, so nothing here can touch the developer's real profile.
+// tempAppData points the user config directory at a temp directory, exactly as
+// config's and app.go's tests do, so nothing here can touch the developer's
+// real profile. It returns the directory Dir() joins DirName onto.
+//
+// Which environment variable os.UserConfigDir reads is per-GOOS — see the long
+// note on internal/config's withAppData for why setting APPDATA alone made this
+// package fail on darwin.
 func tempAppData(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	home := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("APPDATA", home)
+	case "darwin":
+		t.Setenv("HOME", home)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", home)
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("resolving the redirected user config directory: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating the redirected user config directory: %v", err)
+	}
 	return dir
 }
 

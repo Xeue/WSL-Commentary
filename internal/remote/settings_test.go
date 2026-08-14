@@ -3,11 +3,41 @@ package remote
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"wslcomms/internal/config"
 )
+
+// withAppData points the user config directory at a fresh temp directory for
+// the duration of the test, so RemoteDir/Save/LoadSettings exercise a real
+// filesystem without touching the developer's actual profile. It returns the
+// directory RemoteDir joins appDataDirName onto.
+//
+// RemoteDir resolves os.UserConfigDir, and which environment variable that
+// reads is per-GOOS — see the long note on internal/config's withAppData for
+// why setting APPDATA alone made this package fail on darwin.
+func withAppData(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("APPDATA", home)
+	case "darwin":
+		t.Setenv("HOME", home)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", home)
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("resolving the redirected user config directory: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating the redirected user config directory: %v", err)
+	}
+	return dir
+}
 
 // TestAppDataDirName_MatchesConfig guards the one fact this package duplicates
 // rather than imports: the app-data folder name. internal/remote must not depend
@@ -75,9 +105,8 @@ func TestSettings_ValidateRules(t *testing.T) {
 }
 
 func TestSettings_SaveLoadRoundTripAtomic(t *testing.T) {
-	// Redirect %APPDATA% to a temp tree so the real config folder is untouched.
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	// Redirect the user config dir to a temp tree so the real config folder is untouched.
+	dir := withAppData(t)
 
 	s := DefaultSettings()
 	s.Bind = "127.0.0.1"
@@ -107,8 +136,7 @@ func TestSettings_SaveLoadRoundTripAtomic(t *testing.T) {
 }
 
 func TestLoadSettings_MissingFileReturnsOpenDefaults(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	withAppData(t)
 	got, err := LoadSettings()
 	if err != nil {
 		t.Fatalf("LoadSettings on a missing file: %v", err)
@@ -130,8 +158,7 @@ func TestLoadSettings_MissingFileReturnsOpenDefaults(t *testing.T) {
 // the clients, and folds the old port onto httpsPort. A machine upgraded from the
 // previous scheme must keep working, not fail to parse.
 func TestLoadSettings_MigratesLegacyFile(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("APPDATA", dir)
+	dir := withAppData(t)
 
 	remoteDir := filepath.Join(dir, appDataDirName, remoteDirName)
 	if err := os.MkdirAll(remoteDir, 0o700); err != nil {
