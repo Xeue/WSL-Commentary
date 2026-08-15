@@ -39,6 +39,14 @@ these are the ones that change what a package may assume:
    has been removed rather than managed. If you genuinely need a dependency that is not there,
    **stop and report it** — do not add it.
 
+   **RELAXED BY THE OWNER 2026-08-15: "the contracts rule 1 is overzealous, we can relax it."**
+   Adding a dependency is now allowed and these three files are no longer frozen. The rule is
+   amended rather than deleted because its *reason* survives its prohibition: concurrent edits to
+   dependency manifests still lose work, so an agent adding one should say so where the other
+   agents will see it. **Prefer the stdlib, and say why in a comment when you add anything.**
+   Nothing has been added under the relaxation so far — the conform work, the DeckLink device seam
+   and the bus-error filter are all stdlib and existing dependencies.
+
 2. **Each package owns its paths exclusively.** Do not create, edit or delete a file under
    another WP's paths, not even a typo fix, not even a test. `main.go`, `app.go` and
    `main_nocgo.go` belong to WP-8 alone.
@@ -220,6 +228,37 @@ are contract rather than detail:
   cross the Wails boundary, and never appear in a log except as a diagnostic.
 - **`Save` must never write a secret.** `TestSave_NeverWritesSecretFields` enforces it.
 
+**Four fields added 2026-08-15, rule 3** — `videoBitrateKbps`, `videoFormatOverride` (both
+INSTANCE, so both travel in a preset) and `audioSourceKind`, `decklinkPersistentId` (both MACHINE).
+Two of them change rules stated above and so are recorded here rather than only in the source:
+
+- **`videoFormatOverride` is a STRING (`"1920x1080p50"`), parsed by exactly one function**
+  (`ParseVideoFormat` in `videoformat.go`), and not a nested struct of width/height/rate. Two
+  reasons. What the operator typed must stay **visible** — a struct turns a format this build
+  cannot express into three plausible zeros, where a string can be quoted back — and this package's
+  merge primitive would otherwise be a trap: `Load` and `presets.Apply` unmarshal onto an
+  already-populated struct, so a nested object merges **field by field**, and a preset carrying
+  `{"width":1280}` would leave height 1080 and conform to 1280x1080. A string cannot half-arrive.
+  Frame rates are stored as exact fractions (the NTSC decimals map to n×1000/1001); interlace is
+  refused **by name**, because the video leg can only produce progressive.
+- **`Validate` refuses an unparseable `videoFormatOverride`. This is a deliberate, single exception
+  to "nothing in `Validate` may be a reason a match does not go out"** — and the exception is
+  narrow on purpose. A bad value here means the contribution feed **cannot be built either way**,
+  so the match does not go out regardless; the only question is whether the operator is told which
+  box to fix while they can still fix it, or gets `not-negotiated (-4)` naming nothing, twenty
+  seconds after START. **Empty is never an error** — empty means derive, and is the default.
+- **`audioDeviceId` is now required only when the capture is native.** Leaving it unconditional
+  would make a DeckLink seat unstartable over a subsystem its commentary never touches. See the
+  Start-gate note under `app.go` below: until the DeckLink capture leg exists, `Start` refuses a
+  DeckLink seat outright, because that relaxation otherwise lets an empty `audioDeviceId` reach
+  `osxaudiosrc` and open the **system default input** silently.
+- **`frontend/src/ui/validate.js` mirrors `ParseVideoFormat`'s grammar in JavaScript.** It has to:
+  `SaveConfig` deliberately does not validate (a half-filled first-run form must be savable), so
+  Go's `Validate` runs only at START and the JS is what stops a bad value reaching `config.json` at
+  all. The two are pinned together by a 37-case verdict corpus in `settings.test.js`, verified
+  against Go's parser directly, plus source-text assertions on the bounds. A string they disagree
+  about is a defect either way round.
+
 ### `internal/secrets` — WP-1
 `Store` with `Get(key)`/`Set(key, value)`. **Three** keys, not two: `KeyM2LX` (`"m2lx"`), `KeySRT`
 (`"srt"`) and `KeySRTReturn` (`"srtreturn"`), mapping to Credential Manager targets
@@ -295,11 +334,90 @@ Token handling: `TokenLifetime` is the measured 86399 s and `RefreshFraction` is
 `/api/local_auth/refresh_token`. The refresh token's own TTL is unmeasured, so a failed
 `Refresh` must fall back to a full `SignIn`.
 
+**Added 2026-08-15, rule 3: `ConformFormat` and `ConformFormatFrom(payload []byte)`.** The
+instance's **configured** video format, derived from any node that is **running**. M2L-X can be
+configured into any format and requires every source to match it, so a streaming node is reporting
+that format — and there is no other way to learn it: measured against `matchH` on 2026-08-15, all
+35 nodes reported `"format": null` with `stream_state:"stopped"`, and seven plausible REST paths
+(`/api/system`, `/api/settings`, `/api/switcher`, `/api/config`, `/api/events/{id}`,
+`/api/live_operation/outputs`, `/api/router`) all answered 404. **"Nothing to derive from" is
+therefore the normal case, not a fault**, and every caller must have a fallback. Only whole-node
+entries (`path:"/"`) are read; the largest agreeing group wins, ties broken by node name so the
+answer is a function of the frame and not of map iteration order; other running nodes reporting a
+different raster are named in `Disagreeing` rather than swallowed.
+
+`GET /api/input/router/list/{eventId}` **does** state the configured format per router input —
+measured on `matchH`, input 4 `{"name":"COMMS","port":40004,"width":1920,"height":1080,"codec":
+"h264","frame_rate":50}` — and it answers while every node's format is still null. It is not used
+yet. Three traps for whoever wires it, all re-measured against `matchH` on 2026-08-15:
+
+1. `frame_rate` is a **number** there (`50`) and the **string** `"50"` on the status socket.
+2. **Every** input answers with a plausible raster whether or not it is ours — the list came back
+   with **48** entries, all `1920x1080p50 progressive`, of which exactly one was `h264` and the
+   other 47 `h265` — so the match must be exact on `port` against `srtPort`. Matching on the first
+   plausible raster, or on the codec, reads somebody else's input and turns a green lamp into a lie.
+3. **`{eventId}` is not the sign-in response's `id`.** That field is the *user* id
+   (`da8c3058-…`), and using it returns `404 {"detail":"event_id not found"}`. The event id is
+   `event_id` from `GET /api/events/overview` (`9or-l7xtm4y8-sy5x` on `matchH`) — the same value
+   `internal/m2lx.ListEvents` already returns as `Event.ID`.
+
+This is not the `docs/architecture.md` ban on REST format — that ban is on reading REST as
+**detection**, and detection still comes from `switcher_status` alone.
+
 ### `internal/gst` — the contribution pipeline — WP-3a
-`Device{ID, Name}`; `ID` is the IMMDevice endpoint GUID and is the only thing persisted or
+`Device{ID, Name, Kind}`; `ID` is the IMMDevice endpoint GUID and is the only thing persisted or
 passed to `wasapi2src`. `Pipeline` with `Start(PipelineOpts)`, `ReplaceSink(SinkOpts)`,
 `ForceKeyUnit()`, `Errors()`, `Stop()`; package functions `Init(appDir)`, `ListInputDevices()`,
 `New()`.
+
+**`Device.Kind` added 2026-08-15, rule 3.** `DeviceKind` is `"native"` (the platform's own audio
+stack) or `"decklink"` (a Blackmagic card from GStreamer's decklink provider), and it exists
+because `ListInputDevices` now enumerates **both**. The two ID spaces are different kinds of
+identifier in exactly the sense this document uses of `headphoneDeviceId` / `headphoneEndpointId`,
+and neither element reports a stranger's id as a stranger's — `osxaudiosrc` handed a DeckLink
+persistent-id falls back to the **system default input**, silently. It is a **separate field and
+never a prefix inside `ID`**, because `ID` is opaque to everything above this package, and it is
+**not persisted**: `config.json` keeps the id alone, so no migration and no new entry in
+`internal/presets/fields.go`. The empty string means "written before this field existed" and reads
+as native — use `NormaliseDeviceKind`, never a comparison against `""`.
+
+The one measurement that decides the design: the UltraStudio 4K Mini publishes `persistent-id`
+`gint64 2747401380` and **no** `unique-id`, while its CoreAudio twin publishes `unique-id`
+`"90:a3c204a4:00000000:Audio"` — and `0xa3c204a4` **is** 2747401380. The same card, twice, under
+names an operator cannot tell apart, and **the twin a clever de-duplication would discard is the
+one carrying the microphone** (the native twin measures -96 dBFS on all sixteen channels with the
+mic live). Hence the de-dup key is scoped by kind, and hence the dropdown labels rather than
+merges.
+
+**The bus error filter is no longer `isSinkSourced` alone** (`capturefault.go`,
+`capturefault_cgo.go`, added 2026-08-15, rule 3). This **reverses a documented invariant that
+`internal/sender`'s design rested on** — "everything that is not sink-sourced is pipeline-fatal" —
+so it is recorded here rather than only in the source. Errors are now classified by the element
+that posted them: sink-sourced is unchanged and tested first; a **video capture** failure is
+**recoverable** (the gate is not closed, the pipeline stays PLAYING, it is delivered as a warning
+and never reaches `Errors()`, because `internal/sender` treats any error arriving while CONNECTED
+as the peer going away and would spend seven seconds off air on a fault that never touched the
+feed); an **audio capture** failure is fatal but **named**, separating device-missing, device-busy
+and no-signal, which are one generic stream error at this level and have three different fixes.
+The classification must run **before** the gate close, not merely replace the `isSinkSourced` test:
+closing the gate on a video fault would stop media reaching the sink and starve the SRT peer,
+defeating the sparing.
+
+**Element names in `pipelineDescription` are therefore load-bearing.** The audio capture element
+is `asrc` whatever factory is behind it; every element of a video capture leg carries the `vcap`
+prefix. An element that does not rejoins the fatal default **silently** — the failure direction is
+safe and therefore invisible — which is why the names are constants in `capturefault.go`.
+
+**The video leg's two capsfilters are rendered from `PipelineOpts.ConformTo`, not constants.**
+`ConformTarget{Width, Height, FrameRateNum, FrameRateDen}`, whose **zero value means "nothing is
+known"** and resolves to `FallbackConformTarget()` = 1920x1080p50 — the value that used to be
+hardcoded, so an unread switcher behaves exactly as before. The rate is an exact fraction because
+GStreamer's `framerate` caps field takes nothing else; `ConformTargetFromRate` converts the
+switcher's decimal, recognising the 1000/1001 family. **There is deliberately no parser in this
+package**: `internal/config` cannot import `internal/gst` (a config package needing GStreamer
+installed to be tested stops being tested), so the one grammar lives in `config.ParseVideoFormat`
+and `ConformTarget`'s field names match `config.VideoFormatSpec`'s so the bridge is a
+transcription. A second parser here would be a second grammar that drifts.
 
 Two contract points that are easy to get wrong and cost a day each:
 
@@ -546,6 +664,46 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetPresetCredentialStatus()` | `PresetCredentialStatus` | WP-5b | open |
 | `GetRemoteState()` | `RemoteState` | WP-5b | **host-only** |
 | `SetRemoteListener(enabled, bind, httpPort, httpsPort)` | `error` | WP-5b | **host-only** |
+| `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
+
+`GetConformTarget` is added 2026-08-15 with the conform work. It returns
+`{width, height, frameRate, source, node, agreeing, disagreeing, raw}` or **null**, and null is the
+normal answer for every way of not knowing — `lamps.js` then uses its own documented 1080p50
+fallback, i.e. exactly the behaviour this application always had. `frameRate` is the
+**operator-facing decimal** (29.97, never 29.970029970…) because the frontend compares it with
+`===` against a rate the switcher reports as the string `"29.97"`.
+
+**A running session is answered from the session**, read back rather than re-derived: the lamp's
+question is whether what the switcher sees matches what we are **sending**, and what we are sending
+was decided at Start from a switcher that may since have changed. With no session it reports the
+`videoFormatOverride` only and does **not** dial — this is a UI path, and with nothing sending
+there is no feed for the lamp to judge. It is `open` for remote because a remote seat draws the
+same status row: refusing it would leave that seat's VIDEO lamp red on a correctly conforming
+720p50 feed while the desk's reads green, and two seats disagreeing about a lamp is worse than
+either answer alone.
+
+**Two changes to `Start` itself, 2026-08-15, rule 3.**
+
+- **`Start` now makes one extra READ-ONLY status dial before building the pipeline** —
+  `Watcher.RawSnapshot`, bounded at 3 s — to derive the conform format. It is done **first**,
+  before the `statusKey` discovery is armed, because both touch the status socket and only one of
+  them may see our own feed arrive: the discovery's whole method is "which node changed state while
+  we were starting". It can never fail a Start; every failure falls through to the next source with
+  a log line. The precedence is **switcher, then `videoFormatOverride`, then
+  `FallbackConformTarget()`** — the measurement beats the declaration, because the switcher is the
+  thing being conformed *to* and a stale override typed for another venue cannot be more true than
+  a node that is streaming right now. A disagreement between the two is logged naming both, rather
+  than the override being ignored in silence.
+- **`Start` refuses `audioSourceKind:"decklink"` outright, and this is the one line to delete when
+  the DeckLink capture leg lands.** `config`, the Settings screen and `ListInputDevices` all
+  understand the value, but `PipelineOpts` still carries `AudioDeviceID` alone and
+  `pipelineDescription` still builds the platform's own source unconditionally. Combined with
+  `audioDeviceId` no longer being required for a DeckLink seat, accepting it would mean an empty
+  device on `osxaudiosrc`/`wasapi2src` — which is not an error but the **system default input** —
+  and the match going out from the laptop's built-in microphone with every lamp green. It is in
+  `Start` rather than in `config.Validate` deliberately: it is a statement about what
+  `internal/gst` can currently **build**, not about whether the configuration is well formed, and
+  the same value becomes valid the day the element exists with no change to `config` at all.
 
 The two remote-access methods live in `app_remote.go` and are BOTH host-only: they change WHETHER
 the listener runs and on WHAT address and ports, so a remote connection must never reach them — the

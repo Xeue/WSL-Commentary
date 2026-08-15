@@ -279,7 +279,7 @@ const (
 	nameSlateSrc   = "slate"  // filesrc reading the slate PNG
 	nameAudioSrc   = "asrc"   // the platform capture source: captureSourceFactory
 	nameVideoEncod = "venc"   // the H.264 encoder chosen at runtime
-	nameVideoScale = "vscale" // videoscale, so a slate that is not 1920x1080 still starts
+	nameVideoScale = "vscale" // videoscale, so a slate that is not the conform size still starts
 )
 
 // levelStructureName is the name of the GstStructure a level element posts in
@@ -688,6 +688,10 @@ func ListInputDevices() ([]Device, error) {
 	// entry resolves to the same endpoint id as the real device it currently
 	// points at, and offering both would let the operator persist two names for
 	// one endpoint. First entry with a real display name wins.
+	//
+	// The key is (kind, id) and not the id alone: see deviceDedupKey in
+	// decklinkdevices.go for why a collision between the two id spaces is made
+	// impossible to express rather than merely unlikely.
 	byID := make(map[string]int, len(devices))
 	audioSources := 0 // everything with the Audio/Source class, any provider
 	skipped := 0      // Audio/Source devices captureDeviceID refused to offer
@@ -719,7 +723,7 @@ func ListInputDevices() ([]Device, error) {
 			skipped++
 			continue
 		}
-		id, offer := captureDeviceID(dev, props)
+		id, kind, offer := captureDeviceID(dev, props)
 		if !offer {
 			// captureDeviceID has already logged the reason, in the platform's
 			// own vocabulary. Adding a second line here would double every skip.
@@ -727,7 +731,8 @@ func ListInputDevices() ([]Device, error) {
 			continue
 		}
 		name := dev.GetDisplayName()
-		if i, dup := byID[id]; dup {
+		key := deviceDedupKey(kind, id)
+		if i, dup := byID[key]; dup {
 			// The kept name is captured BEFORE the empty-name upgrade below,
 			// or the log would quote the duplicate as having duplicated
 			// itself.
@@ -739,8 +744,8 @@ func ListInputDevices() ([]Device, error) {
 				name, kept, id)
 			continue
 		}
-		byID[id] = len(out)
-		out = append(out, Device{ID: id, Name: name})
+		byID[key] = len(out)
+		out = append(out, Device{ID: id, Name: name, Kind: kind})
 	}
 	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped%s",
 		len(out), audioSources, captureSourceFactory, skipped, skipDetail())
@@ -1084,6 +1089,23 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 			opts.VideoBitrateKbps, opts.AudioBitrateBps)
 	}
 
+	// The conform target is resolved HERE and nowhere else, so that the string
+	// handed to gst_parse_launch and the string written to the log are the same
+	// decision. resolve never fails — a format that cannot be used falls back
+	// to 1920x1080p50 and says why, because no property of a still slate is
+	// worth refusing to carry commentary for. See FallbackConformTarget.
+	conform, fallbackReason := opts.ConformTo.resolve()
+	if fallbackReason != "" {
+		// A fault, and one worth a whole line: somebody supplied a target and
+		// it was not usable, so the leg is about to be built to a raster nobody
+		// chose. M2L-X only accepts a source in its own configured format.
+		log.Printf("gst: Start: conform target %v is unusable (%s); falling back to %v. "+
+			"If this instance is not configured for %v the video leg will be refused",
+			opts.ConformTo, fallbackReason, conform, conform)
+	} else {
+		log.Printf("gst: Start: conforming the video leg to %v", conform)
+	}
+
 	// The levels callback is published BEFORE anything GStreamer is built. The
 	// level element starts posting the moment the pipeline reaches PLAYING,
 	// which happens further down while p.mu is still held — so onBusMessage,
@@ -1101,7 +1123,7 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	}
 	p.encoderName = encoderName
 
-	desc := pipelineDescription(encoderName, opts.AudioBitrateBps)
+	desc := pipelineDescription(encoderName, opts.AudioBitrateBps, conform)
 	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
 	element, err := gogst.ParseLaunch(desc)
@@ -1152,8 +1174,8 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 				nameVideoScale)
 		}
 	} else {
-		log.Printf("gst: parsed pipeline has no element named %s; a slate that is not "+
-			"1920x1080 will fail caps negotiation", nameVideoScale)
+		log.Printf("gst: parsed pipeline has no element named %s; a slate that is not exactly "+
+			"%dx%d will fail caps negotiation", nameVideoScale, conform.Width, conform.Height)
 	}
 
 	asrc := pipeline.GetByName(nameAudioSrc)
@@ -1340,7 +1362,10 @@ func (p *cgoPipeline) drainStartupError() error {
 //
 // encoderName is the H.264 factory resolved at runtime. audioBitrateBps is the
 // AAC encoder's bitrate property, in bits per second — the same unit on
-// mfaacenc and on atenc, which is the one piece of luck in this port.
+// mfaacenc and on atenc, which is the one piece of luck in this port. conform
+// is the ALREADY-RESOLVED raster and rate the slate leg is conformed to: Start
+// resolves it and logs what it resolved, so this function never sees a zero or
+// a nonsense one and does not check.
 //
 // # Exactly two element names in it are per-platform
 //
@@ -1355,6 +1380,34 @@ func (p *cgoPipeline) drainStartupError() error {
 // other part of this string conditional is a change to that promise and needs
 // to be argued for on its own terms.
 //
+// # The string is no longer a constant, and here is that argument
+//
+// The two video capsfilters are rendered from conform rather than written out.
+// That is a real change to the promise above and it is made deliberately,
+// because the promise it was protecting is not the one the sentence literally
+// says. What internal/sender and the timestamp discipline rely on is that the
+// graph is the SAME GRAPH ON BOTH PLATFORMS — same elements, same order, same
+// pad topology, same liveness — not that it is the same text on every run.
+//
+// That property survives intact, for a specific structural reason: the
+// conditional is chosen IDENTICALLY on both platforms, from the same
+// ConformTarget, by the same code in gst.go, which carries no build tag and no
+// runtime.GOOS. Windows and macOS given the same PipelineOpts produce the same
+// bytes here. The per-platform seam therefore stays exactly where it was —
+// captureSourceFactory and aacEncoderFactory in elements_*.go, and nowhere
+// else — and TestPlatformElementContractIsPinned still checks both ports from
+// whichever host Gate A runs on.
+//
+// What it is NOT is a licence for the next conditional. Anything that varies
+// the ELEMENTS, their ORDER or their LIVENESS by platform, by device or by
+// configuration breaks the property this comment is actually about, and a
+// reader who cites this paragraph as precedent for one has cited the wrong
+// half of it.
+//
+// The alternative was to keep the constant and refuse to start on a switcher
+// configured for anything but 1080p50. That is not tidier, it is a commentary
+// position that cannot go on air; see FallbackConformTarget.
+//
 // The full send path was proven end to end over real SRT on macOS on
 // 2026-08-14, receiver first: 16.2 s of media reached a listener-first
 // srtsrc, the received transport stream carried PID 0x41 video (91.2 %) and
@@ -1362,7 +1415,7 @@ func (p *cgoPipeline) drainStartupError() error {
 // 1920x1080", and the audio decoded to 48 kHz stereo with real room tone on it
 // (peak -36.0 dBFS, RMS -59.2 dBFS) rather than the digital silence a
 // mis-negotiated AAC path produces.
-func pipelineDescription(encoderName string, audioBitrateBps int) string {
+func pipelineDescription(encoderName string, audioBitrateBps int, conform ConformTarget) string {
 	// alignment=7 gives 7 x 188 = 1316-byte buffers, exactly one SRT payload,
 	// so nothing fragments. pcr-interval=3600 is the specification's value.
 	// leaky=downstream means output produced during an outage is dropped rather
@@ -1376,13 +1429,51 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 	// re-lock mid-stream.
 	//
 	// videoscale is present so that the slate PNG does not have to be exactly
-	// 1920x1080. assets/slate.png is 1920x1080 today and CONTRACT.md says so,
-	// but the artwork is replaced every season by someone who will not read
-	// this file, and without videoscale a 1920x1200 export fails caps
-	// negotiation at Start with no diagnostic that names the size. The
-	// videoconvertscale plugin is already required for videoconvert, so the
-	// element costs nothing and does nothing at all when the slate is the right
-	// size.
+	// the conform target's size. assets/slate.png is 1920x1080 today and
+	// CONTRACT.md says so, but the artwork is replaced every season by someone
+	// who will not read this file, and without videoscale a 1920x1200 export
+	// fails caps negotiation at Start with no diagnostic that names the size.
+	// The videoconvertscale plugin is already required for videoconvert, so the
+	// element costs nothing and does nothing at all when the slate already
+	// matches. Since the conform target became an option that property matters
+	// MORE, not less: a switcher configured for 720p is now a size the same
+	// 1920x1080 artwork has to reach.
+	//
+	// VIDEOCONVERT AND VIDEOSCALE SIT BEFORE IMAGEFREEZE, and that is the whole
+	// optimisation.
+	//
+	// They used to sit after it, which meant converting and scaling the SAME
+	// STILL PICTURE fifty times a second for the length of the match. Moving
+	// them above imagefreeze does the work ONCE, on the single frame pngdec
+	// produces, and imagefreeze then repeats the finished NV12 buffer.
+	//
+	// Measured on macOS arm64, GStreamer 1.26.10, 2026-08-15, 500 frames at
+	// 50 fps into fakesink, both orders, both slate sizes:
+	//
+	//	order                     1920x1080 slate   1920x1200 slate
+	//	imagefreeze first (old)      2.85 s CPU        3.02 s CPU
+	//	videoscale first (new)       0.04 s CPU        0.05 s CPU
+	//
+	// and the rendered NV12 buffers are BYTE-IDENTICAL between the two orders
+	// for both slates (md5 of the first three frames, checked per size). It is
+	// a pure reordering: nothing is dropped and nothing is approximated.
+	//
+	// The 1920x1200 property the paragraph above is about SURVIVES the reorder,
+	// and survives it for the obvious reason — videoscale is still in the leg,
+	// still upstream of the encoder, and now scales the odd-sized export to the
+	// conform target BEFORE the freeze rather than after it. The 1920x1200 case
+	// is in the measurement above precisely so that this is checked rather than
+	// asserted: it started, and it produced the same bytes.
+	//
+	// The capsfilter has to SPLIT to allow the reorder, and the split is the
+	// only subtle part. Everything about one picture — format, size, PAR,
+	// colorimetry, interlace-mode — is pinned upstream of imagefreeze, where
+	// videoscale can act on it. The frame RATE is pinned downstream, because
+	// the rate is the one thing imagefreeze itself decides: it takes a single
+	// buffer whose upstream framerate is 0/1 and repeats it at whatever rate
+	// its src pad negotiates. Pinning framerate=50/1 upstream instead asks
+	// pngdec for a frame rate it does not have, and the leg fails to
+	// negotiate.
 	//
 	// There is deliberately NO capsfilter between the capture source and
 	// audioconvert. One used to sit there pinning rate=48000,channels=2,
@@ -1405,11 +1496,11 @@ func pipelineDescription(encoderName string, audioBitrateBps int) string {
 
 		"filesrc name=" + nameSlateSrc +
 		" ! pngdec" +
-		" ! imagefreeze is-live=true" +
 		" ! videoconvert" +
 		" ! videoscale name=" + nameVideoScale +
-		" ! video/x-raw,format=NV12,width=1920,height=1080,framerate=50/1," +
-		"pixel-aspect-ratio=1/1,colorimetry=bt709" +
+		" ! " + conform.spatialCaps() +
+		" ! imagefreeze is-live=true" +
+		" ! " + conform.temporalCaps() +
 		" ! " + encoderName + " name=" + nameVideoEncod +
 		" ! video/x-h264,profile=high" +
 		" ! h264parse config-interval=-1" +
@@ -1686,10 +1777,59 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		}
 		debug, gerr := msg.ParseError()
 
-		// Close the gate first, before building the error value. Everything
-		// after this point is allocation, and the buffer that is about to carry
-		// GST_FLOW_ERROR into the queue is racing us.
-		p.gateClosed.Store(true)
+		// CLASSIFY BEFORE CLOSING THE GATE, AND CLASSIFY FROM THE NAME ALONE.
+		//
+		// Something has to run before the store, because a VIDEO CAPTURE failure
+		// must NOT close the gate: the gate is what stops media reaching the
+		// sink, and the whole point of sparing a video fault is that the
+		// commentary keeps flowing through it. Closing it would starve the SRT
+		// peer and defeat the sparing entirely, so this genuinely cannot be
+		// folded into the switch below — it has to move ahead of the store.
+		//
+		// WHAT RUNS THERE IS THE PART THAT COSTS NOTHING, and the split is not
+		// cosmetic. classifyBusError with the zero captureLegs is three string
+		// comparisons on a string already in hand: no allocation, no cgo, no
+		// GObject lock. captureLegsFor is the opposite of all three — it crosses
+		// into C for the element's name, walks up to the parent bin and runs
+		// gst_bin_get_by_name over the whole graph — and running it here would
+		// put a bin traversal in front of the store on the ON-AIR path, where an
+		// srtout-N error arrives on every peer loss and the buffer carrying
+		// GST_FLOW_ERROR into srtq is racing us. That race is not hypothetical:
+		// BUILD-NOTES.md section 8.6 is the 21 ms window in which losing it took
+		// the whole capture chain down and the commentary off air.
+		//
+		// The zero value is exactly right as a first answer. classifyBusError
+		// consults legs in ONE branch — the video-capture prefix — so for every
+		// other source the two stages are provably the same decision, and for
+		// that one branch the refinement happens below, after the gate is
+		// settled. See capturefault.go.
+		class := classifyBusError(source, captureLegs{})
+
+		if class != classVideoCapture {
+			// Close the gate before building the error value. Everything after
+			// this point is allocation, and the buffer that is about to carry
+			// GST_FLOW_ERROR into the queue is racing us.
+			p.gateClosed.Store(true)
+		}
+
+		// STAGE TWO, and it is deliberately below the store rather than above
+		// it. THE CASE THAT LOOKS LIKE AN EXCEPTION: when the commentary audio
+		// comes off the same DeckLink as the video, the card drives audio
+		// capture off the video clock, so an error from a video element is an
+		// audio fault wearing a video element's name and must go fatal. Asking
+		// that question is what costs the bin traversal, so it is asked only on
+		// the one path that can be affected by the answer — never on the sink
+		// path, which is the one that is on air.
+		//
+		// The gate is closed HERE when the answer upgrades the class, because
+		// the first stage deliberately left it open. Closing it a few
+		// microseconds late costs nothing on this path: the fault is at the
+		// card, upstream of the mux, and there is no failing sink pushing a
+		// GST_FLOW_ERROR buffer at srtq to lose a race against.
+		if class == classVideoCapture && captureLegsFor(msg.Source()).AudioClockedByVideo {
+			class = classAudioCapture
+			p.gateClosed.Store(true)
+		}
 
 		err := fmt.Errorf("gst: %s: %v (%s)", source, gerr, debug)
 
@@ -1704,10 +1844,36 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 			return gogst.BusDrop
 		}
 
-		if !isSinkSourced(source) {
-			// Not the sink and not the queue in front of it: replacing the sink
-			// cannot repair this, so mark it and let ReplaceSink refuse rather
-			// than report a connection that carries no media.
+		switch class {
+		case classSinkSourced:
+			// Unchanged, and tested first so the on-air path cannot move:
+			// replacing the sink can repair it, so it goes to internal/sender
+			// on Errors() and the connection ladder handles it.
+
+		case classVideoCapture:
+			// RECOVERABLE. The pipeline stays PLAYING, mpegtsmux keeps
+			// aggregating audio, the sender keeps its socket.
+			//
+			// It must NOT reach Errors(): internal/sender treats ANY error
+			// arriving while CONNECTED as the peer going away, and would spend a
+			// whole DRAINING/BACKOFF cycle — seven seconds off air — on a fault
+			// that never touched the feed.
+			p.deliverWarning("gst: the video capture failed and the commentary is unaffected: " +
+				err.Error())
+			return gogst.BusDrop
+
+		case classAudioCapture:
+			// Fatal, because the commentary IS the product and there is nothing
+			// to degrade to — but NAMED. At this level "device busy", "device
+			// missing" and "no signal" are the same generic stream error and
+			// have three different fixes; capturefault_cgo.go reads the card's
+			// own evidence to tell them apart.
+			p.markFatal(captureFatalError(msg.Source(), source, err))
+
+		default:
+			// Not the sink and not a capture leg: replacing the sink cannot
+			// repair this, so mark it and let ReplaceSink refuse rather than
+			// report a connection that carries no media.
 			//
 			// The wrap puts ErrPipelineFatal — whose text is "gst:
 			// pipeline-fatal", so the rendered message is unchanged and

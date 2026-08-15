@@ -86,6 +86,104 @@ type Config struct {
 	// listener has no passphrase set and encryption is not negotiated.
 	PBKeyLen int `json:"pbkeylen"`
 
+	// VideoBitrateKbps is the H.264 encoder's target bitrate for the video leg
+	// of the contribution feed, in KILOBITS per second. Zero means
+	// DefaultVideoBitrateKbps — see EffectiveVideoBitrateKbps.
+	//
+	// KILOBITS is the unit on both platforms' encoders (mfh264enc's "Bitrate in
+	// kbit/sec", vtenc_h264's "Target video bitrate in kbps") and it is NOT the
+	// unit of the AAC encoder beside it, which takes bits per second. The two
+	// live one line apart in internal/gst; the suffix on this field's name is
+	// there so a value copied from one to the other is off by a thousand in the
+	// name as well as in the number.
+	//
+	// # Why this became a setting
+	//
+	// It was the constant 2000, and 2000 was chosen for what the video leg used
+	// to be: a STILL SLATE, one PNG through imagefreeze, where the encoder has
+	// nothing to spend a bitrate on and 2 Mbit/s is already generous. Live video
+	// on that leg is a different picture entirely and the operator has ruled
+	// 2000 too low for it — nearer 10000 is the figure they want. A constant
+	// that was right for one kind of picture and wrong for the other is a
+	// setting, and this is it.
+	//
+	// # Why INSTANCE, and not MACHINE
+	//
+	// It is a property of the PATH to that M2L-X deployment: how much of the
+	// uplink between this seat and that ingest the feed may take. That is the
+	// same kind of fact as srtLatencyMs and srtPort, which sit either side of it
+	// in internal/presets.InstanceFields for the same reason — a venue's
+	// contribution circuit is a venue's contribution circuit, whichever laptop
+	// is plugged into it.
+	//
+	// # The default is today's effective value, deliberately
+	//
+	// DefaultVideoBitrateKbps is 2000: exactly what internal/gst has been
+	// substituting for an unset bitrate all along. So an existing config.json
+	// (which has no such key, and takes the default through Load) and a new one
+	// both encode at the bitrate the shipped build already encodes at, and
+	// NOTHING changes until somebody sets this. A default of 10000 would have
+	// raised every position's uplink usage fivefold on the next launch, on no
+	// measurement, as a side effect of adding a control.
+	VideoBitrateKbps int `json:"videoBitrateKbps"`
+
+	// VideoFormatOverride is the video format the contribution feed conforms
+	// its video leg to when the format cannot be discovered from the switcher:
+	// a string like "1920x1080p50". EMPTY MEANS DERIVE, and empty is the
+	// default.
+	//
+	// # What it describes, and why it travels in a preset
+	//
+	// M2L-X can be configured into any format, and every source feeding it must
+	// match: a 1080p50 slate into a 1080i25 instance does not "look wrong", it
+	// fails to negotiate. So this describes how THAT SWITCHER is configured —
+	// not this PC, not this laptop's screen — and every commentary position at
+	// a facility is looking at the same answer. That is precisely what the
+	// baked-in facility presets exist to carry (app_builtin_presets.go), which
+	// is why it is classified INSTANCE.
+	//
+	// # Why there is an override at all
+	//
+	// The format is derivable from switcher_status when a node is streaming —
+	// internal/m2lx parses state.streams.video.format into m2lx.VideoFormat —
+	// and it is derivable from NOTHING when one is not. MEASURED against the
+	// live matchH instance on 2026-08-15: all 35 nodes reported
+	// "format": null with stream_state "stopped", including cam4 ("COMMS", our
+	// own input), and seven plausible REST paths (/api/system, /api/settings,
+	// /api/switcher, /api/config, /api/events/{id}, /api/live_operation/outputs,
+	// /api/router) all answered 404. There is no endpoint that states the
+	// instance's configured format, so a commentary position coming up first —
+	// which is the normal case, an hour before anybody else — has nothing to
+	// derive from and needs to be told.
+	//
+	// # THE REPRESENTATION: a string, parsed by exactly one function
+	//
+	// Not a nested struct of width/height/rate. Two reasons, and the first is
+	// the one internal/m2lx already learned the hard way (see VideoFormat.Raw
+	// there): what the operator typed must stay VISIBLE. A struct turns
+	// "1920x1080p59.94" that this build cannot express into three plausible
+	// zeros; a string keeps it, so Validate can quote it back, the Settings
+	// field can show it, and a preset can be read in a text editor and
+	// understood. A format nobody anticipated must read as itself and not as a
+	// silent {0, 0, 0}.
+	//
+	// The second reason is this package's own merge primitive. Load and
+	// presets.Apply both unmarshal onto an ALREADY-POPULATED struct, so a nested
+	// object merges FIELD BY FIELD — that is documented and desirable for
+	// monitorTile, where {"x":1120,"y":720} keeping the live w and h is exactly
+	// right. It is a trap for a video format: a preset carrying {"width":1280}
+	// would leave height 1080 and produce a 1280x1080 conform target nobody
+	// asked for and nothing can negotiate. A string cannot half-arrive. It
+	// merges whole or not at all, which is the only correct behaviour for a
+	// value whose parts are meaningless apart.
+	//
+	// The cost, stated plainly: a string can be misspelled, and a struct cannot.
+	// That cost is paid by ParseVideoFormat (videoformat.go) — the ONE parser,
+	// with the ONE grammar — and by Validate refusing a value it cannot parse,
+	// naming this field. See videoformat.go's header for the grammar and for
+	// what is deliberately not in it.
+	VideoFormatOverride string `json:"videoFormatOverride"`
+
 	// StatusKey is the switcher_status node name for our router input, e.g.
 	// "cam7". Every WebSocket-derived status lamp reads <statusKey>.* .
 	//
@@ -100,7 +198,82 @@ type Config struct {
 
 	// AudioDeviceID is the WASAPI IMMDevice endpoint ID GUID of the commentary
 	// input, written by the input dropdown. It is never the friendly name.
+	//
+	// It is required by Validate ONLY when AudioSourceKind is "native": a seat
+	// capturing from a DeckLink card takes its commentary audio from
+	// decklinkaudiosrc and never opens a CoreAudio or WASAPI endpoint at all.
+	// See the switch in Validate.
 	AudioDeviceID string `json:"audioDeviceId"`
+
+	// AudioSourceKind selects WHERE the commentary audio is captured from:
+	// AudioSourceNative ("native", the default — the platform's own audio API,
+	// wasapi2src or osxaudiosrc, reading AudioDeviceID) or AudioSourceDeckLink
+	// ("decklink" — decklinkaudiosrc, reading DeckLinkPersistentID).
+	//
+	// # Why this is MACHINE state and can never travel in a preset
+	//
+	// It answers "what is plugged into THIS PC", and it is the audioDeviceId
+	// failure exactly: a preset carrying "decklink", applied to a laptop with no
+	// card in it, describes hardware that is not there. That fault arrives by
+	// post — a config or a preset copied from the machine where it was true —
+	// and it surfaces from inside GStreamer as
+	// "Internal data stream error / not-negotiated (-4)", which is measured to
+	// appear in about 100 microseconds and to name NEITHER the device NOR the
+	// cause. It is classified MACHINE in internal/presets/fields.go, and the
+	// whitelist there is what makes carrying it impossible rather than merely
+	// discouraged.
+	//
+	// # Why it is a kind rather than being inferred from the device id
+	//
+	// Because the two device fields answer to different subsystems and an empty
+	// one is a legitimate state in both. "Nothing in decklinkPersistentId"
+	// cannot be read as "not a DeckLink seat": on a single-card machine it is
+	// the ordinary way to say "the only card". An explicit kind means the
+	// question is answered once, by the operator, on a control that says what it
+	// does — not guessed from which of two boxes happens to be empty.
+	//
+	// EffectiveAudioSourceKind substitutes "native" for an empty value, so every
+	// config.json written before this field existed keeps doing exactly what it
+	// did.
+	AudioSourceKind string `json:"audioSourceKind"`
+
+	// DeckLinkPersistentID names WHICH Blackmagic card in THIS PC to capture
+	// from when AudioSourceKind is "decklink". Empty means the only card — see
+	// the note on that below.
+	//
+	// # ONE field for audio AND video, because the id names the CARD
+	//
+	// MEASURED: decklinkaudiosrc and decklinkvideosrc on the same card publish
+	// the SAME persistent-id. It identifies the hardware, not the stream. And
+	// the two elements must be in one pipeline anyway — decklinkaudiosrc CANNOT
+	// preroll alone, because DeckLink drives audio capture off the video clock —
+	// so a pair of fields could only ever hold one value twice, with a way to
+	// disagree. There is no arrangement of hardware in which two fields would be
+	// right, so there is one field.
+	//
+	// # PERSISTENT-ID, NEVER DEVICE-NUMBER
+	//
+	// This is the same rule as HeadphoneEndpointID's, which stores the CoreAudio
+	// UID and never the integer AudioDeviceID, and it is the same rule for the
+	// same reason. decklinkvideosrc/decklinkaudiosrc also take a "device-number"
+	// property: an index into whatever order the driver enumerated the cards in
+	// this boot. It is not an identity — plug in a second card, or reboot, and
+	// device-number 0 is a different piece of hardware while every config on the
+	// machine still says 0. persistent-id is minted by the card and survives
+	// both. The integer, if internal/gst ever needs one, is resolved from this
+	// string at pipeline-open time and never written here.
+	//
+	// # Empty, and why it is allowed rather than required
+	//
+	// Empty means "the card this machine has", and a commentary position has
+	// one. Requiring an id would make a DeckLink seat unstartable until somebody
+	// had gone and found a 16-digit number for a machine with exactly one thing
+	// it could possibly mean — the same mistake that requiring statusKey was.
+	// The exclusivity is what makes empty safe to resolve: the card admits ONE
+	// user (two decklinkvideosrc in one process fail 3/3, and in two processes
+	// fail 3/3), and the incumbent survives, so once this application holds the
+	// card nothing can take it away mid-match.
+	DeckLinkPersistentID string `json:"decklinkPersistentId"`
 
 	// HeadphoneDeviceID is the browser mediaDeviceId of the commentator's
 	// headphone output, written by the output dropdown and consumed only by the
@@ -347,6 +520,61 @@ const (
 	// times the measured 21 ms median round-trip time.
 	DefaultSRTLatencyMs = 120
 
+	// DefaultVideoBitrateKbps is the H.264 target bitrate for the video leg, in
+	// KILOBITS per second. 2000 is not a new decision: it is the value
+	// internal/gst has been substituting for an unset bitrate since the video
+	// leg was a still slate, so a build with this field added encodes exactly as
+	// the build without it did until an operator changes the number.
+	//
+	// It restates internal/gst.DefaultVideoBitrateKbps rather than importing it,
+	// for the reason DefaultPictureLatencyMs and the ReturnChannel constants do:
+	// a configuration package that cannot be tested without GStreamer is a
+	// configuration package that stops being tested. The two cannot drift into
+	// anything dangerous, and it is worth saying why rather than trusting it —
+	// Defaults() now sets this field, and EffectivePictureLatencyMs's sibling
+	// EffectiveVideoBitrateKbps substitutes it for a zero, so the application
+	// path always hands internal/gst an explicit non-zero bitrate. Its own
+	// default is reachable only by a caller that omits the option, which means
+	// the stub twin and its tests.
+	//
+	// MEASURED on macOS: bitrate=2000 produced a 2.05 Mbit/s video PID, which is
+	// the confirmation that the unit really is kilobits on vtenc_h264 as well as
+	// on mfh264enc (internal/gst/gst_cgo.go, applyEncoderProperties).
+	DefaultVideoBitrateKbps = 2000
+
+	// MaxVideoBitrateKbps is the largest video bitrate Validate accepts:
+	// 100 Mbit/s expressed in the field's own unit.
+	//
+	// It is a TYPO GUARD, not an engineering limit, and it is set where it is so
+	// that it can only ever catch one. The operator wants around 10000; a stray
+	// extra digit gives 100000, which is a number no contribution circuit will
+	// carry and which — unlike a bad port or a bad key length — fails by
+	// saturating the uplink and taking the feed with it rather than by refusing
+	// to start. Ten times the largest figure anybody has asked for is far enough
+	// away that refusing above it cannot refuse a setting somebody meant.
+	MaxVideoBitrateKbps = 100000
+
+	// The two commentary capture kinds. They are the strings stored in
+	// audioSourceKind and the values of the Settings screen's control.
+	//
+	// AudioSourceNative is the platform's own audio API — wasapi2src on Windows,
+	// osxaudiosrc on macOS — reading the endpoint named by audioDeviceId.
+	AudioSourceNative = "native"
+	// AudioSourceDeckLink is decklinkaudiosrc, reading the card named by
+	// decklinkPersistentId. It exists because the CoreAudio device a Blackmagic
+	// card publishes is not the one carrying the microphone: the app measured
+	// -96 dBFS on all 16 channels of "Blackmagic UltraStudio 4K Mini" with the
+	// mic live, because the device that does carry it publishes no unique-id and
+	// is therefore skipped by the dropdown (deviceprovider_darwin.go). Capturing
+	// through the card's own element is the way to that audio.
+	AudioSourceDeckLink = "decklink"
+
+	// DefaultAudioSourceKind is AudioSourceNative. Changing this default would
+	// change which subsystem a machine captures from on its next launch without
+	// anyone asking for it — see DefaultReturnSource for the same rule applied
+	// to the return path.
+	DefaultAudioSourceKind = AudioSourceNative
+
 	// DefaultReturnMid is the transceiver mid routed to the headphones: mid 4,
 	// MIC1 — the mix-minus feed the operator labels "Monitor 1" and chose as the
 	// default return.
@@ -456,6 +684,18 @@ func Defaults() *Config {
 		// setting is not the same as "decided: none".
 		SRTReturnPBKeyLen: DefaultSRTReturnPBKeyLen,
 		PictureLatencyMs:  DefaultPictureLatencyMs,
+		// Today's effective bitrate, stated. See the field comment: the point of
+		// this default is that adding the control changes nothing.
+		VideoBitrateKbps: DefaultVideoBitrateKbps,
+		// "native" is a real value rather than the zero value, so it has to be
+		// written here or a fresh config.json would carry an empty kind that only
+		// EffectiveAudioSourceKind makes sense of.
+		AudioSourceKind: DefaultAudioSourceKind,
+		// videoFormatOverride and decklinkPersistentId are deliberately absent.
+		// Both are documented as MEANINGFUL when empty — "derive the format from
+		// the switcher" and "the only card in this machine" — so unlike
+		// srtReturnPBKeyLen above there is nothing a table of defaults could say
+		// about them that the zero value does not already say correctly.
 	}
 }
 
@@ -637,6 +877,83 @@ func (c *Config) UsesSRTReturn() bool {
 	return c.EffectiveReturnSource() == ReturnSourceSRT
 }
 
+// EffectiveVideoBitrateKbps returns the H.264 target bitrate the contribution
+// feed encodes at, substituting DefaultVideoBitrateKbps for a zero or negative
+// value.
+//
+// Zero and "unset" are the same thing here, as they are for the return port and
+// the picture latency: every config.json written before this field existed has
+// no key at all (Load gives those the default) and a hand-edited or older-build
+// file can hold an explicit 0, which is not a bitrate anybody wants — it is what
+// internal/gst already substitutes the default FOR. Doing the substitution here
+// as well means the number the application hands to the encoder is the number
+// Validate checked, rather than a zero that turns into 2000 two packages later.
+//
+// A NEGATIVE value is substituted rather than passed on, even though Validate
+// refuses one: this accessor is also reached from a config that never went
+// through Validate (a hand-edited file, a preset), and internal/gst's response
+// to a negative bitrate is to refuse to build the pipeline at all.
+func (c *Config) EffectiveVideoBitrateKbps() int {
+	if c.VideoBitrateKbps > 0 {
+		return c.VideoBitrateKbps
+	}
+	return DefaultVideoBitrateKbps
+}
+
+// EffectiveAudioSourceKind returns the configured commentary capture kind,
+// substituting DefaultAudioSourceKind for an empty value.
+//
+// Load already substitutes defaults for keys ABSENT from config.json, but an
+// explicitly empty string survives — a hand-edited file, or a preset applied
+// over a config written by a build that had no such field. "native" is the
+// answer in both cases: it is what the machine was doing before anybody touched
+// the file. Compare EffectiveReturnSource, which exists for the same reason.
+func (c *Config) EffectiveAudioSourceKind() string {
+	if s := strings.TrimSpace(c.AudioSourceKind); s != "" {
+		return s
+	}
+	return DefaultAudioSourceKind
+}
+
+// UsesDeckLinkAudio reports whether commentary audio is captured from a
+// Blackmagic card rather than from a platform audio endpoint.
+//
+// It is the one question the rest of the application asks about
+// audioSourceKind — which capture element to build, and whether audioDeviceId
+// means anything on this machine — so it is answered once, here, rather than by
+// string comparison at each call site. Mirrors UsesSRTReturn above.
+func (c *Config) UsesDeckLinkAudio() bool {
+	return c.EffectiveAudioSourceKind() == AudioSourceDeckLink
+}
+
+// VideoFormatOverrideSpec parses videoFormatOverride.
+//
+// The three answers are distinct and every caller has to tell them apart:
+//
+//	("", false, nil)     no override is set: DERIVE the format from the
+//	                     switcher, which is the normal and default case.
+//	(spec, true, nil)    conform to spec.
+//	("", false, err)     a value is set and cannot be parsed. Validate refuses
+//	                     this before Start, so a caller reaching it has a config
+//	                     that never went through Validate — a hand-edited file
+//	                     or a preset from a newer build. It must be reported,
+//	                     never silently treated as "derive": deriving from a
+//	                     switcher with nothing streaming produces the 1080p50
+//	                     guess this field exists to replace, and doing that
+//	                     quietly is how the operator ends up watching a feed
+//	                     that will not negotiate with no idea why.
+func (c *Config) VideoFormatOverrideSpec() (spec VideoFormatSpec, ok bool, err error) {
+	raw := strings.TrimSpace(c.VideoFormatOverride)
+	if raw == "" {
+		return VideoFormatSpec{}, false, nil
+	}
+	spec, err = ParseVideoFormat(raw)
+	if err != nil {
+		return VideoFormatSpec{}, false, err
+	}
+	return spec, true, nil
+}
+
 // ValidateReturn reports every reason the SRT RETURN cannot start, joined one
 // message per problem field, or nil when it is ready.
 //
@@ -748,16 +1065,22 @@ func hostOnly(host string) string {
 // so the Settings screen can show the operator every problem at once rather
 // than one edit-rebuild-fail cycle at a time. It returns nil when c is ready.
 //
-// Required non-empty fields: m2lxHost, alias, eventId, audioDeviceId, and an
-// EffectiveSRTHost — which m2lxHost alone satisfies. srtPort must be a valid
+// Required non-empty fields: m2lxHost, alias, eventId, and an EffectiveSRTHost
+// — which m2lxHost alone satisfies. audioDeviceId is required TOO, but only for
+// a native capture: see the note beside that check. srtPort must be a valid
 // TCP/UDP port, 1..65535. pbkeylen must be 0 (no passphrase negotiated), 16 or
 // 32 — the only key lengths SRT's AES-CTR supports. returnMid must be 1..7, the
 // range of transceiver mids the KVS signalling channel can address.
+// audioSourceKind must be one of the two capture kinds. videoBitrateKbps must be
+// 0 (meaning the default) or within MaxVideoBitrateKbps. videoFormatOverride, if
+// it is set at all, must be a format ParseVideoFormat can read.
 //
 // Deliberately NOT required: statusKey, which only names the node the three
 // WebSocket-derived lamps read (see the field comment). It is not needed to put
 // a feed on air, and requiring it once made the app unstartable until the
-// operator had guessed a value that nothing in the API can tell them.
+// operator had guessed a value that nothing in the API can tell them. Nor
+// decklinkPersistentId, which is empty on the single-card machine that is the
+// normal case, and would be the same mistake with different hardware.
 //
 // WP-1 addition beyond the WP-0 contract; see the package doc comment.
 func (c *Config) Validate() error {
@@ -770,12 +1093,40 @@ func (c *Config) Validate() error {
 		{"m2lxHost", c.M2LXHost},
 		{"alias", c.Alias},
 		{"eventId", c.EventID},
-		{"audioDeviceId", c.AudioDeviceID},
 	}
 	for _, f := range required {
 		if strings.TrimSpace(f.value) == "" {
 			errs = append(errs, fmt.Errorf("%s is required", f.name))
 		}
+	}
+
+	// audioSourceKind decides which capture element Start builds, so an
+	// unrecognised one has no pipeline behind it at all.
+	switch c.EffectiveAudioSourceKind() {
+	case AudioSourceNative, AudioSourceDeckLink:
+	default:
+		errs = append(errs, fmt.Errorf("audioSourceKind must be %q or %q, got %q",
+			AudioSourceNative, AudioSourceDeckLink, c.AudioSourceKind))
+	}
+
+	// audioDeviceId is required for a NATIVE capture and meaningless for a
+	// DeckLink one, so the requirement follows the kind.
+	//
+	// This used to be unconditional, in the table above, and leaving it there
+	// would have made the DeckLink seat unstartable: its audio comes from
+	// decklinkaudiosrc, no CoreAudio or WASAPI endpoint is ever opened, and the
+	// operator would have been made to pick an irrelevant device from a dropdown
+	// to satisfy a check about a subsystem their commentary is not going
+	// through. Note what is NOT required in the DeckLink branch either —
+	// decklinkPersistentId, which is empty on the single-card machine that is
+	// the normal case; see that field's comment.
+	//
+	// It stays required for a native capture for the reason it always was: it is
+	// the one device field Start genuinely cannot proceed without, and an empty
+	// one otherwise fails inside GStreamer twenty seconds late, blaming the
+	// network.
+	if !c.UsesDeckLinkAudio() && strings.TrimSpace(c.AudioDeviceID) == "" {
+		errs = append(errs, errors.New("audioDeviceId is required"))
 	}
 
 	// EffectiveSRTHost is empty exactly when m2lxHost is, which the required
@@ -792,6 +1143,48 @@ func (c *Config) Validate() error {
 
 	if c.ReturnMid < 1 || c.ReturnMid > 7 {
 		errs = append(errs, fmt.Errorf("returnMid must be between 1 and 7, got %d", c.ReturnMid))
+	}
+
+	// The video leg's bitrate. Zero is accepted and means the default (see
+	// EffectiveVideoBitrateKbps, and note that every config.json written before
+	// this field existed has no key at all); a negative one is refused here
+	// rather than by internal/gst, which would otherwise report it as a pipeline
+	// failure after the operator has pressed START. The upper bound is a typo
+	// guard — see MaxVideoBitrateKbps for why it is set as far out as it is.
+	if k := c.VideoBitrateKbps; k < 0 || k > MaxVideoBitrateKbps {
+		errs = append(errs, fmt.Errorf(
+			"videoBitrateKbps must be between 0 (the default, %d) and %d kilobits per second, got %d",
+			DefaultVideoBitrateKbps, MaxVideoBitrateKbps, k))
+	}
+
+	// ================ THE ONE CHECK THAT MUST NOT BE SOFTENED ================
+	//
+	// A videoFormatOverride this application cannot parse is refused HERE, with
+	// the field's name, the value that was typed and the accepted form in the
+	// message — because the alternative is what it replaces. Without this check
+	// an unparseable override reaches the capsfilter on the video leg, and a
+	// capsfilter that cannot negotiate fails as
+	// "Internal data stream error / not-negotiated (-4)": a message that names
+	// no field, no value and no cause, arriving several seconds after START,
+	// with a commentator waiting. An error that says which box to go and fix is
+	// worth more than every other consideration on this line.
+	//
+	// It is in Validate — the gate on Start — and not in ValidateReturn, and
+	// that is a deliberate exception to the rule that nothing in Validate may be
+	// a reason a match does not go out. The rule protects settings whose failure
+	// would be someone else's: statusKey, the monitor fields, the picture
+	// latency. This one is not like those. A bad value here means the
+	// contribution feed CANNOT be built, so the match does not go out either
+	// way; the only thing in question is whether the operator is told why, at
+	// the moment they can still fix it, or twenty seconds later by a message
+	// about a data stream.
+	//
+	// EMPTY IS NOT AN ERROR and never becomes one. Empty means derive, it is the
+	// default, and it is what every existing installation holds.
+	if raw := strings.TrimSpace(c.VideoFormatOverride); raw != "" {
+		if _, err := ParseVideoFormat(raw); err != nil {
+			errs = append(errs, fmt.Errorf("videoFormatOverride: %w", err))
+		}
 	}
 
 	return errors.Join(errs...)

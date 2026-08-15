@@ -47,6 +47,15 @@ export const INSTANCE_FIELD_LABELS = Object.freeze([
   // a change the apply will not make.
   Object.freeze({ tag: 'srtPort', label: 'SRT port' }),
   Object.freeze({ tag: 'srtLatencyMs', label: 'SRT latency (ms)' }),
+  // The two video-leg fields sit between the circuit and the encryption because
+  // that is where internal/presets.InstanceFields puts them, and this list is
+  // asserted against that one in order. Both describe the VENUE rather than the
+  // PC: the bitrate is how much of that instance's contribution path the feed
+  // may take, and the format is what that instance's switcher is configured for
+  // — one answer shared by every commentary position at the facility, which is
+  // the whole argument for a preset carrying it.
+  Object.freeze({ tag: 'videoBitrateKbps', label: 'Video bitrate (kbps)' }),
+  Object.freeze({ tag: 'videoFormatOverride', label: 'Video format when the switcher cannot be read' }),
   Object.freeze({ tag: 'pbkeylen', label: 'Passphrase key length' }),
   Object.freeze({ tag: 'statusKey', label: 'Status key' }),
   Object.freeze({ tag: 'srtReturnPort', label: 'SRT return port' }),

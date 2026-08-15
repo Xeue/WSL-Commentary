@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,14 +25,34 @@ func TestListInputDevicesReturnsFakes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInputDevices: %v", err)
 	}
-	if len(devices) != 3 {
-		t.Fatalf("want 3 fake devices, got %d", len(devices))
+	// Five: the three native endpoints the stub has always carried, plus the
+	// UltraStudio TWIN PAIR — one card enumerating twice under names an operator
+	// cannot tell apart, which is the measured shape of the owner's original bug
+	// and the case the dropdown's labelling exists for. See defaultStubDevices.
+	if len(devices) != 5 {
+		t.Fatalf("want 5 fake devices, got %d", len(devices))
 	}
 	if devices[0].Name != "DVS Receive  1-2 (Dante Virtual Soundcard)" {
 		t.Errorf("first device name = %q", devices[0].Name)
 	}
 	if devices[0].ID == devices[0].Name {
 		t.Error("device ID must be the endpoint GUID, not the display name")
+	}
+
+	// The twin pair must be a pair of DIFFERENT KINDS sharing one piece of
+	// hardware, because a stub in which the two never collide is one where the
+	// labelling that separates them can be broken without any test noticing.
+	var native, deckLink int
+	for _, d := range devices {
+		switch NormaliseDeviceKind(d.Kind) {
+		case KindNative:
+			native++
+		case KindDeckLink:
+			deckLink++
+		}
+	}
+	if native != 4 || deckLink != 1 {
+		t.Errorf("stub device kinds = %d native, %d decklink; want 4 and 1", native, deckLink)
 	}
 }
 
@@ -333,9 +354,17 @@ func TestStartRefusesARenderEndpoint(t *testing.T) {
 // this would let a wiring bug — the headphone dropdown's value reaching
 // PipelineOpts.AudioDeviceID, or vice versa — pass at Gate A and surface in a
 // commentary booth.
+// The capture half is scoped to the NATIVE entries. A DeckLink persistent-id
+// is a bare gint64 rendered as decimal and belongs to neither namespace by
+// construction — device_id.go's classifier is a POSITIVE identification in both
+// directions precisely so that an id it does not recognise is never refused —
+// so asserting it into the capture namespace would be asserting a falsehood
+// about the real provider's data. What must remain true of EVERY entry, kind
+// regardless, is the second clause: nothing in the input list may classify as a
+// render endpoint, because that is the wiring bug this test exists to catch.
 func TestStubDeviceListNamespacesAreContract(t *testing.T) {
 	for _, d := range defaultStubDevices {
-		if !IsCaptureEndpointID(d.ID) {
+		if NormaliseDeviceKind(d.Kind) == KindNative && !IsCaptureEndpointID(d.ID) {
 			t.Errorf("defaultStubDevices %q: %s does not classify as a capture endpoint", d.Name, d.ID)
 		}
 		if IsRenderEndpointID(d.ID) {
@@ -830,19 +859,394 @@ func TestPipelineDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
 }
 
 // TestPipelineDescriptionScalesTheSlate guards the next person to export the
-// artwork. Without videoscale the slate PNG must be exactly 1920x1080 or Start
-// fails caps negotiation, and videoconvertscale is already a required plugin,
-// so the element is free.
+// artwork. Without videoscale the slate PNG must be exactly the conform
+// target's size or Start fails caps negotiation, and videoconvertscale is
+// already a required plugin, so the element is free.
+//
+// THE SECOND ASSERTION CHANGED WHEN THE CONFORM TARGET BECAME AN OPTION, and
+// the reason is worth stating rather than leaving to `git blame`. It used to
+// read `strings.Contains(body, "width=1920,height=1080")`. That literal is
+// gone from this function on purpose: 1920x1080 is now the DEFAULT, in
+// FallbackConformTarget, and pinning it here again would re-assert exactly the
+// hardcoding this change removed — an instance configured for 720p50 must get
+// 720p50 in its caps. What replaces it is stronger, not weaker: this guard
+// checks that the caps come from the parameter, and
+// TestFallbackConformTargetReproducesTheShippedCaps checks — behaviourally, not
+// by reading source — that the default renders the exact string that used to
+// be written here.
 func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
 	body := funcBody(t, fset, file, "", "pipelineDescription")
 
 	if !strings.Contains(body, "videoscale") {
-		t.Fatal("the slate branch has no videoscale; artwork that is not exactly 1920x1080 " +
-			"fails caps negotiation at Start with no diagnostic naming the size")
+		t.Fatal("the slate branch has no videoscale; artwork that is not exactly the conform " +
+			"target's size fails caps negotiation at Start with no diagnostic naming the size")
 	}
-	if !strings.Contains(body, "width=1920,height=1080") {
-		t.Fatal("the slate branch no longer pins 1920x1080")
+	for _, want := range []string{"conform.spatialCaps()", "conform.temporalCaps()"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the video leg no longer renders %s. If the caps have gone back to being "+
+				"written out, they are written out for ONE switcher configuration, and M2L-X "+
+				"refuses any source that is not in the format it is configured for", want)
+		}
+	}
+	for _, literal := range []string{"width=1920", "height=1080", "framerate=50"} {
+		if strings.Contains(body, literal) {
+			t.Errorf("pipelineDescription contains the literal %q again; the conform target is "+
+				"an option and 1080p50 belongs in FallbackConformTarget, where a facility that is "+
+				"not configured for it can be given something else", literal)
+		}
+	}
+}
+
+// TestPipelineDescriptionScalesBeforeFreezing guards the reorder, which is the
+// change in this area with the best ratio of value to risk and the only one
+// that lands on the ON-AIR Windows build.
+//
+// videoconvert and videoscale used to sit AFTER imagefreeze, converting and
+// scaling the same still picture fifty times a second for the length of a
+// match. Above it they do the work once, on the single frame pngdec produces.
+// Measured on macOS arm64 / GStreamer 1.26.10 on 2026-08-15, 500 frames at
+// 50 fps into fakesink: 2.85 s of CPU (1920x1080 slate) and 3.02 s (1920x1200)
+// in the old order, 0.04 s and 0.05 s in the new one, with byte-identical NV12
+// output in both sizes. It is a pure reordering.
+//
+// It is guarded because it is exactly the kind of edit a later reader
+// "tidies" back — imagefreeze reads naturally as the first element of a slate
+// leg — and nothing else at Gate A would notice: the change is invisible to
+// every behavioural test in this package and costs only CPU, which is the one
+// resource a commentary machine has spare right up until it does not.
+func TestPipelineDescriptionScalesBeforeFreezing(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "pipelineDescription")
+
+	convert := strings.Index(body, "videoconvert")
+	scale := strings.Index(body, "videoscale name=")
+	spatial := strings.Index(body, "conform.spatialCaps()")
+	freeze := strings.Index(body, "imagefreeze is-live=true")
+	temporal := strings.Index(body, "conform.temporalCaps()")
+
+	if convert < 0 || scale < 0 || freeze < 0 || spatial < 0 || temporal < 0 {
+		t.Fatal("the slate leg has been restructured out of the shape this guard reads; " +
+			"re-derive it from the new one rather than deleting it")
+	}
+	if !(convert < freeze && scale < freeze) {
+		t.Error("videoconvert/videoscale are back below imagefreeze: the same still picture is " +
+			"being converted and scaled fifty times a second, for 2.9 s of CPU per 500 frames " +
+			"instead of 0.04 s, to produce byte-identical output")
+	}
+	if spatial > freeze {
+		t.Error("the spatial caps are pinned below imagefreeze, so videoscale has no target to " +
+			"scale to and a slate that is not already the conform size fails negotiation")
+	}
+	if temporal < freeze {
+		t.Error("the frame rate is pinned ABOVE imagefreeze. pngdec produces one buffer at no " +
+			"frame rate; the rate is what imagefreeze itself decides on its src pad, so asking " +
+			"for it upstream fails the whole leg at Start")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The conform target. Unlike the guards above these are ORDINARY TESTS: the
+// type and every rule about it live in gst.go, which carries no build tag, so
+// Gate A links and runs the real code rather than reading it as text.
+// ---------------------------------------------------------------------------
+
+// TestFallbackConformTargetReproducesTheShippedCaps is the compatibility
+// statement for the whole change, and it is the test to read first if this
+// area ever misbehaves on air.
+//
+// The two strings below are the caps that were written into gst_cgo.go's parse
+// string before the conform target became an option, split at the point the
+// videoscale-before-imagefreeze reorder required. As long as this passes, an
+// installation that configures nothing — which is every installation until
+// somebody wires the switcher's format through — builds the same graph out of
+// the same caps it has been running on air with.
+//
+// ONE FIELD IS NOT IN THE SHIPPED STRING and is stated here rather than left
+// for somebody to find with `git diff`: interlace-mode=progressive is new. The
+// shipped caps named format, width, height, framerate, pixel-aspect-ratio and
+// colorimetry, and said nothing about scan. spatialCaps says it, for the reason
+// given on that method — it is the one thing this leg can actually produce, and
+// pinning it turns a future GStreamer negotiating otherwise into a loud caps
+// failure at Start instead of a feed the switcher quietly will not take.
+//
+// It is an ADDED CONSTRAINT on a leg that is on air, so it was verified rather
+// than reasoned about. Measured on macOS arm64 / GStreamer 1.26.10 on
+// 2026-08-15, the old caps and the new split pair were each run through
+// `filesrc ! pngdec ! ... ! filesink` for three frames, at both slate sizes:
+// the rendered NV12 was byte-identical (md5 3295158d… for the 1920x1080 slate,
+// 40bea7f4… for a 1920x1200 export scaled down), so the field fixates where it
+// was already being fixated by default and constrains nothing that was
+// previously free.
+func TestFallbackConformTargetReproducesTheShippedCaps(t *testing.T) {
+	f := FallbackConformTarget()
+
+	const wantSpatial = "video/x-raw,format=NV12,width=1920,height=1080," +
+		"pixel-aspect-ratio=1/1,colorimetry=bt709,interlace-mode=progressive"
+	const wantTemporal = "video/x-raw,framerate=50/1"
+
+	if got := f.spatialCaps(); got != wantSpatial {
+		t.Errorf("spatialCaps() = %q\nwant %q", got, wantSpatial)
+	}
+	if got := f.temporalCaps(); got != wantTemporal {
+		t.Errorf("temporalCaps() = %q\nwant %q", got, wantTemporal)
+	}
+	if got := f.String(); got != "1920x1080p50" {
+		t.Errorf("String() = %q, want 1920x1080p50", got)
+	}
+
+	// The zero value must resolve to exactly this and must not read as a fault:
+	// "the switcher has not been read yet" is the ordinary state at Start.
+	got, reason := ConformTarget{}.resolve()
+	if got != f {
+		t.Errorf("the zero ConformTarget resolves to %v, want %v", got, f)
+	}
+	if reason != "" {
+		t.Errorf("the zero ConformTarget resolves with reason %q; nothing known yet is not a "+
+			"fault and a field log that says it is buries the line that means something", reason)
+	}
+}
+
+// TestConformTargetResolve pins which formats reach gst_parse_launch and which
+// are turned back into the default. The rule that matters more than any single
+// row: NOTHING here returns an error. A still slate is not worth refusing to
+// carry commentary for.
+func TestConformTargetResolve(t *testing.T) {
+	def := FallbackConformTarget()
+	tests := []struct {
+		name       string
+		in         ConformTarget
+		want       ConformTarget
+		wantReason bool
+	}{
+		{
+			name: "a measured switcher format passes through",
+			in:   ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 50, FrameRateDen: 1},
+			want: ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 50, FrameRateDen: 1},
+		},
+		{
+			name: "720p50 passes through: this is the case the option exists for",
+			in:   ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1},
+			want: ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1},
+		},
+		{
+			// A numerator with no denominator is NOT rescued into n/1. It is
+			// the shape a caller gets by building the struct by hand instead of
+			// going through ConformTargetFromRate, and rescuing it would make
+			// the hand-built path look like it worked right up until somebody
+			// hand-built 30000 and got 30000 fps.
+			name:       "a numerator with no denominator is not rescued",
+			in:         ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 25},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name: "29.97 as a fraction survives intact",
+			in:   ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 30000, FrameRateDen: 1001},
+			want: ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 30000, FrameRateDen: 1001},
+		},
+		{
+			// An interlaced instance is 1080i25/1080i50 in the switcher's own
+			// vocabulary and 1920x1080 at the reported RATE here: there is no
+			// scan field to set, by the argument in gst.go. This row exists so
+			// that the rate half is not quietly rejected along with the scan.
+			name: "the rate of an interlaced instance passes through",
+			in:   ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 25, FrameRateDen: 1},
+			want: ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 25, FrameRateDen: 1},
+		},
+		{
+			name:       "a size with no frame rate is not a format",
+			in:         ConformTarget{Width: 1920, Height: 1080},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "a frame rate with no size is not a format",
+			in:         ConformTarget{FrameRateNum: 50, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "an odd width cannot be NV12",
+			in:         ConformTarget{Width: 1921, Height: 1080, FrameRateNum: 50, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "an odd height cannot be NV12",
+			in:         ConformTarget{Width: 1920, Height: 1081, FrameRateNum: 50, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "a negative size is refused rather than passed to the parser",
+			in:         ConformTarget{Width: -1920, Height: 1080, FrameRateNum: 50, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "an absurd size is refused before anything allocates",
+			in:         ConformTarget{Width: 100000, Height: 100000, FrameRateNum: 50, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+		{
+			name:       "a swapped fraction reads as an absurd rate",
+			in:         ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 1001, FrameRateDen: 1},
+			want:       def,
+			wantReason: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, reason := tt.in.resolve()
+			if got != tt.want {
+				t.Errorf("resolve() = %v, want %v", got, tt.want)
+			}
+			if (reason != "") != tt.wantReason {
+				t.Errorf("resolve() reason = %q, wantReason %v", reason, tt.wantReason)
+			}
+			// Whatever comes back must be usable, in every row: that is the
+			// property Start relies on when it hands the result to the parser
+			// without checking it again.
+			if got.Width <= 0 || got.Height <= 0 || got.Width%2 != 0 || got.Height%2 != 0 ||
+				got.FrameRateNum <= 0 || got.FrameRateDen <= 0 {
+				t.Errorf("resolve() returned an unusable format %+v", got)
+			}
+		})
+	}
+}
+
+// TestConformTargetFromRate pins the conversion internal/m2lx's float64 frame
+// rate has to go through, and in particular pins the 1000/1001 family by exact
+// value. 29.97 rendered as 2997/100 negotiates, plays, and drifts against the
+// switcher by a frame every 33 seconds at 30p — visible well inside a match,
+// invisible in a twenty-second test.
+func TestConformTargetFromRate(t *testing.T) {
+	tests := []struct {
+		fps      float64
+		num, den int
+		wantErr  bool
+	}{
+		{fps: 50, num: 50, den: 1},
+		{fps: 25, num: 25, den: 1},
+		{fps: 60, num: 60, den: 1},
+		{fps: 24, num: 24, den: 1},
+		{fps: 29.97, num: 30000, den: 1001},
+		{fps: 59.94, num: 60000, den: 1001},
+		{fps: 23.976, num: 24000, den: 1001},
+		{fps: 119.88, num: 120000, den: 1001},
+		// 30 is SIX TIMES the tolerance away from 30000/1001, so an instance
+		// genuinely configured for 30/1 can never be read as the NTSC rate.
+		{fps: 30, num: 30, den: 1},
+		// A rate nobody has met, carried faithfully rather than rounded into
+		// one that was anticipated.
+		{fps: 12.5, num: 25, den: 2},
+		{fps: 0, wantErr: true},
+		{fps: -50, wantErr: true},
+		{fps: math.NaN(), wantErr: true},
+		{fps: math.Inf(1), wantErr: true},
+		{fps: 100000, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.FormatFloat(tt.fps, 'g', -1, 64), func(t *testing.T) {
+			got, err := ConformTargetFromRate(1920, 1080, tt.fps)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ConformTargetFromRate(1920, 1080, %v) = %v, want an error", tt.fps, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ConformTargetFromRate(1920, 1080, %v): %v", tt.fps, err)
+			}
+			if got.FrameRateNum != tt.num || got.FrameRateDen != tt.den {
+				t.Fatalf("rate = %d/%d, want %d/%d",
+					got.FrameRateNum, got.FrameRateDen, tt.num, tt.den)
+			}
+			// And the fraction must be within a rounding of the input. An
+			// exact-value table alone would not catch the table and the code
+			// being wrong in the same direction.
+			if rate := float64(got.FrameRateNum) / float64(got.FrameRateDen); math.Abs(rate-tt.fps) > ntscTolerance {
+				t.Fatalf("rate = %d/%d = %v, which is not %v",
+					got.FrameRateNum, got.FrameRateDen, rate, tt.fps)
+			}
+		})
+	}
+
+	// A raster that is not a raster is an error and never a silent fallback:
+	// the caller has to be the one that decides to fall back, and has to log it.
+	for _, r := range [][2]int{{0, 1080}, {1920, 0}, {-1920, 1080}} {
+		if got, err := ConformTargetFromRate(r[0], r[1], 50); err == nil {
+			t.Errorf("ConformTargetFromRate(%d, %d, 50) = %v, want an error", r[0], r[1], got)
+		}
+	}
+}
+
+// TestConformTargetString pins the rendering that reaches the field log, because
+// a format mismatch is diagnosed by reading two of these lines side by side
+// and a fraction printed raw would not be read at all.
+func TestConformTargetString(t *testing.T) {
+	tests := []struct {
+		in   ConformTarget
+		want string
+	}{
+		{ConformTarget{1920, 1080, 50, 1}, "1920x1080p50"},
+		{ConformTarget{1920, 1080, 25, 1}, "1920x1080p25"},
+		{ConformTarget{1280, 720, 30000, 1001}, "1280x720p29.97"},
+		{ConformTarget{1920, 1080, 60000, 1001}, "1920x1080p59.94"},
+		{ConformTarget{1920, 1080, 24000, 1001}, "1920x1080p23.976"},
+		{ConformTarget{1920, 1080, 25, 2}, "1920x1080p12.5"},
+		{ConformTarget{}, "(no conform target)"},
+	}
+	for _, tt := range tests {
+		if got := tt.in.String(); got != tt.want {
+			t.Errorf("%+v String() = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestStubResolvesTheConformTarget keeps the twin honest: the stub must apply
+// the SAME resolution the real build applies, so that a Gate A test reading
+// StartedWith() is reading what a real pipeline would have been built with.
+func TestStubResolvesTheConformTarget(t *testing.T) {
+	p := NewStubPipeline()
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: stubCaptureID}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := p.StartedWith().ConformTo; got != FallbackConformTarget() {
+		t.Errorf("ConformTo = %v, want the default %v", got, FallbackConformTarget())
+	}
+
+	p = NewStubPipeline()
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		// An odd height: the shape resolve refuses. The stub must refuse it
+		// identically, or a Gate A test would prove a format works that the
+		// real build silently replaces.
+		ConformTo: ConformTarget{Width: 1280, Height: 721, FrameRateNum: 50, FrameRateDen: 1},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := p.StartedWith().ConformTo; got != FallbackConformTarget() {
+		t.Errorf("an unusable ConformTo was stored as %v; want the default %v",
+			got, FallbackConformTarget())
+	}
+
+	p = NewStubPipeline()
+	want := ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
+	err = p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		ConformTo:     want,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := p.StartedWith().ConformTo; got != want {
+		t.Errorf("ConformTo = %v, want %v: a usable target must reach the pipeline unchanged", got, want)
 	}
 }
 
@@ -1210,6 +1614,57 @@ func TestMarkFatalSiteWrapsErrPipelineFatal(t *testing.T) {
 		t.Error("onBusMessage's markFatal site does not wrap ErrPipelineFatal; ReplaceSink's " +
 			"latched error is unmatchable with errors.Is and the sender goes back to retrying " +
 			"an unfixable failure as a network fault")
+	}
+}
+
+// TestBusHandlerClosesTheGateBeforeAnyCgoCall guards the ordering the gate's
+// whole value depends on, and it is here rather than in capturefault_test.go
+// because what it is checking is a property of the CALL SITE, not of the
+// decision being called.
+//
+// The gate is what stops media reaching a sink that has just failed. The
+// comment on the store says why it goes first — "the buffer that is about to
+// carry GST_FLOW_ERROR into the queue is racing us" — and BUILD-NOTES.md
+// section 8.6 is the 21 ms window in which losing that race took the capture
+// chain down and the commentary off air, which is the failure the whole
+// sink-pad gate was added to prevent.
+//
+// The bus error filter had to put SOMETHING in front of the store, because a
+// video capture fault must leave the gate open. What it may not put there is
+// captureLegsFor: that is a cgo call, a parent lookup and a
+// gst_bin_get_by_name over the whole graph, and an srtout-N error takes this
+// path on EVERY peer loss. classifyBusError with the zero captureLegs is three
+// string comparisons and is the correct first answer for every source that is
+// not the video capture leg — see its doc comment — so the expensive half
+// belongs below the store, on the one path whose class it can still change.
+//
+// Nothing else at Gate A would notice: the ordering is invisible to every
+// behavioural test in this package, and the cost of getting it wrong is not a
+// failure but a widened race that only shows up as an outage at a facility.
+func TestBusHandlerClosesTheGateBeforeAnyCgoCall(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+
+	gate := strings.Index(body, "p.gateClosed.Store(true)")
+	if gate < 0 {
+		t.Fatal("onBusMessage no longer closes the gate on a bus error; a failing sink now keeps " +
+			"receiving media and BUILD-NOTES.md section 8.6 is back")
+	}
+	classify := strings.Index(body, "classifyBusError(")
+	if classify < 0 {
+		t.Fatal("onBusMessage no longer classifies bus errors; a video capture fault is fatal " +
+			"again and takes the commentary off air")
+	}
+	if classify > gate {
+		t.Error("the classification has moved BELOW the gate close, so a video capture fault now " +
+			"shuts the gate and starves the SRT peer — which defeats the sparing entirely")
+	}
+	if legs := strings.Index(body, "captureLegsFor("); legs >= 0 && legs < gate {
+		t.Error("captureLegsFor is called BEFORE the gate closes. It is a cgo call and a " +
+			"gst_bin_get_by_name over the whole graph, and this path is taken by every srtout-N " +
+			"error on every peer loss: it puts a bin traversal in front of the store while the " +
+			"buffer carrying GST_FLOW_ERROR into srtq is racing us. Pass captureLegs{} to " +
+			"classifyBusError first and refine the video-capture case below the store")
 	}
 }
 

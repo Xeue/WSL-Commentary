@@ -150,12 +150,22 @@ func TestClassificationIsCaseInsensitive(t *testing.T) {
 // aggregate/virtual device's name, and a driver-assigned UUID. The last one is
 // deliberately the shape closest to a Windows id, because a UUID with hyphens
 // is exactly what a careless prefix or "contains a GUID" test would trip over.
+//
+// The last entry is the Blackmagic card as its CoreAudio driver publishes it,
+// and it earns its place twice over. It is the only measured unique-id
+// containing colons, which is what a hand-rolled "kind:id" encoding would have
+// collided with. And it is the SILENT device — -96 dBFS on all sixteen channels
+// with a microphone live in front of a speaker — that the dropdown offered while
+// hiding the DeckLink entry beside it that carries the audio. Its hex middle
+// token is the DeckLink persistent-id of the same card: 0xa3c204a4 is
+// 2747401380. Nothing reads it that way and nothing may start to.
 var coreAudioIDs = []string{
 	"BuiltInMicrophoneDevice",
 	"BuiltInSpeakerDevice",
 	"NDIAudio",
 	"BF568F24-731B-41DB-932E-AC7E260BC71A",
 	"A33FF27F-E7F1-4055-ABC7-4C0C00000003",
+	"90:a3c204a4:00000000:Audio",
 }
 
 // TestCoreAudioIDsAreInNeitherWindowsNamespace pins the property that makes it
@@ -189,5 +199,80 @@ func TestCoreAudioIDsAreInNeitherWindowsNamespace(t *testing.T) {
 		if err := refuseRenderEndpoint(id); err != nil {
 			t.Errorf("refuseRenderEndpoint(%q) = %v, want nil: the macOS pipeline would not start", id, err)
 		}
+	}
+}
+
+// deckLinkIDs are DeckLink persistent-ids as formatDeckLinkPersistentID renders
+// them. The first is the REAL one, read off the port machine's UltraStudio 4K
+// Mini with gst-device-monitor-1.0; the rest are the boundaries a decimal
+// gint64 id can reach, because "digits" is a family with a very wide range and
+// a classifier that happened to work on ten characters is not a classifier.
+var deckLinkIDs = []string{
+	"2747401380",
+	"0",
+	"1",
+	"9223372036854775807",
+}
+
+// TestDeckLinkIDsAreInNeitherWindowsNamespace is the DeckLink half of the
+// statement TestCoreAudioIDsAreInNeitherWindowsNamespace makes about CoreAudio:
+// the Windows classifiers are INERT on the third family of id this application
+// now persists, rather than wrong about it.
+//
+// IsRenderEndpointID matters most, because refuseRenderEndpoint keys on it and
+// Start calls that on every platform for every id. A DeckLink id that classified
+// as render would make the operator's capture card unselectable with an error
+// about WASAPI playback endpoints — a refusal citing a mechanism that has
+// nothing to do with the device in front of them.
+//
+// IsCaptureEndpointID must be false as well, and on Windows that has a visible
+// consequence rather than a theoretical one: configureCaptureSource uses exactly
+// this test as the cheap gate in front of the "is this actually a DeckLink card"
+// enumeration. If a persistent-id ever started classifying as a WASAPI capture
+// endpoint, that gate would close, the id would go straight to wasapi2src, and
+// the failure would be the asynchronous "Failed to open device 2747401380" the
+// gate exists to pre-empt.
+func TestDeckLinkIDsAreInNeitherWindowsNamespace(t *testing.T) {
+	for _, id := range deckLinkIDs {
+		if IsRenderEndpointID(id) {
+			t.Errorf("IsRenderEndpointID(%q) = true: a DeckLink capture card would be refused by "+
+				"refuseRenderEndpoint as a Windows playback endpoint", id)
+		}
+		if IsCaptureEndpointID(id) {
+			t.Errorf("IsCaptureEndpointID(%q) = true: a DeckLink persistent-id is being positively "+
+				"identified as a WASAPI capture endpoint, which would close the gate in front of "+
+				"deckLinkCardWithID and send the id to wasapi2src instead", id)
+		}
+		if err := refuseRenderEndpoint(id); err != nil {
+			t.Errorf("refuseRenderEndpoint(%q) = %v, want nil: the card would be unstartable", id, err)
+		}
+	}
+}
+
+// TestPrefixedDeckLinkIDsWouldClassifyAndAreThereforeForbidden is the reason a
+// kind is a separate FIELD rather than a prefix inside Device.ID, expressed as
+// the thing that would go wrong.
+//
+// "decklink:2747401380" is a plausible-looking encoding and it is exactly what
+// app.go's ListInputDevices doc comment forbids: a shape inside an opaque id.
+// This test does not assert that such a string is rejected anywhere — nothing
+// produces one, so there would be nothing to reject. It pins the smaller, harder
+// fact that makes the rule worth keeping: a prefixed id is a string that the
+// Windows classifiers, which are supposed to be inert on this family, would
+// still be inert on today and could stop being inert on tomorrow, because
+// "contains a substring anywhere" is what IsRenderEndpointID does. The moment an
+// id carries structure, every string test in the codebase becomes a potential
+// reader of it.
+func TestPrefixedDeckLinkIDsWouldClassifyAndAreThereforeForbidden(t *testing.T) {
+	const prefixed = "decklink:2747401380"
+	if got := formatDeckLinkPersistentID(2747401380); got == prefixed || strings.Contains(got, ":") {
+		t.Fatalf("formatDeckLinkPersistentID(2747401380) = %q: Device.ID has grown a discriminator "+
+			"inside it. CONTRACT.md keeps the browser mediaDeviceId and the native device id in two "+
+			"fields for this reason, and app.go states that nothing above internal/gst may parse "+
+			"Device.ID or assume a shape. The kind is Device.Kind", got)
+	}
+	if _, err := parseDeckLinkPersistentID(prefixed); err == nil {
+		t.Errorf("parseDeckLinkPersistentID(%q) succeeded; a prefixed id must not be silently "+
+			"accepted, or the forbidden encoding becomes the working one", prefixed)
 	}
 }

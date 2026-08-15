@@ -26,9 +26,35 @@
 //
 // Owner: WP-3a. Its twin is deviceprovider_darwin.go, and everything below was
 // lifted out of gst_cgo.go unchanged when the twin was written — same checks,
-// same order, same log lines. Windows behaviour is byte-identical to what it
+// same order, same log lines. Windows behaviour was byte-identical to what it
 // was before the seam existed; that was the constraint the seam was built
 // under.
+//
+// # The one thing that has since changed, and it changes Windows too
+//
+// A Blackmagic capture card enumerates as an Audio/Source device from GStreamer's
+// decklink device provider, publishing a persistent-id and no device.api. The
+// api check below is a HARD SKIP that returns before anything else runs, so the
+// card was refused on Windows by exactly the mechanism that refused it on macOS
+// — a different property missing, the same empty answer, the same operator
+// staring at a dropdown with no card in it. captureDeviceID therefore asks the
+// DeckLink question FIRST, before the api check, and returns a KIND alongside
+// the id. The rules for that kind and the measurements behind them are in
+// decklinkdevices.go; nothing about them is per-platform, which is why there is
+// no Windows copy of them to keep in step.
+//
+// UNVERIFIED ON WINDOWS. Everything about the DeckLink path in this file was
+// reasoned at source level and MEASURED ON macOS with a real UltraStudio 4K
+// Mini; it has not been run on Windows, because a CGO_ENABLED=1 GOOS=windows
+// build needs a MinGW toolchain that the port machine does not have. What that
+// risk actually amounts to is small and worth stating precisely: gstdecklink is
+// one source tree with a per-platform capture backend under it, the device
+// provider and its published properties are in the shared half, and this file's
+// contribution is one function call placed before an existing check. The
+// Windows-specific unknown is whether Desktop Video on Windows publishes the
+// same persistent-id for the same card, which is a driver question rather than a
+// GStreamer one and is answered by running gst-device-monitor-1.0 Audio/Source
+// once on a Windows machine with a card in it.
 //
 // # Why this is a function and not a string comparison
 //
@@ -93,13 +119,26 @@ const propLoopback = "wasapi2.device.loopback"
 var endpointIDKeys = []string{"device.actual-id", "device.id", "device.strid", "device.path"}
 
 // captureDeviceID reports whether one enumerated Audio/Source device should be
-// offered in the commentary input dropdown, and under what persistable id.
+// offered in the commentary input dropdown, of what KIND, and under what
+// persistable id.
 //
-// The id it returns is a WASAPI IMMDevice endpoint GUID. It goes straight into
-// config.json and straight into wasapi2src's device property, unchanged and
-// unresolved — Windows' endpoint GUIDs are stable identities, which is the
-// whole reason the Windows path is the simple one. (The macOS twin cannot do
-// this; see deviceprovider_darwin.go.)
+// The id it returns for a native device is a WASAPI IMMDevice endpoint GUID. It
+// goes straight into config.json and straight into wasapi2src's device property,
+// unchanged and unresolved — Windows' endpoint GUIDs are stable identities,
+// which is the whole reason the Windows path is the simple one. (The macOS twin
+// cannot do this; see deviceprovider_darwin.go.)
+//
+// # The DeckLink question is asked first, and it must be
+//
+// The api check immediately below returns on anything that is not a wasapi2
+// device, and a DeckLink card is not one: the decklink device provider publishes
+// persistent-id, model-name and device-number, and no device.api under any name.
+// So a card asked about SECOND is a card that is never asked about at all, and
+// the log line it produced was "device.api is "", not wasapi2" — a sentence that
+// is true, is correctly aimed at foreign providers, and here means "your capture
+// card has been hidden". The macOS twin puts the same call in the same place for
+// the same reason stated the other way round, so that the two files cannot drift
+// into two different enumeration policies.
 //
 // # Audio/Source is not enough, and this used to be wrong about it
 //
@@ -118,7 +157,10 @@ var endpointIDKeys = []string{"device.actual-id", "device.id", "device.strid", "
 // Every rejection logs its reason, INCLUDING the provider rejection, which used
 // to be the one silent one. A device missing from the dropdown is otherwise
 // indistinguishable from a device that is not plugged in.
-func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
+func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, DeviceKind, bool) {
+	if id, ok := deckLinkCaptureDeviceID(dev, props); ok {
+		return id, KindDeckLink, true
+	}
 	// Devices from any other provider are discarded rather than offered,
 	// because the id below is passed verbatim to wasapi2src and only wasapi2's
 	// ids are meaningful there.
@@ -148,7 +190,7 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 			"be meaningless to %s, which is the only element this build opens a capture endpoint "+
 			"with; device properties are %s",
 			dev.GetDisplayName(), api, captureSourceFactory, structureFieldNames(props))
-		return "", false
+		return "", "", false
 	}
 	// The loopback filter. GetBoolean fails unless the field exists AND is
 	// G_TYPE_BOOLEAN, which is how gstwasapi2device.c publishes it; if a
@@ -162,7 +204,7 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 		log.Printf("gst: ListInputDevices: skipping %q (%s): %s=true — it is wasapi2's loopback "+
 			"republication of a playback endpoint, and opening it would put the operator's own "+
 			"monitor mix on air", dev.GetDisplayName(), props.GetString("device.id"), propLoopback)
-		return "", false
+		return "", "", false
 	}
 	id := endpointID(dev, props)
 	if id == "" {
@@ -173,7 +215,7 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 		// key ever changes.
 		log.Printf("gst: ListInputDevices: skipping %q: no endpoint ID; device properties are %s",
 			dev.GetDisplayName(), structureFieldNames(props))
-		return "", false
+		return "", "", false
 	}
 	// The namespace classifier, device_id.go. Only a POSITIVELY identified
 	// render id is refused; an unrecognised shape is offered with a warning,
@@ -183,14 +225,14 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 		log.Printf("gst: ListInputDevices: skipping %q (%s): its endpoint id is in the RENDER "+
 			"namespace (%s...) — a playback device that cannot be a commentary input",
 			dev.GetDisplayName(), id, RenderEndpointPrefix)
-		return "", false
+		return "", "", false
 	}
 	if !IsCaptureEndpointID(id) {
 		log.Printf("gst: ListInputDevices: WARNING: %q (%s) has an endpoint id of unrecognised "+
 			"shape — offering it anyway (capture ids begin %s); if Start later fails to open it, "+
 			"this line is the diagnosis", dev.GetDisplayName(), id, CaptureEndpointPrefix)
 	}
-	return id, true
+	return id, KindNative, true
 }
 
 // loopbacksSkipped counts the loopback republications captureDeviceID refused
@@ -212,8 +254,13 @@ var loopbacksSkipped atomic.Int64
 // loop, so that the summary describes THIS enumeration rather than every
 // enumeration since the process started — which matters because the operator
 // reopens the Settings screen, and a number that only ever grows would read as
-// loopback devices multiplying.
-func resetSkipDetail() { loopbacksSkipped.Store(0) }
+// loopback devices multiplying. The DeckLink tally is reset in the same breath
+// and for the same reason; it is shared with the macOS twin, which is why it is
+// a call rather than a second Store here.
+func resetSkipDetail() {
+	loopbacksSkipped.Store(0)
+	resetDeckLinkCount()
+}
 
 // skipDetail is the Windows tail of the enumeration summary log line.
 //
@@ -230,9 +277,15 @@ func resetSkipDetail() { loopbacksSkipped.Store(0) }
 // Windows machine is itself a surprise worth seeing — wasapi2 republishes every
 // render endpoint, so a machine with any playback device at all should have
 // some — and a phrase that is always present is a phrase a log search finds.
+//
+// The DeckLink tail appended after it follows the OPPOSITE rule and is silent at
+// zero, which is not an inconsistency: a Windows machine with no capture card in
+// it is the ordinary case rather than a surprise, and there is nothing for a
+// reader to conclude from being told so on every enumeration. deckLinkSkipDetail
+// owns that argument.
 func skipDetail() string {
 	return fmt.Sprintf(", %d of them WASAPI loopback republications of playback endpoints",
-		loopbacksSkipped.Load())
+		loopbacksSkipped.Load()) + deckLinkSkipDetail()
 }
 
 // endpointID extracts the IMMDevice endpoint ID GUID for one device.
@@ -276,14 +329,46 @@ func endpointID(dev gogst.Device, props *gogst.Structure) string {
 	return v
 }
 
-// configureCaptureSource points wasapi2src at the endpoint the operator chose.
+// configureCaptureSource points the capture source at the endpoint the operator
+// chose.
 //
-// deviceID is the value that came out of config.json, and it is passed through
-// UNCHANGED. There is nothing to resolve: a WASAPI endpoint GUID is a stable
-// identity that survives reboots, replugs and renames, and wasapi2src's device
-// property is a G_TYPE_STRING that takes it directly. Start has already logged
-// it verbatim, and has already refused it if it is a render endpoint.
+// It dispatches on the ELEMENT, exactly as the macOS twin does and for the
+// reason set out there: a decklink source has a persistent-id property and
+// wasapi2src has not, so the presence of that property states which vocabulary
+// the saved id should be spoken in without anybody having to inspect the string.
+// No build currently hands this function anything but captureSourceFactory, so
+// the DeckLink branch is the seam's forward edge rather than a live path.
+//
+// deviceID on the wasapi2 path is the value that came out of config.json, and it
+// is passed through UNCHANGED. There is nothing to resolve: a WASAPI endpoint
+// GUID is a stable identity that survives reboots, replugs and renames, and
+// wasapi2src's device property is a G_TYPE_STRING that takes it directly. Start
+// has already logged it verbatim, and has already refused it if it is a render
+// endpoint.
+//
+// # The one place a DeckLink id can now arrive here, and what it costs to catch
+//
+// The dropdown offers capture cards beside the WASAPI endpoints, so a saved id
+// can be a DeckLink persistent-id that wasapi2src has never heard of. Handed one,
+// wasapi2src prerolls and then fails ASYNCHRONOUSLY with "Failed to open device
+// 2747401380" — the same shape of failure as the render-endpoint defect
+// device_id.go was written for, and with the same consequence, the sender
+// blaming the SRT network for a local device fault.
+//
+// The check is gated on IsCaptureEndpointID being false, which costs nothing at
+// all for a real WASAPI endpoint and pays one device enumeration only for an id
+// the Windows classifier already does not recognise. That gate is why this is
+// not a per-start cost: every microphone in the dropdown passes it in a string
+// comparison and never reaches the enumeration.
 func configureCaptureSource(src gogst.Element, deviceID string) error {
+	if hasProperty(src, propPersistentID) {
+		return configureDeckLinkSource(src, deviceID)
+	}
+	if !IsCaptureEndpointID(deviceID) {
+		if card, ok := deckLinkCardWithID(deviceID); ok {
+			return deckLinkKindError(deviceID, card)
+		}
+	}
 	if err := setStringProperty(src, "device", deviceID); err != nil {
 		return err
 	}

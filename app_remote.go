@@ -169,7 +169,16 @@ var remoteAllowlist = map[string]methodPolicy{
 	// machine has, which is the exact fault the method was added to fix. It
 	// returns what the vault is CALLED and never anything in it, so the "no
 	// secret crosses this boundary outbound" rule is untouched.
+	//
+	// GetConformTarget is a read and is reachable for the same shape of reason.
+	// A remote seat draws the same status row, and that row's VIDEO lamp is only
+	// as honest as the raster it judges against; refusing the method would drop
+	// that seat to lamps.js's 1080p50 fallback, so a remote operator watching a
+	// correctly conforming 720p50 feed would see a red lamp the operator at the
+	// desk does not. Two seats disagreeing about a lamp is worse than either
+	// answer alone. It returns a raster, a rate and where they came from.
 	"GetConfig":                 {},
+	"GetConformTarget":          {},
 	"GetKVSCredentials":         {},
 	"GetStatusKeyCandidates":    {},
 	"ListEvents":                {},

@@ -81,16 +81,24 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 	}
 }
 
-// TestClassificationCounts pins the 12 + 4 + 2 + 1 = 19 split (srtHost was
+// TestClassificationCounts pins the 14 + 6 + 2 + 1 = 23 split (srtHost was
 // removed — the SRT host is always derived from m2lxHost — and eventId moved
 // from the whitelist to DiscoveredFields), so growth in any table is a
 // deliberate, reviewed change.
+//
+// The four that moved these numbers, and which way each went:
+// videoBitrateKbps and videoFormatOverride are INSTANCE — one is how much of
+// the circuit to that deployment the feed may take, the other is how that
+// deployment's switcher is configured, and every position at a facility shares
+// both. audioSourceKind and decklinkPersistentId are MACHINE — which subsystem
+// this PC captures from, and which card in it — and a preset carrying either
+// would deliver another machine's hardware by post.
 func TestClassificationCounts(t *testing.T) {
-	if got := len(InstanceFields); got != 12 {
-		t.Errorf("len(InstanceFields) = %d, want 12", got)
+	if got := len(InstanceFields); got != 14 {
+		t.Errorf("len(InstanceFields) = %d, want 14", got)
 	}
-	if got := len(MachineFields); got != 4 {
-		t.Errorf("len(MachineFields) = %d, want 4", got)
+	if got := len(MachineFields); got != 6 {
+		t.Errorf("len(MachineFields) = %d, want 6", got)
 	}
 	if got := len(UIFields); got != 2 {
 		t.Errorf("len(UIFields) = %d, want 2", got)
@@ -120,10 +128,21 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 	}
 }
 
-// TestInstanceFieldsExcludeEveryDeviceField names all four MACHINE tags: the
+// TestInstanceFieldsExcludeEveryDeviceField names all six MACHINE tags: the
 // guarantee "a preset cannot carry a device id" reduced to a table lookup.
+//
+// audioSourceKind and decklinkPersistentId are on this list for exactly the
+// reason the first four are. "decklink" applied to a laptop with no card in it
+// is the phantom-endpoint fault with different hardware missing, and it fails
+// harder — a busy or absent card gives "Internal data stream error /
+// not-negotiated (-4)" in about 100 microseconds, naming neither the device nor
+// the cause — so a preset that could carry it would be a fault delivered by
+// post with no return address.
 func TestInstanceFieldsExcludeEveryDeviceField(t *testing.T) {
-	for _, tag := range []string{"audioDeviceId", "headphoneDeviceId", "headphoneEndpointId", "slatePath"} {
+	for _, tag := range []string{
+		"audioDeviceId", "headphoneDeviceId", "headphoneEndpointId", "slatePath",
+		"audioSourceKind", "decklinkPersistentId",
+	} {
 		if slices.Contains(InstanceFields, tag) {
 			t.Errorf("InstanceFields contains %q: a preset carrying it would deliver another "+
 				"machine's hardware id by post — the phantom-endpoint fault", tag)
@@ -147,8 +166,12 @@ func TestClassify(t *testing.T) {
 		{"statusKey", ClassInstance, true},
 		{"monitorTile", ClassInstance, true},
 		{"returnGainDb", ClassInstance, true},
+		{"videoBitrateKbps", ClassInstance, true},
+		{"videoFormatOverride", ClassInstance, true},
 		{"audioDeviceId", ClassMachine, true},
 		{"slatePath", ClassMachine, true},
+		{"audioSourceKind", ClassMachine, true},
+		{"decklinkPersistentId", ClassMachine, true},
 		{"returnSource", ClassUI, true},
 		{"returnChannel", ClassUI, true},
 		{"eventId", ClassDiscovered, true},
@@ -173,19 +196,26 @@ func fullConfig() *config.Config {
 		SRTPort:             40005,
 		SRTLatencyMs:        240,
 		PBKeyLen:            16,
+		VideoBitrateKbps:    10000,
+		VideoFormatOverride: "1920x1080p50",
 		StatusKey:           "cam7",
 		AudioDeviceID:       "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
-		HeadphoneDeviceID:   "browser-media-device-hash-1234",
-		HeadphoneEndpointID: "{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}",
-		ReturnSource:        "webrtc",
-		ReturnChannel:       "left",
-		SRTReturnPort:       40501,
-		SRTReturnPBKeyLen:   32,
-		PictureLatencyMs:    120,
-		ReturnMid:           2,
-		MonitorTile:         config.Tile{X: 10, Y: 360, W: 640, H: 360},
-		ReturnGainDB:        18.5,
-		SlatePath:           `D:\slates\wembley.png`,
+		AudioSourceKind:     "decklink",
+		// A recognisable persistent-id, NOT a device number. The distinction is
+		// the field's whole point and a fixture holding "0" would quietly make
+		// the wrong shape look normal.
+		DeckLinkPersistentID: "0x0000000000AB12CD",
+		HeadphoneDeviceID:    "browser-media-device-hash-1234",
+		HeadphoneEndpointID:  "{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}",
+		ReturnSource:         "webrtc",
+		ReturnChannel:        "left",
+		SRTReturnPort:        40501,
+		SRTReturnPBKeyLen:    32,
+		PictureLatencyMs:     120,
+		ReturnMid:            2,
+		MonitorTile:          config.Tile{X: 10, Y: 360, W: 640, H: 360},
+		ReturnGainDB:         18.5,
+		SlatePath:            `D:\slates\wembley.png`,
 	}
 }
 
@@ -351,6 +381,78 @@ func TestApplyNeverWritesTheEventID(t *testing.T) {
 	}
 	if live.M2LXHost != "twickenham.example.com" {
 		t.Error("the whitelisted key travelling with the discovered one must still apply")
+	}
+}
+
+// TestTheVideoLegSettingsTravelWithTheInstance is the positive half of the two
+// new INSTANCE fields: a preset saved at a venue carries the bitrate its
+// circuit will take and the format its switcher is configured for, because
+// those are facts about the venue and every seat at it needs the same answers.
+// Without them a position that applies a facility preset still has to be told
+// two numbers by somebody on the phone.
+func TestTheVideoLegSettingsTravelWithTheInstance(t *testing.T) {
+	fields, err := Extract(fullConfig())
+	if err != nil {
+		t.Fatalf("Extract() error = %v", err)
+	}
+	for tag, want := range map[string]string{
+		"videoBitrateKbps":    "10000",
+		"videoFormatOverride": `"1920x1080p50"`,
+	} {
+		got, ok := fields[tag]
+		if !ok {
+			t.Errorf("Extract() dropped %q, which is whitelisted", tag)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("Extract() carried %q as %s, want %s", tag, got, want)
+		}
+	}
+
+	live := &config.Config{VideoBitrateKbps: 2000}
+	if _, err := Apply(live, fields); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if live.VideoBitrateKbps != 10000 {
+		t.Errorf("VideoBitrateKbps after Apply = %d, want 10000", live.VideoBitrateKbps)
+	}
+	if live.VideoFormatOverride != "1920x1080p50" {
+		t.Errorf("VideoFormatOverride after Apply = %q, want %q", live.VideoFormatOverride, "1920x1080p50")
+	}
+}
+
+// TestApplyDropsTheDeckLinkCaptureKeys is the phantom-endpoint test with the
+// hardware that is missing changed. A preset hand-edited (or saved by a future
+// build with a wider whitelist) at a DeckLink-equipped seat must not be able to
+// tell a laptop with no card in it to capture from one: the failure would be
+// "Internal data stream error / not-negotiated (-4)", in about 100
+// microseconds, naming neither the device nor the cause — and the operator
+// would be looking at a Settings screen with nothing wrong on it.
+func TestApplyDropsTheDeckLinkCaptureKeys(t *testing.T) {
+	live := fullConfig()
+	live.AudioSourceKind = config.AudioSourceNative
+	live.DeckLinkPersistentID = ""
+
+	ignored, err := Apply(live, map[string]json.RawMessage{
+		"srtPort":              json.RawMessage(`40009`),
+		"audioSourceKind":      json.RawMessage(`"decklink"`),
+		"decklinkPersistentId": json.RawMessage(`"0x00000000DEADBEEF"`),
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if !slices.Equal(ignored, []string{"audioSourceKind", "decklinkPersistentId"}) {
+		t.Errorf("Apply() ignored = %v, want [audioSourceKind decklinkPersistentId]", ignored)
+	}
+	if live.AudioSourceKind != config.AudioSourceNative {
+		t.Errorf("audioSourceKind became %q; a preset must never change which subsystem this PC "+
+			"captures from", live.AudioSourceKind)
+	}
+	if live.DeckLinkPersistentID != "" {
+		t.Errorf("decklinkPersistentId became %q; that is another machine's card", live.DeckLinkPersistentID)
+	}
+	if live.SRTPort != 40009 {
+		t.Error("the whitelisted key travelling with the machine ones must still apply")
 	}
 }
 

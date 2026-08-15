@@ -47,11 +47,20 @@
 //	mpegtsmux name=mux alignment=7 pcr-interval=3600
 //	  ! queue name=srtq leaky=downstream max-size-buffers=4000
 //	  ! srtsink name=srtout sync=false async=false auto-reconnect=false
-//	filesrc location=<slate> ! pngdec ! imagefreeze is-live=true ! videoconvert
-//	  ! video/x-raw,format=NV12,width=1920,height=1080,framerate=50/1,...
+//	filesrc location=<slate> ! pngdec ! videoconvert ! videoscale name=vscale
+//	  ! video/x-raw,format=NV12,width=1920,height=1080,...   <- PipelineOpts.ConformTo
+//	  ! imagefreeze is-live=true
+//	  ! video/x-raw,framerate=50/1                           <- PipelineOpts.ConformTo
 //	  ! mfh264enc name=venc bitrate=2000 rc-mode=cbr gop-size=100
 //	    low-latency=true cabac=true
 //	  ! h264parse config-interval=-1 ! queue ! mux.
+//
+// The two capsfilters in the video leg are the only part of the string that is
+// not a constant: they are rendered from PipelineOpts.ConformTo, whose zero
+// value reproduces the 1920x1080p50 that used to be written there. The
+// argument for that one conditional — and why it does not move the
+// Windows/macOS seam — is in pipelineDescription's own comment.
+//
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true
 //	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
 //	  ! mfaacenc bitrate=128000
@@ -73,7 +82,12 @@
 // refusal window.
 package gst
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+)
 
 // ErrPipelineFatal is wrapped by every error reporting a failure that
 // replacing the sink cannot repair — the capture or mux chain, not the SRT
@@ -98,10 +112,23 @@ var ErrPipelineFatal = errors.New("gst: pipeline-fatal")
 // Encoder settings fixed by specification section 5. The units differ between
 // the two encoders and the names here say which is which.
 const (
-	// DefaultVideoBitrateKbps is mfh264enc's bitrate property, in KILOBITS per
-	// second. Constant bitrate, not quality-targeted: a static slate under QVBR
-	// collapses to 200-350 kbps, which is cheaper but bursty at every IDR and
-	// makes "is it flowing" harder to observe.
+	// DefaultVideoBitrateKbps is the H.264 encoder's bitrate property, in
+	// KILOBITS per second, for a caller that asks for nothing. Constant
+	// bitrate, not quality-targeted: a static slate under QVBR collapses to
+	// 200-350 kbps, which is cheaper but bursty at every IDR and makes "is it
+	// flowing" harder to observe on a router that shows a bitrate and nothing
+	// else.
+	//
+	// 2000 was chosen for the video leg this application actually has — ONE
+	// STILL SLATE, re-encoded fifty times a second — and the owner has ruled it
+	// FAR TOO LOW for a leg carrying live video, wanting something nearer
+	// 10000 available. That ruling is why PipelineOpts.VideoBitrateKbps exists
+	// and why this number is a DEFAULT rather than the value: leaving it at
+	// 2000 means a build nobody has configured encodes exactly what the on-air
+	// Windows build encodes today, and a facility that puts real motion into
+	// the video leg sets the option instead of editing this file. Nothing in
+	// this package imposes a ceiling — 10000 is an ordinary number to both
+	// encoders, whose property is a guint of kilobits.
 	DefaultVideoBitrateKbps = 2000
 
 	// DefaultAudioBitrateBps is mfaacenc's bitrate property, in BITS per second.
@@ -146,6 +173,447 @@ type Device struct {
 	// Name is the endpoint's display-name, shown in the dropdown and never
 	// persisted or passed to GStreamer.
 	Name string `json:"name"`
+
+	// Kind says which FAMILY of capture device this is, and therefore which
+	// vocabulary ID is spoken in — the platform's own audio stack, or a
+	// Blackmagic card enumerated by GStreamer's decklink provider. The two id
+	// spaces are different kinds of identifier in exactly the sense CONTRACT.md
+	// uses of headphoneDeviceId and headphoneEndpointId, and neither element
+	// reports a stranger's id as a stranger's: osxaudiosrc handed a DeckLink
+	// persistent-id falls back to the system default input, which is the silent
+	// wrong-device failure this package spends most of its length preventing.
+	//
+	// It is a SEPARATE FIELD and never a prefix inside ID, because ID is
+	// documented as an opaque string that nothing above internal/gst may parse.
+	// It is NOT PERSISTED: config.json keeps the id alone, so an existing file
+	// stays valid and no field is added to internal/presets. The empty string
+	// therefore means "written before this field existed" and reads as native;
+	// use NormaliseDeviceKind rather than comparing against "".
+	//
+	// The DeckLink half of the argument — what a persistent-id is, why it is
+	// never a device-number, and how the two providers are told apart — is in
+	// decklinkdevices.go, which WP-DECKLINK owns. The type itself is directly
+	// below, beside the field that carries it.
+	Kind DeviceKind `json:"kind,omitempty"`
+}
+
+// DeviceKind names which family of capture device a Device belongs to, and
+// therefore which element can open it and what its ID means.
+//
+// It is a string rather than an integer so that it survives the Wails JSON
+// boundary as something a human can read in a log or a devtools inspector. An
+// integer enum would cross the wire as 0 and 1, and "kind: 0" in a bug report
+// is a value somebody has to go and look up at the moment they can least afford
+// to.
+//
+// It is a NAMED TYPE and not a bare string so that the compiler refuses any
+// other string assigned to Device.Kind. That matters more here than it looks:
+// the failure mode of a wrong kind is not an error but a SILENT fall-through to
+// the unlabelled native default, which is the exact indistinguishable-twin
+// defect the field was added to close.
+//
+// It lives here, next to Device, rather than in decklinkdevices.go where the
+// DeckLink rules live, for two reasons. KindNative is not a DeckLink concept —
+// it is the absence of one, and every device this application enumerated before
+// a card was ever fitted is one. And frontend/src/ui/devices.test.js pins these
+// two spellings by READING THIS FILE'S SOURCE TEXT, the same way the WASAPI
+// endpoint prefixes are pinned against device_id.go; a contract string whose
+// mirror has to consult two files to check one field is a mirror that will
+// eventually check the wrong one.
+type DeviceKind string
+
+const (
+	// KindNative is a device belonging to the platform's own audio stack:
+	// a WASAPI endpoint on Windows, a CoreAudio device on macOS. Its ID is that
+	// stack's stable identity — see Device.ID — and captureSourceFactory opens
+	// it.
+	//
+	// "native" rather than "coreaudio"/"wasapi" because the value crosses to the
+	// frontend, which is one build for both platforms and must not have to know
+	// which one it is running on to recognise the ordinary case.
+	KindNative DeviceKind = "native"
+
+	// KindDeckLink is a Blackmagic capture card enumerated by GStreamer's
+	// decklink device provider. Its ID is the card's persistent-id, and only a
+	// decklink element can open it.
+	KindDeckLink DeviceKind = "decklink"
+)
+
+// The conform target: the raster and rate the contribution pipeline's VIDEO
+// LEG produces, and the reason it is an option rather than four numbers in a
+// string literal.
+//
+// # Why this type exists at all
+//
+// gst_cgo.go's pipelineDescription used to hard-code
+// width=1920,height=1080,framerate=50/1 in the slate leg's capsfilter, and
+// frontend/src/ui/lamps.js hard-codes GOOD_VIDEO={h264,1920,1080,50} beside
+// it. The owner has confirmed that M2L-X can be configured into ANY format and
+// that every source feeding it must match whatever it is configured for, so
+// both constants are a live defect on any instance not configured for 1080p50
+// — a feed that locks, reports a healthy bitrate, and is the wrong raster.
+//
+// # Why a fraction and not a float
+//
+// GStreamer's framerate caps field takes a GstFraction and nothing else, and
+// the rates that matter are not all decimals: 29.97 is 30000/1001 exactly and
+// 29.97 only approximately. The switcher reports the decimal — frame_rate
+// arrives as the STRING "50", see internal/m2lx/format.go — so the conversion
+// has to happen somewhere, and it happens once, in ConformTargetFromRate, with
+// the 1000/1001 family recognised explicitly rather than left to an
+// approximation that would produce 2997/100 and look entirely plausible. A
+// pipeline paced at 2997/100 against a source at 30000/1001 gains a frame
+// every 1001 frames, which at 30p is a frame every 33 seconds — well inside a
+// match, and invisible in a twenty-second test.
+//
+// # What is given up: scan type
+//
+// There is no interlaced/progressive field, and its absence is a decision
+// rather than an omission. This leg begins at pngdec, which emits progressive
+// frames; there is no interlacer between there and the encoder; and asking for
+// one in the caps does not conjure one. Pinning interlace-mode=interleaved
+// downstream of videoconvert/videoscale fails the whole leg at Start with
+// "Internal data stream error / not-negotiated (-4)" — measured, GStreamer
+// 1.26.10 on macOS arm64, 2026-08-15 — because videoconvert passes
+// interlace-mode through rather than converting it, and the `interlace`
+// element that would do the job is in NEITHER bundler's allowlist today.
+//
+// So there is no interlaced target this pipeline could honour if it were told
+// about one, and a field that can only ever be set wrongly is all cost. A
+// switcher configured for 1080i50 gets 1920x1080p50 out of us and the frame
+// RATE is what is matched; spatialCaps states interlace-mode=progressive
+// rather than leaving it to default, so that is visible in the parse string
+// and in the log rather than inferred. If a facility ever runs an interlaced
+// instance, the fix is to add `interlace` to build/bundle-gst.ps1 and
+// build/bundle-gst-darwin.sh and to put it in this leg — not to widen the
+// capsfilter and hope.
+//
+// Colorimetry, pixel aspect ratio and pixel format are absent for a duller
+// reason: they are fixed by this pipeline (bt709, 1/1, NV12) and are not
+// things the switcher varies independently of the raster in any configuration
+// anyone has measured.
+
+// The compiled-in fallback: the format every instance measured so far has been
+// configured for, and the one this application transmitted for its whole life
+// before the conform target existed.
+//
+// It is a FALLBACK and not a default in the ordinary sense. It is what Start
+// uses when the caller knows nothing — no node running, no control plane, an
+// instance never signed in to — and every path that reaches it says so in the
+// log, because transmitting 1080p50 into a 720p50 switcher is the exact
+// failure this type exists to make visible.
+const (
+	FallbackConformWidth        = 1920
+	FallbackConformHeight       = 1080
+	FallbackConformFrameRateNum = 50
+	FallbackConformFrameRateDen = 1
+)
+
+// ConformTarget is the raster and rate the video leg is conformed to.
+//
+// The FIELD NAMES are deliberately the ones config.VideoFormatSpec uses, so
+// that the bridge from a parsed videoFormatOverride to a pipeline option is a
+// transcription with nothing to get subtly wrong. The other source — the
+// format read off the switcher — arrives as a decimal rate and comes through
+// ConformTargetFromRate.
+//
+// The ZERO VALUE IS NOT A USABLE TARGET and Valid reports so. Callers must not
+// read a zero Width as "the default", which is the mistake PipelineOpts' bitrate
+// fields deliberately make safe and this type deliberately does not: a zero
+// here means nobody has decided, and exactly one place in the application is
+// entitled to turn that into 1080p50 and log that it did. That place is Start.
+type ConformTarget struct {
+	// Width and Height are the raster in pixels.
+	Width  int
+	Height int
+
+	// FrameRateNum and FrameRateDen are the frame rate as the exact fraction
+	// GStreamer wants: 50/1, 25/1, 30000/1001. Den is never zero on a target
+	// that came out of ConformTargetFromRate.
+	FrameRateNum int
+	FrameRateDen int
+}
+
+// FallbackConformTarget is the target used when the caller knows nothing. See
+// the constants above for why it is a fallback and not a default.
+func FallbackConformTarget() ConformTarget {
+	return ConformTarget{
+		Width:        FallbackConformWidth,
+		Height:       FallbackConformHeight,
+		FrameRateNum: FallbackConformFrameRateNum,
+		FrameRateDen: FallbackConformFrameRateDen,
+	}
+}
+
+// Valid reports whether this target can be rendered into caps GStreamer will
+// accept. A zero value is not valid, and neither is anything with a
+// non-positive field: framerate=0/1 negotiates against a live source as "any
+// rate", which would silently defeat the whole point of conforming.
+func (t ConformTarget) Valid() bool {
+	return t.Width > 0 && t.Height > 0 && t.FrameRateNum > 0 && t.FrameRateDen > 0
+}
+
+// String renders the target the way an operator reads a format — 1920x1080p50,
+// 1280x720p29.97 — because it is what goes in the log line at Start and in the
+// message when a feed will not lock. It is the operator-facing spelling, not
+// the caps spelling.
+//
+// The "p" is unconditional; the block comment above says why.
+//
+// The rate is rendered with the FEWEST decimal places that still identify it,
+// which is the whole reason this is not one FormatFloat call. 30000/1001 is
+// 29.970029970... and an operator comparing our log against a switcher that
+// says "29.97" should not have to work out whether 29.97003 is the same
+// number. Nor should 50 acquire a decimal point. See conformRateText.
+func (t ConformTarget) String() string {
+	if !t.Valid() {
+		return "(no conform target)"
+	}
+	return strconv.Itoa(t.Width) + "x" + strconv.Itoa(t.Height) + "p" + t.rateText()
+}
+
+// rateText renders the frame rate the way it is written down: "50", "29.97",
+// "23.976", "12.5".
+//
+// It tries 0, 1, 2 and 3 decimal places in turn and takes the first whose
+// value is within conformRateTextTolerance of the exact fraction. That
+// produces the conventional spelling of every rate anyone writes — the
+// 1000/1001 family included, which is the case a fixed number of places cannot
+// serve, since 29.97 needs two and 23.976 needs three.
+//
+// The tolerance is 1e-4 and NOT ntscTolerance, and the difference matters:
+// ntscTolerance (0.005) is how far a rate READ off the switcher may sit from
+// an exact value and still be recognised as it, whereas this is how much error
+// a rendering may hide. At 0.005 this function would print 24000/1001 as
+// "23.98", which is inside the tolerance and is not what anybody calls that
+// rate. Four decimal places of agreement is enough to identify a rate and not
+// enough to disguise one.
+func (t ConformTarget) rateText() string {
+	const conformRateTextTolerance = 1e-4
+	exact := float64(t.FrameRateNum) / float64(t.FrameRateDen)
+	for places := 0; places < 3; places++ {
+		text := strconv.FormatFloat(exact, 'f', places, 64)
+		if shown, err := strconv.ParseFloat(text, 64); err == nil &&
+			math.Abs(shown-exact) < conformRateTextTolerance {
+			return text
+		}
+	}
+	return strconv.FormatFloat(exact, 'f', 3, 64)
+}
+
+// DisplayFrameRate is the frame rate as the NUMBER an operator would write
+// down: 50, 29.97, 23.976. It is rateText parsed back, and it is a separate
+// method rather than float64(Num)/float64(Den) for one specific reason.
+//
+// The exact fraction 30000/1001 is 29.970029970029970..., and everything this
+// value is ever compared against is the ROUNDED spelling. M2L-X's
+// switcher_status reports frame_rate as the string "29.97"; internal/m2lx
+// parses that to the float64 29.97; frontend/src/ui/lamps.js then compares the
+// two with ===, which is a comparison the exact fraction loses. A VIDEO lamp
+// sitting red on a perfectly conforming 1080p29.97 feed, with "1080P29.97" in
+// green text beside "1080P29.970029970029970" in the log, is a worse failure
+// than the hardcoded constant this whole mechanism replaced, because it looks
+// like a rounding argument rather than a bug.
+//
+// So the rate that crosses the Wails boundary is the same rate String() prints,
+// arrived at by the same function. The pipeline is still built from the EXACT
+// fraction — FrameRateNum/FrameRateDen, which is what temporalCaps renders and
+// what GStreamer requires — and this is only ever the spelling. Nothing may
+// build caps from it.
+func (t ConformTarget) DisplayFrameRate() float64 {
+	if !t.Valid() {
+		return 0
+	}
+	shown, err := strconv.ParseFloat(t.rateText(), 64)
+	if err != nil {
+		// Unreachable: rateText's every return is FormatFloat's output. Falling
+		// back to the exact quotient rather than zero keeps a caller that has
+		// somehow got here comparing against a real rate instead of against a
+		// value no format has.
+		return float64(t.FrameRateNum) / float64(t.FrameRateDen)
+	}
+	return shown
+}
+
+// ntscDen is the denominator of the 1000/1001 family: the rates that are
+// exactly n*1000/1001 and are conventionally written as a truncated decimal —
+// 23.976, 29.97, 59.94, 119.88. They are recognised by construction rather
+// than tabulated, so a member nobody has met yet is handled too.
+const ntscDen = 1001
+
+// ntscTolerance is how far a reported rate may sit from an exact 1000/1001
+// value and still be read as that value.
+//
+// 0.005 is chosen against the two things it has to separate. The reported
+// "29.97" differs from 30000/1001 by 3.0e-5, so every truncation anyone writes
+// down is comfortably inside it. The nearest INTEGER rate, 30, differs from
+// 30000/1001 by 0.03 — six times the tolerance — so an instance genuinely
+// configured for 30/1 can never be read as 30000/1001. Anything between the
+// two is neither, and falls through to the exact-decimal case, which is the
+// honest answer for a rate nobody recognises.
+const ntscTolerance = 0.005
+
+// maxConformFPS is a sanity bound, not a policy. 1000 fps is not a
+// contribution format; a value above it means the numerator and denominator
+// have been swapped, or the field that was read was never a frame rate.
+const maxConformFPS = 1000
+
+// maxConformDimension is the same idea in the space axis, and generous on
+// purpose: 8192 covers every UHD and DCI raster anyone would put through a
+// switcher and refuses the result of having read a field that was never a
+// pixel count. It exists so that a garbled value falls back with a log line
+// rather than reaching gst_parse_launch, where an absurd raster is either caps
+// that fail to negotiate or — worse — caps that negotiate and allocate.
+const maxConformDimension = 8192
+
+// ConformTargetFromRate builds a target from a raster and a DECIMAL frame
+// rate, which is the only form the switcher reports.
+//
+// The rate is resolved in three steps, most specific first:
+//
+//  1. a whole number becomes n/1: 50, 25, 60.
+//  2. a rate within ntscTolerance of n*1000/1001 becomes n*1000/1001 EXACTLY:
+//     29.97, 59.94, 23.976, 47.952, 119.88.
+//  3. anything else becomes the exact decimal reduced to lowest terms, to three
+//     decimal places: 30.5 becomes 61/2.
+//
+// Step 3 exists so that a rate nobody has met is carried faithfully rather
+// than rounded into one of the rates that were anticipated. Three decimal
+// places is the limit of what the switcher has ever been observed to report,
+// and it keeps the numerator inside an int on every platform.
+//
+// An error names the offending value and is never "use the fallback instead":
+// the caller decides that, and has to say in its log which fallback it took.
+func ConformTargetFromRate(width, height int, fps float64) (ConformTarget, error) {
+	if width <= 0 || height <= 0 {
+		return ConformTarget{}, fmt.Errorf("gst: conform raster %dx%d is not a raster", width, height)
+	}
+	if math.IsNaN(fps) || math.IsInf(fps, 0) || fps <= 0 || fps > maxConformFPS {
+		return ConformTarget{}, fmt.Errorf("gst: conform frame rate %v is not a frame rate", fps)
+	}
+
+	t := ConformTarget{Width: width, Height: height}
+
+	if fps == math.Trunc(fps) {
+		t.FrameRateNum, t.FrameRateDen = int(fps), 1
+		return t, nil
+	}
+
+	// The 1000/1001 family. n is the rate this WOULD be if it were exact — 30
+	// for 29.97 — and the test is whether n*1000/1001 lands back on what
+	// arrived.
+	if n := math.Round(fps * ntscDen / 1000); n >= 1 {
+		if math.Abs(fps-n*1000/ntscDen) < ntscTolerance {
+			t.FrameRateNum, t.FrameRateDen = int(n)*1000, ntscDen
+			return t, nil
+		}
+	}
+
+	num, den := int(math.Round(fps*1000)), 1000
+	g := gcdConform(num, den)
+	t.FrameRateNum, t.FrameRateDen = num/g, den/g
+	return t, nil
+}
+
+// gcdConform is Euclid's, guarding the zero that would make the caller divide
+// by it. The stdlib has no integer gcd, and reaching for math/big to reduce a
+// fraction whose denominator is 1000 would be the more surprising choice.
+func gcdConform(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a == 0 {
+		return 1
+	}
+	return a
+}
+
+// resolve returns the conform target the pipeline will actually be built with,
+// and a non-empty reason when that is not the target the caller asked for.
+//
+// The two outcomes are deliberately different things and Start logs them
+// differently. The ZERO ConformTarget is the ordinary "nothing known yet"
+// state — the switcher has not been read, or every node is stopped and
+// reporting format: null, which is the measured shape on all 22 stopped nodes
+// in the 2026-07-31 capture — and it resolves to FallbackConformTarget() with
+// NO reason. It is not a fault and must not read as one in a field log, or the
+// one line that does mean something is lost among the ones that do not.
+// Anything else that cannot be used resolves to the fallback WITH a reason
+// naming the value, because a switcher that reported 1920x1081 is a fact
+// somebody needs.
+//
+// It never returns an unusable target and it never returns an error. Both are
+// the same decision, and it is the one FallbackConformTarget records: refusing
+// to start without a known switcher format would be the tidier rule and it
+// would be wrong here, for the same reason statusKey is deliberately not in
+// config.Validate. Nothing may be a reason a match does not go out. The format
+// is only knowable by reading the switcher, the switcher reports nothing for a
+// node that is not streaming, and the commentary position is routinely started
+// before anything is running at the other end.
+func (t ConformTarget) resolve() (ConformTarget, string) {
+	if t == (ConformTarget{}) {
+		return FallbackConformTarget(), ""
+	}
+	if !t.Valid() {
+		return FallbackConformTarget(), fmt.Sprintf(
+			"%dx%d at %d/%d is not a raster and a rate",
+			t.Width, t.Height, t.FrameRateNum, t.FrameRateDen)
+	}
+
+	// EVEN DIMENSIONS ARE AN NV12 RULE, NOT A SWITCHER RULE, which is why the
+	// check is here and not in Valid — a target this pipeline cannot encode is
+	// still a perfectly good description of what the switcher is doing. This
+	// leg encodes NV12, whose chroma plane is half resolution on both axes, so
+	// an odd dimension is not a rounding question: it is a caps negotiation
+	// that fails at Start with "not-negotiated (-4)" and names neither the
+	// element nor the number that caused it. It falls back rather than
+	// rounding, because a slate one pixel narrower than the switcher expects is
+	// a silent format mismatch of exactly the kind this type exists to end.
+	if t.Width%2 != 0 || t.Height%2 != 0 {
+		return FallbackConformTarget(), fmt.Sprintf(
+			"raster %dx%d is odd on one axis and NV12 chroma is half resolution on both",
+			t.Width, t.Height)
+	}
+	if t.Width > maxConformDimension || t.Height > maxConformDimension {
+		return FallbackConformTarget(), fmt.Sprintf(
+			"raster %dx%d exceeds the %d-pixel sanity limit",
+			t.Width, t.Height, maxConformDimension)
+	}
+	if t.FrameRateNum > maxConformFPS*t.FrameRateDen {
+		return FallbackConformTarget(), fmt.Sprintf(
+			"frame rate %d/%d exceeds the %d fps sanity limit",
+			t.FrameRateNum, t.FrameRateDen, maxConformFPS)
+	}
+	return t, ""
+}
+
+// spatialCaps renders the capsfilter pinned UPSTREAM of imagefreeze:
+// everything about ONE PICTURE, and nothing about how often it is repeated.
+//
+// The split between this and temporalCaps is not a property of a conform
+// target at all — it is a property of the order the slate leg's elements are
+// in, which is what lets videoconvert and videoscale sit above imagefreeze
+// instead of below it. pipelineDescription has the argument and the
+// measurement.
+//
+// interlace-mode=progressive is STATED rather than left to default. It is the
+// one thing this application asserts about scan, it is what the leg can
+// actually produce, and pinning it means that a future GStreamer negotiating
+// differently is a loud caps failure at Start rather than a feed the switcher
+// quietly will not take. The block comment above has the measurement.
+func (t ConformTarget) spatialCaps() string {
+	return "video/x-raw,format=NV12" +
+		",width=" + strconv.Itoa(t.Width) +
+		",height=" + strconv.Itoa(t.Height) +
+		",pixel-aspect-ratio=1/1,colorimetry=bt709,interlace-mode=progressive"
+}
+
+// temporalCaps renders the capsfilter pinned DOWNSTREAM of imagefreeze: the one
+// field imagefreeze itself decides, which is the rate at which it repeats the
+// single frame it was handed.
+func (t ConformTarget) temporalCaps() string {
+	return "video/x-raw,framerate=" +
+		strconv.Itoa(t.FrameRateNum) + "/" + strconv.Itoa(t.FrameRateDen)
 }
 
 // PipelineOpts configures everything upstream of the sink: the slate branch, the
@@ -161,9 +629,49 @@ type PipelineOpts struct {
 	// documented on Device.ID.
 	AudioDeviceID string
 
+	// ConformTo is the raster and rate the VIDEO LEG is conformed to: what the
+	// slate is scaled and paced into before it reaches the H.264 encoder. It is
+	// the switcher's configured format, and it has to be, because M2L-X can be
+	// configured into any format and requires every source to match the one it
+	// is configured for. Until this field existed the leg was hardcoded to
+	// 1920x1080p50, which is a live defect on any instance that is not.
+	//
+	// THE ZERO VALUE MEANS "NOTHING IS KNOWN" and resolves to
+	// FallbackConformTarget() — 1920x1080p50, the value that was written into
+	// the parse string. That is a normal state and not a fault: the switcher is
+	// routinely unread when Start is pressed, and refusing to go on air over it
+	// would be the wrong trade by a distance. Note that this is the OPPOSITE
+	// reading of a zero from ConformTarget.Valid, which reports a zero target as
+	// unusable — deliberately, so that a caller cannot pass a zero on to
+	// something that needs a real one by accident. The fallback decision is made
+	// once, here, in Start, and it is logged.
+	//
+	// The caller builds one with gst.ConformTargetFromRate — the switcher
+	// reports its rate as a decimal and GStreamer takes nothing but a fraction —
+	// or, for the operator-typed override, by transcribing the four fields of a
+	// config.VideoFormatSpec, which (*config.Config).VideoFormatOverrideSpec
+	// returns and config.ParseVideoFormat produces. app.go's conformFormat is
+	// the one place that does both.
+	//
+	// THERE IS DELIBERATELY NO PARSER IN THIS PACKAGE. One grammar, one parser:
+	// internal/config cannot import internal/gst — a config package that needs
+	// GStreamer installed to be tested stops being tested — so the parse has to
+	// live in config for config.Validate to be able to refuse a bad value at
+	// all. A second parser here would be a second grammar, and the two would
+	// drift into disagreeing about which strings are legal, which is a defect
+	// whose symptom is a value the Settings screen accepts and Start rejects.
+	// The field names of ConformTarget and config.VideoFormatSpec are identical
+	// so that the transcription has nothing to get subtly wrong.
+	ConformTo ConformTarget
+
 	// VideoBitrateKbps is the H.264 encoder's bitrate in kilobits per second.
 	// Zero means DefaultVideoBitrateKbps. Kilobits is the unit on mfh264enc and
 	// on vtenc_h264 alike.
+	//
+	// The default is sized for the still slate this leg carries today and the
+	// owner has ruled it far too low for live video; ~10000 is the figure
+	// asked for. Nothing here caps the value — see DefaultVideoBitrateKbps for
+	// why the default stays where it is anyway.
 	VideoBitrateKbps int
 
 	// AudioBitrateBps is the AAC encoder's bitrate in bits per second. Zero

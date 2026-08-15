@@ -922,6 +922,15 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // manage; see app_remote.go and docs/remote-access.md.) GetRemoteState carries
 // no secret, keeping the "no secret crosses this boundary outbound" rule that
 // GetPresetCredentialStatus is the only recorded narrowing of.
+//
+// GetConformTarget is the last, added with the conform work. It is read-only and
+// carries no secret: the raster and rate the video leg is — or would be — built
+// to, plus the provenance of that answer. It is on this surface because the
+// alternative was the defect it replaces, a VIDEO OK lamp judging every feed
+// against a hardcoded 1080p50 and therefore reading red on a correctly
+// configured 720p50 facility. It is the frontend's ONLY route to that number,
+// deliberately: deriving it a second time in JavaScript is how the page and the
+// pipeline start disagreeing about which of them is telling the truth.
 func assertBoundSurface(t *testing.T) {
 	t.Helper()
 
@@ -966,6 +975,8 @@ func assertBoundSurface(t *testing.T) {
 
 		"GetRemoteState":    true,
 		"SetRemoteListener": true,
+
+		"GetConformTarget": true,
 	}
 
 	got := exportedMethodsOfApp()

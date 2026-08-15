@@ -23,10 +23,13 @@
 // real twin does, through the shared refuseRenderEndpoint in device_id.go, so
 // a caller that would hand a playback endpoint to the real pipeline fails the
 // same way at Gate A. Correspondingly, the endpoint-id namespaces of the fake
-// device lists are CONTRACT: every defaultStubDevices id is in the capture
-// namespace ({0.0.1.00000000}.) and every defaultStubOutputDevices id (in
-// return_stub.go) is in the render namespace ({0.0.0.00000000}.), and
-// gst_stub_test.go asserts both against the classifier in device_id.go.
+// device lists are CONTRACT: every NATIVE defaultStubDevices id is in the
+// capture namespace ({0.0.1.00000000}.) and every defaultStubOutputDevices id
+// (in return_stub.go) is in the render namespace ({0.0.0.00000000}.), and
+// gst_stub_test.go asserts both against the classifier in device_id.go. The
+// DeckLink entry is exempt from the first clause and not from the second: a
+// persistent-id belongs to neither namespace on purpose, but nothing in the
+// INPUT list may ever classify as a render endpoint.
 //
 // # This stub is platform-neutral, and there are things it therefore cannot model
 //
@@ -112,18 +115,56 @@ const (
 // They stay Windows-shaped when Gate A runs on a Mac. See the file comment: a
 // CoreAudio unique-id classifies as neither namespace, so a macOS-shaped
 // fixture here would silently stop testing the refusal these ids exist to test.
+// The last two entries reproduce the UltraStudio TWIN PAIR: one card
+// enumerating twice, once through the platform's own audio stack and once
+// through GStreamer's decklink provider, under names an operator cannot tell
+// apart. That is the measured shape of the owner's original bug — the native
+// twin reads -96 dBFS on all sixteen channels with the mic live, and it is the
+// one the dropdown used to offer — and without it in the stub NOTHING at Gate A
+// ever exercises the labelling that exists to separate them. frontend's
+// backend.js FAKE_DEVICES documents itself as mirroring this table and carries
+// the same pair; the two must not drift.
+//
+// THE TWO NAMES ARE IDENTICAL ON PURPOSE. That is what makes it the collision:
+// labelDevices adds the "computer sound input" suffix to a native entry only
+// when a DeckLink entry SHARES its name, so a fixture whose twins were named
+// differently would add no suffix at all and leave the labelling untested by
+// the very case it was written for. 2747401380 is the real persistent-id
+// measured off the card.
+//
+// The DeckLink entry's ID is that bare persistent-id and deliberately NOT in
+// the endpoint namespace, because that is what the real provider publishes — a
+// gint64 rendered as decimal, with no prefix and no braces. It is the one entry
+// here that is not a WASAPI-shaped id, and it is the reason
+// IsCaptureEndpointID's contract is a POSITIVE identification rather than a
+// refusal of everything unrecognised: an id that classifies as neither
+// namespace must not become an unstartable device. frontend's backend.js
+// carries the same pair with the same ids.
 var defaultStubDevices = []Device{
 	{
 		ID:   "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
 		Name: "DVS Receive  1-2 (Dante Virtual Soundcard)",
+		Kind: KindNative,
 	},
 	{
 		ID:   "{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}",
 		Name: "DVS Receive  3-4 (Dante Virtual Soundcard)",
+		Kind: KindNative,
 	},
 	{
 		ID:   "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}",
 		Name: "Microphone (Focusrite Scarlett 2i2 USB)",
+		Kind: KindNative,
+	},
+	{
+		ID:   "{0.0.1.00000000}.{4b1e77a2-0004-438e-9003-51a46e13b7e0}",
+		Name: "Blackmagic UltraStudio 4K Mini",
+		Kind: KindNative,
+	},
+	{
+		ID:   "2747401380",
+		Name: "Blackmagic UltraStudio 4K Mini",
+		Kind: KindDeckLink,
 	},
 }
 
@@ -317,6 +358,15 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	if opts.AudioBitrateBps == 0 {
 		opts.AudioBitrateBps = DefaultAudioBitrateBps
 	}
+	// The conform target is resolved here for the same reason the two bitrates
+	// are defaulted here: StartedWith() is what the Gate A tests read, and it
+	// must report what a pipeline would ACTUALLY have been built with, not what
+	// the caller happened to type. The resolution is the shared one in gst.go —
+	// there is deliberately no second copy of the fallback rule — so the two
+	// twins cannot drift on which formats are refused or on what they fall back
+	// to. The real twin logs the reason; the stub has no field log to write to
+	// and the resolved value in StartedWith() is the equivalent record.
+	opts.ConformTo, _ = opts.ConformTo.resolve()
 
 	p.opts = opts
 	p.state = StubStateRunning

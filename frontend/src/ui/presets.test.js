@@ -108,11 +108,14 @@ test('INSTANCE_FIELD_LABELS mirrors the Go whitelist exactly', () => {
     [...goTags].sort(),
     'presets.js INSTANCE_FIELD_LABELS and internal/presets.InstanceFields must list the same tags',
   );
-  // 12: srtHost went when the SRT host became derived from m2lxHost, and
+  // 14: srtHost went when the SRT host became derived from m2lxHost, and
   // eventId went when it was reclassified DISCOVERED — a preset is which venue,
   // never which match, and the instance can be asked which events it is running.
+  // videoBitrateKbps and videoFormatOverride arrived with the conform work: both
+  // are properties of the VENUE — its contribution circuit and its switcher's
+  // configured raster — rather than of the PC, so both travel in a preset.
   // Growth is a reviewed decision, in fields.go first and here second.
-  assert.equal(jsTags.length, 12, 'the whitelist is 12 INSTANCE fields; growth is a reviewed decision');
+  assert.equal(jsTags.length, 14, 'the whitelist is 14 INSTANCE fields; growth is a reviewed decision');
   for (const { label } of INSTANCE_FIELD_LABELS) {
     assert.ok(label && typeof label === 'string', 'every whitelisted tag needs a screen label');
   }

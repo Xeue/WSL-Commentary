@@ -82,6 +82,19 @@ var InstanceFields = []string{
 	"srtPort",
 	// Retransmission budget for the path to that instance.
 	"srtLatencyMs",
+	// How much of the circuit to that instance the feed may take. The same kind
+	// of fact as the two above it: a venue's contribution path is a venue's
+	// contribution path, whichever laptop is plugged into it. (2000 was chosen
+	// when the video leg was a still slate; live video wants nearer 10000, and
+	// which of those is right is a property of the link, not of the PC.)
+	"videoBitrateKbps",
+	// The format that instance's switcher is configured for, as the fallback for
+	// when no node is streaming and it cannot be derived — MEASURED as the
+	// normal case on a position that comes up first: every node reports
+	// "format": null while stopped, and no REST endpoint states it. It describes
+	// the SWITCHER, so every position at the facility shares one answer, which is
+	// exactly what a preset is for.
+	"videoFormatOverride",
 	// Encryption negotiated with that ingest — the NON-SECRET half. The
 	// passphrase itself lives in Credential Manager under the preset's
 	// credential scope and never enters a preset file; see presets.go and
@@ -123,6 +136,22 @@ var MachineFields = []string{
 	"headphoneEndpointId",
 	// A path on this installation.
 	"slatePath",
+	// WHICH SUBSYSTEM THIS PC CAPTURES COMMENTARY FROM: "native" or "decklink".
+	// It is the audioDeviceId failure in a different spelling — a preset
+	// carrying "decklink", applied to a laptop with no card in it, describes
+	// hardware that is not there — and the fault it produces is worse than a
+	// phantom endpoint, not better: the card's absence surfaces from GStreamer
+	// as "Internal data stream error / not-negotiated (-4)" in about 100
+	// microseconds, naming neither the device nor the cause.
+	"audioSourceKind",
+	// The persistent-id of a Blackmagic card in THIS PC — hardware, by
+	// definition. One field serves audio and video because the id names the
+	// CARD: both elements publish the same one. It is stored as the
+	// persistent-id and never as the device-number, the same rule that stores
+	// the CoreAudio UID and never the integer AudioDeviceID, and for the same
+	// reason: an index into this boot's enumeration order is not an identity, so
+	// it is not a thing that could travel even in principle.
+	"decklinkPersistentId",
 }
 
 // UIFields are the json tags of live-operational choices. Instance-DERIVED is

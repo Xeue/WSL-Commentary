@@ -48,8 +48,126 @@ const RETURN_MID_VALUES = [1, 2, 3, 4, 5, 6, 7];
 // is how a value becomes valid here and unroutable in the audio graph.
 const RETURN_CHANNEL_VALUES = CHANNEL_MODES.map((m) => m.value);
 
+// The video-leg bounds, mirrored from internal/config. MAX_VIDEO_BITRATE_KBPS is
+// config.MaxVideoBitrateKbps and exists as a typo guard rather than as a
+// judgement about the circuit; DEFAULT_VIDEO_BITRATE_KBPS is what a 0 means.
+const MAX_VIDEO_BITRATE_KBPS = 100000;
+const DEFAULT_VIDEO_BITRATE_KBPS = 2000;
+
+// The commentary capture subsystems, mirrored from internal/config's
+// AudioSourceNative/AudioSourceDeckLink. settings.js owns the <select> that
+// produces them; this list is what the form may not save outside of.
+const AUDIO_SOURCE_NATIVE = 'native';
+const AUDIO_SOURCE_KINDS = [AUDIO_SOURCE_NATIVE, 'decklink'];
+
+// The video-format grammar, mirrored from internal/config/videoformat.go.
+//
+// maxVideoDimension and maxVideoFrameRate there; the example is
+// config.VideoFormatExample, and it appears in every message on purpose,
+// because a refusal that does not show a correct value is a refusal an operator
+// has to go and research.
+const MAX_VIDEO_DIMENSION = 8192;
+const MAX_VIDEO_FRAME_RATE = 1000;
+const VIDEO_FORMAT_EXAMPLE = '1920x1080p50';
+
+// How far a typed decimal may sit from an exact n*1000/1001 and still be read
+// as that rate. 0.005, the same figure and for the same reason as Go's: 23.98
+// is 0.004 from 24000/1001, and no rate anybody means as itself is that close
+// to an NTSC one.
+const NTSC_TOLERANCE = 0.005;
+
 function isBlank(v) {
   return typeof v !== 'string' || v.trim().length === 0;
+}
+
+/**
+ * videoFormatError mirrors internal/config.ParseVideoFormat and returns an
+ * operator-facing message, or '' when the value is a format this application
+ * can conform to.
+ *
+ * IT IS A MIRROR, NOT A SECOND GRAMMAR. Go's parser is the authority — it is
+ * what Start actually uses and what a hand-edited config.json meets — and this
+ * exists so the operator learns at the FIELD rather than twenty seconds after
+ * START, by which time the message is "not-negotiated (-4)" and names nothing.
+ * A string these two disagree about is a defect either way round: accepted here
+ * and refused there is a form that saves a value Start rejects; refused here and
+ * accepted there is a format the application can send and the screen will not
+ * let anybody ask for.
+ *
+ * INTERLACE IS REFUSED BY NAME, which is the only reason the scan letter is
+ * read at all. 1080i25 is a real M2L-X configuration and somebody will type it;
+ * the video leg is a still image through imagefreeze and there is no interlacer
+ * in either bundler's element list, so the refusal has to say that this is a
+ * limitation of the application rather than a rejected spelling — otherwise the
+ * operator retypes it four ways and concludes the box is broken.
+ *
+ * @param {string} raw
+ * @returns {string} the message, or '' if the value is acceptable
+ */
+function videoFormatError(raw) {
+  const value = String(raw).trim();
+  const eg = `, e.g. "${VIDEO_FORMAT_EXAMPLE}"`;
+
+  const m = /^(\d*)x(\d*)([pi])(.*)$/i.exec(value);
+  if (!m) {
+    return `"${value}" is not a video format; write it as <width>x<height>p<frame rate>${eg}.`;
+  }
+  const [, widthPart, heightPart, scan, ratePart] = m;
+
+  if (scan.toLowerCase() === 'i') {
+    return (
+      `"${value}" is interlaced (the "i"); this application can only send progressive video, ` +
+      `so an interlaced switcher cannot be conformed to from here. Write a progressive ` +
+      `format such as "${VIDEO_FORMAT_EXAMPLE}" if the switcher can be set to one.`
+    );
+  }
+
+  for (const [part, what] of [
+    [widthPart, 'width'],
+    [heightPart, 'height'],
+  ]) {
+    if (part === '') return `"${value}" has no ${what}${eg}.`;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_VIDEO_DIMENSION) {
+      return `"${value}" has a ${what} of "${part}"; it must be between 1 and ${MAX_VIDEO_DIMENSION} pixels${eg}.`;
+    }
+  }
+
+  if (ratePart === '') return `"${value}" has no frame rate after the "p"${eg}.`;
+
+  // Whole numbers are exact: p50 is 50/1. The digits test is explicit rather
+  // than left to Number(), which accepts "+50", "5e1" and " 50" — every one of
+  // which parses to a plausible rate and means the operator typed something
+  // else.
+  if (/^\d+$/.test(ratePart)) {
+    const n = Number(ratePart);
+    if (n < 1 || n > MAX_VIDEO_FRAME_RATE) {
+      return `"${value}" has a frame rate of "${ratePart}"; it must be between 1 and ${MAX_VIDEO_FRAME_RATE}${eg}.`;
+    }
+    return '';
+  }
+
+  // The NTSC family, accepted as the decimals broadcasters actually write and
+  // meaning the fraction it really is: 59.94 is 60000/1001. Any OTHER decimal
+  // is refused rather than rounded — 50.5 is a typo, not a format, and
+  // conforming to it would be this form inventing a video standard.
+  if (!/^\d+(\.\d+)?$/.test(ratePart)) {
+    return `"${value}" has a frame rate of "${ratePart}", which is not a number of frames per second${eg}.`;
+  }
+  const f = Number(ratePart);
+  const n = Math.round((f * 1001) / 1000);
+  if (
+    f > 0 &&
+    n >= 1 &&
+    n <= MAX_VIDEO_FRAME_RATE &&
+    Math.abs(f - (n * 1000) / 1001) <= NTSC_TOLERANCE
+  ) {
+    return '';
+  }
+  return (
+    `"${value}" has a frame rate of "${ratePart}"; whole numbers (24, 25, 30, 50, 60) and ` +
+    `the NTSC rates (23.98, 29.97, 59.94) are the frame rates there are${eg}.`
+  );
 }
 
 function hasScheme(v) {
@@ -138,6 +256,68 @@ export function validateConfig(config) {
   if (!isInt(config.pictureLatencyMs) || config.pictureLatencyMs < 0 || config.pictureLatencyMs > 8000) {
     errors.pictureLatencyMs =
       'Picture buffer must be a whole number of milliseconds from 0 to 8000 — 120 is the default.';
+  }
+
+  // --- the contribution video leg -----------------------------------------
+  //
+  // The two fields below are the form's half of an acceptance condition worth
+  // stating in full: IT MUST NOT BE POSSIBLE TO SAVE A VALUE THAT MAKES START
+  // FAIL LATER WITH A CAPS ERROR NAMING NO FIELD. Go's SaveConfig deliberately
+  // does not validate — a half-filled form on first run has to be savable — so
+  // internal/config.Validate runs only at START. That makes it the backstop for
+  // a hand-edited file or a preset from a newer build, and makes THIS the thing
+  // that stops a bad value reaching config.json at all. The two must not drift:
+  // every bound and every accepted spelling below is mirrored from
+  // internal/config/videoformat.go, and videoformat_test.go is where the
+  // authority lives.
+
+  // Zero means "use the default", which is why 0 is accepted rather than
+  // treated as an empty box — the same shape as pictureLatencyMs above and for
+  // the same upgrade reason: every config.json written before this field
+  // existed holds 0. The ceiling is a typo guard and nothing more; it is not a
+  // statement about what the circuit will carry.
+  if (
+    !isInt(config.videoBitrateKbps) ||
+    config.videoBitrateKbps < 0 ||
+    config.videoBitrateKbps > MAX_VIDEO_BITRATE_KBPS
+  ) {
+    errors.videoBitrateKbps =
+      `Video bitrate must be a whole number of kbps from 0 to ${MAX_VIDEO_BITRATE_KBPS}. ` +
+      `0 means the default, ${DEFAULT_VIDEO_BITRATE_KBPS} — which was sized for a still slate; ` +
+      'nearer 10000 is wanted for live video.';
+  }
+
+  // BLANK IS VALID and is the default: empty means derive the format from the
+  // switcher, which is what happens whenever any node is streaming. The check
+  // fires only on a value somebody typed.
+  if (!isBlank(config.videoFormatOverride)) {
+    const message = videoFormatError(config.videoFormatOverride);
+    if (message) errors.videoFormatOverride = message;
+  }
+
+  // --- the commentary input subsystem --------------------------------------
+
+  if (!AUDIO_SOURCE_KINDS.includes(config.audioSourceKind ?? AUDIO_SOURCE_NATIVE)) {
+    errors.audioSourceKind =
+      'Commentary input must be either the computer sound input or a Blackmagic DeckLink card.';
+  }
+
+  // OPTIONAL — empty means "the only card in the machine", which is the normal
+  // case. The one check is against the ONE WRONG VALUE a hurried operator will
+  // type: the small integer Blackmagic's own tools show beside a card. That is
+  // the device-number, an ENUMERATION INDEX that changes when a card is added
+  // or moved, and the whole reason this field stores persistent-id instead is
+  // that a device-number silently addresses a different card after the next
+  // reboot. A one- or two-digit value is refused by name; anything longer is
+  // accepted, because a real persistent-id is a large decimal (the measured
+  // UltraStudio 4K Mini reports 2747401380) and a positive rule here would turn
+  // an unrecognised future id into an unsavable form.
+  if (!isBlank(config.decklinkPersistentId) && /^\d{1,2}$/.test(config.decklinkPersistentId.trim())) {
+    errors.decklinkPersistentId =
+      `"${config.decklinkPersistentId.trim()}" is a device number, not a persistent ID. ` +
+      'A device number is a position in the enumeration and addresses a different card once ' +
+      'one is added or moved; a persistent ID names the card itself and is a long number ' +
+      '(e.g. 2747401380). Leave this blank if there is only one card.';
   }
 
   // The RETURN path's key length. Same three values, a different endpoint, and

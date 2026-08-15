@@ -68,8 +68,15 @@ function validForm() {
     srtPort: 40001,
     srtLatencyMs: 120,
     pbkeylen: 0,
+    videoBitrateKbps: 2000,
+    // Blank is the DEFAULT and means "read the format from the switcher". A
+    // baseline that filled it in would be testing the unusual case as if it were
+    // the normal one.
+    videoFormatOverride: '',
     statusKey: '',
     audioDeviceId: '',
+    audioSourceKind: 'native',
+    decklinkPersistentId: '',
     headphoneDeviceId: '',
     headphoneEndpointId: '',
     returnMid: 2,
@@ -122,6 +129,201 @@ test('the return key length rejects everything else, including the plausible mis
       errors.srtReturnPBKeyLen,
       `srtReturnPBKeyLen ${String(value)} must be rejected`,
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// validateConfig: the contribution video leg
+//
+// validate.js's videoFormatError is a MIRROR of internal/config.ParseVideoFormat
+// written in another language, which is a thing that drifts unless something
+// holds the two together. Two mechanisms do, and they catch different failures:
+// the corpus below pins the VERDICTS (a string these two disagree about is a
+// defect either way round), and the constants test after it pins the BOUNDS
+// against Go's source text, which is what would silently move if somebody
+// widened maxVideoDimension for an 8K instance and updated one file.
+//
+// The verdicts were verified against Go's parser directly on 2026-08-15 — every
+// case run through config.ParseVideoFormat and diffed — and they agreed on all
+// 37. The empty string is the one deliberate difference and is not in the table:
+// ParseVideoFormat refuses it, config.Validate and this form both skip it,
+// because empty means DERIVE FROM THE SWITCHER and is the default.
+// ---------------------------------------------------------------------------
+
+// [value, acceptable]. Grouped by what each case is actually testing, because a
+// flat list of 37 strings is a list nobody maintains.
+const VIDEO_FORMAT_CASES = [
+  // The ordinary formats, and the spellings a keyboard produces.
+  ['1920x1080p50', true],
+  ['1280x720p50', true],
+  ['3840x2160p25', true],
+  ['1920X1080P50', true],
+  [' 1920x1080p50 ', true],
+  // The NTSC family: accepted as the decimals broadcasters write, because a
+  // field that refused "59.94" would be a field nobody could fill in.
+  ['1920x1080p59.94', true],
+  ['1920x1080p29.97', true],
+  ['1920x1080p23.98', true],
+  ['1920x1080p23.976', true],
+  ['1920x1080p119.88', true],
+  ['1920x1080p29.970', true],
+  // 59.939 is inside the 0.005 tolerance of 60000/1001; 59.95 and 59.9 are not,
+  // and are refused rather than rounded to the rate they are nearest.
+  ['1920x1080p59.939', true],
+  ['1920x1080p59.95', false],
+  ['1920x1080p59.9', false],
+  // 50.5 is a typo, not a format. Accepting it would be the form inventing a
+  // video standard and conforming the feed to it.
+  ['1920x1080p50.5', false],
+  // The bounds, on both sides of each edge.
+  ['1920x1080p24', true],
+  ['1920x1080p1000', true],
+  ['1920x1080p1001', false],
+  ['1920x1080p0', false],
+  ['8192x8192p50', true],
+  ['8193x1080p50', false],
+  ['0x1080p50', false],
+  ['1920x0p50', false],
+  // INTERLACE, refused by name. 1080i25 is a real M2L-X configuration and the
+  // refusal has to say this is a limitation of the application, not a spelling
+  // it did not recognise — see the assertion after the table.
+  ['1920x1080i25', false],
+  ['1920x1080I25', false],
+  // Numbers that parse in one language and mean the operator typed something
+  // else. "5e1" is 50 to Number() and nothing to Go; "+50" is 50 to Atoi with a
+  // sign; "5_0" is 50 to Go's underscore separator. All three are refused by
+  // both, which is the whole reason the digit tests are explicit regexes rather
+  // than a call to the language's own number parser.
+  ['1920x1080p+50', false],
+  ['1920x1080p5_0', false],
+  ['1920x1080p5e1', false],
+  ['1920x1080p.5', false],
+  ['1920x1080p50.', false],
+  // Structurally not a format.
+  ['x1080p50', false],
+  ['1920xp50', false],
+  ['1920x1080p', false],
+  ['1920x1080', false],
+  ['1920*1080p50', false],
+  ['1920 x 1080p50', false],
+  ['hello', false],
+];
+
+test('videoFormatOverride accepts and refuses exactly what internal/config does', () => {
+  for (const [value, acceptable] of VIDEO_FORMAT_CASES) {
+    const { videoFormatOverride } = validateConfig({ ...validForm(), videoFormatOverride: value });
+    if (acceptable) {
+      assert.equal(
+        videoFormatOverride,
+        undefined,
+        `${JSON.stringify(value)} is a format config.ParseVideoFormat accepts, so the form must ` +
+          `not refuse it — a value Start can use that Settings will not save is unreachable`,
+      );
+    } else {
+      assert.ok(
+        videoFormatOverride,
+        `${JSON.stringify(value)} is refused by config.ParseVideoFormat, so saving it here would ` +
+          `put a value in config.json that fails at START with "not-negotiated (-4)" naming nothing`,
+      );
+      assert.ok(
+        videoFormatOverride.includes('1920x1080p50'),
+        'every refusal must show a correct value; a refusal without one is research homework',
+      );
+    }
+  }
+});
+
+test('BLANK videoFormatOverride is valid, because blank means derive', () => {
+  // The one place this form and ParseVideoFormat deliberately differ. Empty is
+  // the default and is what every existing installation holds; refusing it would
+  // make the Settings screen unsavable until somebody typed a raster they may
+  // have no way of knowing.
+  for (const blank of ['', '   ', undefined, null]) {
+    const errors = validateConfig({ ...validForm(), videoFormatOverride: blank });
+    assert.equal(errors.videoFormatOverride, undefined, `${JSON.stringify(blank)} must be valid`);
+  }
+});
+
+test('an interlaced format is refused as a LIMITATION, not as a bad spelling', () => {
+  const { videoFormatOverride } = validateConfig({
+    ...validForm(),
+    videoFormatOverride: '1920x1080i25',
+  });
+  // The operator whose switcher really is interlaced must learn that this
+  // application cannot send it, or they retype the value four ways and conclude
+  // the box is broken. The word "progressive" is the load-bearing part.
+  assert.match(videoFormatOverride, /progressive/);
+});
+
+test('the mirrored video-format bounds still match internal/config/videoformat.go', () => {
+  // The verdict table above cannot catch a bound that moves in Go, because the
+  // cases either side of the edge would simply start disagreeing in a way no
+  // test names. Pinned against the source text, the same way devices.test.js
+  // pins the endpoint prefixes.
+  const go = read(repoRoot, 'internal', 'config', 'videoformat.go');
+  assert.match(go, /maxVideoDimension\s+=\s+8192/, 'the width/height ceiling moved in Go');
+  assert.match(go, /maxVideoFrameRate\s+=\s+1000/, 'the frame-rate ceiling moved in Go');
+  assert.match(go, /VideoFormatExample = "1920x1080p50"/, 'the example format changed in Go');
+  // The NTSC tolerance, which decides whether "59.939" is 60000/1001. It is
+  // written as a literal in parseVideoFrameRate rather than as a named constant.
+  assert.ok(go.includes('0.005'), 'the NTSC tolerance moved in Go');
+});
+
+test('videoBitrateKbps mirrors config.MaxVideoBitrateKbps, and 0 means the default', () => {
+  for (const value of [0, 1, 2000, 10000, 100000]) {
+    const { videoBitrateKbps } = validateConfig({ ...validForm(), videoBitrateKbps: value });
+    assert.equal(videoBitrateKbps, undefined, `${value} kbps must be accepted`);
+  }
+  for (const value of [-1, 100001, 1.5, '2000', undefined, null, NaN]) {
+    const { videoBitrateKbps } = validateConfig({ ...validForm(), videoBitrateKbps: value });
+    assert.ok(videoBitrateKbps, `${String(value)} must be refused`);
+  }
+  // The message has to name both figures. The default is what a 0 means, and
+  // 10000 is the owner's ruling for live video — a bitrate box with neither is
+  // a box an operator has to guess at.
+  const { videoBitrateKbps } = validateConfig({ ...validForm(), videoBitrateKbps: -1 });
+  assert.match(videoBitrateKbps, /2000/);
+  assert.match(videoBitrateKbps, /10000/);
+
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(go, /MaxVideoBitrateKbps = 100000/, 'the bitrate ceiling moved in Go');
+  assert.match(go, /DefaultVideoBitrateKbps = 2000/, 'the default bitrate moved in Go');
+});
+
+// ---------------------------------------------------------------------------
+// validateConfig: the commentary input subsystem
+// ---------------------------------------------------------------------------
+
+test('audioSourceKind must be one of the two kinds internal/config names', () => {
+  for (const kind of ['native', 'decklink', undefined]) {
+    const { audioSourceKind } = validateConfig({ ...validForm(), audioSourceKind: kind });
+    assert.equal(audioSourceKind, undefined, `${String(kind)} must be accepted`);
+  }
+  // Undefined is accepted and reads as native — that is what a config.json
+  // written before the field existed holds, and refusing it would make the
+  // Settings screen unsavable on the first launch after an upgrade.
+  for (const kind of ['blackmagic', 'NATIVE', 'coreaudio', '', 2]) {
+    const { audioSourceKind } = validateConfig({ ...validForm(), audioSourceKind: kind });
+    assert.ok(audioSourceKind, `${JSON.stringify(kind)} must be refused`);
+  }
+});
+
+test('a DeckLink device NUMBER is refused by name, and a persistent ID is not', () => {
+  // The one wrong value a hurried operator types: the small integer Blackmagic's
+  // own tools show beside a card. It is an enumeration index and addresses a
+  // different card once one is added or moved, which is the same failure storing
+  // the CoreAudio integer AudioDeviceID would cause and the reason neither is
+  // ever persisted.
+  for (const value of ['0', '1', '7', '42']) {
+    const { decklinkPersistentId } = validateConfig({ ...validForm(), decklinkPersistentId: value });
+    assert.ok(decklinkPersistentId, `${JSON.stringify(value)} is a device number and must be refused`);
+    assert.match(decklinkPersistentId, /device number/);
+  }
+  // The measured UltraStudio 4K Mini's real persistent-id, and blank, which
+  // means "the only card in the machine" and is the normal case.
+  for (const value of ['2747401380', '', '   ', undefined]) {
+    const { decklinkPersistentId } = validateConfig({ ...validForm(), decklinkPersistentId: value });
+    assert.equal(decklinkPersistentId, undefined, `${JSON.stringify(value)} must be accepted`);
   }
 });
 
@@ -1335,5 +1537,220 @@ test('the Remote access group has no listener-configuring controls', () => {
   const js = ui('settings.js');
   for (const gone of ['f-remoteEnabled', 'f-remoteBind', 'f-remotePort', 'Apply listener settings']) {
     assert.equal(js.includes(gone), false, `settings.js still builds the "${gone}" control`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The video leg and the capture source
+// ---------------------------------------------------------------------------
+//
+// Four fields added together, two of each kind, and the tests below are about
+// the two ways a new config field goes wrong on this screen:
+//
+//   - it has no collectConfig() entry, and every Save then DELETES it. That is
+//     the data-loss failure, and it is silent — the field is simply absent from
+//     the document the form writes, Go's Load substitutes the default on the
+//     next launch, and nothing anywhere says a value was thrown away;
+//   - it is spelled differently on the two sides of the Wails boundary, which
+//     also does not fail: Go never sees the value, keeps its default, and the
+//     screen goes on showing what the operator typed.
+//
+// Both are pinned by reading source, for the reason this file's header gives at
+// length: settings.js builds against a real DOM and package.json is frozen, so
+// there is no jsdom to drive it through.
+
+test('every config field the form loads is restated when it saves', () => {
+  // THE DATA-LOSS GUARD, and the reason it is written against config.go rather
+  // than against a list in here: collectConfig REPLACES the whole stored
+  // document, so a field it does not restate is a field a Save deletes. A test
+  // with its own hand-written list of fields would fall out of date at exactly
+  // the moment it was needed — when somebody adds a field.
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  const struct = go.slice(go.indexOf('type Config struct {'));
+  const body = struct.slice(0, struct.indexOf('\n}'));
+  const tags = [...body.matchAll(/json:"([A-Za-z0-9]+)"/g)].map((m) => m[1]);
+  assert.ok(tags.length > 15, `reflected only ${tags.length} tags out of config.Config; the regex is broken`);
+
+  const js = ui('settings.js');
+  const collect = js.slice(js.indexOf('function collectConfig()'), js.indexOf('function clearAllErrors'));
+  const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('function refreshSecretBadges'));
+  assert.ok(collect.length > 0 && populate.length > 0, 'settings.js no longer has collectConfig/populate');
+
+  for (const tag of tags) {
+    // headphoneEndpointId is the one field addressed through a constant —
+    // DEVICE_KEY_SRT, imported from returnsource.js so that the SRT return's
+    // device key has one spelling in the application. Both functions use the
+    // computed-key form, so the literal tag is legitimately absent.
+    if (tag === 'headphoneEndpointId') {
+      assert.ok(collect.includes('[DEVICE_KEY_SRT]'), 'collectConfig must restate the SRT return device key');
+      assert.ok(populate.includes('[DEVICE_KEY_SRT]'), 'populate must read the SRT return device key');
+      continue;
+    }
+    assert.ok(
+      collect.includes(tag),
+      `collectConfig() does not restate ${tag}: every Save would DELETE it from config.json`,
+    );
+    assert.ok(
+      populate.includes(tag),
+      `populate() does not read ${tag}: the form would show a blank and then save the blank`,
+    );
+  }
+});
+
+test('the video bitrate has a real control, populated and collected', () => {
+  // It was the constant 2000, chosen when the video leg was a still PNG through
+  // imagefreeze. The operator has ruled that too low for live video and wants
+  // nearer 10000 — and a number nobody can reach is a number nobody can
+  // correct, which is the lesson srtReturnPort taught this screen already.
+  const js = ui('settings.js');
+  assert.match(js, /numberInput\('f-videoBitrateKbps'\)/, 'the bitrate must have a numeric input');
+  assert.match(js, /addField\(\s*'videoBitrateKbps',/, 'it must be a real field, not a carried value');
+  assert.match(
+    js,
+    /videoBitrateKbps: Number\(fields\.videoBitrateKbps\.input\.value\)/,
+    'collectConfig must send the bitrate as a number, not a <select> string',
+  );
+  assert.match(
+    js,
+    /fields\.videoBitrateKbps\.input\.value = String\(\s*config\.videoBitrateKbps \|\| blankConfig\(\)\.videoBitrateKbps,?\s*\)/,
+    'populate must substitute the default for a stored 0, as it does for the return port — 0 is ' +
+      'what internal/config.EffectiveVideoBitrateKbps substitutes the default FOR',
+  );
+  // And the hint has to carry the two numbers, because nothing else on the
+  // screen can tell an operator what to type in a bitrate box.
+  const field = js.slice(js.indexOf("addField(\n    'videoBitrateKbps',"), js.indexOf("addField(\n    'videoFormatOverride',"));
+  assert.ok(field.includes('2000') && field.includes('10000'), 'the hint must name the default and the live-video figure');
+});
+
+test('the video format override defaults to blank, which means derive', () => {
+  // EMPTY IS A SETTING. It means "read the format from the switcher", it is what
+  // every existing installation holds, and a form that helpfully filled in
+  // 1920x1080p50 would turn the derivation off on every machine that opened
+  // Settings once — silently pinning the hard-coded guess this field exists to
+  // replace.
+  const js = ui('settings.js');
+  assert.match(js, /videoFormatOverride: '',/, 'blankConfig must default it to empty');
+  assert.match(
+    js,
+    /fields\.videoFormatOverride\.input\.value = config\.videoFormatOverride \|\| '';/,
+    'populate must leave it empty rather than substituting a format',
+  );
+  assert.match(
+    js,
+    /videoFormatOverride: fields\.videoFormatOverride\.input\.value\.trim\(\)/,
+    'collectConfig must send what the operator typed, trimmed and otherwise verbatim — a form that ' +
+      'rewrote it would answer a different question from the one on screen',
+  );
+  // Ends at the next heading, not at a phrase: "SRT return encryption" appears
+  // in this file's own header prose long before the field, so slicing to it
+  // would produce an empty string and a test that passes on nothing.
+  const field = js.slice(
+    js.indexOf("addField(\n    'videoFormatOverride',"),
+    js.indexOf("statusHeading.textContent = 'Status'"),
+  );
+  assert.ok(field.includes('1920x1080p50'), 'the hint must show the form the field wants');
+  assert.match(field, /[Bb]lank/, 'and say what blank does, or the box reads as "force this format"');
+});
+
+test('Go refuses a video format it cannot parse, and names the field when it does', () => {
+  // THE ACCEPTANCE CONDITION for the whole override design. The failure it
+  // replaces is a capsfilter that cannot negotiate: "not-negotiated (-4)",
+  // several seconds after START, naming no field, no value and no cause. So the
+  // refusal has to happen in config.Validate, with the field's name in it.
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  const validate = go.slice(go.indexOf('func (c *Config) Validate() error'));
+  assert.match(
+    validate,
+    /ParseVideoFormat\(raw\)/,
+    'config.Validate no longer parses videoFormatOverride; a bad value would reach the capsfilter',
+  );
+  assert.match(validate, /videoFormatOverride: %w/, 'and the error must name the field');
+  // Empty must stay acceptable for ever: it is the default and every installed
+  // config.json holds it.
+  assert.match(
+    validate,
+    /if raw := strings\.TrimSpace\(c\.VideoFormatOverride\); raw != ""/,
+    'an empty override must be skipped, not refused',
+  );
+  // One grammar, one parser, one canonical spelling — and the form and the
+  // parser must agree about what that spelling is.
+  const parser = read(repoRoot, 'internal', 'config', 'videoformat.go');
+  assert.match(parser, /VideoFormatExample = "1920x1080p50"/, 'the canonical example must be a named constant');
+  assert.ok(
+    ui('settings.js').includes('1920x1080p50'),
+    'the Settings hint must show the same form the parser accepts',
+  );
+});
+
+test('the capture-source control offers exactly the two kinds Go accepts', () => {
+  // A third option here would save cleanly and be refused by Validate at START;
+  // a spelling that differs from Go's would save cleanly and capture from the
+  // wrong subsystem. Both are pinned against config.go's own constants.
+  const go = read(repoRoot, 'internal', 'config', 'config.go');
+  assert.match(go, /AudioSourceNative = "native"/, 'internal/config no longer spells the native kind "native"');
+  assert.match(go, /AudioSourceDeckLink = "decklink"/, 'internal/config no longer spells the card kind "decklink"');
+
+  const js = ui('settings.js');
+  assert.match(js, /const AUDIO_SOURCE_NATIVE = 'native';/);
+  assert.match(js, /const AUDIO_SOURCE_DECKLINK = 'decklink';/);
+  assert.match(js, /selectInput\('f-audioSourceKind',/, 'the capture source must be a <select>, not free text');
+  const control = js.slice(js.indexOf("selectInput('f-audioSourceKind',"), js.indexOf("addField(\n    'decklinkPersistentId',"));
+  const options = [...control.matchAll(/value: (AUDIO_SOURCE_[A-Z]+)/g)].map((m) => m[1]);
+  assert.deepEqual(options, ['AUDIO_SOURCE_NATIVE', 'AUDIO_SOURCE_DECKLINK'], 'exactly the two kinds, in that order');
+  assert.match(
+    js,
+    /audioSourceKind: normaliseAudioSourceKind\(fields\.audioSourceKind\.input\.value\)/,
+    'collectConfig must send a normalised kind',
+  );
+  assert.match(
+    js,
+    /fields\.audioSourceKind\.input\.value = normaliseAudioSourceKind\(config\.audioSourceKind\)/,
+    'and populate must normalise on the way IN too — an unrecognised value assigned to a <select> ' +
+      'shows nothing, and the next Save would write that nothing back',
+  );
+});
+
+test('the DeckLink card is named by its persistent id, never by a device number', () => {
+  // The same rule as headphoneEndpointId's — store the CoreAudio UID, never the
+  // integer AudioDeviceID — applied to the other kind of hardware. A device
+  // number is a position in this boot's enumeration order: plug in a second card
+  // and "0" is a different piece of hardware while every config on the machine
+  // still says 0.
+  const js = ui('settings.js');
+  assert.match(js, /textInput\('f-decklinkPersistentId'\)/);
+  assert.match(
+    js,
+    /decklinkPersistentId: fields\.decklinkPersistentId\.input\.value\.trim\(\)/,
+    'collectConfig must restate the card id, or a Save deletes it',
+  );
+  const field = js.slice(js.indexOf("addField(\n    'decklinkPersistentId',"), js.indexOf('--- monitor / return'));
+  assert.match(field, /persistent/i, 'the hint must say which kind of id this is');
+  assert.match(field, /device number/i, 'and which kind it is not');
+  assert.match(field, /[Bb]lank/, 'and that blank means the card in this machine, which is the usual answer');
+
+  // No control anywhere may offer a device number instead. There is exactly one
+  // identifier for the card in this application.
+  assert.equal(/f-decklinkDeviceNumber|deviceNumber:/.test(js), false, 'settings.js offers a device number');
+});
+
+test('the four new fields are classified in the Go whitelist, two each way', () => {
+  // The reflection test in internal/presets fails by name on an unclassified
+  // field, and this is the JS-side statement of which way each went — because
+  // the two INSTANCE ones are the ones that show up in the preset preview on
+  // this form, and the two MACHINE ones must never appear there at all.
+  const fields = read(repoRoot, 'internal', 'presets', 'fields.go');
+  const instance = fields.slice(fields.indexOf('var InstanceFields'), fields.indexOf('// MachineFields'));
+  const machine = fields.slice(fields.indexOf('var MachineFields'), fields.indexOf('// UIFields'));
+  for (const tag of ['videoBitrateKbps', 'videoFormatOverride']) {
+    assert.ok(instance.includes(`"${tag}"`), `${tag} must travel in a preset: it describes the venue, not the PC`);
+    assert.equal(machine.includes(`"${tag}"`), false);
+  }
+  for (const tag of ['audioSourceKind', 'decklinkPersistentId']) {
+    assert.ok(
+      machine.includes(`"${tag}"`),
+      `${tag} must be MACHINE: a preset carrying it would tell a laptop with no card in it to ` +
+        'capture from one, and that fails as not-negotiated (-4) naming neither device nor cause',
+    );
+    assert.equal(instance.includes(`"${tag}"`), false);
   }
 });

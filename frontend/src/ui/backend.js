@@ -187,18 +187,47 @@ async function callGo(method, ...args) {
 // including the double space in the Dante Virtual Soundcard display names —
 // a caller that mishandles it should fail in the browser tab, not at the
 // facility.
+//
+// The last two entries are ONE PHYSICAL BOX seen twice: an UltraStudio 4K Mini
+// enumerated through CoreAudio and through the DeckLink driver, the same name
+// from both, exactly as it was measured. They are in the fake because that pair
+// is the case ui/devices.js's labelDevices exists for, and a dev session in
+// which the list never collides is a dev session in which the labelling can be
+// broken without anybody noticing. The CoreAudio twin is the SILENT one
+// (-96 dBFS on all sixteen channels with the mic live).
 const FAKE_DEVICES = [
   {
     id: '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}',
     name: 'DVS Receive  1-2 (Dante Virtual Soundcard)',
+    kind: 'native',
   },
   {
     id: '{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}',
     name: 'DVS Receive  3-4 (Dante Virtual Soundcard)',
+    kind: 'native',
   },
   {
     id: '{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}',
     name: 'Microphone (Focusrite Scarlett 2i2 USB)',
+    kind: 'native',
+  },
+  {
+    id: '{0.0.1.00000000}.{4b1e77a2-0004-438e-9003-51a46e13b7e0}',
+    name: 'Blackmagic UltraStudio 4K Mini',
+    kind: 'native',
+  },
+  {
+    // A BARE PERSISTENT-ID, not a WASAPI endpoint GUID, because that is what
+    // GStreamer's decklink provider actually publishes: a gint64 rendered as
+    // decimal, with no prefix and no braces, and 2747401380 is the value
+    // measured off the real UltraStudio 4K Mini. An endpoint-shaped id here
+    // would teach a dev session that the two families look alike, which is the
+    // one thing about them that is not true — and it is why the endpoint
+    // classifier identifies POSITIVELY in both directions rather than refusing
+    // whatever it does not recognise.
+    id: '2747401380',
+    name: 'Blackmagic UltraStudio 4K Mini',
+    kind: 'decklink',
   },
 ];
 
@@ -244,6 +273,27 @@ const secretSetThisSession = {
 };
 let fakeDevices = FAKE_DEVICES.slice();
 let fakeDeviceError = null;
+
+// The fake switcher's conform target, answered by getConformTarget(). 1080p50
+// with the provenance of a raster derived off one running node, because that is
+// the shape a healthy instance actually produces — a `npm run dev` session then
+// shows the DERIVED path agreeing with the fake status events, rather than a
+// green lamp that is really the fallback in disguise and would stay green
+// however badly the derivation were wired.
+//
+// From the console: window.__wslcommsFake.setConformTarget({width: 1280,
+// height: 720, frameRate: 50}) for the 720p50 instance the old constant got
+// wrong, or null for the not-known case.
+let fakeConformTarget = {
+  width: 1920,
+  height: 1080,
+  frameRate: 50,
+  source: 'switcher',
+  node: 'cam4',
+  agreeing: 1,
+  disagreeing: [],
+  raw: 'codec="h264" width=1920 height=1080 frame_rate="50" scan_type="P"',
+};
 
 // FAKE_EVENTS is what a `npm run dev` session lists through listEvents(). ONE
 // event by default, shaped exactly like the Go m2lx.Event ({id, name, status}),
@@ -409,6 +459,14 @@ function installFakeConsoleHandle() {
     setEvents: (list) => {
       fakeEvents = Array.isArray(list) ? list : [];
     },
+    // Drive the VIDEO OK lamp's comparison target: an object for a switcher
+    // configured that way, null for "not known" so the lamp falls back to
+    // lamps.js's DEFAULT_CONFORM_TARGET. Pair it with emitStatus to see a
+    // 720p50 instance read green on a 720p50 feed, which the old constant made
+    // impossible.
+    setConformTarget: (format) => {
+      fakeConformTarget = format && typeof format === 'object' ? { ...format } : null;
+    },
   };
 }
 
@@ -449,7 +507,21 @@ if (usingFakeBackend) {
   );
 }
 
-/** Returns the audio capture endpoints for the commentary input dropdown. */
+/**
+ * Returns the audio capture endpoints for the commentary input dropdown:
+ * [{id, name, kind}], mirroring internal/gst.Device.
+ *
+ * `kind` is "native" (the platform's own audio system) or "decklink" (a capture
+ * card's embedded audio), and it matters because ONE PHYSICAL BOX CAN APPEAR
+ * TWICE under the same name — measured on an UltraStudio 4K Mini, where the
+ * DeckLink entry carries the microphone and the CoreAudio entry carries -96 dBFS
+ * of nothing. ui/devices.js's labelDevices is what turns that field into
+ * something an operator can choose between; nothing may infer it from the id,
+ * which internal/gst/gst.go documents as opaque.
+ *
+ * An older Go build omits the field entirely, and the labelling degrades to the
+ * bare device name rather than guessing.
+ */
 export async function listInputDevices() {
   if (hasWails()) return callGo('ListInputDevices');
   if (fakeDeviceError) throw new Error(fakeDeviceError);
@@ -588,6 +660,113 @@ export async function credentialStoreName() {
     }
   }
   return 'Windows Credential Manager';
+}
+
+// ---------------------------------------------------------------------------
+// The conform target: what format this instance is configured for
+// ---------------------------------------------------------------------------
+//
+// One binding, App.GetConformTarget, for the question the VIDEO OK lamp used to
+// answer with a constant.
+//
+// # The defect this closes
+//
+// lamps.js compared the detected format against a hard-coded
+// {h264, 1920, 1080, 50}, written when every instance anyone had seen was
+// 1080p50. M2L-X's raster is a per-instance CONFIGURATION and every source
+// feeding it must match, so on a correctly configured 720p50 facility that lamp
+// read RED on a feed arriving perfectly — and the only remedy available at the
+// desk was to learn to ignore a red lamp, which is the habit the whole row
+// exists to prevent. lamps.js keeps the constant as its FALLBACK and takes the
+// raster from here whenever it is known. See DEFAULT_CONFORM_TARGET there.
+//
+// # Where Go gets the answer, and why this side does not care
+//
+// The resolution is internal/m2lx's (ConformFormat) and internal/config's
+// (VideoFormatOverride), and it is deliberately not restated here: it is a
+// question about the switcher, and duplicating it in JavaScript is how the two
+// answers start to disagree about which lamp is telling the truth. What this
+// side is entitled to assume is only the shape below, and that a null means
+// nothing is known.
+//
+// # A measurement worth having, recorded here because it was made here
+//
+// MEASURED on the live matchH instance, 2026-08-15, signed in as `matchh`:
+//
+//	GET /api/input/router/list/{eventId}
+//	{"id":3,"name":"SLATE","type":"SRT","width":1920,"height":1080,
+//	 "codec":"h265","frame_rate":50,"scan_type":"progressive","port":40003, ...}
+//	{"id":4,"name":"COMMS","type":"SRT","width":1920,"height":1080,
+//	 "codec":"h264","frame_rate":50,"scan_type":"progressive","port":40004, ...}
+//
+// Router input 4 is OUR input — port 40004 is config.srtPort on matchH, and its
+// node is cam4 — and those width/height/frame_rate/codec ARE the configured
+// format, stated by the switcher, available while every node's detected format
+// is still JSON null because nothing has come up yet. That is exactly the case
+// config.VideoFormatOverride was added to cover by hand.
+//
+// This does NOT breach docs/architecture.md's ban on REST format. That ban is on
+// reading REST as DETECTION — width/height/frame_rate there will cheerfully
+// report 1080p50 over a 720p25 stream — and detection still comes from the
+// switcher_status socket alone. The field everyone was warned off as evidence is
+// the right answer to a different question: what is this input CONFIGURED for.
+//
+// Two traps in that sample, for whoever wires it up. frame_rate is a NUMBER here
+// while switcher_status renders the same quantity as the STRING "50"
+// (internal/m2lx/format.go documents that); nothing may assume either, which is
+// why normaliseConformTarget coerces. And EVERY router input answers with a
+// plausible raster whether or not it is ours — unconfigured input 5 reports
+// 1920x1080/h265/50, the defaults — so the match must be exact, on `port`
+// against config.srtPort. A believable raster read off somebody else's input is
+// worse than none: it turns a green lamp into a lie, where no answer at all
+// merely leaves the honest fallback in place.
+
+/** GetConformTarget's bound method name. One place, so a rename is one edit. */
+const CONFORM_TARGET_METHOD = 'GetConformTarget';
+
+/**
+ * The video format every source feeding this M2L-X instance must be produced
+ * in, or null when it is not known.
+ *
+ * Only width, height and frameRate are load-bearing — they are the three fields
+ * lamps.js compares against, and normaliseConformTarget ignores everything else.
+ * The rest of the object is PROVENANCE, carried so that a readout can one day
+ * say where the number came from without any of this having to change: `source`
+ * distinguishes an operator's videoFormatOverride from a raster derived off the
+ * switcher, `node` names the switcher_status node it was read from, and
+ * `agreeing`/`disagreeing` are how much the derivation had to go on. A lamp that
+ * judges against a number is one thing; a lamp that judges against a number
+ * nobody can trace is another, and the second is not worth having.
+ *
+ * NULL IS A NORMAL ANSWER and it is what this returns for every way of not
+ * knowing: no Wails runtime, an older build without the binding, no host, not
+ * signed in, nothing running on the switcher to derive from, or a Go-side
+ * failure of any kind. The caller's response is the same to all of them — use
+ * lamps.js's DEFAULT_CONFORM_TARGET — and there is deliberately no second copy
+ * of that constant here. Two fallbacks for one question is how they drift, and
+ * the drift would be silent: the lamp would start judging against a raster
+ * nothing on screen names.
+ *
+ * NEVER THROWS, for the same reason credentialStoreName does not. This is a
+ * refinement of a lamp, called on the page's startup path; a rejected promise
+ * here must not be able to take out the status row it exists to improve.
+ *
+ * @returns {Promise<{width: number, height: number, frameRate: number,
+ *   source?: string, node?: string, agreeing?: number, disagreeing?: string[],
+ *   raw?: string}|null>}
+ */
+export async function getConformTarget() {
+  if (hasWails()) {
+    try {
+      const got = await callGoBound(CONFORM_TARGET_METHOD);
+      return got && typeof got === 'object' ? got : null;
+    } catch {
+      // BindingMissingError, a signed-out client, a REST failure: all of them
+      // mean "not known", and the caller falls back for all of them alike.
+      return null;
+    }
+  }
+  return fakeConformTarget ? { ...fakeConformTarget } : null;
 }
 
 // subscribe wires cb to event, using the real Wails runtime's EventsOn/

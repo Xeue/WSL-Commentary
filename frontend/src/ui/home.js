@@ -2,7 +2,7 @@ import { createLampRow } from './lamps.js';
 // The dropdowns' pure logic: display order and the saved-but-missing marker.
 // It lives in its own module so `node --test` can drive it without a DOM —
 // this file is wiring, devices.test.js is where the behaviour is proved.
-import { sortDevices, describeDeviceSelection } from './devices.js';
+import { sortDevices, labelDevices, describeDeviceSelection } from './devices.js';
 import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
 import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
 import {
@@ -848,11 +848,22 @@ export function createHomeView(handlers) {
     // both interleaves 1-2 with 10-11 and files them above the one Focusrite
     // the commentator actually uses. sortDevices copies; the caller's array
     // (app.js's currentInputDevices) is not reordered under it.
-    const ordered = sortDevices(devices);
+    //
+    // labelDevices then adds the DISAMBIGUATING SUFFIX, and it has to run after
+    // the sort because what it adds depends on which entries share a name. One
+    // Blackmagic card enumerates TWICE — once through the platform's audio
+    // stack and once through GStreamer's decklink provider — under names an
+    // operator cannot tell apart, and the native twin measures -96 dBFS on all
+    // sixteen channels with the mic live. Rendering d.name here would put those
+    // two on adjacent lines as equals, which is exactly the choice the operator
+    // cannot be asked to make. labelDevices copies too, so the caller's array
+    // is still untouched, and .id is unchanged on every entry — the option
+    // VALUE and describeDeviceSelection below both still read the real id.
+    const ordered = labelDevices(sortDevices(devices));
     for (const d of ordered) {
       const opt = document.createElement('option');
       opt.value = d.id;
-      opt.textContent = d.name;
+      opt.textContent = d.label;
       select.appendChild(opt);
     }
     const selection = describeDeviceSelection(ordered, previousValue);

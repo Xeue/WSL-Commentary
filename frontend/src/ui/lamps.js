@@ -7,15 +7,17 @@
 // says can be read and reasoned about without a DOM; createLamp/createLampRow
 // are the only part that touches the document.
 //
-// frontend/package.json is frozen (CONTRACT.md, rule 1) and has no test
-// runner in it, so none of this can be exercised with a `go test` equivalent
-// from this package. The derivation functions are therefore written as
-// small, dependency-free functions of plain data — no DOM, no imports — so
-// that whoever adds a JS test runner later can import and test them with no
-// rework, and so that in the meantime each function's doc comment enumerates
-// its cases for review by inspection. They are also exercised by hand against
-// backend.js's fakes; see that file's doc comment for how to run the UI
-// against them.
+// The derivation functions are written as small, dependency-free functions of
+// plain data — no DOM, no imports — which is what lets `node --test` drive them
+// with nothing installed (lamps.test.js). That shape was originally chosen
+// because there was no test runner at all and each doc comment had to enumerate
+// its own cases for review by inspection; the doc comments have been kept in
+// that register anyway, because they are also what the operator-facing wording
+// is reviewed from. They are additionally exercised by hand against backend.js's
+// fakes; see that file's doc comment for how to run the UI against them.
+//
+// The DOM half (createLamp, createLampRow) is still untested: there is no jsdom
+// here and a shim widened until a test passes stops being evidence.
 
 /** The four lamp levels. Colour is never the only signal — see createLamp. */
 export const LEVEL = Object.freeze({
@@ -130,8 +132,123 @@ export function deriveHonestLine(state) {
   }
 }
 
-const GOOD_VIDEO = { codec: 'h264', width: 1920, height: 1080, frameRate: 50 };
+// ===================== WHAT "GOOD VIDEO" IS COMPARED AGAINST =================
+//
+// It used to be a constant: {codec:'h264', width:1920, height:1080,
+// frameRate:50}, written when every instance anyone had seen was 1080p50. That
+// was a live defect. M2L-X's raster is a per-instance CONFIGURATION — every
+// source feeding it must match whatever it is set to — so on a correctly
+// configured 720p50 facility this lamp went RED on a perfectly good feed, and
+// the operator's only remedy was to ignore a red lamp, which is the habit this
+// row exists to prevent.
+//
+// So the RASTER half of the comparison is now supplied by the caller, out of
+// the switcher's own reported configuration, and the constant below is only
+// what is used when nothing is known. The CODEC half stays absolute; the two
+// paragraphs after the constants say why each is the way it is.
+
+/**
+ * DEFAULT_CONFORM_TARGET is the raster used when the caller supplies nothing:
+ * the 1080p50 this function has always assumed, kept because it is still the
+ * measured configuration of every facility instance seen so far and because
+ * gst_cgo.go's slate capsfilter is pinned to it.
+ *
+ * It is a FALLBACK and it is deliberately not treated as authoritative. "The
+ * app has not learned the switcher's format yet" and "the switcher is 1080p50"
+ * are different states, and this constant is what makes the first one behave
+ * exactly as this application did before the target became derived — no worse,
+ * on any instance, at any moment during startup.
+ *
+ * @type {Readonly<{width: number, height: number, frameRate: number}>}
+ */
+export const DEFAULT_CONFORM_TARGET = Object.freeze({ width: 1920, height: 1080, frameRate: 50 });
+
+/**
+ * CONFORM_CODEC is NOT derived, and that is a decision rather than an
+ * oversight.
+ *
+ * The raster is the operator's to configure and this application follows it.
+ * The codec is not: H.264 is the only thing this build can produce — mfh264enc
+ * on Windows, vtenc_h264 on macOS, with no second encoder anywhere in
+ * gst_cgo.go — so "what codec should M2L-X be seeing from us" has exactly one
+ * answer whatever the switcher is set to. Comparing against our own encoder
+ * makes this half of the lamp a statement about OUR pipeline, which is the half
+ * this process actually knows.
+ *
+ * The derived source does carry a codec, and it is ignored on purpose. MEASURED
+ * on the live matchH instance, 2026-08-15, GET /api/input/router/list: router
+ * input 3 (SLATE) is configured "h265" and input 4 (COMMS, port 40004 — ours)
+ * is configured "h264". Had the codec been derived from that field, an instance
+ * whose commentary input was left on the h265 default would light this lamp RED
+ * on a feed that is arriving correctly and that the operator cannot change:
+ * there is no way to make this application send H.265. A red lamp nobody can
+ * act on is worse than no lamp.
+ *
+ * What that costs, honestly: if a facility really does configure the commentary
+ * input for H.265 and expects H.265, this lamp stays green while the input is
+ * misconfigured. That misconfiguration is visible where it belongs — the
+ * SWITCHER SEES FEED lamp and the input's own state — and it is a provisioning
+ * error, not something the commentator can be asked to notice.
+ */
+const CONFORM_CODEC = 'h264';
+
 const GOOD_AUDIO = { codec: 'aac', sampleRate: 48000, channels: 2 };
+
+/**
+ * normaliseConformTarget turns whatever the app layer supplies into a complete
+ * {width, height, frameRate}, falling back to DEFAULT_CONFORM_TARGET.
+ *
+ * FIELD BY FIELD, not whole-object. A source that knows the raster but reports
+ * a zero frame rate would otherwise make the comparison unsatisfiable — no real
+ * format has frameRate 0, so the lamp would sit red forever with nothing on
+ * screen explaining why. Every field that is not a finite positive number is
+ * replaced individually, so the worst case is the behaviour this application
+ * had before the target was derived at all.
+ *
+ * Values are coerced with Number() because the two places a format comes from
+ * disagree about the type and always have: M2L-X's switcher_status renders
+ * frame_rate as the STRING "50" while width and height beside it are NUMBERS
+ * (internal/m2lx/format.go documents that trap), whereas REST's
+ * /api/input/router/list renders frame_rate as the number 50 (measured, matchH,
+ * 2026-08-15). Neither shape may be assumed here.
+ *
+ * @param {{width?: unknown, height?: unknown, frameRate?: unknown}|null|undefined} target
+ * @returns {{width: number, height: number, frameRate: number}}
+ */
+export function normaliseConformTarget(target) {
+  const t = target || {};
+  return {
+    width: positiveOr(t.width, DEFAULT_CONFORM_TARGET.width),
+    height: positiveOr(t.height, DEFAULT_CONFORM_TARGET.height),
+    frameRate: positiveOr(t.frameRate, DEFAULT_CONFORM_TARGET.frameRate),
+  };
+}
+
+function positiveOr(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * describeConformTarget is the GREEN lamp's text: "1080P50", "720P50", "2160P25"
+ * — height, scan letter, frame rate, the vocabulary the operator already reads
+ * on the switcher.
+ *
+ * The P is this application's own and is not read from anywhere. Everything it
+ * can send is progressive: the video leg is a still image through imagefreeze,
+ * and there is no interlaced path anywhere in gst_cgo.go. So the letter is a
+ * true statement about the feed being described, not an unchecked claim about
+ * the switcher's configuration — which matters, because the parsed
+ * switcher_status format this lamp compares against carries scan_type only
+ * inside Raw and the comparison never sees it.
+ *
+ * @param {{width?: unknown, height?: unknown, frameRate?: unknown}|null|undefined} target
+ * @returns {string}
+ */
+export function describeConformTarget(target) {
+  const want = normaliseConformTarget(target);
+  return `${want.height}P${want.frameRate}`;
+}
 
 /**
  * deriveStatusLamps turns one m2lx.Status (the "status" event payload) into
@@ -149,6 +266,21 @@ const GOOD_AUDIO = { codec: 'aac', sampleRate: 48000, channels: 2 };
  * while the switcher itself is not (yet) streaming. An EMPTY audio array is
  * read RED, not grey — it is the MP2/AC-3 silent-drop signature (spec
  * section 8) and must not be mistaken for "no data yet".
+ *
+ * conformTarget is the RASTER the switcher is configured for, supplied by the
+ * app layer (app.js, from backend.getConformTarget) and normalised
+ * field-by-field against DEFAULT_CONFORM_TARGET. Omitting it is a supported
+ * call and reproduces this function's behaviour before the target was derived.
+ * See the block above DEFAULT_CONFORM_TARGET for why the raster is derived and
+ * the codec is not.
+ *
+ * WHAT THE RED TEXT IS FOR IS UNCHANGED, and it is the point of the lamp: on a
+ * mismatch the operator is shown v.raw — the format M2L-X says it ACTUALLY
+ * received, verbatim, with the fields it named — rather than a verdict. The
+ * lamp exists to make an unexpected format visible, and "1080P50 expected" tells
+ * nobody what arrived instead. Nothing about the comparison target being derived
+ * changes that: the target decides the colour, Raw is still what carries the
+ * information.
  *
  * Illustrative cases:
  *
@@ -168,8 +300,14 @@ const GOOD_AUDIO = { codec: 'aac', sampleRate: 48000, channels: 2 };
  *                       video:{codec:'h264',width:1280,height:720,frameRate:25,raw:'h264 1280x720 25 P'},
  *                       audio:[{codec:'aac',sampleRate:48000,channels:2}]})
  *     -> video red "h264 1280x720 25 P" (wrong format, shown verbatim via Raw)
+ *   the SAME status on an instance configured for 720p25:
+ *   deriveStatusLamps(that, {width:1280, height:720, frameRate:25})
+ *     -> video green "720P25" (the feed was always fine; the constant was wrong)
+ *
+ * @param {object|null|undefined} status the "status" event payload
+ * @param {{width?: unknown, height?: unknown, frameRate?: unknown}|null} [conformTarget]
  */
-export function deriveStatusLamps(status) {
+export function deriveStatusLamps(status, conformTarget) {
   if (!status) {
     const l = { level: LEVEL.GREY, text: 'NO STATUS' };
     return { switcher: l, video: l, audio: l, unavailable: false };
@@ -194,15 +332,18 @@ export function deriveStatusLamps(status) {
       switcher = { level: LEVEL.GREY, text: status.streamState || 'UNKNOWN' };
   }
 
+  const want = normaliseConformTarget(conformTarget);
   const v = status.video || {};
   const videoGood =
-    v.codec === GOOD_VIDEO.codec &&
-    v.width === GOOD_VIDEO.width &&
-    v.height === GOOD_VIDEO.height &&
-    v.frameRate === GOOD_VIDEO.frameRate;
+    v.codec === CONFORM_CODEC &&
+    v.width === want.width &&
+    v.height === want.height &&
+    v.frameRate === want.frameRate;
   const video = videoGood
-    ? { level: LEVEL.GREEN, text: '1080P50' }
-    : { level: LEVEL.RED, text: v.raw || 'NO VIDEO' };
+    ? { level: LEVEL.GREEN, text: describeConformTarget(want) }
+    : // Raw, verbatim — what M2L-X says it received, not what it should have
+      // been. This is the whole reason the lamp carries text at all.
+      { level: LEVEL.RED, text: v.raw || 'NO VIDEO' };
 
   const audioList = Array.isArray(status.audio) ? status.audio : [];
   let audio;

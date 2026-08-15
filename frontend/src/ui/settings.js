@@ -68,8 +68,14 @@ function blankConfig() {
     srtPort: 0,
     srtLatencyMs: 120,
     pbkeylen: 0,
+    videoBitrateKbps: 2000,
+    // Empty means DERIVE the format from the switcher, which is the default and
+    // the normal case. It is not "unknown" — see the field's hint below.
+    videoFormatOverride: '',
     statusKey: '',
     audioDeviceId: '',
+    audioSourceKind: 'native',
+    decklinkPersistentId: '',
     headphoneDeviceId: '',
     headphoneEndpointId: '',
     returnMid: 4,
@@ -82,6 +88,34 @@ function blankConfig() {
     returnGainDb: 18,
     slatePath: 'slate.png',
   };
+}
+
+// The two commentary capture kinds, spelled exactly as internal/config spells
+// them (config.AudioSourceNative / config.AudioSourceDeckLink). They are the
+// <option> values and the value collectConfig sends, so a drift here is the
+// silent kind: Go's Validate refuses an unrecognised kind by name, which is at
+// least loud, but a kind that differs only in case would save cleanly and
+// capture from the wrong subsystem.
+//
+// They live at module scope in this file rather than in a shared module because
+// this screen is the only thing that asks the question today. If a second screen
+// ever needs them, they belong in a pure module of their own — the house pattern
+// is returnsource.js and channels.js — not copied.
+const AUDIO_SOURCE_NATIVE = 'native';
+const AUDIO_SOURCE_DECKLINK = 'decklink';
+
+/**
+ * normaliseAudioSourceKind maps anything to one of the two kinds, defaulting to
+ * native — which is what every machine did before the field existed.
+ *
+ * It is applied on the way IN as well as on the way out, and the way in is the
+ * one that would otherwise bite: assigning an unrecognised value to a <select>
+ * leaves it showing '' — no option selected — and collectConfig would then save
+ * an empty kind over whatever the file actually held. normaliseChannelMode is
+ * used the same way, three lines further down populate, for the same reason.
+ */
+function normaliseAudioSourceKind(value) {
+  return value === AUDIO_SOURCE_DECKLINK ? AUDIO_SOURCE_DECKLINK : AUDIO_SOURCE_NATIVE;
 }
 
 function row(labelText, id, inputEl, hint) {
@@ -1131,6 +1165,55 @@ export function createSettingsView(handlers) {
     'Passwords are write-only; "set" means saved during this run.';
   currentGroup.appendChild(secretsHint);
 
+  // --- the contribution feed's video leg ----------------------------------
+  //
+  // Two settings that describe the VIDEO the feed carries, as opposed to the
+  // transport above it. They are their own group because they are the two
+  // numbers a facility engineer sets once per venue and nobody touches again —
+  // and because putting them under "SRT output" would file them beside the port
+  // and the latency, which are about the socket rather than the picture.
+  //
+  // Both travel in an instance preset (internal/presets.InstanceFields): the
+  // bitrate is a property of the circuit to that deployment, and the format is a
+  // property of that deployment's switcher. Every commentary position at a
+  // facility needs the same two answers, which is exactly what the baked-in
+  // facility presets are for.
+  const videoHeading = document.createElement('h2');
+  videoHeading.textContent = 'Contribution video';
+  openGroup(videoHeading);
+
+  // WHY THIS IS A CONTROL AND NOT A CONSTANT. It was 2000, and 2000 was chosen
+  // for what the video leg used to be — one still PNG through imagefreeze, where
+  // there is nothing for a bitrate to be spent on. The operator has ruled it too
+  // low for live video and wants nearer 10000. The default stays 2000 so that
+  // adding this box changes nothing until somebody types in it.
+  addField(
+    'videoBitrateKbps',
+    'Video bitrate (kbps)',
+    numberInput('f-videoBitrateKbps'),
+    'Kilobits per second. Default 2000, which suits a still slate; live video wants nearer 10000. ' +
+      'It is the uplink from this seat to the switcher that has to carry it.',
+  );
+
+  // THE FALLBACK CONFORM TARGET, and the hint has to say what "fallback" means
+  // or the box reads as "force the format to this".
+  //
+  // The app derives the format from the switcher whenever any node is streaming.
+  // MEASURED on the live instance: when nothing is streaming every node reports
+  // no format at all, and no REST endpoint states the instance's configured
+  // format either — so a position that comes up first, which is the normal case
+  // an hour before kick-off, has nothing to derive from. This is what it falls
+  // back to. Blank leaves the derivation to do its job.
+  addField(
+    'videoFormatOverride',
+    'Video format when the switcher cannot be read',
+    textInput('f-videoFormatOverride'),
+    'Blank = read the format from the switcher, which works whenever anything is streaming into it. ' +
+      'Fill this in for the case where nothing is: write it as 1920x1080p50 — width x height, then ' +
+      'p and the frame rate (50, 25, 59.94). It describes how the SWITCHER is set up, so every ' +
+      'position at a venue has the same answer.',
+  );
+
   // --- status ---------------------------------------------------------
   const statusHeading = document.createElement('h2');
   statusHeading.textContent = 'Status';
@@ -1238,6 +1321,65 @@ export function createSettingsView(handlers) {
   addHiddenField('audioDeviceId', textInput('f-audioDeviceId'));
   addHiddenField('headphoneDeviceId', textInput('f-headphoneDeviceId'));
   addHiddenField(DEVICE_KEY_SRT, textInput('f-headphoneEndpointId'));
+
+  // --- where the commentary is captured from ------------------------------
+  //
+  // WHY THIS GROUP EXISTS AT ALL, when the group above it was deleted for being
+  // device selection on the wrong screen. It is not a device picker: it is the
+  // question of which SUBSYSTEM the commentary comes through, and the main
+  // screen's dropdown cannot ask it — that dropdown lists the platform's audio
+  // endpoints, and the whole point of the DeckLink route is that the microphone
+  // is NOT on one of them.
+  //
+  // The operator's original bug, in one sentence: the CoreAudio device a
+  // Blackmagic card publishes ("Blackmagic UltraStudio 4K Mini") measured
+  // -96 dBFS on all 16 channels with the mic live, while the device that does
+  // carry the mic publishes no unique-id and is therefore hidden by the
+  // dropdown's own filter. So the input list offers the silent one and hides the
+  // real one, and no amount of choosing from it can be right.
+  //
+  // Both fields are MACHINE state (internal/presets.MachineFields): they answer
+  // "what is plugged into THIS PC", and a preset carrying either would deliver
+  // another machine's hardware by post — the audioDeviceId fault, with a card
+  // instead of an endpoint, and a worse error when it lands.
+  const captureHeading = document.createElement('h2');
+  captureHeading.textContent = 'Commentary input';
+  openGroup(captureHeading);
+
+  addField(
+    'audioSourceKind',
+    'Capture from',
+    selectInput('f-audioSourceKind', [
+      { value: AUDIO_SOURCE_NATIVE, label: 'This computer’s audio devices' },
+      { value: AUDIO_SOURCE_DECKLINK, label: 'A Blackmagic DeckLink card' },
+    ]),
+    'Leave this on the computer’s audio devices unless the microphone arrives on an SDI card. ' +
+      'The card’s own audio does not appear in the input list on the main screen, which is why ' +
+      'it is chosen here instead.',
+  );
+
+  // A FREE-TEXT DEVICE FIELD, WHICH THIS SCREEN OTHERWISE HAS NONE OF — so the
+  // reason it is allowed to be one is worth stating.
+  //
+  // The fields that were removed were removed because a pasted value bypassed
+  // the dropdown's filter and failed SILENTLY: a playback endpoint id in
+  // audioDeviceId prerolled, then failed asynchronously, and the sender blamed
+  // the network and retried for ever. This one cannot fail that way. A card id
+  // that names nothing on this machine fails at START, immediately, with the id
+  // in the message — and the ordinary answer is to leave the box EMPTY, which
+  // means "the card in this machine" and is right on every seat that has one.
+  //
+  // It is a text box today because nothing enumerates the cards across the Wails
+  // boundary yet. When something does, this becomes a dropdown and the box goes.
+  addField(
+    'decklinkPersistentId',
+    'DeckLink card ID — optional',
+    textInput('f-decklinkPersistentId'),
+    'Blank = the card in this machine, which is the usual answer. Fill it in only on a machine ' +
+      'with more than one card. It is the card’s persistent ID, never its device number: a device ' +
+      'number is a position in this boot’s enumeration order and means something different after ' +
+      'a replug.',
+  );
 
   // --- monitor / return ---------------------------------------------------
   const monitorHeading = document.createElement('h2');
@@ -1558,8 +1700,24 @@ export function createSettingsView(handlers) {
     fields.srtPort.input.value = String(config.srtPort ?? 0);
     fields.srtLatencyMs.input.value = String(config.srtLatencyMs ?? 120);
     fields.pbkeylen.input.value = String(config.pbkeylen ?? 0);
+    // `||`, not `??`, for the reason given at srtReturnPort below: 0 is what
+    // internal/config.EffectiveVideoBitrateKbps substitutes the default FOR, and
+    // a form showing 0 would be showing a bitrate the encoder never uses.
+    fields.videoBitrateKbps.input.value = String(
+      config.videoBitrateKbps || blankConfig().videoBitrateKbps,
+    );
+    // No default substituted, and that is not an oversight: EMPTY IS A SETTING
+    // here. It means "read the format from the switcher", it is what every
+    // existing installation holds, and writing 1920x1080p50 into the box on the
+    // operator's behalf would turn the derivation off on every machine that
+    // opened Settings once.
+    fields.videoFormatOverride.input.value = config.videoFormatOverride || '';
     fields.statusKey.input.value = config.statusKey || '';
     fields.audioDeviceId.input.value = config.audioDeviceId || '';
+    // Normalised on the way in: an unrecognised kind assigned to a <select>
+    // shows nothing at all, and a save would then write that nothing back.
+    fields.audioSourceKind.input.value = normaliseAudioSourceKind(config.audioSourceKind);
+    fields.decklinkPersistentId.input.value = config.decklinkPersistentId || '';
     fields.headphoneDeviceId.input.value = config.headphoneDeviceId || '';
     fields[DEVICE_KEY_SRT].input.value = config[DEVICE_KEY_SRT] || '';
     fields.returnMid.input.value = String(
@@ -1634,8 +1792,18 @@ export function createSettingsView(handlers) {
       srtPort: Number(fields.srtPort.input.value),
       srtLatencyMs: Number(fields.srtLatencyMs.input.value),
       pbkeylen: Number(fields.pbkeylen.input.value),
+      videoBitrateKbps: Number(fields.videoBitrateKbps.input.value),
+      // Trimmed and otherwise sent VERBATIM — never normalised into the
+      // canonical spelling on the way through. What the operator typed is what
+      // Go parses and what Go quotes back if it cannot: a form that silently
+      // rewrote "1920X1080P50" would be answering a different question from the
+      // one on screen, and the first value it could not rewrite would be the one
+      // that mattered.
+      videoFormatOverride: fields.videoFormatOverride.input.value.trim(),
       statusKey: fields.statusKey.input.value.trim(),
       audioDeviceId: fields.audioDeviceId.input.value.trim(),
+      audioSourceKind: normaliseAudioSourceKind(fields.audioSourceKind.input.value),
+      decklinkPersistentId: fields.decklinkPersistentId.input.value.trim(),
       headphoneDeviceId: fields.headphoneDeviceId.input.value.trim(),
       [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
       returnMid: Number(fields.returnMid.input.value),

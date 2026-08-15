@@ -4,8 +4,9 @@
  * namespace a pasted GUID belongs to.
  *
  * Owner: WP-5b. No DOM, no browser API — it runs under `node --test` with
- * nothing installed (package.json is frozen). home.js's fillDeviceSelect and
- * validate.js are the callers; devices.test.js drives everything here for real.
+ * nothing installed, and nothing here should ever need anything installed.
+ * home.js's fillDeviceSelect and validate.js are the callers; devices.test.js
+ * drives everything here for real.
  *
  * ======================= THE FAILURE THIS SERVES ============================
  *
@@ -27,6 +28,8 @@
  *   - sortDevices puts the devices an operator actually wants — real
  *     microphones — above the walls of virtual endpoints (eight DVS pairs on
  *     the measured machine) that pushed them off screen.
+ *   - labelDevices makes the TWO ENTRIES FOR ONE BOX tellable apart; see its
+ *     own section below, which is a different failure with the same shape.
  */
 
 /**
@@ -207,8 +210,19 @@ export function compareDevicesForDisplay(a, b) {
 
   if (ca.length !== cb.length) return ca.length - cb.length;
   // Identical names under the rules above: fall back to the raw name, then the
-  // id, so the order is total and a refreshed list cannot reshuffle equals.
+  // KIND, then the id, so the order is total and a refreshed list cannot
+  // reshuffle equals.
   if (nameA !== nameB) return nameA < nameB ? -1 : 1;
+  // The one place kind decides anything about ORDER, and it decides it only
+  // between two entries the operating system has given the SAME name — which is
+  // exactly the UltraStudio's pair of entries. The DeckLink one goes first
+  // because it is the one carrying the microphone: measured, the CoreAudio twin
+  // reports -96 dBFS on all sixteen channels with the mic live. Putting the
+  // silent entry above the working one in a dropdown two identical lines long
+  // is an invitation to pick the wrong one.
+  const ka = kindOrder(a && a.kind);
+  const kb = kindOrder(b && b.kind);
+  if (ka !== kb) return ka - kb;
   const idA = str(a && a.id);
   const idB = str(b && b.id);
   return idA < idB ? -1 : idA > idB ? 1 : 0;
@@ -227,6 +241,134 @@ export function compareDevicesForDisplay(a, b) {
 export function sortDevices(devices) {
   if (!Array.isArray(devices)) return [];
   return devices.slice().sort(compareDevicesForDisplay);
+}
+
+// ===================== TWO ENTRIES, ONE PHYSICAL BOX =========================
+//
+// A Blackmagic UltraStudio enumerates TWICE, measured: once through CoreAudio,
+// which the operating system names after the box, and once through the DeckLink
+// driver, which names the same box. One of those two entries delivers the
+// commentator's microphone. The other delivers silence — the CoreAudio twin
+// reads -96 dBFS on all sixteen channels with the mic live — and there is
+// nothing in the name, the order or the id to say which is which.
+//
+// That is the owner's original bug seen from the other end. It used to be
+// invisible because captureDeviceID (deviceprovider_darwin.go) skipped any
+// device publishing no unique-id, which HID the DeckLink entry entirely and
+// offered only the silent one. With both offered, the operator has to be able
+// to choose, at speed, under pressure, from a dropdown of two identical lines.
+//
+// So the kind is rendered into the label. Two rules, and the asymmetry is
+// deliberate:
+//
+//   - a DeckLink entry is ALWAYS labelled. It is the unfamiliar one, and its
+//     audio arrives from somewhere the device name does not mention: the video
+//     signal on the card's input, not the computer's sound system.
+//   - a native entry is labelled only when a DeckLink entry shares its name.
+//     That is the collision above and the only case where the name alone is
+//     ambiguous; suffixing every built-in microphone on every other machine
+//     would be noise, and noise is what stops labels being read.
+//
+// NOTHING HERE PARSES AN ID. internal/gst/gst.go documents Device.ID as opaque
+// and per-platform — a WASAPI GUID, a CoreAudio unique-id, whatever a future
+// provider publishes — and the kind is a field precisely so that nobody has to
+// infer it from a string shape. Measured and relevant: DeckLink audio and video
+// publish the SAME persistent-id, because it names the CARD and not the stream,
+// so an id says less here than it looks like it does.
+
+/**
+ * DEVICE_KIND mirrors internal/gst's Device.Kind values EXACTLY. These strings
+ * are the contract; devices.test.js pins them against gst.go so the two sides
+ * cannot drift into a state where every device silently falls through to the
+ * unlabelled default.
+ */
+export const DEVICE_KIND = Object.freeze({
+  /** The platform's own audio system: WASAPI on Windows, CoreAudio on macOS. */
+  NATIVE: 'native',
+  /** A Blackmagic DeckLink / UltraStudio capture card's embedded audio. */
+  DECKLINK: 'decklink',
+});
+
+/**
+ * The label suffixes, in the operator's vocabulary rather than the driver's.
+ *
+ * "DeckLink" and "CoreAudio" are the names of software nobody at a commentary
+ * position chose or installed; SDI and HDMI are the cables in front of them.
+ * The pair reads, on the measured machine:
+ *
+ *   Blackmagic UltraStudio 4K Mini — SDI/HDMI audio
+ *   Blackmagic UltraStudio 4K Mini — computer sound input
+ *
+ * which answers "which one is my microphone" without knowing anything about
+ * either driver, provided the microphone is patched into the card. Both lines
+ * are needed: one labelled entry beside one bare entry reads as though the bare
+ * one were the normal choice, which is precisely the wrong conclusion here.
+ */
+const DECKLINK_SUFFIX = 'SDI/HDMI audio';
+const NATIVE_TWIN_SUFFIX = 'computer sound input';
+
+/** The separator between an OS device name and the kind suffix. */
+const LABEL_SEPARATOR = ' — ';
+
+/**
+ * labelDevices returns a NEW array of NEW objects, each the input device plus a
+ * `label`: what the dropdown should show for it. The input is not mutated and
+ * neither are its entries — app.js keeps currentInputDevices, and a device that
+ * grew a label under it would be a side effect on somebody else's state.
+ *
+ * Order is preserved; this does not sort. Compose it with sortDevices at the
+ * call site (home.js: `labelDevices(sortDevices(devices))`) so that each
+ * function stays one idea.
+ *
+ * A device with no kind — every output device, every Windows entry today, an
+ * older Go build — is labelled with its bare name. Falling through to the name
+ * is the right default in all three cases: nothing is claimed that is not known.
+ *
+ * @param {Array<{id?: string, name?: string, kind?: string}>|null|undefined} devices
+ * @returns {Array<{id?: string, name?: string, kind?: string, label: string}>}
+ */
+export function labelDevices(devices) {
+  if (!Array.isArray(devices)) return [];
+
+  // The names a DeckLink entry has claimed. Matching is on the NAME, normalised
+  // the same way the comparator normalises it (case and whitespace runs), and
+  // not on the id — see the section header: the id is opaque, and the DeckLink
+  // card's own audio and video entries share theirs anyway.
+  const decklinkNames = new Set();
+  for (const d of devices) {
+    if (d && d.kind === DEVICE_KIND.DECKLINK) decklinkNames.add(labelKey(d.name));
+  }
+
+  return devices.map((d) => {
+    const device = d || {};
+    const name = str(device.name);
+    if (device.kind === DEVICE_KIND.DECKLINK) {
+      return { ...device, label: name + LABEL_SEPARATOR + DECKLINK_SUFFIX };
+    }
+    if (device.kind === DEVICE_KIND.NATIVE && decklinkNames.has(labelKey(name))) {
+      return { ...device, label: name + LABEL_SEPARATOR + NATIVE_TWIN_SUFFIX };
+    }
+    return { ...device, label: name };
+  });
+}
+
+/** labelKey normalises a device name for the twin test: case and padding. */
+function labelKey(name) {
+  return str(name).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * kindOrder ranks the kinds for the comparator's final tie-break: DeckLink
+ * first, native second, an unknown or absent kind last. Unknown sorting last
+ * rather than first is the opposite of DEVICE_RANKS' "unrecognised is presumed
+ * real hardware", and deliberately so — this tie-break only ever runs between
+ * devices whose NAMES are already identical, where an entry nothing knows the
+ * kind of is the one least worth putting at the top.
+ */
+function kindOrder(kind) {
+  if (kind === DEVICE_KIND.DECKLINK) return 0;
+  if (kind === DEVICE_KIND.NATIVE) return 1;
+  return 2;
 }
 
 function str(v) {

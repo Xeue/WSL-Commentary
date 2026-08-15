@@ -83,6 +83,24 @@
 // filtered on, Audio/Source versus Audio/Sink. Names that look directional
 // ("BuiltInSpeakerDevice") are display conventions, not guarantees. That
 // classification lives in deviceprovider_darwin.go.
+//
+// # There is now a THIRD family of id here, and this file is inert on it too
+//
+// The commentary input dropdown offers Blackmagic capture cards as well as the
+// platform's own endpoints, and a card's id is its DeckLink persistent-id —
+// decimal digits, measured as "2747401380" on the port machine's UltraStudio 4K
+// Mini. It is in neither Windows namespace: it cannot begin "{0.0.0.00000000}."
+// or "{0.0.1.00000000}." and contains no DEVINTERFACE class GUID, so both
+// classifiers below are false for it and refuseRenderEndpoint never fires on
+// one. device_id_test.go pins that with the measured value.
+//
+// Being false for a DeckLink id is not a gap to be filled in. Nothing about the
+// render/capture distinction applies to a capture card — it has no playback
+// direction to be confused with — and the question that DOES need answering
+// about it, which element can open it, is answered by Device.Kind and not by the
+// shape of the string. decklinkdevices.go sets out why that discriminator is a
+// separate field and why an id of the form "decklink:2747401380", which WOULD be
+// classifiable here, is forbidden.
 package gst
 
 import (

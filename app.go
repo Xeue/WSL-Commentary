@@ -552,6 +552,19 @@ const (
 	// day when the SRT listener took a few extra seconds to accept.
 	statusKeyDiscoveryWindow = 90 * time.Second
 
+	// conformSnapshotTimeout bounds the one status-socket dial START makes to
+	// read the switcher's video format off it (see conformFormat).
+	//
+	// It is SHORT, and the reason is the whole design of that read: the answer
+	// improves the feed and its absence costs nothing that was not already
+	// being paid, so it must never be the reason START takes noticeably longer
+	// or — far worse — the reason START fails. Three seconds is comfortably
+	// more than the measured cost of the dial (a TLS handshake and one frame,
+	// 83 KB from the live instance on 2026-08-15) and short enough that an
+	// instance which has gone away delays the pipeline by less than one rung of
+	// the sender's backoff ladder.
+	conformSnapshotTimeout = 3 * time.Second
+
 	// kvsFetchTimeout bounds one run of the M2L-X to Cognito credential chain.
 	// It is three REST calls, each of which internal/m2lx already bounds at ten
 	// seconds, plus one AWS call.
@@ -723,6 +736,25 @@ type App struct {
 	// here. See runStatusKeyDiscovery.
 	discMu              sync.Mutex
 	statusKeyCandidates []m2lx.StatusKeyCandidate
+
+	// conformTo is the video format the NEXT pipeline will be built to: the
+	// switcher's own format when a running node reported one, the operator's
+	// videoFormatOverride when it did not, and nil when neither could answer
+	// (internal/gst then applies its own 1920x1080p50 fallback).
+	//
+	// It is written by Start, immediately before startSession, and read by
+	// senderOpts inside it. It is an ATOMIC and not a field under sessMu for a
+	// lock-order reason, not a performance one: deriving it needs the status
+	// watcher, which lives under ctlMu, and the lock order below says ctlMu is
+	// never held with sessMu — so the derivation has to happen OUTSIDE
+	// startSession and hand its answer in through something that needs no lock.
+	//
+	// Nil is the correct value on every path that never derived one, which
+	// includes every unit test that calls senderOpts directly: a nil here is a
+	// zero gst.ConformTarget in PipelineOpts, which internal/gst documents as
+	// "nothing is known" and resolves to exactly the format that was hardcoded
+	// before this field existed.
+	conformTo atomic.Pointer[gst.ConformTarget]
 
 	// sessMu guards session and is held for the whole of Start and Stop, so a
 	// Start cannot begin while a Stop is still taking the previous pipeline to
@@ -1483,15 +1515,31 @@ func (a *App) SetSecret(key, value string) error {
 // operator on the "error" event instead, rate-limited; see senderOpts and
 // connectErrorReporter.
 //
-// Start is a thin wrapper around startSession for two reasons. The statusKey
-// discovery it may kick off takes ctlMu, and the lock order in this file's
-// header says ctlMu is never held with either of the others — taking it under
-// sessMu would be the first exception to that and there is no reason to make
-// one. And the discovery has to be armed BEFORE the pipeline: its baseline is
-// the first switcher_status frame it sees, and a baseline taken after our feed
-// had already reached the switcher would show our own node streaming and never
+// Start is a thin wrapper around startSession for THREE reasons, two of them
+// the same reason. The statusKey discovery it may kick off takes ctlMu, and the
+// lock order in this file's header says ctlMu is never held with either of the
+// others — taking it under sessMu would be the first exception to that and
+// there is no reason to make one. The conform-format read takes ctlMu for
+// exactly the same reason, and its answer is handed to startSession through
+// a.conformTo rather than as an argument, because senderOpts has callers in
+// the test suite whose signature is not this change's to move. And the
+// discovery has to be armed BEFORE the pipeline: its baseline is the first
+// switcher_status frame it sees, and a baseline taken after our feed had
+// already reached the switcher would show our own node streaming and never
 // report the transition that identifies it.
+//
+// The ORDER of the first two matters, and it is not the order it looks like.
+// The conform read is done FIRST, before the discovery is armed, because both
+// touch the status socket and only one of them is allowed to see our own feed
+// arrive: the discovery's whole method is "which node changed state while we
+// were starting", and the conform read is one more connection opening at that
+// moment, which is invisible to it. Doing it the other way round is also
+// correct; doing it INSIDE the discovery window, on the discovery's own socket,
+// would not be, because RawSnapshot takes the opening frame of its OWN
+// connection and would consume nothing of the discovery's.
 func (a *App) Start() error {
+	a.conformTo.Store(a.conformFormat(a.snapshotConfig()))
+
 	stopDiscovery := a.maybeDiscoverStatusKey()
 	if err := a.startSession(); err != nil {
 		// Nothing is going to come up, so there is nothing to discover. Leaving
@@ -1526,6 +1574,37 @@ func (a *App) startSession() error {
 		// config.Validate joins one message per bad field, so the operator sees
 		// every problem at once instead of one edit-fail cycle at a time.
 		return fmt.Errorf("wslcomms: cannot start, the configuration is incomplete: %w", err)
+	}
+
+	// ============ THE DECKLINK CAPTURE PATH IS NOT BUILT IN THIS REVISION ====
+	//
+	// config, the Settings screen and internal/gst's device enumeration all
+	// understand audioSourceKind="decklink" — the field is stored, classified,
+	// validated and offered in a dropdown — but gst.PipelineOpts still carries
+	// AudioDeviceID alone and pipelineDescription still builds the platform's
+	// own source unconditionally. There is no decklinkaudiosrc leg yet.
+	//
+	// WITHOUT THIS REFUSAL THAT COMBINATION IS A SILENT WRONG-DEVICE FAILURE,
+	// which is the one class of defect this application is built end to end to
+	// prevent. config.Validate stopped requiring audioDeviceId for a DeckLink
+	// seat — correctly, since its commentary never touches CoreAudio or WASAPI —
+	// so a seat set to "decklink" passes validation with that field EMPTY, and
+	// an empty device on osxaudiosrc or wasapi2src is not an error: it is the
+	// system default input. The match would go out from the laptop's built-in
+	// microphone with every lamp green.
+	//
+	// So it is refused here, at the gate, naming the setting and the way back.
+	// This is the ONE line to delete when the capture leg lands; it is
+	// deliberately in Start rather than in config.Validate because it is a
+	// statement about what internal/gst can currently BUILD, not about whether
+	// the configuration is well formed — the same value becomes perfectly valid
+	// the day the element exists, with no change to config at all.
+	if cfg.UsesDeckLinkAudio() {
+		return fmt.Errorf("wslcomms: cannot start: the commentary input is set to a Blackmagic " +
+			"DeckLink card, and this version cannot capture from one yet — the card is offered in " +
+			"the device list but the capture pipeline for it is not built. Set the commentary " +
+			"input back to the computer sound input on the Settings screen and choose the device " +
+			"there")
 	}
 
 	if err := a.preflightAudioDevice(cfg.AudioDeviceID); err != nil {
@@ -1909,6 +1988,338 @@ func (a *App) preflightAudioDevice(id string) error {
 		id, len(devices))
 }
 
+// ---------------------------------------------------------------------------
+// The conform format: what raster and rate the video leg is built to
+// ---------------------------------------------------------------------------
+
+// conformFormat decides the format this session's video leg is conformed to,
+// or nil when nothing could answer and internal/gst should apply its own
+// fallback.
+//
+// # The three sources, in the order they are consulted
+//
+//  1. THE SWITCHER, read off a running node. M2L-X requires every source to
+//     match the format it is configured for, so any node that is streaming is
+//     reporting that format. This is a MEASUREMENT of the thing we must match.
+//  2. videoFormatOverride, the operator's declaration.
+//  3. nothing: nil, and internal/gst's FallbackConformTarget() — 1920x1080p50,
+//     the value that was hardcoded before any of this existed.
+//
+// # Why the measurement beats the declaration, and what that costs
+//
+// The switcher is the thing being conformed TO. If a node is streaming, the
+// format it reports is what M2L-X is accepting right now, and a stale override
+// typed weeks ago for a different venue cannot be more true than that. The
+// field is a fallback for the case that is actually common — MEASURED against
+// the live matchH instance on 2026-08-15, every one of its 24 router inputs was
+// stopped with a null format, which is the normal state of a facility twenty
+// minutes before kick-off — and not a way to contradict a switcher we can see.
+//
+// The cost is stated rather than hidden: an operator who believes the
+// derivation is wrong has no way to force a value while a node is streaming.
+// That is why a disagreement between the two is logged at the moment it
+// happens, naming both, rather than the override simply being ignored in
+// silence. If it ever turns out that operators need the escape hatch more than
+// they need the measurement, this is the one function that has to change.
+//
+// # It never fails, and never delays START by more than conformSnapshotTimeout
+//
+// Every failure — no control plane, not signed in yet, a socket that will not
+// open, an override that will not parse — falls through to the next source with
+// a log line. Nothing here may be a reason a match does not go out; that is the
+// same rule that keeps statusKey out of config.Validate.
+func (a *App) conformFormat(cfg *config.Config) *gst.ConformTarget {
+	// The override is parsed FIRST even though it is consulted second, so that
+	// a value which cannot be parsed is reported once, here, whether or not the
+	// switcher answers. config.Validate refuses such a value before Start
+	// completes, so in practice this line fires only for a hand-edited file or
+	// a preset from a newer build — the two cases in which nothing else would
+	// ever mention it.
+	spec, haveOverride, err := cfg.VideoFormatOverrideSpec()
+	if err != nil {
+		log.Printf("wslcomms: ignoring videoFormatOverride: %v", err)
+	}
+
+	if derived, ok := a.switcherConformFormat(); ok {
+		// ConformTargetFromRate, not a struct literal: the switcher reports the
+		// rate as a DECIMAL (frame_rate arrives as the string "50"), and 29.97
+		// is a rounding of 30000/1001 rather than a rate. internal/gst is where
+		// that conversion is written down, once.
+		t, err := gst.ConformTargetFromRate(derived.Width, derived.Height, derived.FrameRate)
+		if err != nil {
+			// A raster with no usable rate is not a conform target: pinning the
+			// size without the rate would leave imagefreeze free to negotiate
+			// any rate at all, which is the unpinned behaviour this whole
+			// change replaces. Fall through to the override.
+			log.Printf("wslcomms: the switcher's node %q reports a format this application "+
+				"cannot conform to (%s): %v", derived.Node, derived.Raw, err)
+		} else {
+			log.Printf("wslcomms: conforming the video leg to %s, read from the switcher's node %q "+
+				"(%d node(s) agreeing)", t, derived.Node, derived.Agreeing)
+			if derived.Interlaced {
+				// internal/gst's video leg begins at pngdec and can only
+				// produce progressive; the `interlace` element that would
+				// change that is in neither bundler's allowlist. So this is
+				// said out loud rather than silently absorbed: the raster and
+				// the rate will match and the scan will not, and an operator
+				// whose switcher will not take the feed should find that here
+				// rather than deduce it.
+				log.Printf("wslcomms: WARNING: node %q reports an INTERLACED format (%s) and the "+
+					"video leg can only produce progressive; sending %s",
+					derived.Node, derived.Raw, t)
+			}
+			if len(derived.Disagreeing) > 0 {
+				// One of the switcher's own sources is not conforming to it.
+				// That is somebody else's fault and it is worth saying so by
+				// name, because the symptom an operator sees is OUR feed
+				// looking wrong on a switcher that has two formats on it.
+				log.Printf("wslcomms: WARNING: node(s) %s are streaming a DIFFERENT format from %q — "+
+					"one of the switcher's sources is not conforming to it",
+					strings.Join(derived.Disagreeing, ", "), derived.Node)
+			}
+			if haveOverride && !sameConformTarget(t, spec) {
+				log.Printf("wslcomms: WARNING: videoFormatOverride says %s but the switcher is "+
+					"running %s; using the switcher. Clear the override, or correct it, if this "+
+					"position is meant to send %s", spec.Canonical(), t, spec.Canonical())
+			}
+			return &t
+		}
+	}
+
+	if haveOverride {
+		// The spec's fraction is used as it stands rather than reconstructed
+		// from spec.FrameRate(): config.ParseVideoFormat has already done the
+		// decimal-to-fraction conversion, with the same 1000/1001 family
+		// recognised, and round-tripping it through a float64 could only lose.
+		t := gst.ConformTarget{
+			Width:        spec.Width,
+			Height:       spec.Height,
+			FrameRateNum: spec.FrameRateNum,
+			FrameRateDen: spec.FrameRateDen,
+		}
+		log.Printf("wslcomms: conforming the video leg to %s, from videoFormatOverride — "+
+			"nothing is streaming on the switcher to read it from", t)
+		return &t
+	}
+
+	// Neither. internal/gst applies FallbackConformTarget, and the log says
+	// which way that was arrived at: "1080p50 because we could not read
+	// anything" and "1080p50 because the switcher says so" are the same
+	// pipeline and very different facts.
+	log.Printf("wslcomms: no node is streaming on the switcher and no videoFormatOverride is set; "+
+		"the video leg falls back to %s. Set videoFormatOverride (%s) if this instance is "+
+		"configured for anything else.", gst.FallbackConformTarget(), config.VideoFormatExample)
+	return nil
+}
+
+// switcherConformFormat opens ONE status connection, takes the frame that
+// carries the whole document, and reads the conform format off whatever is
+// running on it.
+//
+// The dial is the cost and it is deliberate. A complete document exists exactly
+// once per connection (internal/m2lx's RawSnapshot says so at length), so there
+// is no cached frame that could answer this, and the alternative — reading the
+// format off the Watch stream this application already has — is not available:
+// Watch is subscribed to ONE node, our own, which is by definition the node
+// that is not streaming at the moment START is pressed.
+//
+// Every failure is a log line and ok false. In particular ErrNotSignedIn is
+// ordinary rather than exceptional: startControlPlane's sign-in runs on its own
+// goroutine, and a START pressed within a second or two of launch legitimately
+// arrives before it has finished.
+func (a *App) switcherConformFormat() (m2lx.ConformFormat, bool) {
+	a.ctlMu.Lock()
+	watcher := a.watcher
+	a.ctlMu.Unlock()
+
+	if watcher == nil {
+		// No M2L-X host configured, or the control plane has not been built
+		// yet. Not worth a log line of its own — the caller's fallback line
+		// says what happened and this would only add "and here is one of the
+		// several reasons".
+		return m2lx.ConformFormat{}, false
+	}
+
+	ctx, cancel := context.WithTimeout(a.rootCtx, conformSnapshotTimeout)
+	defer cancel()
+
+	raw, err := watcher.RawSnapshot(ctx)
+	if err != nil {
+		log.Printf("wslcomms: could not read the switcher's video format: %v", err)
+		return m2lx.ConformFormat{}, false
+	}
+	return m2lx.ConformFormatFrom(raw)
+}
+
+// sameConformTarget compares what the switcher reports against what the
+// operator declared, on the three things that decide a capsfilter and on
+// nothing else.
+//
+// The rates are compared by CROSS-MULTIPLYING rather than by comparing the two
+// fractions field by field, so that 50/1 and 100/2 are the same rate. Neither
+// producer emits an unreduced fraction today; the comparison costs one
+// multiplication and removes a whole class of false warning if either ever
+// does.
+//
+// Scan is excluded on purpose: config.ParseVideoFormat's grammar describes
+// progressive video only, so a spec can never say interlaced and comparing it
+// would report a disagreement no operator could ever resolve.
+func sameConformTarget(t gst.ConformTarget, spec config.VideoFormatSpec) bool {
+	return t.Width == spec.Width && t.Height == spec.Height &&
+		t.FrameRateNum*spec.FrameRateDen == spec.FrameRateNum*t.FrameRateDen
+}
+
+// The conform-target provenance strings. They cross to the frontend inside
+// ConformTargetView.Source and exist so a readout can say WHERE the number came
+// from: a lamp judging against a number nobody can trace is not worth having.
+const (
+	// conformSourceSession is the strongest answer there is — the target the
+	// RUNNING pipeline was actually built to, read back rather than recomputed.
+	conformSourceSession = "session"
+
+	// conformSourceOverride is the operator's videoFormatOverride, reported
+	// when nothing is running to have been built to anything.
+	conformSourceOverride = "override"
+)
+
+// ConformTargetView is App.GetConformTarget's answer: the video format every
+// source feeding this M2L-X instance must be produced in.
+//
+// Width, Height and FrameRate are the load-bearing three — they are what
+// lamps.js compares the detected format against. The rest is PROVENANCE and
+// nothing reads it yet; it is carried because the fields that explain an answer
+// have to be gathered at the moment the answer is decided or they cannot be
+// gathered at all.
+//
+// FrameRate is the OPERATOR-FACING DECIMAL and deliberately not the exact
+// fraction — gst.ConformTarget.DisplayFrameRate says at length why 30000/1001
+// must cross this boundary as 29.97, and the summary is that the frontend
+// compares it with === against a rate M2L-X reports as the string "29.97".
+type ConformTargetView struct {
+	Width     int     `json:"width"`
+	Height    int     `json:"height"`
+	FrameRate float64 `json:"frameRate"`
+
+	// Source is one of the conformSource* constants above.
+	Source string `json:"source"`
+
+	// Node, Agreeing and Disagreeing describe a target DERIVED from the
+	// switcher: which node it was read off, how many agreed, and which running
+	// nodes are streaming something else. They are absent on an override.
+	Node        string   `json:"node,omitempty"`
+	Agreeing    int      `json:"agreeing,omitempty"`
+	Disagreeing []string `json:"disagreeing,omitempty"`
+
+	// Raw is the format as it was written down — the operator's
+	// videoFormatOverride string, canonicalised. It is what a readout should
+	// show when it wants to quote rather than describe.
+	Raw string `json:"raw,omitempty"`
+}
+
+// GetConformTarget reports the video format the contribution feed's video leg
+// is — or would be — conformed to, or nil when nothing is known.
+//
+// It is the binding that closes the last hardcoded raster in the application.
+// frontend/src/ui/lamps.js used to judge the switcher's detected format against
+// a constant {h264, 1920, 1080, 50}, so on a correctly configured 720p50
+// facility the VIDEO OK lamp read RED on a feed arriving perfectly, and the only
+// remedy at the desk was to learn to ignore a red lamp — the habit the whole
+// status row exists to prevent.
+//
+// # A RUNNING SESSION IS ANSWERED FROM THE SESSION, and that is the whole point
+//
+// When a pipeline is up, this returns the target THAT pipeline was built to,
+// read back out of a.conformTo rather than derived again. It is not an
+// optimisation. The lamp's question is "does what the switcher sees match what
+// we are sending", and what we are sending was decided once, at Start, from a
+// switcher that may since have changed. Re-deriving here would let the lamp
+// judge our feed against a target the feed was never built to — a red lamp on a
+// correct feed, or worse a green one on a feed that no longer conforms — which
+// is a subtler version of the very defect being fixed. The pipeline's own answer
+// is the only one that can be right about the pipeline.
+//
+// # WITH NO SESSION IT DOES NOT DIAL, and reports only the override
+//
+// conformFormat's first source is the switcher, read with a 3 s RawSnapshot.
+// This does not do that, for two reasons that point the same way. It is called
+// on the page's startup path, and a UI call that can block for three seconds to
+// refine a lamp is a bad trade; and with no session there is no feed for the
+// lamp to judge, because our own node cannot be streaming when we are not
+// sending — so the answer is advisory until Start, at which point Start derives
+// properly and the frontend re-reads.
+//
+// The consequence is stated rather than hidden: before Start this reports the
+// operator's declaration and not the switcher's measurement, and it says so in
+// Source. It can therefore differ from what Start will go on to choose. What it
+// can NEVER do is contradict a pipeline that exists, which is the property that
+// matters.
+//
+// # NEVER AN ERROR, AND NEVER PARTIAL
+//
+// Every way of not knowing returns nil, which backend.js documents as the normal
+// answer and lamps.js answers with DEFAULT_CONFORM_TARGET — today's 1080p50, so
+// an unknown switcher behaves exactly as this application always has. A partial
+// target is never returned: normaliseConformTarget replaces non-positive fields
+// INDIVIDUALLY, which is safe but would silently mix two sources into one
+// raster that neither of them describes.
+func (a *App) GetConformTarget() *ConformTargetView {
+	// The running pipeline first. sessMu is held only to read the pointer —
+	// conformTo is an atomic and is not covered by it — and nothing here calls
+	// out under the lock, so this cannot interact with the Start/Stop path it
+	// shares the mutex with.
+	a.sessMu.Lock()
+	running := a.session != nil
+	a.sessMu.Unlock()
+
+	if running {
+		// A session whose conformTo is nil derived nothing at Start: the
+		// pipeline was built to internal/gst's own fallback. Report that as the
+		// session's target rather than as "not known", because it IS what the
+		// feed is being produced in and the lamp should judge against it.
+		t := gst.FallbackConformTarget()
+		if stored := a.conformTo.Load(); stored != nil {
+			t = *stored
+		}
+		return conformTargetView(t, conformSourceSession, "")
+	}
+
+	spec, ok, err := a.snapshotConfig().VideoFormatOverrideSpec()
+	if err != nil || !ok {
+		// A value that will not parse is NOT reported here. config.Validate
+		// refuses it at Start naming the field, and validate.js refuses it
+		// before it can be saved; repeating it as a lamp fault would put a
+		// third, vaguer voice on the same defect. Nil is the honest answer:
+		// nothing is known.
+		return nil
+	}
+
+	return conformTargetView(gst.ConformTarget{
+		Width:        spec.Width,
+		Height:       spec.Height,
+		FrameRateNum: spec.FrameRateNum,
+		FrameRateDen: spec.FrameRateDen,
+	}, conformSourceOverride, spec.Canonical())
+}
+
+// conformTargetView renders a target for the frontend, or nil if it is not a
+// usable one.
+//
+// The Valid check is the guard against a partial answer described on
+// GetConformTarget. It is cheap and it is the only place the invariant can be
+// enforced, because every caller above has already decided it has an answer.
+func conformTargetView(t gst.ConformTarget, source, raw string) *ConformTargetView {
+	if !t.Valid() {
+		return nil
+	}
+	return &ConformTargetView{
+		Width:     t.Width,
+		Height:    t.Height,
+		FrameRate: t.DisplayFrameRate(),
+		Source:    source,
+		Raw:       raw,
+	}
+}
+
 // senderOpts builds the options for one session from a configuration snapshot
 // and the passphrase already read from the credential store.
 //
@@ -1927,16 +2338,32 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 	srtHost := cfg.EffectiveSRTHost()
 	reporter := newConnectErrorReporter(a.emitError, srtHost, cfg.SRTPort, time.Now)
 
+	// The conform format Start derived, or the zero VideoFormat when it derived
+	// none — which internal/gst documents as "nothing is known" and resolves to
+	// its own 1920x1080p50. A nil here is therefore not a missing value to
+	// guard against; it is the third of the three answers conformFormat can
+	// give, and it is the one every test that calls senderOpts directly
+	// receives, so those tests keep asserting exactly the pipeline the shipped
+	// build produces today.
+	var conformTo gst.ConformTarget
+	if f := a.conformTo.Load(); f != nil {
+		conformTo = *f
+	}
+
 	return sender.Opts{
 		Pipeline: gst.PipelineOpts{
 			SlatePath:     a.slatePath(cfg),
 			AudioDeviceID: cfg.AudioDeviceID,
-			// The bitrates are left at zero so that internal/gst applies its own
-			// documented constants — 2000 kbps video, 128000 bps audio,
-			// specification section 5. Codec, resolution and bitrate are
-			// explicitly not exposed to the user (specification section 2), so
-			// config.Config carries no field for them and nothing here should
-			// invent one.
+			ConformTo:     conformTo,
+			// The AUDIO bitrate is left at zero so that internal/gst applies
+			// its own documented constant of 128000 bps (specification section
+			// 5); the codec is likewise not exposed to the user. The VIDEO
+			// bitrate no longer is: the owner has ruled 2000 kbps — chosen for
+			// a still slate — far too low for a leg carrying live video, and
+			// config.EffectiveVideoBitrateKbps substitutes the same 2000 for an
+			// unset field, so a configuration nobody has touched still encodes
+			// exactly what the on-air build encodes.
+			VideoBitrateKbps: cfg.EffectiveVideoBitrateKbps(),
 
 			// The input meters. The pipeline's level element measures what is
 			// actually encoded and sent and calls this on a streaming thread

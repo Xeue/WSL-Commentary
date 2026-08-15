@@ -78,6 +78,14 @@ export function mountApp(root) {
   let currentConfig = null;
   let currentSenderState = undefined;
   let currentStatus = undefined;
+  // The raster and rate the VIDEO OK lamp judges the switcher's detected format
+  // against, or null while nothing is known — in which case lamps.js uses its
+  // own documented 1080p50 fallback and the row behaves exactly as it always
+  // has. It is deliberately NOT derived on this side: it is a question about the
+  // switcher, Go answers it (App.GetConformTarget), and a second derivation in
+  // JavaScript is how the two answers start disagreeing about which lamp is
+  // telling the truth.
+  let currentConformTarget = null;
   let monitor = null;
   // Caches of the last device lists fetched, kept only so a Settings save
   // can re-render the dropdowns' selection without a second device fetch.
@@ -385,20 +393,54 @@ export function mountApp(root) {
   }
 
   function renderStatusLamps() {
-    const { switcher, video, audio, unavailable } = deriveStatusLamps(currentStatus);
+    const { switcher, video, audio, unavailable } = deriveStatusLamps(
+      currentStatus,
+      currentConformTarget,
+    );
     home.lamps['SWITCHER SEES FEED'].update(switcher);
     home.lamps.VIDEO.update(video);
     home.lamps.AUDIO.update(audio);
     home.setStatusUnavailable(unavailable);
   }
 
+  /**
+   * refreshConformTarget re-reads the conform target and redraws the lamps.
+   *
+   * It is called on startup and after anything that can change WHICH SWITCHER
+   * this application is pointed at or WHAT IT IS SENDING: a Settings save, an
+   * applied preset (which repoints the app at a different instance whose raster
+   * may differ), another seat's save arriving on the config event, and the
+   * sender starting or stopping. That last one is not housekeeping — Go answers
+   * a RUNNING session from the target its pipeline was actually built to, which
+   * is the only answer that can be right about a feed in flight, and it is
+   * available only once the session exists.
+   *
+   * backend.getConformTarget never throws, so there is nothing to catch: every
+   * way of not knowing arrives as null and the lamp falls back.
+   */
+  async function refreshConformTarget() {
+    currentConformTarget = await backend.getConformTarget();
+    renderStatusLamps();
+  }
+
   renderSenderLamp();
   renderStatusLamps();
   home.lamps.MONITOR.update(deriveMonitorLamp(undefined));
+  // Not awaited: the lamp row is drawn immediately from the fallback and
+  // refines itself when Go answers. Blocking the mount on it would let a slow
+  // binding delay the whole page to improve one lamp.
+  refreshConformTarget();
 
   backend.onSender((state) => {
+    const wasRunning = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
     currentSenderState = state;
     renderSenderLamp();
+    // Only on the edge. The sender cycles through CONNECTING/BACKOFF states
+    // during a retry ladder and the conform target cannot change across those —
+    // it is fixed for the life of the pipeline — so re-reading on every state
+    // would be one Wails round trip per rung for an answer known not to differ.
+    const isRunning = !!state && state !== backend.SENDER_STATE.STOPPED;
+    if (isRunning !== wasRunning) refreshConformTarget();
   });
 
   backend.onStatus((status) => {
@@ -500,6 +542,14 @@ export function mountApp(root) {
       const sink = selectedHeadphoneId();
       if (sink && currentReturnSource !== RETURN_SOURCE_SRT) m.setSinkId(sink);
     });
+
+    // The conform target IS re-read for a remote save, unlike the return path
+    // above, and the asymmetry is deliberate. Rebuilding the return risks a
+    // glitch in somebody's headphones for a change they did not make; re-reading
+    // a lamp's reference raster risks nothing and corrects a lamp that would
+    // otherwise judge this desk's feed against the instance it was pointed at
+    // before the other seat moved it.
+    refreshConformTarget();
   }
 
   // The connected remote seats, straight to the home-screen indicator. The
@@ -958,6 +1008,14 @@ export function mountApp(root) {
     // rebuilding on every Save would take the return away for a second or two
     // because somebody corrected a typo in the event id.
     applyReturnOptionsFromConfig();
+
+    // The conform target last, because both things that can change it are in
+    // the config that just arrived: videoFormatOverride directly, and m2lxHost
+    // by repointing the whole application at a different switcher. An applied
+    // preset does both at once, which is exactly the case where a stale target
+    // would leave the VIDEO lamp judging this venue's feed against the last
+    // one's raster.
+    refreshConformTarget();
   }
 
   /**

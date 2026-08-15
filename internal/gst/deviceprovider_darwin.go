@@ -81,6 +81,22 @@
 // config; picking a different device from the operator's saved one because
 // macOS changed its default would be the same wrong-device failure by another
 // route.
+//
+// # What IS here now, and was not: a second kind of device
+//
+// Everything above is about CoreAudio, and CoreAudio is no longer the only
+// provider whose Audio/Source devices reach this file. A Blackmagic capture card
+// enumerates alongside the microphones, publishes a persistent-id instead of a
+// unique-id, and is opened by a different element entirely. captureDeviceID
+// therefore answers a THIRD question — which kind is this — and the rules for
+// the DeckLink kind live in decklinkdevices.go, which is where the measurements
+// are and which should be read before anything below is changed.
+//
+// The one sentence of it that matters here: a device publishing no unique-id
+// used to be skipped, and the device it was skipping was the one with the
+// operator's microphone on it. That skip is still correct for a CoreAudio
+// device and is still made, but it is now made LAST, after the card has had its
+// chance to be recognised.
 
 package gst
 
@@ -113,54 +129,96 @@ const propUniqueID = "unique-id"
 const bundleAllowlistNoun = "dylib"
 
 // resetSkipDetail and skipDetail are the macOS half of the enumeration summary
-// line's platform tail. They do nothing, and that is the correct implementation
-// rather than a stub waiting to be filled in.
+// line's platform tail. Both now do exactly one thing, and it is not the thing
+// the Windows twin does.
 //
-// The Windows twin counts wasapi2's loopback republications of playback
-// endpoints, because on that platform every render endpoint is republished as a
-// fake Audio/Source and the number of them that were filtered out is the most
-// useful figure in the line. CoreAudio has no such republication — see this
-// file's header — so there is nothing to count. Printing "0 loopbacks" here
-// would assert a filter that does not exist and quietly invite a future reader
-// to go looking for the macOS loopback rule, of which there is none.
+// There is still no macOS loopback count and there never will be. The Windows
+// twin counts wasapi2's loopback republications of playback endpoints, because
+// on that platform every render endpoint is republished as a fake Audio/Source
+// and the number of them that were filtered out is the most useful figure in the
+// line. CoreAudio has no such republication — see this file's header — so there
+// is nothing to count, and printing "0 loopbacks" here would assert a filter
+// that does not exist and quietly invite a future reader to go looking for the
+// macOS loopback rule, of which there is none.
+//
+// What there is instead is the DeckLink count, and it is deliberately SILENT at
+// zero: a Mac with no Blackmagic hardware, or with hardware but without the
+// Desktop Video driver, must produce the log it produced before DeckLink support
+// existed, down to the character. deckLinkSkipDetail owns that rule and the
+// reasoning behind it.
 //
 // The generic part of the summary — offered, total, skipped — is shared and
 // already covers the only skip this platform has, which is a device publishing
-// no unique-id.
-func resetSkipDetail()   {}
-func skipDetail() string { return "" }
+// neither a CoreAudio unique-id nor a DeckLink persistent-id.
+func resetSkipDetail()   { resetDeckLinkCount() }
+func skipDetail() string { return deckLinkSkipDetail() }
 
 // captureDeviceID reports whether one enumerated Audio/Source device should be
-// offered in the commentary input dropdown, and under what persistable id.
+// offered in the commentary input dropdown, of what KIND, and under what
+// persistable id.
 //
-// The predicate is "it is an Audio/Source device carrying a non-empty
-// unique-id". That is deliberately the weakest test that is still safe, for the
-// reason device_id.go gives about asymmetry: refusing devices of an unfamiliar
-// shape turns a future CoreAudio or GStreamer change into an empty dropdown at
-// a facility, whereas offering one costs at worst a loud failure at Start.
+// Two families of device reach it, and they are tested in the order below.
 //
-// A device with no unique-id is skipped, because there would be nothing to
-// persist and nothing to resolve later — the dropdown entry would produce a
-// selection that could never be reopened.
-func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
+// A DeckLink capture card is tested for FIRST, on the property the decklink
+// device provider publishes and CoreAudio does not. It has to be first here for
+// no macOS-specific reason at all — the two property sets are disjoint, so the
+// order cannot change the answer on this platform — but the Windows twin's
+// native test is a hard skip that returns before anything else can run, so the
+// card must be asked about before it there. The two files ask the same questions
+// in the same order deliberately: a difference in enumeration ORDER between the
+// twins is a difference in enumeration POLICY that nothing would catch.
+//
+// A CoreAudio device is then tested on "it is an Audio/Source device carrying a
+// non-empty unique-id". That is deliberately the weakest test that is still
+// safe, for the reason device_id.go gives about asymmetry: refusing devices of
+// an unfamiliar shape turns a future CoreAudio or GStreamer change into an empty
+// dropdown at a facility, whereas offering one costs at worst a loud failure at
+// Start.
+//
+// A device that is neither is skipped, because there would be nothing to persist
+// and nothing to resolve later — the dropdown entry would produce a selection
+// that could never be reopened. That skip is the ORIGINAL BUG when it fires on a
+// DeckLink card, and the branch above is what stops it doing so; the log line
+// below now names both identities so that a future third provider is diagnosed
+// from one line rather than from an empty dropdown.
+func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, DeviceKind, bool) {
+	if id, ok := deckLinkCaptureDeviceID(dev, props); ok {
+		return id, KindDeckLink, true
+	}
 	id := props.GetString(propUniqueID)
 	if id == "" {
 		// The property names are logged rather than guessed at, so that if a
 		// future GStreamer renames the key this line is the whole diagnosis
 		// instead of "the dropdown is empty again".
-		log.Printf("gst: ListInputDevices: skipping %q: it publishes no %s; device properties are %s",
-			dev.GetDisplayName(), propUniqueID, structureFieldNames(props))
-		return "", false
+		log.Printf("gst: ListInputDevices: skipping %q: it publishes neither %s nor %s; device "+
+			"properties are %s",
+			dev.GetDisplayName(), propUniqueID, propPersistentID, structureFieldNames(props))
+		return "", "", false
 	}
-	return id, true
+	return id, KindNative, true
 }
 
-// configureCaptureSource points osxaudiosrc at the device the operator chose.
+// configureCaptureSource points the capture source at the device the operator
+// chose.
 //
-// deviceID is the CoreAudio unique-id that came out of config.json. It is
-// resolved to the current AudioDeviceID integer HERE, at pipeline-open time,
-// against a fresh enumeration — see the file comment for why that indirection
-// is mandatory and what silently breaks without it.
+// It dispatches on the ELEMENT rather than on the id, because the element is the
+// thing that knows what it can be told. A decklink source has a persistent-id
+// property and osxaudiosrc has not, so the presence of that property is an exact
+// statement of which vocabulary the id in hand should be spoken in — and it
+// stays exact if a future id shape makes the two families look alike, which
+// inspecting the string never could. This is the seam's forward edge: no build
+// currently hands it anything but captureSourceFactory, so the DeckLink branch
+// is not yet reachable from Start. It is here rather than in the pipeline
+// because "given the persisted string, point the capture source at the device it
+// names" is precisely this file's job on both kinds, and splitting that across
+// two owners is how the two grow different rules about the same saved value.
+//
+// deviceID on the CoreAudio path is the unique-id that came out of config.json.
+// It is resolved to the current AudioDeviceID integer HERE, at pipeline-open
+// time, against a fresh enumeration — see the file comment for why that
+// indirection is mandatory and what silently breaks without it. On the DeckLink
+// path there is nothing to resolve, which is the difference between an id
+// derived from the hardware and a handle allocated by a daemon.
 //
 // osxaudiosrc has no low-latency property (its Windows counterpart does, and
 // the Windows twin sets it). The nearest equivalents are buffer-time —
@@ -170,8 +228,22 @@ func captureDeviceID(dev gogst.Device, props *gogst.Structure) (string, bool) {
 // feed acquires dropouts. If that trade is ever revisited it should be
 // revisited with a measurement, not with an intuition.
 func configureCaptureSource(src gogst.Element, deviceID string) error {
+	if hasProperty(src, propPersistentID) {
+		return configureDeckLinkSource(src, deviceID)
+	}
 	index, err := resolveCaptureDeviceIndex(deviceID)
 	if err != nil {
+		// The dropdown offers DeckLink cards beside the CoreAudio devices, so
+		// "CoreAudio has never heard of this id" is now a sentence with two very
+		// different meanings. Ask the cards before blaming the operator: without
+		// this the message is "device 2747401380 is no longer present, CoreAudio
+		// currently offers: [...]" about a card that is plugged in, powered and
+		// working, which sends the person reading it to look for a fault that is
+		// not there. The extra enumeration is paid only here, on a path that has
+		// already failed.
+		if card, ok := deckLinkCardWithID(deviceID); ok {
+			return deckLinkKindError(deviceID, card)
+		}
 		return err
 	}
 	// The integer is logged as a DIAGNOSTIC and nowhere else. It is meaningful
