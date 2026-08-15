@@ -258,6 +258,19 @@ type Client interface {
 	// events.go; it drops id-less entries and sorts by name.
 	ListEvents(ctx context.Context) ([]Event, error)
 
+	// SwitcherConfiguration reads the instance's CONFIGURED video format (GET
+	// /api/v1/switcher_configuration) using the held bearer token, returning
+	// ErrNotSignedIn if SignIn has not succeeded. It is the authoritative
+	// answer to "what format must every source feeding this switcher be
+	// produced in", and the contribution pipeline's video leg is built to it.
+	//
+	// The format is a SETTING and this is the only way to read it. It used to
+	// be derived from the detected format of whatever node happened to be
+	// streaming; configuration.go's tombstone has the measurement that killed
+	// that — a live 720p50 feed reported as frame_rate="0" — and should be read
+	// before anyone tries it again.
+	SwitcherConfiguration(ctx context.Context) (SwitcherConfiguration, error)
+
 	// Close cancels the background token-refresh goroutine started by
 	// SignIn, if one was ever started, and blocks until it has actually
 	// exited. Idempotent and safe to call concurrently with itself and

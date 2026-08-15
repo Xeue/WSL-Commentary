@@ -192,6 +192,15 @@ type App struct {
 	decoyDelta     string
 	transitionPush string
 
+	// switcherFormat is what GET /api/v1/switcher_configuration reports as the
+	// instance's CONFIGURED video format — the first rung of the app's conform
+	// ladder. It lives here beside the fault flags rather than in doc because it
+	// is a setting, not part of the synthesised status document: it changes a
+	// handful of times a match at most, which is what App.mu is for, and the
+	// broadcaster never touches it. Settable at runtime from
+	// /control/switcher-format (configuration.go).
+	switcherFormat switcherVideoFormatDoc
+
 	// doc is the switcher_status document's own synthesis state: the delta
 	// sequence, the meter sweep, the frozen statistics and the last lamp
 	// reading published. It has a separate, narrower lock (switcherdoc.go)
@@ -239,6 +248,7 @@ func NewApp(opts Options, logger *log.Logger) *App {
 		doc:            newSwitcherDoc(),
 		srt:            newSRTState(),
 		wsClients:      make(map[*wsClient]struct{}),
+		switcherFormat: defaultSwitcherConfiguration(),
 	}
 }
 

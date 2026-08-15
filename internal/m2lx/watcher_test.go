@@ -75,6 +75,12 @@ func (f *fakeClientToken) KVSToken(ctx context.Context, eventID string) (KVSToke
 // exercised here.
 func (f *fakeClientToken) ListEvents(ctx context.Context) ([]Event, error) { return nil, nil }
 
+// SwitcherConfiguration satisfies Client. The watcher reads the status socket,
+// never the instance's settings, so it is not exercised here.
+func (f *fakeClientToken) SwitcherConfiguration(ctx context.Context) (SwitcherConfiguration, error) {
+	return SwitcherConfiguration{}, nil
+}
+
 // Close satisfies the Client interface. fakeClientToken starts no
 // goroutine of its own, so there is nothing to cancel or wait for.
 func (f *fakeClientToken) Close() error { return nil }

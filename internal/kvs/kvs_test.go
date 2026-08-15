@@ -58,6 +58,13 @@ func (c *testClient) Close() error                                             {
 // exercised here.
 func (c *testClient) ListEvents(ctx context.Context) ([]m2lx.Event, error) { return nil, nil }
 
+// SwitcherConfiguration satisfies m2lx.Client. Fetch never reads the switcher's
+// configured video format — that is the conform ladder's business, in app.go —
+// so it is not exercised here either.
+func (c *testClient) SwitcherConfiguration(ctx context.Context) (m2lx.SwitcherConfiguration, error) {
+	return m2lx.SwitcherConfiguration{}, nil
+}
+
 func (c *testClient) KVSInfo(ctx context.Context, eventID string) (m2lx.KVSInfo, error) {
 	body, status, err := getJSON(ctx, c.baseURL+"/api/live_operation/kvs/webrtc_info/"+eventID)
 	if err != nil {

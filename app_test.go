@@ -2718,6 +2718,13 @@ type stubClient struct {
 
 	fakeEvents    []m2lx.Event
 	fakeEventsErr error
+
+	// fakeConfig and fakeConfigErr drive conformFormat's first source: the
+	// switcher's configured video format. The zero value is an instance that
+	// answers with nothing usable, which conformFormat must survive by falling
+	// through to the override — see app_conform_test.go, which sets these.
+	fakeConfig    m2lx.SwitcherConfiguration
+	fakeConfigErr error
 }
 
 func (c stubClient) SignIn(context.Context, string, string) error { return nil }
@@ -2728,6 +2735,12 @@ func (c stubClient) Token() string                                { return c.tok
 // App.ListEvents can be exercised without a live instance.
 func (c stubClient) ListEvents(context.Context) ([]m2lx.Event, error) {
 	return c.fakeEvents, c.fakeEventsErr
+}
+
+// SwitcherConfiguration returns the canned configuration (or error) the test
+// configured, so the conform ladder can be exercised without a live instance.
+func (c stubClient) SwitcherConfiguration(context.Context) (m2lx.SwitcherConfiguration, error) {
+	return c.fakeConfig, c.fakeConfigErr
 }
 
 func (c stubClient) KVSInfo(context.Context, string) (m2lx.KVSInfo, error) {

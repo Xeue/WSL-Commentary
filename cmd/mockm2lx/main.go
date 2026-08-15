@@ -164,8 +164,14 @@ func run(opts Options, logger *log.Logger) error {
 	mux.HandleFunc("GET /api/live_operation/kvs/webrtc_info/{event}", a.requireAuth(a.handleKVSInfo))
 	mux.HandleFunc("GET /api/live_operation/kvs/webrtc_token/{event}", a.requireAuth(a.handleKVSToken))
 	mux.HandleFunc("GET /api/v1/switcher_status", a.handleStatusWS)
+	// The FIRST rung of the conform ladder. Without it the mock 404s, the app
+	// falls to its 1920x1080p50 default, and every run against this mock
+	// exercises the fallback while looking like a success — see
+	// configuration.go's header.
+	mux.HandleFunc("GET /api/v1/switcher_configuration", a.requireAuth(a.handleSwitcherConfiguration))
 
 	mux.HandleFunc("GET /control/state", a.handleControlState)
+	mux.HandleFunc("POST /control/switcher-format", a.handleControlSwitcherFormat)
 	mux.HandleFunc("POST /control/drop-srt", a.handleControlDropSRT)
 	mux.HandleFunc("POST /control/one-peer-only", a.handleControlOnePeerOnly)
 	mux.HandleFunc("POST /control/refusal-window", a.handleControlRefusalWindow)

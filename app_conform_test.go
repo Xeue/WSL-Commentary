@@ -5,10 +5,10 @@
 // is built to.
 //
 // It is a file of its own rather than more lines in app_test.go because the
-// three sources it arbitrates between — the switcher, the operator's
-// videoFormatOverride, and the compiled-in fallback — live in three different
-// packages, and the ORDER they are consulted in is a decision that has to be
-// written down somewhere it can be read on one screen.
+// three sources it arbitrates between — the switcher's own setting, the
+// operator's videoFormatOverride, and the compiled-in fallback — live in three
+// different packages, and the ORDER they are consulted in is a decision that
+// has to be written down somewhere it can be read on one screen.
 
 package main
 
@@ -21,24 +21,25 @@ import (
 	"wslcomms/internal/m2lx"
 )
 
-// conformSnapshot builds an opening-snapshot frame with one streaming node at
-// the given raster, in the measured wire shape — frame_rate a STRING beside
-// numeric width and height.
-func conformSnapshot(node string, width, height int, frameRate string) []byte {
-	return []byte(`{"status":[{"node":"` + node + `","path":"/","state":{` +
-		`"display_name":"COMMS","stream_state":"streaming","streams":{"audio":[],` +
-		`"video":{"format":{"codec":"h264","width":` + itoa(width) +
-		`,"height":` + itoa(height) + `,"frame_rate":"` + frameRate + `","scan_type":"P"}}}}}]}`)
-}
-
-// stoppedSnapshot is what the live matchH instance actually returned on
-// 2026-08-15: every router input stopped, every video format JSON null. It is
-// the NORMAL state of a facility before kick-off and therefore the case the
-// override exists for.
-func stoppedSnapshot() []byte {
-	return []byte(`{"status":[{"node":"cam4","path":"/","state":{` +
-		`"display_name":"COMMS","stream_state":"stopped","streams":{"audio":[],` +
-		`"video":{"format":null}}}}]}`)
+// configuredFormat is what a healthy instance answers
+// GET /api/v1/switcher_configuration with, as internal/m2lx has already parsed
+// it: a raster, a rate, and the signal_type that is the colorimetry.
+//
+// Raw is filled in the shape parseVideoFormat renders, because two of the tests
+// below assert on what a log line would quote and a Raw that did not look like
+// the real thing would prove nothing.
+func configuredFormat(width, height int, frameRate float64, signalType string) m2lx.SwitcherConfiguration {
+	return m2lx.SwitcherConfiguration{
+		VideoFormat: m2lx.VideoFormat{
+			Raw: `width=` + itoa(width) + ` height=` + itoa(height) +
+				` frame_rate="` + ftoa(frameRate) + `" bit_depth=8 color_space="YCbCr"` +
+				` signal_type="` + signalType + `"`,
+			Width:     width,
+			Height:    height,
+			FrameRate: frameRate,
+		},
+		SignalType: signalType,
+	}
 }
 
 func itoa(i int) string {
@@ -53,29 +54,35 @@ func itoa(i int) string {
 	return string(b)
 }
 
-// withStubWatcher installs a watcher whose RawSnapshot returns raw, in the
-// place conformFormat looks for one: under ctlMu, exactly where
-// startControlPlane puts the real one.
-func withStubWatcher(a *App, raw []byte, err error) *stubWatcher {
-	w := newStubWatcher()
-	w.setRaw(raw, err)
+// ftoa renders a rate the way the wire does: "50", "29.97".
+func ftoa(f float64) string {
+	whole := int(f)
+	if float64(whole) == f {
+		return itoa(whole)
+	}
+	hundredths := int(f*100+0.5) % 100
+	return itoa(whole) + "." + itoa(hundredths/10) + itoa(hundredths%10)
+}
+
+// withStubClient installs a client that answers SwitcherConfiguration with
+// conf/err, in the place conformFormat looks for one: under ctlMu, exactly
+// where startControlPlane puts the real one.
+func withStubClient(a *App, conf m2lx.SwitcherConfiguration, err error) {
 	a.ctlMu.Lock()
-	a.watcher = w
+	a.client = stubClient{token: "tok", fakeConfig: conf, fakeConfigErr: err}
 	a.ctlMu.Unlock()
-	return w
 }
 
 func TestConformFormatPrefersTheSwitcher(t *testing.T) {
-	// The whole point of the derivation. A 720p50 instance with one camera up
-	// reports 720p50, and the pipeline must be built to that — the compiled-in
-	// 1080p50 is a live defect there and nothing else in the application could
-	// ever have known.
+	// The whole point. A 720p50 instance says so, and the pipeline must be
+	// built to that — the compiled-in 1080p50 is a live defect there and
+	// nothing else in the application could ever have known.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, conformSnapshot("cam1", 1280, 720, "50"), nil)
+	withStubClient(a, configuredFormat(1280, 720, 50, "rec709"), nil)
 
 	got := a.conformFormat(validConfig())
 	if got == nil {
-		t.Fatal("conformFormat returned nil with a streaming node on the switcher")
+		t.Fatal("conformFormat returned nil with a switcher that answered")
 	}
 	want := gst.ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
 	if *got != want {
@@ -89,11 +96,11 @@ func TestConformFormatConvertsAnNTSCRate(t *testing.T) {
 	// of a match — which is why the conversion lives in internal/gst and is
 	// exercised from here rather than assumed.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, conformSnapshot("cam1", 1920, 1080, "29.97"), nil)
+	withStubClient(a, configuredFormat(1920, 1080, 29.97, "rec709"), nil)
 
 	got := a.conformFormat(validConfig())
 	if got == nil {
-		t.Fatal("conformFormat returned nil with a streaming node on the switcher")
+		t.Fatal("conformFormat returned nil with a switcher that answered")
 	}
 	if got.FrameRateNum != 30000 || got.FrameRateDen != 1001 {
 		t.Fatalf("frame rate = %d/%d, want 30000/1001", got.FrameRateNum, got.FrameRateDen)
@@ -103,18 +110,18 @@ func TestConformFormatConvertsAnNTSCRate(t *testing.T) {
 func TestConformFormatBeatsTheOverride(t *testing.T) {
 	// The precedence, stated as a test because it is the one part of this that
 	// is a judgement rather than a mechanism: the switcher is the thing being
-	// conformed TO, and a node that is streaming is a MEASUREMENT of what it is
-	// accepting. A videoFormatOverride typed for another venue cannot be more
-	// true than that. The disagreement is logged; see conformFormat.
+	// conformed TO and it states its own format, so a videoFormatOverride typed
+	// for another venue cannot be more true than that. The disagreement is
+	// logged; see conformFormat.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, conformSnapshot("cam1", 1280, 720, "50"), nil)
+	withStubClient(a, configuredFormat(1280, 720, 50, "rec709"), nil)
 
 	cfg := validConfig()
 	cfg.VideoFormatOverride = "1920x1080p50"
 
 	got := a.conformFormat(cfg)
 	if got == nil {
-		t.Fatal("conformFormat returned nil with a streaming node on the switcher")
+		t.Fatal("conformFormat returned nil with a switcher that answered")
 	}
 	if got.Width != 1280 || got.Height != 720 {
 		t.Fatalf("conform target = %v, want the switcher's 1280x720 and not the override", *got)
@@ -122,12 +129,11 @@ func TestConformFormatBeatsTheOverride(t *testing.T) {
 }
 
 func TestConformFormatFallsBackToTheOverride(t *testing.T) {
-	// MEASURED on the live matchH instance, 2026-08-15: all 24 router inputs
-	// stopped, all 24 video formats null. That is the normal state of a
-	// facility before kick-off, so this is the path a real position takes far
-	// more often than the one above.
+	// The case that is actually common, and the reason a failure to reach the
+	// endpoint must not be fatal: an operator setting a position up long before
+	// kick-off, against an instance that is not answering yet. It has to start.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, stoppedSnapshot(), nil)
+	withStubClient(a, m2lx.SwitcherConfiguration{}, errors.New("dial tcp: i/o timeout"))
 
 	cfg := validConfig()
 	cfg.VideoFormatOverride = "1280x720p59.94"
@@ -143,13 +149,14 @@ func TestConformFormatFallsBackToTheOverride(t *testing.T) {
 }
 
 func TestConformFormatFallsBackToNothing(t *testing.T) {
-	// Nothing streaming, no override. The answer is nil, which senderOpts turns
-	// into a zero ConformTo, which internal/gst resolves to its own
-	// 1920x1080p50 — the value that was hardcoded before any of this existed.
-	// So a facility that has configured nothing gets exactly the pipeline the
-	// on-air build produces today.
+	// No switcher, no override. The answer is nil, which senderOpts turns into
+	// a zero ConformTo, which internal/gst resolves to its own 1920x1080p50 —
+	// the value that was hardcoded before any of this existed. So a facility
+	// that has configured nothing gets exactly the pipeline the on-air build
+	// produces today. conformFormat logs that it reached this rung; it is the
+	// only place in the application that turns unknown into a format.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, stoppedSnapshot(), nil)
+	withStubClient(a, m2lx.SwitcherConfiguration{}, errors.New("dial tcp: i/o timeout"))
 
 	if got := a.conformFormat(validConfig()); got != nil {
 		t.Fatalf("conform target = %v, want nil so internal/gst applies its own fallback", *got)
@@ -162,26 +169,36 @@ func TestConformFormatSurvivesEverythingTheSwitcherCanDo(t *testing.T) {
 	// genuine live condition and each must fall through to the override rather
 	// than fail, panic or block.
 	cases := []struct {
-		name    string
-		raw     []byte
-		rawErr  error
-		watcher bool
+		name   string
+		conf   m2lx.SwitcherConfiguration
+		err    error
+		client bool
 	}{
-		{name: "no control plane at all", watcher: false},
-		{name: "not signed in yet", rawErr: m2lx.ErrNotSignedIn, watcher: true},
-		{name: "the socket would not open", rawErr: errors.New("dial tcp: i/o timeout"), watcher: true},
-		{name: "a frame that is not switcher_status", raw: []byte(`<html>502</html>`), watcher: true},
-		{name: "an empty frame", raw: []byte(`{"status":[]}`), watcher: true},
-		{name: "a raster with no rate", watcher: true, raw: []byte(
-			`{"status":[{"node":"cam1","path":"/","state":{"stream_state":"streaming",` +
-				`"streams":{"audio":[],"video":{"format":{"width":1920,"height":1080}}}}}]}`)},
+		{name: "no control plane at all", client: false},
+		{name: "not signed in yet", err: m2lx.ErrNotSignedIn, client: true},
+		{name: "the instance will not answer", err: errors.New("dial tcp: i/o timeout"), client: true},
+		{name: "HTTP 500 from the endpoint", err: errors.New("returned HTTP 500"), client: true},
+		{name: "an empty configuration", client: true},
+		{name: "a raster with no rate", client: true,
+			conf: m2lx.SwitcherConfiguration{VideoFormat: m2lx.VideoFormat{
+				Raw: `width=1920 height=1080`, Width: 1920, Height: 1080}}},
+		{
+			// THE MEASUREMENT THAT KILLED THE OLD DERIVATION, kept as a live
+			// case rather than only as a comment: the switcher reported
+			// frame_rate="0" for a real 1280x720p50 feed that was streaming.
+			// The setting has never been seen to do this, but a zero rate is
+			// not a rate wherever it comes from, and it must fall through
+			// rather than build a 0 fps capsfilter.
+			name: "a rate of zero, the shape a running node reported",
+			conf: configuredFormat(1280, 720, 0, "rec709"), client: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := newTestApp(t)
-			if tc.watcher {
-				withStubWatcher(a, tc.raw, tc.rawErr)
+			if tc.client {
+				withStubClient(a, tc.conf, tc.err)
 			}
 
 			cfg := validConfig()
@@ -198,12 +215,52 @@ func TestConformFormatSurvivesEverythingTheSwitcherCanDo(t *testing.T) {
 	}
 }
 
+func TestConformFormatTakesTheRasterWhateverTheColorimetry(t *testing.T) {
+	// The colorimetry is REPORTED, never obeyed: internal/gst pins
+	// colorimetry=bt709 in the video leg's capsfilter and this change does not
+	// widen that package. So an instance stating something else — or something
+	// unrecognised, or nothing at all — must still get its raster and rate
+	// conformed to, with the disagreement in the log and nowhere else. A
+	// signal_type that silently changed the raster would be far worse than one
+	// that is only mentioned.
+	for _, signalType := range []string{"rec709", "rec2020", "something-new", ""} {
+		a, _ := newTestApp(t)
+		withStubClient(a, configuredFormat(1280, 720, 50, signalType), nil)
+
+		got := a.conformFormat(validConfig())
+		if got == nil {
+			t.Fatalf("signal_type %q: conformFormat returned nil", signalType)
+		}
+		want := gst.ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
+		if *got != want {
+			t.Fatalf("signal_type %q: conform target = %v, want %v", signalType, *got, want)
+		}
+	}
+}
+
+func TestVideoLegColorimetryMatchesWhatTheSwitcherStates(t *testing.T) {
+	// The one thing that makes the hard-coded colorimetry defensible: the
+	// switcher agrees with it. matchH states signal_type "rec709", which is
+	// bt709 under GStreamer's name for it, which is what
+	// gst.ConformTarget.spatialCaps pins. If either side ever changes, this
+	// fails and the decision has to be taken again rather than discovered on
+	// air.
+	got, ok := configuredFormat(1920, 1080, 50, "rec709").Colorimetry()
+	if !ok {
+		t.Fatal(`Colorimetry() of the measured signal_type "rec709" is not recognised`)
+	}
+	if got != videoLegColorimetry {
+		t.Fatalf("the switcher states %q colorimetry and the video leg pins %q; "+
+			"the leg's capsfilter is now wrong on every instance", got, videoLegColorimetry)
+	}
+}
+
 func TestConformFormatIgnoresAnUnparseableOverride(t *testing.T) {
 	// config.Validate refuses such a value before Start completes, so this can
 	// only be reached by a hand-edited file or a preset from a newer build. It
 	// must not become a panic and must not become a silent 25 fps.
 	a, _ := newTestApp(t)
-	withStubWatcher(a, stoppedSnapshot(), nil)
+	withStubClient(a, m2lx.SwitcherConfiguration{}, errors.New("dial tcp: i/o timeout"))
 
 	cfg := validConfig()
 	cfg.VideoFormatOverride = "the usual one"

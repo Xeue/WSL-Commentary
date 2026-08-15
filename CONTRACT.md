@@ -334,17 +334,34 @@ Token handling: `TokenLifetime` is the measured 86399 s and `RefreshFraction` is
 `/api/local_auth/refresh_token`. The refresh token's own TTL is unmeasured, so a failed
 `Refresh` must fall back to a full `SignIn`.
 
-**Added 2026-08-15, rule 3: `ConformFormat` and `ConformFormatFrom(payload []byte)`.** The
-instance's **configured** video format, derived from any node that is **running**. M2L-X can be
-configured into any format and requires every source to match it, so a streaming node is reporting
-that format — and there is no other way to learn it: measured against `matchH` on 2026-08-15, all
-35 nodes reported `"format": null` with `stream_state:"stopped"`, and seven plausible REST paths
-(`/api/system`, `/api/settings`, `/api/switcher`, `/api/config`, `/api/events/{id}`,
-`/api/live_operation/outputs`, `/api/router`) all answered 404. **"Nothing to derive from" is
-therefore the normal case, not a fault**, and every caller must have a fallback. Only whole-node
-entries (`path:"/"`) are read; the largest agreeing group wins, ties broken by node name so the
-answer is a function of the frame and not of map iteration order; other running nodes reporting a
-different raster are named in `Disagreeing` rather than swallowed.
+**Added 2026-08-15, rule 3: `SwitcherConfiguration(ctx)`.** `GET /api/v1/switcher_configuration`,
+bearer-authenticated like the KVS and events calls, in the same `/api/v1/switcher_*` family as the
+`switcher_status` and `switcher_controller` sockets. Its first key is the instance's **configured**
+video format — the setting itself, not an observation of a consequence of it:
+
+```
+{"format":{"video":{"bit_depth":8,"color_space":"YCbCr","frame_rate":"50",
+                    "height":1080,"signal_type":"rec709","width":1920}}, ...}
+```
+
+Measured on `matchH` 2026-08-15: 12108 bytes, HTTP 200 in 34 ms, top-level keys
+`[format nodes system_info]`. `frame_rate` is a STRING while `width`/`height` beside it are
+NUMBERS — the same trap `format.go` already documents, and the same `parseFrameRate` reads it.
+`nodes[]` and `system_info` are deliberately unmodelled. `signal_type:"rec709"` is GStreamer's
+`bt709`, which is what the video leg already pins.
+
+**This replaced a derivation, and the replacement is the point.** An earlier pass on the same day
+inferred the format from any node that was *running*, on the reasoning that every source must match
+the switcher so a streaming node reports it. That is true and useless: with a real 1280x720p50 feed
+accepted and streaming on `cam4 "COMMS"`, `matchH` reported `frame_rate="0"`, stable across 45 s.
+The derivation correctly refused to build a 0 fps target and fell back — so it would have shipped
+and silently never fired. And at the moment of the live check, 24 of 24 router inputs were stopped
+with null formats, so it had nothing to read at all. The setting is always there.
+`internal/m2lx/configuration.go` carries that measurement verbatim, so nobody rebuilds it.
+
+The earlier note that "seven plausible REST paths all answered 404" was correct about those seven
+and wrong to conclude no endpoint existed. It was found the way `/api/events/overview` was found:
+by reading the switcher's own Angular bundle.
 
 `GET /api/input/router/list/{eventId}` **does** state the configured format per router input —
 measured on `matchH`, input 4 `{"name":"COMMS","port":40004,"width":1920,"height":1080,"codec":
@@ -667,7 +684,7 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
 
 `GetConformTarget` is added 2026-08-15 with the conform work. It returns
-`{width, height, frameRate, source, node, agreeing, disagreeing, raw}` or **null**, and null is the
+`{width, height, frameRate, source, raw}` or **null**, and null is the
 normal answer for every way of not knowing — `lamps.js` then uses its own documented 1080p50
 fallback, i.e. exactly the behaviour this application always had. `frameRate` is the
 **operator-facing decimal** (29.97, never 29.970029970…) because the frontend compares it with

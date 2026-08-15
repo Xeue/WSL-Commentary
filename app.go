@@ -552,18 +552,24 @@ const (
 	// day when the SRT listener took a few extra seconds to accept.
 	statusKeyDiscoveryWindow = 90 * time.Second
 
-	// conformSnapshotTimeout bounds the one status-socket dial START makes to
-	// read the switcher's video format off it (see conformFormat).
+	// conformFetchTimeout bounds the one REST call START makes to read the
+	// switcher's configured video format (see conformFormat).
 	//
-	// It is SHORT, and the reason is the whole design of that read: the answer
+	// It is SHORT, and deliberately shorter than internal/m2lx's own ten-second
+	// httpTimeout, because the whole design of that read says so: the answer
 	// improves the feed and its absence costs nothing that was not already
 	// being paid, so it must never be the reason START takes noticeably longer
-	// or — far worse — the reason START fails. Three seconds is comfortably
-	// more than the measured cost of the dial (a TLS handshake and one frame,
-	// 83 KB from the live instance on 2026-08-15) and short enough that an
-	// instance which has gone away delays the pipeline by less than one rung of
-	// the sender's backoff ladder.
-	conformSnapshotTimeout = 3 * time.Second
+	// or — far worse — the reason START fails. An operator configuring twenty
+	// minutes before kick-off, against an instance that is not up yet, must
+	// still be able to go on air on the override.
+	//
+	// Three seconds is thirty-five times the measured cost. GET
+	// /api/v1/switcher_configuration against the live matchH instance on
+	// 2026-08-15, each call a fresh connection including the TLS handshake:
+	// 72.2/85.0/94.7/153.2 ms (min/median/mean/max, n=6) for a 12108-byte
+	// response. It is also short enough that an instance which has gone away
+	// delays the pipeline by less than one rung of the sender's backoff ladder.
+	conformFetchTimeout = 3 * time.Second
 
 	// kvsFetchTimeout bounds one run of the M2L-X to Cognito credential chain.
 	// It is three REST calls, each of which internal/m2lx already bounds at ten
@@ -738,18 +744,18 @@ type App struct {
 	statusKeyCandidates []m2lx.StatusKeyCandidate
 
 	// conformTo is the video format the NEXT pipeline will be built to: the
-	// switcher's own format when a running node reported one, the operator's
-	// videoFormatOverride when it did not, and nil when neither could answer
-	// (internal/gst then applies its own 1920x1080p50 fallback).
+	// format the switcher says it is configured for, the operator's
+	// videoFormatOverride when the instance did not answer, and nil when
+	// neither could (internal/gst then applies its own 1920x1080p50 fallback).
 	//
 	// It is written by Start, immediately before startSession, and read by
 	// senderOpts inside it. It is an ATOMIC and not a field under sessMu for a
-	// lock-order reason, not a performance one: deriving it needs the status
-	// watcher, which lives under ctlMu, and the lock order below says ctlMu is
-	// never held with sessMu — so the derivation has to happen OUTSIDE
-	// startSession and hand its answer in through something that needs no lock.
+	// lock-order reason, not a performance one: reading it needs the m2lx
+	// client, which lives under ctlMu, and the lock order below says ctlMu is
+	// never held with sessMu — so the read has to happen OUTSIDE startSession
+	// and hand its answer in through something that needs no lock.
 	//
-	// Nil is the correct value on every path that never derived one, which
+	// Nil is the correct value on every path that never read one, which
 	// includes every unit test that calls senderOpts directly: a nil here is a
 	// zero gst.ConformTarget in PipelineOpts, which internal/gst documents as
 	// "nothing is known" and resolves to exactly the format that was hardcoded
@@ -1528,15 +1534,15 @@ func (a *App) SetSecret(key, value string) error {
 // already reached the switcher would show our own node streaming and never
 // report the transition that identifies it.
 //
-// The ORDER of the first two matters, and it is not the order it looks like.
-// The conform read is done FIRST, before the discovery is armed, because both
-// touch the status socket and only one of them is allowed to see our own feed
-// arrive: the discovery's whole method is "which node changed state while we
-// were starting", and the conform read is one more connection opening at that
-// moment, which is invisible to it. Doing it the other way round is also
-// correct; doing it INSIDE the discovery window, on the discovery's own socket,
-// would not be, because RawSnapshot takes the opening frame of its OWN
-// connection and would consume nothing of the discovery's.
+// The ORDER of the first two no longer matters, and the reason it used to is
+// worth keeping. The conform read was once an opening snapshot of the status
+// socket, which is the same socket the discovery watches, so it had to be done
+// FIRST — before the discovery armed its baseline — to keep two readers of one
+// stream from interfering. It is now a REST call to
+// /api/v1/switcher_configuration and touches nothing the discovery uses. It
+// stays first because it must finish before startSession builds the pipeline
+// that consumes its answer, and because its bound (conformFetchTimeout, three
+// seconds) is the only delay it can add to a START.
 func (a *App) Start() error {
 	a.conformTo.Store(a.conformFormat(a.snapshotConfig()))
 
@@ -1998,36 +2004,45 @@ func (a *App) preflightAudioDevice(id string) error {
 //
 // # The three sources, in the order they are consulted
 //
-//  1. THE SWITCHER, read off a running node. M2L-X requires every source to
-//     match the format it is configured for, so any node that is streaming is
-//     reporting that format. This is a MEASUREMENT of the thing we must match.
+//  1. THE SWITCHER'S OWN SETTING, read with one bearer-authenticated GET of
+//     /api/v1/switcher_configuration (internal/m2lx's SwitcherConfiguration).
+//     M2L-X is CONFIGURED into a format and requires every source to match it,
+//     so this is not evidence about the format — it is the format.
 //  2. videoFormatOverride, the operator's declaration.
 //  3. nothing: nil, and internal/gst's FallbackConformTarget() — 1920x1080p50,
 //     the value that was hardcoded before any of this existed.
 //
-// # Why the measurement beats the declaration, and what that costs
+// # Why the setting beats the declaration, and what that costs
 //
-// The switcher is the thing being conformed TO. If a node is streaming, the
-// format it reports is what M2L-X is accepting right now, and a stale override
-// typed weeks ago for a different venue cannot be more true than that. The
-// field is a fallback for the case that is actually common — MEASURED against
-// the live matchH instance on 2026-08-15, every one of its 24 router inputs was
-// stopped with a null format, which is the normal state of a facility twenty
-// minutes before kick-off — and not a way to contradict a switcher we can see.
+// The switcher is the thing being conformed TO, and it now states its own
+// answer. A stale override typed weeks ago for a different venue cannot be more
+// true than the setting the instance is running on, so the override is a
+// fallback for the case that is genuinely common — an instance that is not
+// reachable yet, twenty minutes before kick-off, while an operator sets a
+// position up — and not a way to contradict a switcher we can read.
 //
-// The cost is stated rather than hidden: an operator who believes the
-// derivation is wrong has no way to force a value while a node is streaming.
-// That is why a disagreement between the two is logged at the moment it
-// happens, naming both, rather than the override simply being ignored in
-// silence. If it ever turns out that operators need the escape hatch more than
-// they need the measurement, this is the one function that has to change.
+// The cost is stated rather than hidden: an operator who believes the switcher
+// is wrong has no way to force a value while the instance answers. That is why
+// a disagreement between the two is logged at the moment it happens, naming
+// both, rather than the override simply being ignored in silence. If it ever
+// turns out that operators need the escape hatch more than they need the
+// setting, this is the one function that has to change.
 //
-// # It never fails, and never delays START by more than conformSnapshotTimeout
+// # THE FALLBACK HAPPENS HERE, ONCE, AND SAYS SO
 //
-// Every failure — no control plane, not signed in yet, a socket that will not
-// open, an override that will not parse — falls through to the next source with
-// a log line. Nothing here may be a reason a match does not go out; that is the
-// same rule that keeps statusKey out of config.Validate.
+// This is the only place in the application that turns "the format is unknown"
+// into a format. Every way of not knowing — no control plane, not signed in
+// yet, an instance that will not answer, a configuration this build cannot
+// read, an override that will not parse — falls through to the next rung with a
+// log line naming what failed, and the bottom rung logs that it was reached.
+// "1080p50 because the switcher says so" and "1080p50 because we could not read
+// anything" are the same pipeline and very different facts, and the log is
+// where the difference lives.
+//
+// # It never fails, and never delays START by more than conformFetchTimeout
+//
+// Nothing here may be a reason a match does not go out; that is the same rule
+// that keeps statusKey out of config.Validate.
 func (a *App) conformFormat(cfg *config.Config) *gst.ConformTarget {
 	// The override is parsed FIRST even though it is consulted second, so that
 	// a value which cannot be parsed is reported once, here, whether or not the
@@ -2040,47 +2055,45 @@ func (a *App) conformFormat(cfg *config.Config) *gst.ConformTarget {
 		log.Printf("wslcomms: ignoring videoFormatOverride: %v", err)
 	}
 
-	if derived, ok := a.switcherConformFormat(); ok {
-		// ConformTargetFromRate, not a struct literal: the switcher reports the
+	if conf, ok := a.switcherConfiguredFormat(); ok {
+		// ConformTargetFromRate, not a struct literal: the switcher states the
 		// rate as a DECIMAL (frame_rate arrives as the string "50"), and 29.97
 		// is a rounding of 30000/1001 rather than a rate. internal/gst is where
 		// that conversion is written down, once.
-		t, err := gst.ConformTargetFromRate(derived.Width, derived.Height, derived.FrameRate)
+		t, err := gst.ConformTargetFromRate(conf.Width, conf.Height, conf.FrameRate)
 		if err != nil {
-			// A raster with no usable rate is not a conform target: pinning the
+			// A raster the pipeline cannot be built to — a rate that will not
+			// reduce, or a size past internal/gst's sanity limits. Pinning the
 			// size without the rate would leave imagefreeze free to negotiate
 			// any rate at all, which is the unpinned behaviour this whole
-			// change replaces. Fall through to the override.
-			log.Printf("wslcomms: the switcher's node %q reports a format this application "+
-				"cannot conform to (%s): %v", derived.Node, derived.Raw, err)
+			// change replaces, so this falls through to the override instead.
+			log.Printf("wslcomms: the switcher is configured for a format this application "+
+				"cannot conform to (%s): %v", conf.Raw, err)
 		} else {
-			log.Printf("wslcomms: conforming the video leg to %s, read from the switcher's node %q "+
-				"(%d node(s) agreeing)", t, derived.Node, derived.Agreeing)
-			if derived.Interlaced {
-				// internal/gst's video leg begins at pngdec and can only
-				// produce progressive; the `interlace` element that would
-				// change that is in neither bundler's allowlist. So this is
-				// said out loud rather than silently absorbed: the raster and
-				// the rate will match and the scan will not, and an operator
-				// whose switcher will not take the feed should find that here
-				// rather than deduce it.
-				log.Printf("wslcomms: WARNING: node %q reports an INTERLACED format (%s) and the "+
-					"video leg can only produce progressive; sending %s",
-					derived.Node, derived.Raw, t)
+			// Both sides of the colorimetry claim on ONE line: what the leg
+			// pins, and — inside Raw — the signal_type the switcher stated. So
+			// agreement needs no log line of its own, and disagreement gets the
+			// two below.
+			log.Printf("wslcomms: conforming the video leg to %s, read from the switcher's "+
+				"configuration (%s); colorimetry stays pinned at %s", t, conf.Raw, videoLegColorimetry)
+
+			switch c, known := conf.Colorimetry(); {
+			case !known && conf.SignalType != "":
+				log.Printf("wslcomms: WARNING: the switcher states signal_type %q, which this "+
+					"application does not recognise; the video leg is pinned to colorimetry=%s. "+
+					"If the feed is accepted but looks wrong in colour, this line is why",
+					conf.SignalType, videoLegColorimetry)
+			case known && c != videoLegColorimetry:
+				log.Printf("wslcomms: WARNING: the switcher is configured for %s colorimetry "+
+					"(signal_type %q) and the video leg is pinned to %s; the feed will be "+
+					"colorimetrically wrong even though the raster and rate match",
+					c, conf.SignalType, videoLegColorimetry)
 			}
-			if len(derived.Disagreeing) > 0 {
-				// One of the switcher's own sources is not conforming to it.
-				// That is somebody else's fault and it is worth saying so by
-				// name, because the symptom an operator sees is OUR feed
-				// looking wrong on a switcher that has two formats on it.
-				log.Printf("wslcomms: WARNING: node(s) %s are streaming a DIFFERENT format from %q — "+
-					"one of the switcher's sources is not conforming to it",
-					strings.Join(derived.Disagreeing, ", "), derived.Node)
-			}
+
 			if haveOverride && !sameConformTarget(t, spec) {
 				log.Printf("wslcomms: WARNING: videoFormatOverride says %s but the switcher is "+
-					"running %s; using the switcher. Clear the override, or correct it, if this "+
-					"position is meant to send %s", spec.Canonical(), t, spec.Canonical())
+					"configured for %s; using the switcher. Clear the override, or correct it, if "+
+					"this position is meant to send %s", spec.Canonical(), t, spec.Canonical())
 			}
 			return &t
 		}
@@ -2098,57 +2111,86 @@ func (a *App) conformFormat(cfg *config.Config) *gst.ConformTarget {
 			FrameRateDen: spec.FrameRateDen,
 		}
 		log.Printf("wslcomms: conforming the video leg to %s, from videoFormatOverride — "+
-			"nothing is streaming on the switcher to read it from", t)
+			"the switcher did not tell us what it is configured for", t)
 		return &t
 	}
 
-	// Neither. internal/gst applies FallbackConformTarget, and the log says
-	// which way that was arrived at: "1080p50 because we could not read
-	// anything" and "1080p50 because the switcher says so" are the same
+	// Neither. This is the one place "unknown" becomes a format: nil, which
+	// senderOpts passes to internal/gst as the zero ConformTo and internal/gst
+	// resolves to FallbackConformTarget. It is logged because the alternative
+	// is a pipeline nobody can account for — "1080p50 because the switcher says
+	// so" and "1080p50 because we could not read anything" are the same
 	// pipeline and very different facts.
-	log.Printf("wslcomms: no node is streaming on the switcher and no videoFormatOverride is set; "+
-		"the video leg falls back to %s. Set videoFormatOverride (%s) if this instance is "+
-		"configured for anything else.", gst.FallbackConformTarget(), config.VideoFormatExample)
+	log.Printf("wslcomms: the switcher did not tell us what it is configured for and no "+
+		"videoFormatOverride is set; the video leg falls back to %s. Set videoFormatOverride "+
+		"(%s) if this instance is configured for anything else.",
+		gst.FallbackConformTarget(), config.VideoFormatExample)
 	return nil
 }
 
-// switcherConformFormat opens ONE status connection, takes the frame that
-// carries the whole document, and reads the conform format off whatever is
-// running on it.
+// videoLegColorimetry is the colorimetry internal/gst pins in the video leg's
+// spatial capsfilter (ConformTarget.spatialCaps: colorimetry=bt709).
 //
-// The dial is the cost and it is deliberate. A complete document exists exactly
-// once per connection (internal/m2lx's RawSnapshot says so at length), so there
-// is no cached frame that could answer this, and the alternative — reading the
-// format off the Watch stream this application already has — is not available:
-// Watch is subscribed to ONE node, our own, which is by definition the node
-// that is not streaming at the moment START is pressed.
+// It is TRANSCRIBED here rather than imported because internal/gst exports no
+// constant for it, and widening that package's API is not this change's to do.
+// The duplication is deliberate and cheap: the value is compared against what
+// the switcher states, so if internal/gst ever pins something else, the two
+// disagree and this file's log line is the thing that is wrong — a comment
+// mismatch, not a broken pipeline. m2lx.SwitcherConfiguration.Colorimetry
+// carries the reasoning for why the pipeline is not simply built to whatever
+// the switcher states.
+const videoLegColorimetry = "bt709"
+
+// switcherConfiguredFormat asks the instance what video format it is
+// configured for: one bearer-authenticated GET, bounded by conformFetchTimeout.
 //
-// Every failure is a log line and ok false. In particular ErrNotSignedIn is
-// ordinary rather than exceptional: startControlPlane's sign-in runs on its own
-// goroutine, and a START pressed within a second or two of launch legitimately
-// arrives before it has finished.
-func (a *App) switcherConformFormat() (m2lx.ConformFormat, bool) {
+// It reads a SETTING, which is why this is a REST call and not a status-socket
+// dial. The version of this that scanned switcher_status for a streaming node
+// is gone, and internal/m2lx/configuration.go's tombstone has the measurement
+// that killed it — a live 720p50 feed reported by the switcher as
+// frame_rate="0" — for the next person who thinks the detected format of a
+// running node is a cheaper source than this call. It is not cheaper and it is
+// not right: 72 ms of REST beats a value that is sometimes zero.
+//
+// Every failure is a log line and ok false, never an error and never a panic.
+// In particular ErrNotSignedIn is ordinary rather than exceptional:
+// startControlPlane's sign-in runs on its own goroutine, and a START pressed
+// within a second or two of launch legitimately arrives before it has finished.
+// So does an instance that is not up yet — the operator can be configuring a
+// position long before the facility switches on, and that must still start.
+func (a *App) switcherConfiguredFormat() (m2lx.SwitcherConfiguration, bool) {
 	a.ctlMu.Lock()
-	watcher := a.watcher
+	client := a.client
 	a.ctlMu.Unlock()
 
-	if watcher == nil {
+	if client == nil {
 		// No M2L-X host configured, or the control plane has not been built
 		// yet. Not worth a log line of its own — the caller's fallback line
 		// says what happened and this would only add "and here is one of the
 		// several reasons".
-		return m2lx.ConformFormat{}, false
+		return m2lx.SwitcherConfiguration{}, false
 	}
 
-	ctx, cancel := context.WithTimeout(a.rootCtx, conformSnapshotTimeout)
+	ctx, cancel := context.WithTimeout(a.rootCtx, conformFetchTimeout)
 	defer cancel()
 
-	raw, err := watcher.RawSnapshot(ctx)
+	conf, err := client.SwitcherConfiguration(ctx)
 	if err != nil {
-		log.Printf("wslcomms: could not read the switcher's video format: %v", err)
-		return m2lx.ConformFormat{}, false
+		log.Printf("wslcomms: could not read the switcher's configured video format: %v", err)
+		return m2lx.SwitcherConfiguration{}, false
 	}
-	return m2lx.ConformFormatFrom(raw)
+	if !conf.Valid() {
+		// The instance answered and this build could not read its answer: a
+		// format block that is absent, or whose width/height/frame_rate did not
+		// parse into a raster. Distinct from the error above and worth its own
+		// line, because the fix is a firmware or a parser rather than a network
+		// — and Raw quotes exactly what arrived, so the next person does not
+		// have to reproduce it to see it.
+		log.Printf("wslcomms: the switcher's configuration carries no video format this "+
+			"application can read (%q); falling back", conf.Raw)
+		return m2lx.SwitcherConfiguration{}, false
+	}
+	return conf, true
 }
 
 // sameConformTarget compares what the switcher reports against what the
@@ -2203,12 +2245,13 @@ type ConformTargetView struct {
 	// Source is one of the conformSource* constants above.
 	Source string `json:"source"`
 
-	// Node, Agreeing and Disagreeing describe a target DERIVED from the
-	// switcher: which node it was read off, how many agreed, and which running
-	// nodes are streaming something else. They are absent on an override.
-	Node        string   `json:"node,omitempty"`
-	Agreeing    int      `json:"agreeing,omitempty"`
-	Disagreeing []string `json:"disagreeing,omitempty"`
+	// There used to be three more fields here — node, agreeing, disagreeing —
+	// describing which streaming node the format had been derived from and how
+	// many others agreed with it. They went with the derivation itself
+	// (internal/m2lx/configuration.go's tombstone), and they are not replaced:
+	// a SETTING has no node to name and cannot disagree with itself. The
+	// frontend's typedef in backend.js still lists them as optional, which
+	// costs nothing and is honest — nothing sends them now.
 
 	// Raw is the format as it was written down — the operator's
 	// videoFormatOverride string, canonicalised. It is what a readout should
@@ -2240,16 +2283,18 @@ type ConformTargetView struct {
 //
 // # WITH NO SESSION IT DOES NOT DIAL, and reports only the override
 //
-// conformFormat's first source is the switcher, read with a 3 s RawSnapshot.
-// This does not do that, for two reasons that point the same way. It is called
-// on the page's startup path, and a UI call that can block for three seconds to
-// refine a lamp is a bad trade; and with no session there is no feed for the
-// lamp to judge, because our own node cannot be streaming when we are not
-// sending — so the answer is advisory until Start, at which point Start derives
+// conformFormat's first source is the switcher's own setting, read with one
+// REST call bounded at conformFetchTimeout. This does not make that call, for
+// two reasons that point the same way. It is called on the page's startup path,
+// and a UI call that can block for three seconds on an unreachable instance to
+// refine a lamp is a bad trade — the bound is what it can cost, not the 72 ms it
+// usually costs; and with no session there is no feed for the lamp to judge,
+// because our own node cannot be streaming when we are not sending — so the
+// answer is advisory until Start, at which point Start reads the switcher
 // properly and the frontend re-reads.
 //
 // The consequence is stated rather than hidden: before Start this reports the
-// operator's declaration and not the switcher's measurement, and it says so in
+// operator's declaration and not the switcher's setting, and it says so in
 // Source. It can therefore differ from what Start will go on to choose. What it
 // can NEVER do is contradict a pipeline that exists, which is the property that
 // matters.
