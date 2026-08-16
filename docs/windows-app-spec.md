@@ -106,9 +106,9 @@ GPL `x264enc` and LGPL-plus-patent-encumbered `gst-libav` into a commercial deli
 `coreelements`, `typefindfunctions`, `videoconvertscale`, `audioconvert`, `audioresample`,
 **`volume`**, `imagefreeze`, `png`, `audioparsers`, `videoparsersbad`, `wasapi2`, `mediafoundation`,
 `mpegtsmux`, **`mpegtsdemux`**, `srt`, **`d3d11`**, **`level`**, **`decklink`**, **`videorate`**,
-**`deinterlace`** — twenty.
+**`deinterlace`**, **`proxy`** — twenty-one.
 
-Seven of those twenty were added after this section was first written, and they are marked here
+Eight of those twenty-one were added after this section was first written, and they are marked here
 rather than folded in silently, because `build\bundle-gst.ps1` **throws** when its file list and this
 paragraph disagree: adding a plugin is a specification change, so the two move together or the build
 stops. `mpegtsdemux` is the return monitor's demuxer, `d3d11` the picture's HEVC decoder and video
@@ -122,12 +122,25 @@ not one new library — see `build\README-darwin.md` §9.
 unconditional and on every seat, so a bundle without it is not a seat lacking a cough button — it is
 `gst_parse_launch` failing at Start on every machine.
 
+`proxy` is the eighth, added on 2026-08-16 for the **capture/send seam**: `proxysink` ends each
+always-live capture pipeline and `proxysrc` begins the per-session send pipeline, which is what lets
+preview, the input meters and the channel routing panel work before the operator goes to air. One
+plugin file supplies both factories, and both are in `internal/gst`'s `requiredElements`, so a bundle
+without it does not start the application at all. On macOS the cost was measured — one plugin file,
+75,344 bytes, no new library, the closure's printed size unchanged at 22.5 MB — and on Windows it is
+reasoned from that: `proxysink`/`proxysrc` are pure GstElement plumbing with no codec and no OS media
+framework behind them. **That `libgstproxy.dll` exists in the official MinGW build is UNVERIFIED from
+the macOS host this was written on**; `gst-inspect-1.0 proxysink` on the Windows build host is what
+settles it, and a missing non-optional plugin is a hard failure in `bundle-gst.ps1`, not a quiet one.
+
 One correction to the paragraph above, because it overstates its own guard: `bundle-gst.ps1` does
 **not** read this file. Its `Assert-ManifestSane` compares two PowerShell arrays *inside the script*,
 so a plugin added to the bundler and not to this list will build clean and leave the specification
-quietly stale. The forcing function that does fire is `TestTheVolumePluginIsStagedByBothBundlers`
-(Gate A, `internal/gst/coughmute_test.go`), which fails by name if either bundler stops staging the
-plugin. Keeping this paragraph correct is still a manual step.
+quietly stale. The forcing functions that do fire are `TestTheVolumePluginIsStagedByBothBundlers`
+(Gate A, `internal/gst/coughmute_test.go`) and `TestTheProxyPluginIsStagedByBothBundlers` (Gate A,
+`internal/gst/seambundle_test.go`), which fail by name if either bundler stops staging their plugin.
+There is one such test per unconditional plugin, not one for the list; keeping this paragraph
+correct is still a manual step.
 
 ---
 

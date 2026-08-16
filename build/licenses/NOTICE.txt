@@ -50,20 +50,27 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
     Version 1.28.5, mingw-x86_64 build, from the GStreamer project's official
     Windows installers. Includes the core library and the following libraries
     and plugins only: coreelements, typefindfunctions, videoconvertscale,
-    audioconvert, audioresample, imagefreeze, png, audioparsers,
+    audioconvert, audioresample, volume, imagefreeze, png, audioparsers,
     videoparsersbad, wasapi2, mediafoundation, mpegtsmux, mpegtsdemux, srt,
-    d3d11, level, decklink, videorate, deinterlace.
+    d3d11, level, decklink, videorate, deinterlace, proxy.
     (mpegtsdemux was added for the SRT return monitor, d3d11 for the SRT
-    picture, level for the input meters, and decklink, videorate and
-    deinterlace for the SDI capture path - each is recorded in
-    build\bundle-gst.ps1 beside the closed allowlist it extends.)
-    All nineteen are LGPL-2.1-or-later, the three most recent verified with
-    gst-inspect rather than assumed: decklink is gst-plugins-bad, videorate is
-    gst-plugins-base and deinterlace is gst-plugins-good, and all three report
-    License LGPL. deinterlace's own description reads "Deinterlace Methods
-    ported from DScaler/TvTime", which is recorded here because it is the kind
-    of line that starts a licensing question later: the plugin as the GStreamer
-    project ships it is LGPL and that is what is redistributed.
+    picture, level for the input meters, decklink, videorate and deinterlace
+    for the SDI capture path, volume for the cough mute, and proxy for the
+    capture/send seam - each is recorded in build\bundle-gst.ps1 beside the
+    closed allowlist it extends.)
+    All twenty-one are LGPL-2.1-or-later, the five most recent verified with
+    gst-inspect rather than assumed: decklink and proxy are gst-plugins-bad,
+    videorate and volume are gst-plugins-base and deinterlace is
+    gst-plugins-good, and all five report License LGPL. deinterlace's own
+    description reads "Deinterlace Methods ported from DScaler/TvTime", which
+    is recorded here because it is the kind of line that starts a licensing
+    question later: the plugin as the GStreamer project ships it is LGPL and
+    that is what is redistributed.
+    (volume was shipping before this list named it - the enumeration above said
+    nineteen while the bundler staged twenty. Corrected on 2026-08-16, in the
+    same edit that added proxy. Nothing in the build enforces this file, which
+    is why it drifted and why the correction is recorded rather than made
+    silently.)
     The decklink plugin needs a driver this product does not ship. See section
     F3 - it is a user-installed prerequisite, not a component of this work.
     The complete file list, with SHA-256 for every file, is in
@@ -72,12 +79,12 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
   GStreamer (macOS)               LGPL-2.1-or-later
     Version 1.26.10, arm64, from Homebrew's gstreamer formulae. A DIFFERENT
     build from the Windows one above, and a different plugin set, because the
-    platform-specific halves have no overlap. Twenty plugins:
+    platform-specific halves have no overlap. Twenty-two plugins:
 
       coreelements typefindfunctions videoconvertscale audioconvert
-      audioresample imagefreeze png audioparsers videoparsersbad
-      mpegtsmux mpegtsdemux srt level
-      decklink videorate deinterlace           - the same fifteen as Windows
+      audioresample volume imagefreeze png audioparsers videoparsersbad
+      mpegtsmux mpegtsdemux srt level proxy
+      decklink videorate deinterlace           - the same eighteen as Windows
       osxaudio applemedia opengl osxvideo      - in place of wasapi2,
                                                  mediafoundation and d3d11
 
@@ -86,6 +93,8 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
     wrappers over macOS itself - see section F2. decklink supplies
     decklinkvideosrc and decklinkaudiosrc and is the one plugin in this bundle
     that wraps something the operator must install separately - section F3.
+    proxy supplies proxysink and proxysrc, the seam between the always-live
+    capture pipelines and the per-session send pipeline.
 
     Unlike the Windows bundle, which is copied from an explicit allowlist, the
     macOS bundle is a COMPUTED transitive dependency closure: build/bundle-gst-
@@ -172,7 +181,7 @@ the ARTEFACT instead. Every file named below was read out of
 
   WSL Commentary.app/Contents/Resources/GST-BUNDLE-MANIFEST.txt
 
-of a built bundle - 51 Mach-O files - which carries a SHA-256 for every file
+of a built bundle - 53 Mach-O files - which carries a SHA-256 for every file
 that shipped. Each licence was then read from the COPYING or LICENSE file in
 the corresponding Homebrew keg on the build host, and NOT from `brew info`:
 section G already gives this file cause to distrust that metadata, which is
@@ -190,11 +199,23 @@ exactly those three lines. Not one library was added, because `otool -L` on all
 three names only libgstreamer, libgstbase, libgstvideo, libgstaudio, liborc,
 libglib and libgobject, every one of which the closure already contained.
 
-So nothing below changes. All three are LGPL GStreamer plugins and belong to
+It went 51 -> 52 for volume (libgstvolume.dylib, 78,448 bytes, the cough mute)
+and 52 -> 53 for proxy (libgstproxy.dylib, 75,344 bytes, the capture/send seam),
+both later on 2026-08-16 and both by the same one-file-and-nothing-else rule.
+The 52 was never written down here, which is the drift being corrected: this
+file is the redistribution record for an LGPL bundle and nothing in the build
+enforces it, so the only thing keeping it true is somebody editing it in the
+same commit. The proxy step was diffed manifest-against-manifest and the diff is
+exactly one added line; the closure's printed size did not move at all, 22.5 MB
+either side, because 75,344 bytes is 0.07 MB.
+
+So nothing below changes. All five are LGPL GStreamer plugins and belong to
 section A, which is where they are listed; this section enumerates what the
-otool walk pulled in that is NEITHER GStreamer NOR GLib, and the capture path
-pulled in nothing of that kind. The Blackmagic API the decklink plugin uses is
-not in the closure either, and cannot be: see section F3.
+otool walk pulled in that is NEITHER GStreamer NOR GLib, and neither the capture
+path nor the seam pulled in anything of that kind - proxysink and proxysrc are
+GstElement plumbing with no codec and no third library behind them. The
+Blackmagic API the decklink plugin uses is not in the closure either, and cannot
+be: see section F3.
 
 FIRST, WHAT SECTIONS B AND C LIST THAT THE macOS BUNDLE DOES NOT CONTAIN. It is
 recorded rather than left to inference, because an absence that is only inferred

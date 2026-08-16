@@ -72,7 +72,7 @@ WSL Commentary.app/Contents/
     slate.png                           symlink -> ../Resources/slate.png
   Frameworks/                    28 dylibs, the core GStreamer/GLib runtime
   Resources/
-    gstreamer-1.0/               20 plugins
+    gstreamer-1.0/               22 plugins
     gio-modules/                        deliberately empty — see section 6
     slate.png                           1920x1080 slate for filesrc ! pngdec ! imagefreeze
     licenses/                           LGPL text, written offer, third-party notice
@@ -262,7 +262,7 @@ machine; it fails as a missing dylib at *launch* on the customer's.
 
 So the macOS bundler **computes** the list:
 
-1. **29 element names**, taken from this repo's own Go code —
+1. **36 element names**, taken from this repo's own Go code —
    `requiredElements` in `internal/gst/gst_cgo.go`, plus
    `returnRequiredElements` and `pictureRequiredElements` — with the darwin
    substitutions spelled out in the script where the Windows name has no twin.
@@ -286,14 +286,14 @@ So the macOS bundler **computes** the list:
 
 ### 5.1 The measured closure
 
-| | Measured 2026-08-14 | Measured 2026-08-16 |
-|---|---|---|
-| Wanted elements | 29 | **33** |
-| Unique plugin dylibs | 17 | **20** |
-| Transitive closure | 48 Mach-O files, 21.9 MB | **51 Mach-O files, 22.4 MB** |
-| The whole Homebrew keg, for comparison | ~190 MB, 268 plugins | ~190 MB, 268 plugins |
-| `/opt/homebrew` load commands in the finished bundle | 0 of 49 Mach-O files | **0 of 52 Mach-O files** |
-| Licence patterns applied | 19, zero matches | 19, zero matches |
+| | 2026-08-14 | + capture path | + cough mute and seam |
+|---|---|---|---|
+| Wanted elements | 29 | 33 | **36** |
+| Unique plugin dylibs | 17 | 20 | **22** |
+| Transitive closure | 48 Mach-O files, 21.9 MB | 51 Mach-O files, 22.4 MB | **53 Mach-O files, 22.5 MB** |
+| The whole Homebrew keg, for comparison | ~190 MB, 268 plugins | ~190 MB, 268 plugins | ~190 MB, 268 plugins |
+| `/opt/homebrew` load commands in the finished bundle | 0 of 49 Mach-O files | 0 of 52 Mach-O files | **0 of 54 Mach-O files** |
+| Licence patterns applied | 19, zero matches | 19, zero matches | 19, zero matches |
 
 The second column is the SDI capture path — `decklinkvideosrc`,
 `decklinkaudiosrc`, `videorate` and `deinterlace`. **The three new files are the
@@ -304,7 +304,21 @@ one new library, because `otool -L` on all three names only `libgstreamer`,
 — every one already in the closure. That is a diff of the two manifests, not an
 estimate.
 
-Nothing Blackmagic appears in either column, and section 0 says why: the
+The third column is `volume` (the cough mute, `libgstvolume.dylib`, 78,448
+bytes) and `proxysink`/`proxysrc` (the capture/send seam, `libgstproxy.dylib`,
+75,344 bytes, one file for both factories). Same rule again, and again from a
+manifest diff rather than an estimate: **one new file each and no new library**
+— `libgstproxy.dylib` names only `libgstreamer-1.0.0`, `libglib-2.0.0`,
+`libgobject-2.0.0` and `/usr/lib/libSystem.B.dylib`. The closure's printed size
+does not move between the second and third columns because 75,344 bytes is
+0.07 MB; the file count is the honest measure of that change, not the megabytes.
+
+`volume` landed without this table being updated, which is why the second column
+reads 33/20/51 rather than the 34/21/52 the bundle actually carried by the end
+of that day. Recorded rather than silently folded in: these numbers are only
+ever as good as the edit that accompanies the change.
+
+Nothing Blackmagic appears in any column, and section 0 says why: the
 DeckLink API is opened as a `CFBundle` from an absolute path, which no load
 command names and no `otool` walk can see.
 
@@ -598,7 +612,7 @@ whatever `GST_PLUGIN_PATH` said — under `env -i`, and requires the resolved
 `Filename` to be inside `Contents/Resources/gstreamer-1.0`. Anything else is a
 LEAK and fails the build.
 
-**All 29 elements resolve from inside the bundle.** That is why the two
+**All 36 elements resolve from inside the bundle.** That is why the two
 diagnostic tools ship: 0.2 MB, and without them the proof is impossible and a
 plugin problem on a machine with no GStreamer is undiagnosable.
 
@@ -635,8 +649,9 @@ predates the capture path.
 | | Measured | Note |
 |---|---|---|
 | `wslcomms` binary | 29 MB | Go + Wails + embedded frontend, cgo |
-| GStreamer closure | **22.4 MB** | 51 Mach-O files: 28 core dylibs, 20 plugins, 3 tools |
+| GStreamer closure | **22.5 MB** | 53 Mach-O files: 28 core dylibs, 22 plugins, 3 tools |
 | — of which the SDI capture path | 0.5 MB | `decklink` 246 KB, `deinterlace` 205 KB, `videorate` 115 KB, and no new library |
+| — of which the cough mute and the seam | 0.15 MB | `volume` 78 KB, `proxy` 75 KB — one file for both `proxysink` and `proxysrc`, and no new library |
 | Whole Homebrew keg, for comparison | ~190 MB | 268 plugins |
 | `WSL Commentary.app` | **42 MB** | 41 MB before the capture path |
 | `wslcomms-<v>-macos-arm64.dmg` | 18 MB | UDZO, 0.1.0 — re-measure at the next release |
@@ -689,7 +704,7 @@ dependency.
 4. `build/ship-darwin.sh <version>` — the version argument is a deliberate
    double-check against step 2, not a second source of truth.
 5. Read the output. Specifically: the licence gate line, `0 of N Mach-O files
-   reference /opt/homebrew`, `all 29 elements resolved`, both `status:
+   reference /opt/homebrew`, `all 36 elements resolved`, both `status:
    Accepted`, and both `spctl` verdicts.
 6. Note the `sha256` the script prints. That is the artefact's identity.
 7. Test on a Mac that has never had Homebrew. **This is the one step this

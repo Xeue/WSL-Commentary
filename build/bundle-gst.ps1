@@ -28,7 +28,7 @@
     *** GATE B MUST VERIFY IT AGAINST A REAL GSTREAMER INSTALL. ***
 
     It was written on a machine with no GStreamer installed (Gate B closed), so
-    the exact DLL names and the transitive dependency closure of the thirteen
+    the exact DLL names and the transitive dependency closure of the twenty-one
     allowlisted plugins could not be computed. Two mechanisms make that
     recoverable rather than fatal:
 
@@ -233,7 +233,7 @@ function New-BundleEntry {
 function Get-PluginEntries {
     <#
     .SYNOPSIS
-        The plugins of specification section 3, plus the six additions
+        The plugins of specification section 3, plus the eight additions
         enumerated below, and nothing else.
     .DESCRIPTION
         This list is closed. Adding to it is a specification change, not a build
@@ -241,7 +241,7 @@ function Get-PluginEntries {
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
 
-        There have been exactly six additions since section 3 was written,
+        There have been exactly eight additions since section 3 was written,
         and all are stated here rather than slipped into the list, because that
         is the rule this function exists to enforce on everyone else:
 
@@ -255,6 +255,11 @@ function Get-PluginEntries {
                         from BOTH platforms' bundlers until that date, so the
                         shipped app could not use a Blackmagic card at all
                         however good the Go code was.
+          volume        the COUGH MUTE, 2026-08-16. It was added to the list
+                        below and to spec section 3 without this paragraph being
+                        updated, which is the drift this paragraph exists to
+                        prevent; it is recorded now.
+          proxy         the CAPTURE/SEND SEAM, 2026-08-16. See its Why line.
 
         One plugin was CONSIDERED and deliberately NOT added:
 
@@ -332,13 +337,16 @@ function Get-PluginEntries {
             -Why 'videorate, and it is MANDATORY rather than a nicety. MEASURED 3/3 runs: decklinkvideosrc emits the 720x486 NTSC PLACEHOLDER as its first buffer on EVERY start and the real caps arrive ~170 ms later, so a fixed capsfilter downstream of it and nothing else sees a frame it cannot accept before it ever sees a real one - the pipeline dies in 0.088 s with not-negotiated (-4). videorate is what absorbs that first buffer and the rate change behind it. Leaving it out does not degrade the capture, it prevents it, with an error about caps that names no plugin. gst-plugins-base, LGPL.'
         New-BundleEntry -Kind Plugin -Names 'libgstdeinterlace.dll' `
             -Why 'deinterlace: the only element in this bundle that can handle a 1080i50 camera, which is a likely feed in a UK sports facility and is handled NOWHERE today - everything downstream of the capture in section 5''s pipeline is progressive. gst-plugins-good, LGPL. Its own description says "Deinterlace Methods ported from DScaler/TvTime"; the plugin as GStreamer ships it is LGPL and that is what the licence gate and NOTICE.txt section A record.'
+        New-BundleEntry -Kind Plugin -Names 'libgstproxy.dll' `
+            -Why 'proxysink and proxysrc: THE SEAM. The pipeline is split into always-live CAPTURE pipelines and a per-session SEND pipeline joined by these two elements, which is what makes preview, the input meters and the channel routing panel work BEFORE the operator goes to air. Every seat has the seam - there is no configuration, card or microphone, that builds a pipeline without a proxysink on one side and a proxysrc on the other - so both are in internal/gst''s requiredElements and a bundle without this file cannot start the app at all. ONE FILE supplies both. gst-plugins-bad, LGPL - read out of gst-inspect-1.0 proxysink, not assumed, though on the macOS twin (1.26.10): the Windows build''s own gst-inspect is the authority for this bundle and Gate B is where it is consulted. NO NEW RUNTIME DLL: the macOS twin, libgstproxy.dylib, names only libgstreamer-1.0.0, libglib-2.0.0, libgobject-2.0.0 and libSystem in its otool -L, and the first three are already Runtime entries here.' `
+            -Fix 'gst-plugins-bad builds gst/proxy unconditionally, so a missing FILE means -GstRoot points at a partial install. UNVERIFIED FROM THE macOS HOST THIS ENTRY WAS WRITTEN ON: run gst-inspect-1.0 proxysink on the Windows build host and confirm the Filename is libgstproxy.dll before trusting this line. If the element is there under a different file name, ADD that name to the candidate list above - do not relax the check.'
     )
 }
 
 function Get-RuntimeEntries {
     <#
     .SYNOPSIS
-        The libraries the .exe and the thirteen plugins link against.
+        The libraries the .exe and the twenty-one plugins link against.
     .DESCRIPTION
         UNVERIFIED - Gate B must confirm every line of this function against a
         real C:\gstreamer\1.0\mingw_x86_64\bin, and against the output of
@@ -356,9 +364,18 @@ function Get-RuntimeEntries {
         source against the same libraries plus the MinGW C++ runtime that
         libgstmediafoundation, libgstwasapi2 and libgstsrt already require.
 
+        THE SEAM ADDITION ADDED NOTHING HERE EITHER, on the same footing and
+        with the same caveat. libgstproxy.dylib's whole otool -L set on macOS is
+        libgstreamer-1.0.0, libglib-2.0.0, libgobject-2.0.0 and libSystem; the
+        first three are already Runtime entries below and the fourth is the C
+        library. proxysink and proxysrc are pure GstElement plumbing with no
+        codec, no OS media framework and no third library behind them, so there
+        is nothing platform-specific for the Windows build to link that the
+        macOS one did not.
+
         That is REASONING, not a Windows measurement, and this file does not
         pretend otherwise: -DependencyReport at Gate B is the authority. If it
-        reports an unresolved import from any of the three, add it here with a
+        reports an unresolved import from any of the four, add it here with a
         one-line reason exactly as gstcodecs and gstdxva were added for d3d11.
         Note in particular that libgstdecklink.dll does NOT import the
         Blackmagic API - on macOS it opens the framework as a CFBundle at run
@@ -418,7 +435,7 @@ function Get-RuntimeEntries {
         New-BundleEntry -Kind Runtime -Names 'gio-2.0-0.dll', 'libgio-2.0-0.dll' `
             -Why 'GIO. GStreamer core and the srt plugin use it.'
         New-BundleEntry -Kind Runtime -Names 'gmodule-2.0-0.dll', 'libgmodule-2.0-0.dll' `
-            -Why 'g_module_open is how GStreamer loads the thirteen plugins. Without it the registry is empty and nothing works.'
+            -Why 'g_module_open is how GStreamer loads the twenty-one plugins. Without it the registry is empty and nothing works.'
         New-BundleEntry -Kind Runtime -Names 'gthread-2.0-0.dll', 'libgthread-2.0-0.dll' -Optional `
             -Why 'Empty stub since GLib 2.32 but still shipped by some builds. Copied if present.'
         New-BundleEntry -Kind Runtime -Names 'libffi-8.dll', 'libffi-7.dll', 'ffi-8.dll', 'ffi-7.dll' `
@@ -515,24 +532,25 @@ function Assert-ManifestSane {
     }
 
     # The plugin allowlist is closed and must equal specification section 3, plus
-    # the six deliberate additions since: mpegtsdemux, the return monitor's
+    # the eight deliberate additions since: mpegtsdemux, the return monitor's
     # demuxer; d3d11, the picture's HEVC decoder and video sink; level, the
-    # input meters' analyser; and decklink, videorate and deinterlace, the SDI
-    # capture path. Adding a plugin remains a specification change and this list
-    # is where it has to be made, not somewhere it can be drifted into - which is
-    # why this check exists at all and why it caught d3d11 on the first run of
-    # that change.
+    # input meters' analyser; decklink, videorate and deinterlace, the SDI
+    # capture path; volume, the cough mute; and proxy, the capture/send seam.
+    # Adding a plugin remains a specification change and this list is where it
+    # has to be made, not somewhere it can be drifted into - which is why this
+    # check exists at all and why it caught d3d11 on the first run of that
+    # change.
     #
     # THIS LIST AND SECTION 3 OF docs\windows-app-spec.md MOVE TOGETHER. The
     # throw below is the mechanism that makes that true: an edit here alone
     # fails the build, and an edit there alone leaves this list disagreeing with
     # the document it names. Both were changed for the capture path on
-    # 2026-08-16.
+    # 2026-08-16, and again for the seam.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'volume', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
         'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11',
-        'level', 'decklink', 'videorate', 'deinterlace'
+        'level', 'decklink', 'videorate', 'deinterlace', 'proxy'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {

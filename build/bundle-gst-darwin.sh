@@ -213,8 +213,9 @@ echo "==> licence gate: $FORBIDDEN_N patterns parsed from forbidden-names.ps1"
 # list whose absence makes Init fail and the app refuse to start:
 #
 #   filesrc queue capsfilter pngdec imagefreeze videoconvert videoscale
-#   audioconvert audioresample h264parse aacparse level mpegtsmux srtsink
-#     — identical factory names on both platforms, all 14 of them.
+#   audioconvert audioresample volume h264parse aacparse level mpegtsmux
+#   srtsink proxysink proxysrc
+#     — identical factory names on both platforms, all 17 of them.
 #   wasapi2src  -> osxaudiosrc   the CoreAudio capture source. Its "device"
 #                                property is an INTEGER AudioDeviceID, not a
 #                                string; that is internal/gst's problem, not
@@ -354,6 +355,29 @@ echo "==> licence gate: $FORBIDDEN_N patterns parsed from forbidden-names.ps1"
 # whether the elements are absent from the registry or merely find nothing is a
 # distinction the operator cannot make and does not care about.
 #
+# THE SEAM — proxysink and proxysrc, added 2026-08-16
+# ---------------------------------------------------
+# The pipeline is being split into always-live CAPTURE pipelines and a
+# per-session SEND pipeline, joined by proxysink/proxysrc, so that preview, the
+# input meters and the channel routing panel work BEFORE the operator goes to
+# air. Every seat has the seam — there is no configuration that builds a
+# pipeline without a proxysink on one side and a proxysrc on the other — which
+# is why both are in gst_cgo.go's requiredElements rather than in one of the
+# conditional lists, and why they are wanted here rather than treated as an
+# optional extra.
+#
+# ONE FILE, libgstproxy.dylib, 75,344 bytes, gst-plugins-bad, License LGPL
+# (read out of gst-inspect-1.0 proxysink against 1.26.10, not assumed). Its
+# whole otool -L set — libgstreamer-1.0.0, libglib-2.0.0, libgobject-2.0.0 and
+# /usr/lib/libSystem.B.dylib — is already in this closure, so the cost is
+# exactly one file. MEASURED, by diffing the manifest either side of this
+# change: 34 -> 36 wanted, 21 -> 22 plugin dylibs, 52 -> 53 closure Mach-O,
+# and the closure's printed size does not move at all — 22.5 MB before and
+# after, because 75,344 bytes is 0.07 MB. The manifest delta is exactly one
+# added line. MINOS-FLOOR is unchanged at 26.0; the plugin's own
+# LC_BUILD_VERSION minos is 26.0. The queue factory proxysrc instantiates
+# internally is coreelements, which is already wanted above.
+#
 # typefindfunctions is wanted because it is not optional: GStreamer's own
 # typefinding is a plugin, and a registry without it produces caps negotiation
 # failures that read like anything but a missing plugin.
@@ -366,6 +390,7 @@ h264parse h265parse aacparse
 level
 mpegtsmux tsdemux
 srtsink srtsrc
+proxysink proxysrc
 osxaudiosrc osxaudiosink
 decklinkvideosrc decklinkaudiosrc
 atenc atdec
@@ -816,6 +841,18 @@ fi
 # with a SHA-256 for every file so that a bundle in the field can be compared
 # against the one that was built. Written last so that a failed audit or a
 # failed proof leaves no manifest behind claiming success.
+#
+# ONE LINE OF IT MOVES ON EVERY RUN AND IT IS NOT A PAYLOAD CHANGE. NOTICE.txt
+# section C2 asks whoever adds a plugin to diff two manifests, so the trap is
+# worth naming here: Contents/MacOS/<exe>'s hash differs between two runs with
+# IDENTICAL inputs. MEASURED, twice in a row on 2026-08-16 — 53 of the 54 file
+# lines byte-identical, the executable's the one that moved. The cause is
+# step 3.5's `codesign --force --sign - "$APP"`: signing a bundle seals
+# Contents/Resources into CodeResources and CodeResources into the main
+# executable's CodeDirectory, and two files in there — GST-ELEMENT-RESOLUTION.txt
+# written above and the PREVIOUS run's GST-BUNDLE-MANIFEST.txt, which nothing
+# clears — each carry a UTC timestamp. So read a manifest diff as the plugin and
+# framework lines plus one expected line of noise.
 {
     echo "WSL Commentary — bundled GStreamer runtime for macOS"
     echo "Written by build/bundle-gst-darwin.sh on $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
