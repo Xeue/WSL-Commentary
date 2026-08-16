@@ -63,7 +63,7 @@ import {
   describePreviewBox,
   deriveCameraLamp,
   PREVIEW_AT_START_CAVEAT,
-  VIDEO_SOURCE_AT_START_CAVEAT,
+  describeCardOptionRefusal,
   VIDEO_LEG_WHILE_SENDING,
 } from './videosource.js';
 import { LEVEL } from './lamps.js';
@@ -368,42 +368,67 @@ test('NO CAMERA reads differently from NO AUDIO, in four ways at once', () => {
 // The preview, and its caveat
 // ---------------------------------------------------------------------------
 
-test('the preview caveat says what to press and why it has to be pressed', () => {
-  // "Applied at Start" reads as an unfinished feature unless the reason is
-  // beside it, and a control that appears to do nothing is a control an operator
-  // presses again. Both halves have to be in the one string the field carries.
-  assert.match(PREVIEW_AT_START_CAVEAT, /Off by default/);
+test('the preview caveat is the two facts an operator acts on, and nothing else', () => {
+  // IT WAS 432 CHARACTERS, the second-largest block of prose on the Settings
+  // screen, and it argued its own case at length: that switching the preview
+  // during a live feed was MEASURED to stop the picture going to air
+  // permanently, with everything still reporting success, and that the
+  // application therefore refuses to do it.
+  //
+  // Every word of that is true and none of it is the operator's business at the
+  // moment they are ticking a box. Two things are: WHEN it takes effect, because
+  // a control that appears to do nothing is a control they press again, and that
+  // it does not touch the transmitted feed, because that is the fear a preview
+  // beside an on-air path creates.
   assert.match(PREVIEW_AT_START_CAVEAT, /START/, 'it must name the button');
   assert.match(
     PREVIEW_AT_START_CAVEAT,
-    /Press STOP, change it, then START/,
-    'and the actual instruction, in the order it has to be done in — the control is disabled ' +
-      'while a feed is up, so stopping really is first, and Go\'s refusal says the same words',
+    /changes nothing that is transmitted/i,
+    'the reassurance that the preview itself is not on the feed',
   );
-  assert.match(
-    PREVIEW_AT_START_CAVEAT,
-    /measured/i,
-    'and say the limitation is a measurement, not an oversight',
-  );
-  assert.match(
-    PREVIEW_AT_START_CAVEAT,
-    /going to air/i,
-    'and what the measurement was: the picture going to air stops',
-  );
-  assert.match(
-    PREVIEW_AT_START_CAVEAT,
-    /changes nothing about what is transmitted/i,
-    'and the reassurance that the preview itself is not on the feed',
+  assert.ok(
+    PREVIEW_AT_START_CAVEAT.length < 100,
+    `the caveat is ${PREVIEW_AT_START_CAVEAT.length} characters and is rendered permanently under ` +
+      'a tick box; the measurement that justifies it belongs in videosource.js',
   );
 
-  // The source carries the same rule with a bigger stake, and says so.
-  assert.match(VIDEO_SOURCE_AT_START_CAVEAT, /START/);
-  assert.match(VIDEO_SOURCE_AT_START_CAVEAT, /STOP, change it, then START/);
-  assert.match(VIDEO_SOURCE_AT_START_CAVEAT, /measured/i);
+  // AND THE MEASUREMENT IS STILL WRITTEN DOWN, in the source, where the next
+  // person tempted to make the preview switch live will meet it. Deleting the
+  // knowledge is a different act from not rendering it, and this is the guard
+  // against the two being confused.
+  const src = ui('videosource.js');
+  assert.match(src, /50 fps to 0/, 'the measured consequence must survive as a comment');
+  assert.match(src, /PERMANENTLY/, 'including that it does not recover');
+
+  // The SOURCE control's own version of the caveat is gone entirely. It was a
+  // second permanent paragraph saying the same thing about the control above,
+  // and the fact is now carried where it can be acted on — on the control, as
+  // the reason it is disabled, while a feed is actually up.
+  assert.equal(
+    /VIDEO_SOURCE_AT_START_CAVEAT/.test(src.replace(/\/\/[^\n]*/g, '')),
+    false,
+    'the source caveat is back as a rendered string; VIDEO_LEG_WHILE_SENDING is where that fact ' +
+      'belongs, because off air there is nothing to caveat',
+  );
+});
+
+test('the card option refuses in one line, and only when it is actually refused', () => {
+  // The owner's report was "The declink input is grayed out in settings?" on a
+  // machine with a working card. Two separate things had to be true of the
+  // rendering afterwards: the refusal must be readable at a glance rather than
+  // being a paragraph, and it must not be attached to an option that is NOT
+  // refused — a configuration naming the card on a machine with none leaves the
+  // option enabled on purpose, so that the screen and config.json cannot
+  // disagree, and a tooltip claiming no card was found would contradict it.
+  const line = describeCardOptionRefusal();
+  assert.match(line, /No DeckLink card was found/);
+  assert.ok(line.length < 80, 'a tooltip is read at a glance or not at all');
+
+  const js = codeOnly(ui('settings.js'));
   assert.match(
-    VIDEO_SOURCE_AT_START_CAVEAT,
-    /does not move what is on air now/i,
-    'the one thing an operator could otherwise believe about this control',
+    js,
+    /cardOption\.title = cardOption\.disabled \? describeCardOptionRefusal\(\) : ''/,
+    'the reason must be keyed on the option being DISABLED, not on the card being absent',
   );
 });
 
@@ -569,7 +594,7 @@ test('the video source is a <select> of exactly the two sources, first in its gr
   const heading = js.indexOf("videoHeading.textContent = 'Contribution video'");
   const source = js.indexOf("addField(\n    'videoSource',");
   const bitrate = js.indexOf("addField(\n    'videoBitrateKbps',");
-  const format = js.indexOf("addField(\n    'videoFormatOverride',");
+  const format = js.indexOf("addField('videoFormatOverride',");
   assert.ok(heading > 0 && source > 0 && bitrate > 0 && format > 0);
   assert.ok(source > heading, 'the source belongs in the Contribution video group');
   assert.ok(source < bitrate && source < format, 'and above the two settings that describe it');
@@ -583,6 +608,31 @@ test('the video source is a <select> of exactly the two sources, first in its gr
     [VIDEO_SOURCE_SLATE, VIDEO_SOURCE_DECKLINK],
     'exactly the two sources, slate first — the default is the one an operator lands on',
   );
+
+  // AND THE CONTROL CARRIES NO HINT AT ALL. It used to render both options'
+  // summary and cost plus the at-START caveat: 933 characters, the largest block
+  // of prose on the screen and the one the owner named. The <select> now gets
+  // three arguments, not four, and describeToAir below it is what answers the
+  // operator's actual question.
+  const call = js.slice(source, js.indexOf('videoToAirLine', source));
+  assert.equal(
+    /s\.summary|s\.cost|AT_START_CAVEAT/.test(call),
+    false,
+    'the video-source hint is back; the measurements it carried belong in videosource.js',
+  );
+  for (const field of ['summary', 'cost']) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(VIDEO_SOURCES[0], field),
+      false,
+      `VIDEO_SOURCES still carries ${field}: data with no consumer is the rendered paragraph ` +
+        'waiting to come back, and the figures are written out in videosource.js instead',
+    );
+  }
+  // The figures themselves must not have been lost with the fields. The card
+  // being the CHEAPER leg is the counter-intuitive fact an engineer needs.
+  const src = ui('videosource.js');
+  assert.match(src, /18\.5-23\.9 %/, 'the slate cost must survive as a comment');
+  assert.match(src, /9\.3-14\.6 %/, 'and the card cost, which is the lower of the two');
 });
 
 test('the form says which one is going to air, and marks the one that cannot start', () => {
@@ -635,11 +685,31 @@ test('the card option is withdrawn when there is no card — but never hidden fr
 
   // And the device list is asked for, once, on open — with its own failure
   // swallowed to "not known" rather than to "no card".
-  assert.match(js, /async function refreshVideoDevices\(\)/);
-  assert.match(js, /videoDevices = Array\.isArray\(devices\) \? devices : null/);
-  assert.match(js, /videoDevices = null/, 'a failed listing must read as unknown, never as empty');
+  //
+  // ONE LISTING, TWO CONTROLS. It was `videoDevices`, read only here; the
+  // commentary-input picker is a list of the same devices, and asking twice
+  // would be two chances for the two controls to disagree about whether a card
+  // is fitted — on a screen where one of them greys out an option over it.
+  assert.match(js, /async function refreshInputDevices\(\)/);
+  assert.match(js, /inputDevices = Array\.isArray\(devices\) \? devices : null/);
+  assert.match(js, /inputDevices = null/, 'a failed listing must read as unknown, never as empty');
+  const refresh = js.slice(js.indexOf('async function refreshInputDevices()'));
+  const body2 = refresh.slice(0, refresh.indexOf('\n  }'));
+  assert.match(body2, /renderVideoSource\(\)/);
+  assert.match(body2, /renderAudioInput\(\)/, 'the picker must be redrawn from the same answer');
   const open = js.slice(js.indexOf('async function open()'));
-  assert.match(open, /await refreshVideoDevices\(\)/, 'open() must ask');
+  assert.match(open, /await refreshInputDevices\(\)/, 'open() must ask');
+
+  // THE GREYING IS ON POSITIVE EVIDENCE ONLY, which is the half of the owner's
+  // "The declink input is grayed out in settings?" that this file can hold. A
+  // listing that FAILED leaves cardKnown false and the option enabled — see
+  // deriveVideoSourceEffects — so no amount of enumeration trouble can withdraw
+  // the option, and a greyed option is therefore always a real empty answer.
+  assert.equal(
+    deriveVideoSourceEffects(VIDEO_SOURCE_DECKLINK, null).cardKnown,
+    false,
+    'a failed listing must never be evidence that no card is fitted',
+  );
 });
 
 test('the preview toggle is offered only where there is something to preview', () => {

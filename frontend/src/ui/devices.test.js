@@ -403,15 +403,35 @@ test('the kind strings are spelled exactly as internal/gst spells them', () => {
   // in which it has been renamed or had its tag changed, is a build where the
   // frontend's DEVICE_KIND no longer matches anything Go sends. That must fail.
   //
-  // The field is `Kind DeviceKind `json:"kind,omitempty"`` — a NAMED TYPE, so
-  // that no bare string can be assigned to it, and omitempty because the field
-  // is not persisted and an absent kind reads as native.
+  // The field is `Kind DeviceKind `json:"kind"`` — a NAMED TYPE, so that no bare
+  // string can be assigned to it, and WITHOUT omitempty.
+  //
+  // ======================= WHY THE omitempty HAD TO GO =======================
+  //
+  // It used to be `json:"kind,omitempty"`, and this test used to pin that. The
+  // reasoning was that the field is not persisted, so an absent kind reads as
+  // native and the shorter JSON costs nothing. What it actually cost was the
+  // ability to tell "this build does not send a kind" from "this device is
+  // native": encoding/json omits the field entirely when it is "", so a native
+  // device and an older Go build arrive as the SAME object across the Wails
+  // boundary, and every consumer on this side has to treat an absent kind as
+  // native by policy rather than by evidence.
+  //
+  // That is exactly the state the operator's "The declink input is grayed out in
+  // settings?" report had to be debugged in: the only way to tell whether a
+  // device list carried kinds at all was to find one entry that happened to be a
+  // DeckLink. With the tag unconditional, every device says which it is, and a
+  // list with no `kind` on any entry is positively an old build rather than a
+  // machine of native devices. Nothing on this side changed: KindNative is
+  // "native" either way, and NormaliseDeviceKind still maps "" to it for the
+  // config files and older builds that legitimately carry neither.
   const go = read(repoRoot, 'internal', 'gst', 'gst.go');
   assert.match(
     go,
-    /Kind\s+DeviceKind\s+`json:"kind,omitempty"`/,
-    'internal/gst.Device must carry Kind as the named type DeviceKind with the json tag ' +
-      '"kind,omitempty" — the frontend reads this field by that name off every device',
+    /Kind\s+DeviceKind\s+`json:"kind"`/,
+    'internal/gst.Device must carry Kind as the named type DeviceKind with the json tag "kind" — ' +
+      'the frontend reads this field by that name off every device, and omitempty made a native ' +
+      'device indistinguishable from a build that sends no kind at all',
   );
   // The constants carry the type in their declaration — `KindNative DeviceKind
   // = "native"` — because they are declared in a const block with no shared
@@ -594,4 +614,54 @@ test('validateConfig keys its device-id refusals on the namespace helpers', () =
   const errors = validateConfig({ audioDeviceId: render, headphoneEndpointId: render });
   assert.ok(errors.audioDeviceId, 'a render id in audioDeviceId is refused');
   assert.equal(errors.headphoneEndpointId, undefined, 'and accepted where playback is what is wanted');
+});
+
+// --------------------------------------------------------------------------
+// The MAIN screen's input dropdown writes all three capture fields
+// --------------------------------------------------------------------------
+// The Settings screen was rebuilt around one picker over both capture kinds,
+// where selecting an entry sets audioSourceKind, sets the id that applies and
+// CLEARS the one that does not. app.js's own dropdown lists both kinds too —
+// labelDevices suffixes them "SDI/HDMI audio" and "computer sound input"
+// precisely because both are offered — and it went on writing audioDeviceId
+// alone for a while after Settings stopped.
+//
+// That leaves audioSourceKind at "native" while audioDeviceId holds a DeckLink
+// PERSISTENT-ID, which is a well-formed string naming nothing the platform's
+// audio stack has ever heard of. There is no error at the boundary; the failure
+// is a capture that opens the wrong subsystem, which is the fault internal/gst
+// spends most of its length preventing.
+//
+// Asserted on source text with the house comment-stripper, for the reason the
+// other structural guards in this file are: package.json is frozen, there is no
+// jsdom, and what matters is that this handler routes through the shared model
+// rather than restating it.
+
+test('the main screen input dropdown sets the capture KIND, not just the id', () => {
+  const src = codeOnly(ui('app.js'));
+
+  const start = src.indexOf('function onInputChange(');
+  assert.ok(start >= 0, 'app.js has no onInputChange handler');
+  const body = src.slice(start, src.indexOf('\n  }', start));
+
+  assert.match(
+    body,
+    /deriveAudioInputEffects\(/,
+    'onInputChange must route through audioinput.js\'s deriveAudioInputEffects, which is the one ' +
+      'statement of what selecting a device means. Restating it here is how the two screens drift ' +
+      'apart, and the drift is silent: a DeckLink id under audioSourceKind "native" opens the ' +
+      'wrong capture subsystem with no error anywhere.',
+  );
+  assert.ok(
+    !/persistConfig\(\s*\{\s*audioDeviceId:/.test(body),
+    'onInputChange writes audioDeviceId on its own again. Picking the card then leaves ' +
+      'audioSourceKind at "native" and hands a DeckLink persistent-id to the CoreAudio path.',
+  );
+  // The kind must come from the DEVICE, not from the option value: fillDeviceSelect
+  // puts the real id in the value and is shared with the headphone control.
+  assert.match(
+    body,
+    /currentInputDevices\.find\(/,
+    'the kind must be read off the device list, since the option value carries only the id',
+  );
 });

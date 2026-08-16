@@ -354,8 +354,20 @@ test('the caveat states the measured facts, in the words the operator needs', ()
   assert.match(ROUTER_CAVEAT, /not a mixer/i);
   assert.match(ROUTER_CAVEAT, /0 dB is the maximum/i, 'the clamp, stated as a limit rather than as an error');
   assert.match(ROUTER_CAVEAT, /ADD TOGETHER and clip/i, 'what happens when two channels share an output');
-  assert.match(ROUTER_CAVEAT, /no gain stage after this one/i);
   assert.match(ROUTER_CAVEAT, /immediately/i, 'a live control has to say that it is live');
+
+  // AND IT IS SHORT ENOUGH TO BE READ. It used to carry two more clauses — that
+  // there is no gain stage after this one to absorb the sum, and the instruction
+  // to turn a contribution down rather than expect the feed to take it — which
+  // are the REASON for the third fact and what that fact MEANS. Both are still
+  // written down, in ROUTER_CAVEAT's own doc comment, where somebody proposing to
+  // allow boost above 0 dB will read them. A settings screen is scanned, and a
+  // five-sentence paragraph above a grid is a paragraph nobody finishes.
+  assert.ok(
+    ROUTER_CAVEAT.length < 200,
+    `the caveat is ${ROUTER_CAVEAT.length} characters; it is permanent prose above a grid and ` +
+      'the argument for each sentence belongs in the source, not on the screen',
+  );
 });
 
 test('an output sums the MAGNITUDES of everything routed to it', () => {
@@ -602,10 +614,31 @@ test('the routing screen is only reachable from a DeckLink input', () => {
     /channelMapGroup\.hidden = !decklink/,
     'the whole group hides for a native input: that seat must see this screen exactly as it was',
   );
+  // THE GROUP FOLLOWS THE PICKER, NOT A LISTENER ON THE FIELD. audioSourceKind
+  // used to be a <select> the operator touched, so a 'change' listener on it was
+  // the live link. It is a HIDDEN INPUT now — the one commentary-input picker
+  // writes it, along with the two device ids — and assigning an input's value
+  // from script fires neither 'input' nor 'change', so that listener would be a
+  // group that never opened. The picker calls the renderer directly instead.
   assert.match(
     js,
-    /fields\.audioSourceKind\.input\.addEventListener\('change', renderChannelMapGroup\)/,
-    'the group must follow the capture-kind control live',
+    /audioInputSelect\.addEventListener\('change', applyAudioInputSelection\)/,
+    'the picker must be what drives the setup',
+  );
+  const apply = js.slice(
+    js.indexOf('function applyAudioInputSelection()'),
+    js.indexOf("audioInputSelect.addEventListener('change'"),
+  );
+  assert.ok(apply.length > 0, 'settings.js must define applyAudioInputSelection');
+  assert.match(
+    apply,
+    /renderChannelMapGroup\(\)/,
+    'the group must follow the picker live: choosing the card is what reveals its routing',
+  );
+  assert.equal(
+    /fields\.audioSourceKind\.input\.addEventListener/.test(js),
+    false,
+    'a listener on a hidden input never fires; the group would open only on a re-populate',
   );
   const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('function refreshSecretBadges'));
   assert.match(

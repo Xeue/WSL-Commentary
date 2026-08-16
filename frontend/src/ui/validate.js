@@ -419,12 +419,21 @@ export function validateConfig(config) {
   // accepted, because a real persistent-id is a large decimal (the measured
   // UltraStudio 4K Mini reports 2747401380) and a positive rule here would turn
   // an unrecognised future id into an unsavable form.
+  //
+  // THE CLOSING INSTRUCTION CHANGED WITH THE CONTROL. It used to read "Leave
+  // this blank if there is only one card", which was the right advice while this
+  // was a free-text box the operator typed into. It is a dropdown now — the
+  // value can only be a stored one or an enumerated card's own id — so a
+  // device-number reaching here came out of a config.json written by an older
+  // build or edited by hand, and the operator's move is to pick the card off the
+  // list rather than to clear a box they cannot see. An error whose remedy names
+  // a control that is not on the screen is an error nobody can act on.
   if (!isBlank(config.decklinkPersistentId) && /^\d{1,2}$/.test(config.decklinkPersistentId.trim())) {
     errors.decklinkPersistentId =
       `"${config.decklinkPersistentId.trim()}" is a device number, not a persistent ID. ` +
       'A device number is a position in the enumeration and addresses a different card once ' +
       'one is added or moved; a persistent ID names the card itself and is a long number ' +
-      '(e.g. 2747401380). Leave this blank if there is only one card.';
+      '(e.g. 2747401380). Choose the card from the microphone list above.';
   }
 
   // THE CARD'S CHANNEL ROUTING. Absent or empty is VALID and is the normal state

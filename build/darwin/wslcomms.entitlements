@@ -57,29 +57,27 @@
     this key. Without NSMicrophoneUsageDescription the process is killed
     outright; see build/darwin/Info.plist note 1.
 
-  ── CONSIDERED AND DELIBERATELY NOT TAKEN ───────────────────────────────────
-
   com.apple.security.cs.disable-library-validation
 
-    The obvious candidate, and the one an app that dlopens a directory full of
-    third-party plugins usually ends up needing. MEASURED on this bundle,
-    2026-08-14, and the answer is NO — with the control experiment, because
-    "it worked" on its own would not have told us library validation was even
-    switched on.
+    TAKEN, and this section is a CORRECTION. It sat under "considered and
+    deliberately not taken" until 2026-08-16, with a careful measurement behind
+    it, and the measurement was right about what it measured and blind to the
+    only load that matters. What follows is the old reasoning, why it was
+    incomplete, and what proved it.
 
-    Test. The whole bundle signed inside-out with the real Developer ID and
-    the hardened runtime, entitlements exactly as in this file. Then, with
-    `env -i` and every GST_* pointed inside the .app, the bundle's own
-    hardened-runtime gst-inspect asked for osxaudiosrc:
+    ── what was measured, and is still true ──
+
+    Every Mach-O INSIDE the bundle loads without this key, and that was
+    established with a control rather than by it happening to work. The whole
+    bundle signed inside-out with the real Developer ID and the hardened
+    runtime; then, with `env -i` and every GST_* pointed inside the .app, the
+    bundle's own hardened-runtime gst-inspect asked for osxaudiosrc:
 
       Factory Details:
         Rank                     primary (256)
         Long-name                Audio Source (macOS)
 
-    — libgstosxaudio.dylib dlopened out of Contents/Resources/gstreamer-1.0
-    into a hardened-runtime process with no library-validation waiver at all.
-
-    Control. One plugin, libgstlevel.dylib, re-signed ad-hoc so that it carried
+    Control: one plugin, libgstlevel.dylib, re-signed ad-hoc so that it carried
     a different team from the process loading it, everything else untouched:
 
       module_open failed: dlopen(.../libgstlevel.dylib, 0x0006): code signature
@@ -87,15 +85,92 @@
       (non-platform) have different Team IDs
       No such element or plugin 'level'
 
-    So library validation is enforced, and what satisfies it is that
-    build/ship-darwin.sh signs EVERY Mach-O in the bundle — 49 of them — with
-    the same Developer ID team as the app. Same-team signatures pass unaided.
-    Taking the waiver instead would let any dylib from any signer be loaded
-    into this process for the life of the product, to buy nothing.
+    So library validation IS enforced, and same-team signatures satisfy it.
+    build/ship-darwin.sh signing EVERY Mach-O in the bundle is what makes the
+    bundle's own payload load, and that stays true and stays required.
 
-    This is therefore a load-bearing dependency between two files: if
-    ship-darwin.sh ever stops signing part of the payload, the app stops
-    loading that part, and the fix is to sign it — not to add this key here.
+    ── what it was blind to ──
+
+    THE BUNDLE IS NOT THE ONLY THING THIS PROCESS LOADS. libgstdecklink.dylib
+    does not link Blackmagic's API; it holds one string,
+    "/Library/Frameworks/DeckLinkAPI.framework", and loads it through CFBundle
+    at first use. That framework is installed by Desktop Video, lives outside
+    the bundle, and is signed by Blackmagic Design (Team ID 9ZGFBWLSYP), not by
+    Sygnal TV Ltd (Team ID 5P76UVY5WF). No amount of signing our own payload
+    can change that, because it is not our payload.
+
+    The experiment above could not have caught it: it asked whether a bundled
+    plugin loads, and every bundled plugin does. The load that fails is one the
+    plugin performs afterwards, at device-enumeration time, from a path nothing
+    in build/ ever touches.
+
+    ── what proved it, 2026-08-16 ──
+
+    A fitted, working UltraStudio 4K Mini, persistent-id 2747401380. Present in
+    gst-device-monitor-1.0 as an Audio/Source device; present in an unsigned
+    build of this application; ABSENT from the signed, notarised bundle, whose
+    log read:
+
+      gst: ListInputDevices: offered 4 of 4 Audio/Source devices (osxaudiosrc);
+      0 were skipped
+
+    Four where there are five, no skip, no warning, and NOTHING in the GStreamer
+    debug log at any level, because from GStreamer's point of view nothing had
+    failed: the provider probed and found no cards. The whole diagnosis was in
+    the kernel log, which no operator will ever read:
+
+      AppleMobileFileIntegrity: Library Validation failed: Rejecting
+      '/Library/Frameworks/DeckLinkAPI.framework/Versions/A/DeckLinkAPI'
+      (Team ID: 9ZGFBWLSYP, platform: no) for process 'wslcomms' (Team ID:
+      5P76UVY5WF, platform: no), reason: mapping process and mapped file
+      (non-platform) have different Team IDs
+
+    The visible symptom at the desk was the Settings screen greying out the
+    DeckLink video source and stating that no card was fitted, about a card
+    whose tally light was on.
+
+    ── why there is no narrower fix ──
+
+    Apple offers no per-library waiver: this key is the only mechanism by which
+    a hardened-runtime process may load a Mach-O signed by another team. The
+    three alternatives were considered and all of them are worse:
+
+      Re-sign DeckLinkAPI.framework with our team. It is Blackmagic's driver in
+      /Library/Frameworks, shared with Desktop Video Setup and everything else
+      on the machine that captures. Re-signing it on an operator's Mac is
+      modifying another vendor's installed product, it breaks THEIR signature
+      for every other application, and the next driver update silently undoes
+      it. Not shippable.
+
+      Ship without DeckLink support. The card is the commentary input and the
+      camera path; that is the feature.
+
+      Drive the card out of process. A helper that is not hardened, talking to
+      the app over a socket, is a second binary to sign, notarise, launch,
+      supervise and kill, to avoid one entitlement.
+
+    ── what is given up, said plainly ──
+
+    Any dylib signed by anyone may now be loaded into this process, for the
+    life of the product. That is a real widening and it is bought for one
+    named, necessary load.
+
+    IT IS NOT A LICENCE TO STOP SIGNING THE PAYLOAD. build/ship-darwin.sh still
+    signs every Mach-O in the bundle with our team, and must keep doing so.
+    Before this key, that discipline enforced itself: an unsigned or
+    foreign-signed file in the bundle failed to load and somebody noticed. Now
+    it will load. The enforcement therefore moves entirely to ship-darwin.sh's
+    own signing pass and its verification step, which is the thing to keep
+    honest.
+
+    A defence in depth remains on the application side: internal/gst's
+    ListInputDevices now logs one line whenever the decklink plugin is loaded
+    and enumerates no cards, and decklinkapi_darwin.go dlopens the framework on
+    that path to say WHY in the log. If this key is ever lost, the failure is a
+    sentence in the application log naming this file, rather than four devices
+    where there are five.
+
+  ── CONSIDERED AND DELIBERATELY NOT TAKEN ───────────────────────────────────
 
   com.apple.security.cs.allow-jit
   com.apple.security.cs.allow-unsigned-executable-memory
@@ -197,5 +272,6 @@
 <plist version="1.0">
 <dict>
     <key>com.apple.security.device.audio-input</key><true/>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
 </dict>
 </plist>

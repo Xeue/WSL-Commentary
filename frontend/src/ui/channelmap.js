@@ -440,12 +440,16 @@ function joinNumbers(numbers) {
  * pipeline staying PLAYING, which is why this is a real-time control rather than
  * an apply-and-restart form.
  */
+// The four facts an operator cannot recover from the grid itself, in one line:
+// what this is, where the ceiling is, what sharing an output costs, and that it
+// is live. The instruction that followed them ("turn a contribution down rather
+// than expecting the feed to take it") is what the third fact means, and the
+// reason there is no headroom to absorb it — no gain stage after this one — is
+// in this constant's own doc comment above, which is where somebody proposing to
+// allow boost will read it.
 export const ROUTER_CAVEAT =
-  'This is a ROUTER with attenuation, not a mixer. A crosspoint can be turned DOWN but never up — ' +
-  '0 dB is the maximum there is — and two channels at 0 dB into the same output ADD TOGETHER and ' +
-  'clip, because there is no gain stage after this one to absorb it. Turn a contribution down ' +
-  'rather than expecting the feed to take it. Every change here reaches the running feed ' +
-  'immediately.';
+  'A ROUTER, not a mixer: 0 dB is the maximum, two channels into one output ADD TOGETHER and clip, ' +
+  'and every change here is live immediately.';
 
 /**
  * outputSummary is the arithmetic behind that caveat, per output: which channels
@@ -1046,12 +1050,14 @@ export function createChannelMapView(handlers = {}) {
   /** renderPad draws the line that says where the grid came from. */
   function renderPad() {
     if (padChannels === 0) {
-      padNote.textContent =
-        'The capture has not been opened yet, so the number of audio channels the card presents is ' +
-        'not known — and this grid is built from the channels the capture actually negotiated, ' +
-        'never from what the card advertises, because a map naming a channel the stream does not ' +
-        'have stops the feed dead. Press START once: the routing can then be changed live, while ' +
-        'the feed is running.';
+      // THE INSTRUCTION SURVIVES; the justification for it does not. An operator
+      // looking at an empty grid needs to know that pressing START once fills it
+      // and that the routing is live thereafter. WHY the grid waits — it is built
+      // from the channels the capture actually NEGOTIATED and never from what the
+      // card advertises, because a map naming a channel the stream does not have
+      // stops the feed dead — is the design of gridFromMap and belongs to whoever
+      // is tempted to build it from the advertised count instead.
+      padNote.textContent = 'Press START once to size this grid. The routing is live after that.';
       return;
     }
     const sized = `Sized from the ${padChannels} channels this capture negotiated.`;
@@ -1059,8 +1065,7 @@ export function createChannelMapView(handlers = {}) {
     // and the difference is the first question asked after a wrong feed. gst's
     // IsDefault exists for exactly this line.
     padNote.textContent = neverMapped
-      ? `${sized} Nothing has been routed at this position yet, so the grid shows the default — ` +
-        'channel 1 to the left and channel 2 to the right, which is what the feed carries today.'
+      ? `${sized} Nothing routed yet — the default is channel 1 left, channel 2 right.`
       : sized;
   }
 

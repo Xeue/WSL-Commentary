@@ -865,6 +865,30 @@ type App struct {
 	// before this field existed.
 	conformTo atomic.Pointer[gst.ConformTarget]
 
+	// switcherFmt caches GetSwitcherFormat's answer, and switcherFmtAt is when
+	// it was read. Both guarded by switcherFmtMu.
+	//
+	// THE CACHE IS ABOUT THE SETTINGS SCREEN AND NOT ABOUT COST. The REST call
+	// behind it is 85 ms against a live instance and bounded at
+	// conformFetchTimeout, and neither number would justify a cache. What
+	// justifies it is the instance that is NOT up: three seconds of stall,
+	// every time the operator opens Settings, on the exact screen they are
+	// using twenty minutes before kick-off precisely because the facility is
+	// not switched on yet. One three-second wait is a slow screen; one per open
+	// is a screen that feels broken.
+	//
+	// A NEGATIVE ANSWER IS CACHED TOO, and that is the half that matters: nil
+	// is what an unreachable instance produces, so caching only successes would
+	// cache away the fast case and keep the slow one.
+	//
+	// It is deliberately NOT invalidated when m2lxHost changes. The window is
+	// switcherFmtTTL and the wrong answer inside it is a READOUT beside the
+	// override box, not anything the pipeline is built to — Start reads the
+	// switcher itself, through conformFormat, and never looks here.
+	switcherFmtMu sync.Mutex
+	switcherFmt   *ConformTargetView
+	switcherFmtAt time.Time
+
 	// sessMu guards session and is held for the whole of Start and Stop, so a
 	// Start cannot begin while a Stop is still taking the previous pipeline to
 	// NULL. Two pipelines contending for one capture device is the failure
@@ -1658,6 +1682,35 @@ func teardownStep(what string, budget time.Duration, stop func() error) (finishe
 // is the single place that inspects one, it does so through internal/gst's own
 // classifiers rather than by reading the string, and its comment sets out which
 // half of that knowledge is Windows-only and why it stays.
+//
+// # THIS IS ALSO THE CARD LISTING, AND THERE IS DELIBERATELY NO SECOND BINDING
+//
+// The Settings screen needs three lists and this method is all three of them:
+//
+//	the commentary input   every entry, grouped by Device.Kind — one dropdown
+//	                       over both families, which is the whole point of the
+//	                       Kind field
+//	the DeckLink cards     the entries whose Kind is "decklink"
+//	the video source's     the same entries again: is a card fitted at all, and
+//	  card                 which one
+//
+// A ListDeckLinkCards() binding was considered and is NOT added, because it
+// would return a filter of this list and nothing else. The card publishes ONE
+// persistent-id and it names the CARD rather than a stream — measured on the
+// fitted UltraStudio 4K Mini, whose Audio/Source and Video/Source entries both
+// publish 2747401380 — which is exactly why config.json holds one
+// decklinkPersistentId that the audio leg and the video leg share, and why
+// resolveDeckLinkCard can answer a question about the VIDEO leg out of an AUDIO
+// enumeration. A second binding could only publish the same numbers under a
+// second name, and the first time the two disagreed about which cards exist
+// would be the first time somebody added a filter to one of them.
+//
+// Device.Kind is the ONLY thing that may be read to tell the families apart. It
+// always crosses the boundary — its json tag has no omitempty, and internal/gst
+// normalises every entry before returning, so the frontend sees an explicit
+// "native" or "decklink" and never a missing field. Inferring the kind from the
+// shape of an id is forbidden by the paragraph above and would be wrong the
+// first time a platform minted an id that looked like the other family's.
 func (a *App) ListInputDevices() ([]gst.Device, error) {
 	if a.gstInitErr != nil {
 		return nil, a.gstInitErr
@@ -2882,7 +2935,25 @@ const (
 	// conformSourceOverride is the operator's videoFormatOverride, reported
 	// when nothing is running to have been built to anything.
 	conformSourceOverride = "override"
+
+	// conformSourceSwitcher is the INSTANCE'S OWN SETTING, read live by
+	// GetSwitcherFormat. GetConformTarget never returns it, and that is not an
+	// oversight: see GetSwitcherFormat for why the two questions are two
+	// bindings.
+	conformSourceSwitcher = "switcher"
 )
+
+// switcherFmtTTL is how long GetSwitcherFormat's cached answer is reused for.
+//
+// It is a SETTING, not a measurement — an instance's configured video format
+// changes when an engineer changes it, which is a thing that happens between
+// events rather than during one — so the only thing the TTL trades away is how
+// long a Settings screen left open would keep showing the old raster after
+// somebody reconfigured the switcher underneath it. Thirty seconds is short
+// enough that reopening the screen is the fix, and long enough that the
+// unreachable-instance case costs one three-second wait rather than one per
+// open.
+const switcherFmtTTL = 30 * time.Second
 
 // ConformTargetView is App.GetConformTarget's answer: the video format every
 // source feeding this M2L-X instance must be produced in.
@@ -3023,6 +3094,105 @@ func conformTargetView(t gst.ConformTarget, source, raw string) *ConformTargetVi
 		Source:    source,
 		Raw:       raw,
 	}
+}
+
+// GetSwitcherFormat reports the video format THE M2L-X INSTANCE IS CONFIGURED
+// FOR, read live from the instance, or nil when that cannot be established.
+//
+// # Why this is a second binding and not a branch inside GetConformTarget
+//
+// Because they are two different questions and the Settings screen wants both
+// at once, side by side:
+//
+//	GetConformTarget    what will WE produce?    (the running pipeline's target,
+//	                                              or the operator's declaration)
+//	GetSwitcherFormat   what does the SWITCHER   (the instance's own setting,
+//	                    require?                  read over REST)
+//
+// The whole value of showing them together is that a DIVERGENCE is visible: an
+// override typed for last month's venue, against a switcher configured for this
+// one. Folding the switcher's answer into GetConformTarget would collapse the
+// two into one number and destroy exactly the comparison the screen exists to
+// make.
+//
+// There is a second, harder reason, and it is why GetConformTarget must not
+// simply start dialling. GetConformTarget is called on the PAGE'S STARTUP PATH,
+// by the status lamps, and its own doc commits to not making a network call
+// there — a lamp that costs up to conformFetchTimeout on an unreachable
+// instance is a bad trade. This binding is called from the Settings screen's
+// open, which is a screen the operator is already waiting on and which is not on
+// the air path. Same data, different budget, so: different method.
+//
+// # IT NEEDS NO SESSION, WHICH IS THE ENTIRE POINT
+//
+// switcherConfiguredFormat reads a SETTING through one bearer-authenticated GET
+// of /api/v1/switcher_configuration. It needs the control-plane client — built
+// at startup from m2lxHost, and signed in on its own goroutine — and nothing
+// else. It does NOT need a pipeline, a streaming node, or anything to be on air.
+// That matters because the Settings screen is precisely where there is no
+// session: an operator picking a format an hour before kick-off can be shown
+// what the facility is set to, which is the one fact that makes the choice
+// obvious.
+//
+// The version of this that read a streaming node's DETECTED format could not
+// have done that, and would have been wrong anyway — internal/m2lx's tombstone
+// has the measurement, a live 720p50 feed reported by the switcher as
+// frame_rate="0".
+//
+// # Every way of not knowing is nil
+//
+// No m2lxHost, not signed in yet, an instance that is not up, a format block
+// this build cannot read, a raster internal/gst will not accept: all nil, never
+// an error. The frontend renders nothing rather than a wrong number, exactly as
+// it does for GetConformTarget. Each of those has already been logged by
+// switcherConfiguredFormat with the reason, so this adds no line of its own
+// except for the one case that function cannot see.
+func (a *App) GetSwitcherFormat() *ConformTargetView {
+	a.switcherFmtMu.Lock()
+	defer a.switcherFmtMu.Unlock()
+
+	// The lock is held ACROSS the REST call, deliberately. Settings screens are
+	// opened one at a time by one person; two seats opening one at the same
+	// instant would serialise, and the second would then find the first's
+	// answer already cached. The alternative — dropping the lock, dialling,
+	// retaking it — buys concurrency nothing measures and admits two in-flight
+	// reads racing to store different answers.
+	if !a.switcherFmtAt.IsZero() && time.Since(a.switcherFmtAt) < switcherFmtTTL {
+		return a.switcherFmt
+	}
+
+	view := a.readSwitcherFormat()
+	a.switcherFmt = view
+	a.switcherFmtAt = time.Now()
+	return view
+}
+
+// readSwitcherFormat is GetSwitcherFormat's uncached body: one instance read,
+// turned into the view or into nil.
+func (a *App) readSwitcherFormat() *ConformTargetView {
+	conf, ok := a.switcherConfiguredFormat()
+	if !ok {
+		// Already logged, with the reason, by switcherConfiguredFormat.
+		return nil
+	}
+	// ConformTargetFromRate, for the reason conformFormat gives: the switcher
+	// states its rate as a DECIMAL, and 29.97 is a rounding of 30000/1001
+	// rather than a rate. This is a READOUT and Start's derivation is the real
+	// decision, so the two must not reach the operator's screen having done the
+	// conversion two different ways.
+	t, err := gst.ConformTargetFromRate(conf.Width, conf.Height, conf.FrameRate)
+	if err != nil {
+		// The one failure switcherConfiguredFormat cannot log, because it is
+		// about what internal/gst will accept rather than about what arrived.
+		log.Printf("wslcomms: the switcher is configured for %s, which this application cannot "+
+			"render as a video format (%v); the Settings screen will show nothing beside the "+
+			"override", conf, err)
+		return nil
+	}
+	// t.String() is the OPERATOR'S spelling — "1920x1080p50" — and is the same
+	// function that writes the format into the log at Start, so the readout and
+	// the log cannot disagree about how a rate is printed.
+	return conformTargetView(t, conformSourceSwitcher, t.String())
 }
 
 // senderOpts builds the options for one session from a configuration snapshot

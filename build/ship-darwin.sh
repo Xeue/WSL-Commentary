@@ -446,8 +446,15 @@ echo "  $SIGNED nested Mach-O files signed (no entitlements — they need none)"
 
 # The outer bundle last. This is also what signs the main executable, and it is
 # the only thing that carries entitlements: see build/darwin/wslcomms.entitlements
-# for why the set is as small as it is, and in particular for the measurement
-# that says disable-library-validation is NOT needed here.
+# for why each key is there.
+#
+# ONE OF THOSE KEYS MAKES THE PASS ABOVE UNENFORCED, AND THE PASS ABOVE STILL
+# MATTERS. disable-library-validation is taken, because libgstdecklink loads
+# Blackmagic's /Library/Frameworks/DeckLinkAPI.framework and no signing of OUR
+# payload can make that another team's Mach-O acceptable. The side effect is that
+# a bundled dylib this script failed to sign will now load happily instead of
+# failing loudly, so "every nested Mach-O signed with our team" is no longer
+# self-checking. It is checked here and in step 6b, and nowhere else.
 sign_macho "$APP" --entitlements "$ENTITLEMENTS"
 echo "  outer bundle signed with $(basename "$ENTITLEMENTS")"
 

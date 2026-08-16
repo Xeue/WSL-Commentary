@@ -181,8 +181,17 @@ var remoteAllowlist = map[string]methodPolicy{
 	// correctly conforming 720p50 feed would see a red lamp the operator at the
 	// desk does not. Two seats disagreeing about a lamp is worse than either
 	// answer alone. It returns a raster, a rate and where they came from.
+	//
+	// GetSwitcherFormat is reachable for a plainer reason: it reports what the
+	// M2L-X instance is CONFIGURED for, which is a property of the facility and
+	// not of this machine. It is drawn beside videoFormatOverride on the Settings
+	// screen so a divergence between the two is visible, and a remote seat that
+	// could not ask would render that comparison with one side blank — inviting
+	// an operator to "fix" an override that already agrees with the switcher. It
+	// reaches no hardware and returns a raster and a rate.
 	"GetConfig":              {},
 	"GetConformTarget":       {},
+	"GetSwitcherFormat":      {},
 	"GetKVSCredentials":      {},
 	"GetStatusKeyCandidates": {},
 	"ListEvents":             {},
@@ -353,6 +362,15 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 	// -------- view --------
 	case "GetConfig":
 		return a.GetConfig()
+	// GetConformTarget was ALLOWLISTED WITHOUT A CASE HERE, so every remote seat
+	// asking for it got "method has no dispatch case" — the table said reachable
+	// and the switch said no. The default branch below asserts that cannot
+	// happen; TestRemoteDispatchCoversEveryReachableMethod is what now makes the
+	// assertion true instead of merely stated.
+	case "GetConformTarget":
+		return a.GetConformTarget(), nil
+	case "GetSwitcherFormat":
+		return a.GetSwitcherFormat(), nil
 	case "GetKVSCredentials":
 		return a.GetKVSCredentials()
 	case "GetStatusKeyCandidates":

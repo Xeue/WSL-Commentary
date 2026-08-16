@@ -194,7 +194,19 @@ func ListInputDevices() ([]Device, error) {
 	if stubDevErr != nil {
 		return nil, stubDevErr
 	}
-	return append([]Device(nil), stubDevices...), nil
+	// Normalised on the way out, exactly as the cgo build does, so that
+	// Device.Kind ALWAYS crosses the Wails boundary as one of the two spellings
+	// on both builds. Without it a test that injects a Kind-less device through
+	// SetStubDevices would exercise a frame shape the real build cannot produce
+	// — and the frontend's one dropdown groups on this field, so an entry with
+	// no kind lands in neither optgroup and vanishes from the only control that
+	// could select it. A dev build that can produce a device the release build
+	// cannot is a dev build that hides exactly this.
+	out := append([]Device(nil), stubDevices...)
+	for i := range out {
+		out[i].Kind = NormaliseDeviceKind(out[i].Kind)
+	}
+	return out, nil
 }
 
 // SetStubDevices replaces the fake device list returned by ListInputDevices.

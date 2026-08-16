@@ -48,6 +48,13 @@ import {
 // of returnpath.js for why the ordering is a module rather than a convention.
 import { createReturnPath, returnOptsFingerprint } from './returnpath.js';
 import { DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../monitor/channels.js';
+// The capture-input model, shared with the Settings screen so that picking a
+// device means the same thing on both. See onInputChange.
+import {
+  deriveAudioInputEffects,
+  encodeAudioInput,
+  normaliseAudioSourceKind,
+} from './audioinput.js';
 
 // The frontend seam (fixed by CONTRACT.md, not negotiable by either side):
 // WP-5a's module exports one factory, createMonitor(opts) -> Monitor, with
@@ -900,8 +907,31 @@ export function mountApp(root) {
     await backend.saveConfig(currentConfig);
   }
 
+  /**
+   * onInputChange writes ALL THREE capture fields, not just the id.
+   *
+   * It used to write audioDeviceId alone, and that was the same fault the
+   * Settings screen was rebuilt to remove, still live one screen over. This
+   * dropdown lists BOTH kinds — labelDevices suffixes them "SDI/HDMI audio" and
+   * "computer sound input" precisely because both are offered — so picking the
+   * card here left audioSourceKind at "native" and handed a DeckLink
+   * persistent-id to the CoreAudio path. That is the silent wrong-device
+   * failure internal/gst spends most of its length preventing, and it arrives
+   * with no error: the id is a perfectly well-formed string that names nothing
+   * the platform's audio stack has ever heard of.
+   *
+   * The KIND comes from the device list rather than from the option value,
+   * because fillDeviceSelect puts the real id in the value and is shared with
+   * the headphone control, which has its own meaning for the same field.
+   * deriveAudioInputEffects is then the single statement of what a selection
+   * means — the same one Settings uses — so the two screens cannot disagree
+   * about it, and the field that no longer applies is CLEARED rather than left
+   * behind as a second answer to the same question.
+   */
   function onInputChange(deviceId) {
-    persistConfig({ audioDeviceId: deviceId });
+    const chosen = currentInputDevices.find((d) => d && d.id === deviceId);
+    const kind = normaliseAudioSourceKind(chosen ? chosen.kind : '');
+    persistConfig(deriveAudioInputEffects(encodeAudioInput(kind, deviceId)));
   }
 
   /**

@@ -45,10 +45,36 @@ import {
   deriveVideoSourceEffects,
   describeToAir,
   describeCardAvailability,
+  describeCardOptionRefusal,
   PREVIEW_AT_START_CAVEAT,
-  VIDEO_SOURCE_AT_START_CAVEAT,
   VIDEO_LEG_WHILE_SENDING,
 } from './videosource.js';
+// THE ONE COMMENTARY-INPUT PICKER. The kind constants, the grouping rule and —
+// the part that used to be the operator's job — what SELECTING an entry means
+// for all three config fields. Pure and DOM-free; see audioinput.js's header for
+// the two-controls-one-question failure it removes.
+// AUDIO_SOURCE_NATIVE is deliberately NOT imported: nothing on this screen
+// compares against it any more. The one place that used to — the capture-kind
+// <select>'s option list — is gone, and the one place that still asks a
+// question about the kind (renderChannelMapGroup) asks whether it is the CARD,
+// because that is the only kind with anything extra to show.
+import {
+  AUDIO_SOURCE_DECKLINK,
+  DECKLINK_AUDIO_NOT_BUILT,
+  normaliseAudioSourceKind,
+  planAudioInputs,
+  deriveAudioInputEffects,
+} from './audioinput.js';
+// THE VIDEO FORMAT, as a list of rasters rather than a box to type one into,
+// and the switcher's own format to judge it against. Pure and DOM-free — the
+// canonical spellings, the "a saved value is never dropped" rule and the
+// divergence wording all live there and are driven for real in
+// videoformat.test.js.
+import {
+  planVideoFormats,
+  describeConformTarget,
+  deriveFormatMatch,
+} from './videoformat.js';
 
 // THE MIXER DRAWER IS NOT HERE ANY MORE. It moved to a button beside Settings
 // on the main screen, at the operator's request — reaching the clean-feed
@@ -118,33 +144,13 @@ function blankConfig() {
   };
 }
 
-// The two commentary capture kinds, spelled exactly as internal/config spells
-// them (config.AudioSourceNative / config.AudioSourceDeckLink). They are the
-// <option> values and the value collectConfig sends, so a drift here is the
-// silent kind: Go's Validate refuses an unrecognised kind by name, which is at
-// least loud, but a kind that differs only in case would save cleanly and
-// capture from the wrong subsystem.
-//
-// They live at module scope in this file rather than in a shared module because
-// this screen is the only thing that asks the question today. If a second screen
-// ever needs them, they belong in a pure module of their own — the house pattern
-// is returnsource.js and channels.js — not copied.
-const AUDIO_SOURCE_NATIVE = 'native';
-const AUDIO_SOURCE_DECKLINK = 'decklink';
-
-/**
- * normaliseAudioSourceKind maps anything to one of the two kinds, defaulting to
- * native — which is what every machine did before the field existed.
- *
- * It is applied on the way IN as well as on the way out, and the way in is the
- * one that would otherwise bite: assigning an unrecognised value to a <select>
- * leaves it showing '' — no option selected — and collectConfig would then save
- * an empty kind over whatever the file actually held. normaliseChannelMode is
- * used the same way, three lines further down populate, for the same reason.
- */
-function normaliseAudioSourceKind(value) {
-  return value === AUDIO_SOURCE_DECKLINK ? AUDIO_SOURCE_DECKLINK : AUDIO_SOURCE_NATIVE;
-}
+// AUDIO_SOURCE_NATIVE, AUDIO_SOURCE_DECKLINK and normaliseAudioSourceKind USED
+// TO BE DECLARED HERE. They moved to audioinput.js when the two controls that
+// asked "which subsystem" and "which device" became one picker: the module that
+// decides which kind a selection means is the module that should own the
+// spelling of the kinds, and a constant owned by the screen that merely renders
+// the answer is a constant two files have to agree about. The cross-language
+// pin against internal/config's own constants moved with them.
 
 function row(labelText, id, inputEl, hint) {
   const wrap = document.createElement('div');
@@ -192,6 +198,43 @@ function selectInput(id, options) {
     input.appendChild(o);
   }
   return input;
+}
+
+/**
+ * fillGroupedSelect rebuilds a <select> from a plan of <optgroup>s and restores
+ * the plan's selection. It is the DOM half of planAudioInputs and
+ * planVideoFormats, which decide everything about WHAT is in the list; nothing
+ * here chooses, orders or words anything.
+ *
+ * `leading` is an ungrouped option placed above every group. It exists for the
+ * video format's "Follow the switcher", which must read as the thing the groups
+ * are exceptions to rather than as one entry among seventeen — an <optgroup> of
+ * one would file it beside the rasters as an equal.
+ *
+ * THE SELECTION IS ASSIGNED LAST, after every option exists. A <select> silently
+ * discards a value it has no option for, so assigning first — or against a list
+ * still being built — is how a saved device ends up showing as device #1.
+ *
+ * @param {HTMLSelectElement} select
+ * @param {{groups: Array<{label: string, options: Array<{value: string, label: string}>}>, value: string}} plan
+ * @param {{value: string, label: string}|null} leading
+ */
+function fillGroupedSelect(select, plan, leading) {
+  select.textContent = '';
+  const option = (spec) => {
+    const o = document.createElement('option');
+    o.value = spec.value;
+    o.textContent = spec.label;
+    return o;
+  };
+  if (leading) select.appendChild(option(leading));
+  for (const group of plan.groups) {
+    const g = document.createElement('optgroup');
+    g.label = group.label;
+    for (const spec of group.options) g.appendChild(option(spec));
+    select.appendChild(g);
+  }
+  select.value = plan.value;
 }
 
 /**
@@ -943,9 +986,15 @@ export function createSettingsView(handlers) {
     'M2L-X address',
     'f-liveUrl',
     liveURLInput,
-    'The instance address is enough — the event is found from the instance and chosen below. ' +
-      'A full live-operation URL is also accepted, and fills the event in from its own path; ' +
-      'this box then shows the instance address on its own, which is all it needs.',
+    // Both halves stop a real mistake and neither can be shortened away. The
+    // operator was previously REFUSED when they pasted the instance address, so
+    // "the instance address is enough" is the correction; and the live-operation
+    // URL is still the only source of an event id before sign-in succeeds, so
+    // somebody holding one must be told it still works. The sentence that used
+    // to follow — explaining that the box then re-displays the base address on
+    // its own — described the field's own behaviour rather than preventing
+    // anything, and is now stated in formatM2LXAddress's comment alone.
+    'The instance address is enough. A full live-operation URL is also accepted.',
   );
   const liveURLNote = document.createElement('p');
   liveURLNote.className = 'field-hint field-note';
@@ -1021,12 +1070,12 @@ export function createSettingsView(handlers) {
   // The rule itself is in events.js (pure, tested); this is the wiring.
   const eventSelect = document.createElement('select');
   eventSelect.id = 'f-eventSelect';
-  const eventSelectRow = row(
-    'Event',
-    'f-eventSelect',
-    eventSelect,
-    'This instance is running more than one event — choose which one this seat controls.',
-  );
+  // No hint. The row is HIDDEN unless the instance is running more than one
+  // event, so its mere presence already says "there is a choice here" — and a
+  // labelled picker of named events beside it says the rest. The sentence that
+  // stood here explained why the control had appeared, which is a thing the
+  // control appearing does by itself.
+  const eventSelectRow = row('Event', 'f-eventSelect', eventSelect);
   eventSelectRow.wrap.hidden = true;
   currentGroup.appendChild(eventSelectRow.wrap);
 
@@ -1249,6 +1298,26 @@ export function createSettingsView(handlers) {
   //
   // The values are internal/config's own (VideoSourceSlate / VideoSourceDeckLink)
   // through ./videosource.js, which is also where the wording below comes from.
+  //
+  // ================== THERE IS NO HINT UNDER THIS CONTROL ANY MORE ===========
+  //
+  // It used to render both options' `summary` and `cost` plus
+  // VIDEO_SOURCE_AT_START_CAVEAT: 933 characters, the single largest block of
+  // prose on the screen, and the one the owner named — "SOO much text bellow
+  // controbution info that really isn't appropriate to be there".
+  //
+  // NONE OF THE KNOWLEDGE WAS DELETED. Every sentence of it is still written
+  // down, in videosource.js, beside the code it explains: what each option puts
+  // on air, the measured processor cost of each (9.3-14.6 % of a core for the
+  // card against 18.5-23.9 % for the slate — the intuition is backwards and an
+  // engineer needs to know it), and why the leg cannot be swapped under a
+  // running feed. What changed is WHO reads it. The measurement belongs to
+  // whoever edits this application; the operator picking a source needs the two
+  // option labels and the line below that says which one is going to air.
+  //
+  // The at-START caveat is not lost from the screen either: it is on the
+  // control, as the reason it is disabled, at the only moment it can be acted on
+  // — see VIDEO_LEG_WHILE_SENDING in renderVideoSource.
   addField(
     'videoSource',
     'Video sent to the switcher',
@@ -1256,8 +1325,6 @@ export function createSettingsView(handlers) {
       'f-videoSource',
       VIDEO_SOURCES.map((s) => ({ value: s.value, label: s.label })),
     ),
-    `${VIDEO_SOURCES.map((s) => `${s.label}: ${s.summary} ${s.cost}`).join(' ')} ` +
-      VIDEO_SOURCE_AT_START_CAVEAT,
   );
 
   // WHICH ONE IS GOING TO AIR, in a sentence, under the control that decides it.
@@ -1325,8 +1392,14 @@ export function createSettingsView(handlers) {
    * the strength of a listing that FAILED would send an engineer to look for
    * hardware that is sitting in the slot. deriveVideoSourceEffects reads the
    * difference; nothing here decides it.
+   *
+   * ONE LISTING SERVES BOTH CONTROLS. It was called videoDevices when only the
+   * video-source control read it; the commentary-input picker reads the same
+   * answer, because it is the same answer — the card's audio and its video are
+   * two entries publishing one persistent-id, so a second call would be a second
+   * chance for the two controls to disagree about whether a card is fitted.
    */
-  let videoDevices = null;
+  let inputDevices = null;
 
   /**
    * renderVideoSource redraws everything that depends on the selected source and
@@ -1338,7 +1411,7 @@ export function createSettingsView(handlers) {
    * — the same trap renderChannelMapGroup documents further down.
    */
   function renderVideoSource() {
-    const effects = deriveVideoSourceEffects(fields.videoSource.input.value, videoDevices);
+    const effects = deriveVideoSourceEffects(fields.videoSource.input.value, inputDevices);
 
     videoToAirLine.textContent = describeToAir(effects);
     // Marked as well as worded when the configuration cannot start: the sentence
@@ -1363,13 +1436,33 @@ export function createSettingsView(handlers) {
     // A disabled <option> that is nonetheless SELECTED still renders, so the
     // operator sees "the card" with the note above explaining why it cannot
     // start, and the only move available to them is the one that fixes it.
+    //
+    // ============ AND IT IS WITHDRAWN ONLY ON POSITIVE EVIDENCE ==============
+    //
+    // The owner's report was "The declink input is grayed out in settings?" on a
+    // machine with a working UltraStudio in it. The gate is `effects.cardKnown &&
+    // !effects.cardPresent` and both halves are deliberate: cardKnown is FALSE
+    // when the listing failed or has not happened, so a failure to enumerate can
+    // never grey this out — deriveVideoSourceEffects is written around exactly
+    // that distinction, and a control disabled on the strength of a call that did
+    // not answer is a control nobody can talk out of it.
+    //
+    // Which leaves one way to reach the greyed state wrongly: a listing that
+    // SUCCEEDS and carries no entry whose kind is "decklink" on a machine that
+    // has one. That is a data fault upstream of this file — the list is
+    // App.ListInputDevices' — and it is not papered over here. Rendering a card
+    // as available on the strength of nothing having been enumerated would just
+    // move the failure to START, where it costs not-negotiated (-4) in about a
+    // ten-thousandth of a second, naming neither the device nor the cause.
     const cardOption = [...fields.videoSource.input.options].find(
       (o) => o.value === VIDEO_SOURCE_DECKLINK,
     );
     if (cardOption) {
       const unavailable = effects.cardKnown && !effects.cardPresent;
       cardOption.disabled = unavailable && !effects.wantCard;
-      cardOption.title = unavailable ? 'No DeckLink card was found in this machine.' : '';
+      // ONE SHORT LINE, and only when the option is genuinely refused. It used to
+      // read the same whether the option was disabled or merely already chosen.
+      cardOption.title = cardOption.disabled ? describeCardOptionRefusal() : '';
     }
 
     // The preview only means something when there is live video to preview: a
@@ -1471,8 +1564,10 @@ export function createSettingsView(handlers) {
   fields.decklinkPreviewEnabled.input.addEventListener('change', renderVideoSource);
 
   /**
-   * refreshVideoDevices asks what capture hardware this machine has, so the
-   * control above can refuse a configuration that cannot start.
+   * refreshInputDevices asks what capture hardware this machine has. It feeds
+   * BOTH controls that depend on the answer: the video-source control, which
+   * must refuse a configuration that cannot start, and the commentary-input
+   * picker, which is a list of these very devices.
    *
    * It swallows every failure to `null` — not to an empty list — because those
    * are different claims and only one of them is true after a failed call. The
@@ -1481,18 +1576,19 @@ export function createSettingsView(handlers) {
    * audio and video entries alike, which is why an input listing answers a
    * question about the video leg at all.
    */
-  async function refreshVideoDevices() {
+  async function refreshInputDevices() {
     try {
       const devices = await backend.listInputDevices();
-      videoDevices = Array.isArray(devices) ? devices : null;
+      inputDevices = Array.isArray(devices) ? devices : null;
     } catch (err) {
-      videoDevices = null;
+      inputDevices = null;
       console.info(
-        'wslcomms: could not list capture devices for the video source control',
+        'wslcomms: could not list capture devices for the Settings screen',
         err?.message || err,
       );
     }
     renderVideoSource();
+    renderAudioInput();
   }
 
   // WHY THIS IS A CONTROL AND NOT A CONSTANT. It was 2000, and 2000 was chosen
@@ -1500,32 +1596,114 @@ export function createSettingsView(handlers) {
   // there is nothing for a bitrate to be spent on. The operator has ruled it too
   // low for live video and wants nearer 10000. The default stays 2000 so that
   // adding this box changes nothing until somebody types in it.
+  // The hint carries the two NUMBERS and nothing else. It used to explain what a
+  // kilobit is and which link has to carry it; both are true, neither stops a
+  // mistake, and the operator typing in this box already knows what a bitrate
+  // does. 2000 is the default and 10000 is the owner's ruling for live video —
+  // those two an operator cannot guess, so those two stay.
   addField(
     'videoBitrateKbps',
     'Video bitrate (kbps)',
     numberInput('f-videoBitrateKbps'),
-    'Kilobits per second. Default 2000, which suits a still slate; live video wants nearer 10000. ' +
-      'It is the uplink from this seat to the switcher that has to carry it.',
+    'Default 2000; live video wants nearer 10000.',
   );
 
-  // THE FALLBACK CONFORM TARGET, and the hint has to say what "fallback" means
-  // or the box reads as "force the format to this".
+  // --- THE VIDEO FORMAT, AND THE SWITCHER'S OWN FORMAT BESIDE IT ------------
   //
-  // The app derives the format from the switcher whenever any node is streaming.
-  // MEASURED on the live instance: when nothing is streaming every node reports
-  // no format at all, and no REST endpoint states the instance's configured
-  // format either — so a position that comes up first, which is the normal case
-  // an hour before kick-off, has nothing to derive from. This is what it falls
-  // back to. Blank leaves the derivation to do its job.
-  addField(
-    'videoFormatOverride',
-    'Video format when the switcher cannot be read',
-    textInput('f-videoFormatOverride'),
-    'Blank = read the format from the switcher, which works whenever anything is streaming into it. ' +
-      'Fill this in for the case where nothing is: write it as 1920x1080p50 — width x height, then ' +
-      'p and the frame rate (50, 25, 59.94). It describes how the SWITCHER is set up, so every ' +
-      'position at a venue has the same answer.',
-  );
+  // A SELECTOR, NOT A BOX. The operator's words: "the video format should be a
+  // selector, not a free text field and it should show the M2LX format clearly
+  // so it is obvious to the users when you diverge". It was a free-text field
+  // whose hint had to teach the grammar — "width x height, then p and the frame
+  // rate (50, 25, 59.94)" — which is a four-line lesson in a format nobody
+  // should be reciting from memory an hour before kick-off. The rasters are a
+  // list now and the lesson is gone with the box that needed it.
+  //
+  // THE STORED VALUE IS STILL THE STRING, deliberately. CONTRACT.md argues it:
+  // a struct merges field-by-field, so a preset carrying {"width":1280} would
+  // leave height at 1080 and conform this feed to 1280x1080 — a raster nobody
+  // chose. A string cannot half-arrive. This is a UI change and not a schema
+  // change; collectConfig still sends the same trimmed string it always did.
+  //
+  // FOLLOWING THE SWITCHER IS THE DEFAULT AND IS NOT ONE ENTRY AMONG MANY. It
+  // is the ungrouped option above every group (fillGroupedSelect's `leading`),
+  // because deriving is right on almost every seat and an override is the
+  // exception — the app reads the format from the switcher at START, and this
+  // field exists for the position that comes up before anything is streaming
+  // for it to read.
+  const videoFormatSelect = document.createElement('select');
+  videoFormatSelect.id = 'f-videoFormatOverride';
+  addField('videoFormatOverride', 'Video format', videoFormatSelect);
+
+  // WHAT M2L-X IS ACTUALLY CONFIGURED FOR, and whether this seat agrees with it.
+  //
+  // Every source feeding an instance must be produced in the instance's format;
+  // one that is not is refused. So an override that disagrees is not a
+  // preference, it is a feed that will not be accepted — and divergence is both
+  // the only reason this control exists and the only way to get it wrong. It is
+  // therefore MARKED as well as worded: the line says what is wrong and the
+  // class on the row is what makes it findable without reading anything.
+  const videoFormatLine = document.createElement('p');
+  videoFormatLine.className = 'field-hint video-format-note';
+  fields.videoFormatOverride.wrap.insertBefore(videoFormatLine, fields.videoFormatOverride.errorEl);
+
+  /**
+   * The INDEPENDENT format this seat's override is judged against, or null for
+   * not known — and why describeConformTarget reads the view's `source` rather
+   * than trusting any raster it is handed. See refreshConformTarget.
+   */
+  let conformTarget = null;
+
+  /**
+   * renderVideoFormat redraws the readout under the format control: the
+   * switcher's own format, and — when this seat is overriding it — whether the
+   * two agree.
+   *
+   * Called from populate() and from refreshConformTarget as well as from the
+   * control's own event, because assigning a <select>'s value from script fires
+   * neither 'input' nor 'change'.
+   */
+  function renderVideoFormat() {
+    const match = deriveFormatMatch(videoFormatSelect.value, conformTarget);
+    const switcher = describeConformTarget(conformTarget);
+    videoFormatLine.textContent = match.line === '' ? switcher : `${switcher} · ${match.line}`;
+    videoFormatLine.classList.toggle('video-format-note--diverges', match.diverges);
+    fields.videoFormatOverride.wrap.classList.toggle('field--diverges', match.diverges);
+  }
+
+  videoFormatSelect.addEventListener('change', renderVideoFormat);
+
+  /**
+   * refreshConformTarget asks what format the SWITCHER requires.
+   *
+   * ===================== TWO BINDINGS, IN THIS ORDER =========================
+   *
+   * getSwitcherFormat is asked FIRST and is the one that matters here, because
+   * it reads the INSTANCE'S OWN SETTING over one REST call and needs no session.
+   * A Settings screen is opened an hour before kick-off with nothing running,
+   * and that is precisely when an operator is choosing a format — so a readout
+   * that only worked once a feed was up would be absent for the whole of the
+   * time it was wanted.
+   *
+   * getConformTarget is the FALLBACK and is only ever better in one state: a
+   * session is already running, and its target was read back off the pipeline
+   * that was actually built rather than off a setting that may have been changed
+   * since. It is asked second and only accepted when it is independent of the
+   * operator — with no session it hands back the operator's own
+   * videoFormatOverride stamped source="override", and quoting that as the
+   * switcher's would be the screen inventing a confirmation. That refusal is
+   * isIndependentOfTheOperator's, in videoformat.js, so this function does not
+   * restate the rule; it only has to not defeat it, which is why the fallback is
+   * applied to a NULL first answer rather than merged into it.
+   *
+   * NEITHER THROWS and both answer null for every way of not knowing — no
+   * binding, no host, not signed in, an instance that is not up — so this needs
+   * no try/catch and has no failure of its own to degrade.
+   */
+  async function refreshConformTarget() {
+    conformTarget = await backend.getSwitcherFormat();
+    if (!conformTarget) conformTarget = await backend.getConformTarget();
+    renderVideoFormat();
+  }
 
   // --- status ---------------------------------------------------------
   const statusHeading = document.createElement('h2');
@@ -1535,7 +1713,7 @@ export function createSettingsView(handlers) {
     'statusKey',
     'Status key — optional',
     textInput('f-statusKey'),
-    'Our router input in switcher_status, e.g. "cam7". Blank = the three lamps read NO STATUS.',
+    'Our router input in switcher_status, e.g. "cam7". Blank = the lamps read NO STATUS.',
   );
 
   // The suggestions. There is no endpoint that names this node, so the app
@@ -1562,19 +1740,25 @@ export function createSettingsView(handlers) {
     suggestionsList.textContent = '';
 
     if (list.length === 0) {
-      suggestionsIntro.textContent =
-        'No suggestion yet. Leave this blank, go back and press START: the app watches every ' +
-        'switcher_status node and offers the one that starts streaming as your feed comes up.';
+      // The INSTRUCTION survives and the explanation of the mechanism does not.
+      // An operator has to be told that pressing START is what produces a
+      // suggestion — nothing else on the screen implies it — but how the watcher
+      // works is for whoever reads app_statuskey.go.
+      suggestionsIntro.textContent = 'No suggestion yet. Leave this blank and press START.';
       return;
     }
 
     if (list.length === 1) {
       suggestionsIntro.textContent = 'One node started streaming as your feed came up:';
     } else {
+      // The AMBIGUITY has to be stated — several nodes came up together and the
+      // app genuinely cannot tell which is this seat's, and a wrong statusKey
+      // shows three green lamps for somebody else's feed, which reads as
+      // confirmation. What went is the advice on how to break the tie; the
+      // evidence line under each candidate carries the video format that breaks
+      // it, which is more use than a sentence saying it might.
       suggestionsIntro.textContent =
-        `${list.length} nodes started streaming at the same time, so the app cannot tell which is ` +
-        'yours — another operator may have started too. Choose by the video format if one matches ' +
-        'your feed, or try again when nobody else is coming up:';
+        `${list.length} nodes started streaming at once — the app cannot tell which is yours:`;
     }
 
     for (const c of list) {
@@ -1659,40 +1843,126 @@ export function createSettingsView(handlers) {
   captureHeading.textContent = 'Commentary input';
   openGroup(captureHeading);
 
-  addField(
-    'audioSourceKind',
-    'Capture from',
-    selectInput('f-audioSourceKind', [
-      { value: AUDIO_SOURCE_NATIVE, label: 'This computer’s audio devices' },
-      { value: AUDIO_SOURCE_DECKLINK, label: 'A Blackmagic DeckLink card' },
-    ]),
-    'Leave this on the computer’s audio devices unless the microphone arrives on an SDI card. ' +
-      'The card’s own audio does not appear in the input list on the main screen, which is why ' +
-      'it is chosen here instead.',
-  );
+  // ================== ONE PICKER, TWO SUBSYSTEMS, NO RAW IDS ================
+  //
+  // THREE CONTROLS BECAME ONE. There used to be a "Capture from" <select>
+  // choosing the SUBSYSTEM, a free-text "DeckLink card ID" box, and — on another
+  // screen entirely — the dropdown that chose the computer's own endpoint. An
+  // operator wanting the microphone on the SDI input had to know that picking a
+  // microphone implies a capture subsystem, and had to set two halves
+  // consistently by hand, on two screens, with a persistent-id typed from
+  // memory into a box whose own comment admitted it was a box only because
+  // nothing enumerated the cards yet.
+  //
+  // Something enumerates them now: App.ListInputDevices returns both kinds, and
+  // the DeckLink entry's id IS the persistent-id — it names the CARD and serves
+  // audio and video alike (measured: the fitted UltraStudio's Audio/Source and
+  // Video/Source entries both publish 2747401380). So the box is a dropdown and
+  // the subsystem question is gone: SELECTING AN ENTRY DOES THE WHOLE SETUP.
+  //
+  // The three config fields are still three fields and are still collected and
+  // validated exactly as they were — they are HIDDEN inputs below, written by
+  // this control. Keeping them as fields rather than deriving them at collect
+  // time is what leaves populate(), collectConfig(), validateConfig() and the
+  // preset diff untouched by any of this.
+  const audioInputSelect = document.createElement('select');
+  audioInputSelect.id = 'f-commentaryInput';
+  const audioInputRow = row('Microphone', 'f-commentaryInput', audioInputSelect);
+  currentGroup.appendChild(audioInputRow.wrap);
 
-  // A FREE-TEXT DEVICE FIELD, WHICH THIS SCREEN OTHERWISE HAS NONE OF — so the
-  // reason it is allowed to be one is worth stating.
+  // THE ONLY LINE UNDER IT, and it is shown only when there is something wrong
+  // to say — a saved device that is not plugged in today. Hidden otherwise:
+  // never an empty flourish under a control that is already correct.
+  const audioInputNote = document.createElement('p');
+  audioInputNote.className = 'field-hint audio-input-note';
+  audioInputNote.hidden = true;
+  audioInputRow.wrap.insertBefore(audioInputNote, audioInputRow.errorEl);
+
+  // The three fields the picker writes. Registered exactly as any other field —
+  // populate reads them, collectConfig restates them, the validator lights them
+  // — but with no row of their own, because the picker above IS their row.
   //
-  // The fields that were removed were removed because a pasted value bypassed
-  // the dropdown's filter and failed SILENTLY: a playback endpoint id in
-  // audioDeviceId prerolled, then failed asynchronously, and the sender blamed
-  // the network and retried for ever. This one cannot fail that way. A card id
-  // that names nothing on this machine fails at START, immediately, with the id
-  // in the message — and the ordinary answer is to leave the box EMPTY, which
-  // means "the card in this machine" and is right on every seat that has one.
-  //
-  // It is a text box today because nothing enumerates the cards across the Wails
-  // boundary yet. When something does, this becomes a dropdown and the box goes.
-  addField(
-    'decklinkPersistentId',
-    'DeckLink card ID — optional',
-    textInput('f-decklinkPersistentId'),
-    'Blank = the card in this machine, which is the usual answer. Fill it in only on a machine ' +
-      'with more than one card. It is the card’s persistent ID, never its device number: a device ' +
-      'number is a position in this boot’s enumeration order and means something different after ' +
-      'a replug.',
-  );
+  // audioDeviceId is registered further down with the other device ids; these
+  // two are registered here, beside the control that decides them.
+  addHiddenField('audioSourceKind', textInput('f-audioSourceKind'));
+  addHiddenField('decklinkPersistentId', textInput('f-decklinkPersistentId'));
+
+  /**
+   * applyAudioInputSelection is the "and then do the correct setup based on what
+   * is selected" half. All three fields move together, with the one that no
+   * longer applies CLEARED — see deriveAudioInputEffects for why clearing
+   * matters as much as setting.
+   */
+  function applyAudioInputSelection() {
+    const effects = deriveAudioInputEffects(audioInputSelect.value);
+    fields.audioSourceKind.input.value = effects.audioSourceKind;
+    fields.audioDeviceId.input.value = effects.audioDeviceId;
+    fields.decklinkPersistentId.input.value = effects.decklinkPersistentId;
+    // The routing grid belongs to the card, so it follows the kind. Called here
+    // rather than listened for, because these fields are hidden inputs and
+    // assigning one from script fires nothing at all. The note under the picker
+    // follows the kind too — a DeckLink selection is refused at START and the
+    // operator has to be told at the moment they make it, not at kick-off.
+    //
+    // `false` for absent: a selection the operator has just made came from the
+    // list, so it is by construction present. The absent state is only ever
+    // reached by LOADING a configuration, which is renderAudioInput's path.
+    renderAudioInputNote(false);
+    renderChannelMapGroup();
+  }
+
+  audioInputSelect.addEventListener('change', applyAudioInputSelection);
+
+  /**
+   * renderAudioInput rebuilds the picker from today's device list and the three
+   * saved fields, and says so when the saved selection is not among them.
+   *
+   * It does NOT write the fields back: rebuilding a list is not the operator
+   * choosing from it, and a saved-but-absent device must stay saved. That is the
+   * whole point of showing it as absent rather than dropping it — a dropdown
+   * that silently moved to device #1 would leave the screen and config.json
+   * disagreeing, which is the fault describeDeviceSelection exists to prevent.
+   */
+  function renderAudioInput() {
+    const plan = planAudioInputs(inputDevices, {
+      audioSourceKind: fields.audioSourceKind.input.value,
+      audioDeviceId: fields.audioDeviceId.input.value,
+      decklinkPersistentId: fields.decklinkPersistentId.input.value,
+    });
+    fillGroupedSelect(audioInputSelect, plan, null);
+    renderAudioInputNote(plan.absent);
+  }
+
+  /**
+   * renderAudioInputNote is the ONE LINE under the picker.
+   *
+   * It is separate from renderAudioInput because it is called from the picker's
+   * own change handler as well, and rebuilding a <select> from inside its own
+   * 'change' listener is a thing that works until it does not. Only the note
+   * depends on the selection; the list does not.
+   *
+   * TWO THINGS CAN BE WRONG and only one line is spent on them. The device not
+   * being plugged in is about THIS selection and is reported first, because it
+   * is the one the operator can fix by choosing again. The DeckLink audio leg
+   * not being built is about the whole subsystem, is true of every entry in that
+   * group, and is what Start will refuse — see DECKLINK_AUDIO_NOT_BUILT for why
+   * it is said here rather than by greying the group out.
+   */
+  function renderAudioInputNote(absent) {
+    const decklinkSelected =
+      normaliseAudioSourceKind(fields.audioSourceKind.input.value) === AUDIO_SOURCE_DECKLINK;
+    const note = absent
+      ? 'This device is not connected. Choose another, or plug it back in.'
+      : decklinkSelected
+        ? DECKLINK_AUDIO_NOT_BUILT
+        : '';
+    audioInputNote.hidden = note === '';
+    audioInputNote.textContent = note;
+    // Marked as well as worded for the reason the format row is: a sentence says
+    // what is wrong and the mark is what makes it findable on a form two
+    // screenfuls deep. Both states refuse to start, so both mark.
+    audioInputRow.wrap.classList.toggle('field--absent', absent || decklinkSelected);
+  }
 
   // --- the DeckLink routing grid ------------------------------------------
   //
@@ -1731,9 +2001,10 @@ export function createSettingsView(handlers) {
   // nobody saved is a routing that lasts until the app is closed.
   const channelMapSaveHint = document.createElement('p');
   channelMapSaveHint.className = 'field-hint channelmap-save-hint';
-  channelMapSaveHint.textContent =
-    'Changes here reach the running feed the moment you make them. Press Save settings to keep ' +
-    'them for the next launch as well.';
+  // Both halves are the operator's business and neither is an explanation: a
+  // change here IS live, and a change nobody saved lasts only until the app is
+  // closed. Said in one line instead of two sentences.
+  channelMapSaveHint.textContent = 'Live immediately. Save settings to keep it for the next launch.';
   currentGroup.appendChild(channelMapSaveHint);
 
   const channelMapView = createChannelMapView({
@@ -1761,9 +2032,11 @@ export function createSettingsView(handlers) {
   // and picture groups.
   const channelMapUnsupported = document.createElement('p');
   channelMapUnsupported.className = 'field-hint';
+  // What the build cannot do, and what it does instead. The reason it cannot —
+  // no channel-map bindings — is a fact about how this copy was compiled and is
+  // no use to somebody at a desk; it stays in this comment.
   channelMapUnsupported.textContent =
-    'This build cannot route the card’s channels — it has no channel-map bindings. The capture ' +
-    'takes the card’s first two embedded channels.';
+    'This build cannot route the card’s channels. The capture takes the first two.';
   channelMapUnsupported.hidden = channelMapSupported;
   channelMapView.el.hidden = !channelMapSupported;
   channelMapSaveHint.hidden = !channelMapSupported;
@@ -1781,7 +2054,11 @@ export function createSettingsView(handlers) {
     channelMapGroup.hidden = !decklink;
   }
 
-  fields.audioSourceKind.input.addEventListener('change', renderChannelMapGroup);
+  // NO LISTENER ON THE KIND FIELD ANY MORE, and its absence is the point.
+  // audioSourceKind is a hidden input now — the commentary-input picker writes
+  // it — and assigning an input's value from script fires neither 'input' nor
+  // 'change', so a listener here would be a group that never opened. The picker
+  // calls this directly instead; see applyAudioInputSelection.
 
   /**
    * adoptChannelMapState takes GetChannelMap's report, or the "channelMap"
@@ -1878,8 +2155,12 @@ export function createSettingsView(handlers) {
     'srtReturnPort',
     'SRT return port',
     numberInput('f-srtReturnPort'),
-    '40501 pgm (dirty, the default) / 40502 pvw (encrypted) / 40503 cln (encrypted) / 40504+ relays. ' +
-      'Encrypted outputs need the key and passphrase below.',
+    // THE MENU STAYS. There is no endpoint that lists the M2L-X outputs — this
+    // table was measured by dialling each one — so a bare five-digit box is a
+    // number with no way to find out what to type. The closing sentence about
+    // encrypted outputs needing the key below went: the two controls that supply
+    // it are the next two on the screen, under a heading that says so.
+    '40501 pgm · 40502 pvw (encrypted) · 40503 cln (encrypted) · 40504+ relays.',
   );
 
   // HOW MUCH SRT BUFFER THE COMMENTATOR'S PICTURE CARRIES. A real control, for
@@ -1902,8 +2183,13 @@ export function createSettingsView(handlers) {
     'pictureLatencyMs',
     'Picture buffer (ms)',
     numberInput('f-pictureLatencyMs'),
-    'Default 120. SRT uses the larger end: this M2L-X output sets 300 ms, so below that, ' +
-      'change it on M2L-X.',
+    // THE MOST IMPORTANT STRING ON THIS SCREEN, and it is short because it can
+    // be. SRT negotiates the LARGER of the two ends and this M2L-X output is set
+    // to 300 ms, so an operator who drops this to 40, sees no change and is told
+    // nothing concludes the control is broken — when in fact it works and the far
+    // end is overriding it. All three facts survive; the instruction that
+    // followed them ("change it on M2L-X") is what an operator does with them.
+    'Default 120. SRT takes the larger end, and this M2L-X output sets 300.',
   );
 
   // --- SRT return encryption ---------------------------------------------
@@ -2146,7 +2432,17 @@ export function createSettingsView(handlers) {
     // existing installation holds, and writing 1920x1080p50 into the box on the
     // operator's behalf would turn the derivation off on every machine that
     // opened Settings once.
-    fields.videoFormatOverride.input.value = config.videoFormatOverride || '';
+    // EMPTY IS A SETTING here — it means "read the format from the switcher" —
+    // so no default is substituted, and planVideoFormats keeps a saved raster
+    // this build's list does not carry rather than letting the <select> discard
+    // it. The list is rebuilt on every populate for that reason alone: which
+    // options exist depends on what is saved.
+    fillGroupedSelect(
+      fields.videoFormatOverride.input,
+      planVideoFormats(config.videoFormatOverride || ''),
+      planVideoFormats('').follow,
+    );
+    renderVideoFormat();
     fields.statusKey.input.value = config.statusKey || '';
     // WHAT GOES TO AIR, normalised on the way IN as well as out. An unrecognised
     // value assigned to a <select> selects nothing at all, and the next Save
@@ -2164,10 +2460,15 @@ export function createSettingsView(handlers) {
     );
     renderVideoSource();
     fields.audioDeviceId.input.value = config.audioDeviceId || '';
-    // Normalised on the way in: an unrecognised kind assigned to a <select>
-    // shows nothing at all, and a save would then write that nothing back.
+    // Normalised on the way in: an unrecognised kind would otherwise reach
+    // planAudioInputs, which would file the selection under the wrong group and
+    // then find it absent from it.
     fields.audioSourceKind.input.value = normaliseAudioSourceKind(config.audioSourceKind);
     fields.decklinkPersistentId.input.value = config.decklinkPersistentId || '';
+    // The picker is drawn from those three fields, never the other way round, so
+    // this must come after all three. It does not write them back — see
+    // renderAudioInput on why a saved-but-absent device stays saved.
+    renderAudioInput();
     // The routing map is held by the grid, not by a field: it is a LIST of
     // contributions and there is no box to put one in. It goes through the same
     // populate/collect pair as everything else all the same — see collectConfig,
@@ -2313,15 +2614,46 @@ export function createSettingsView(handlers) {
   // address, so their errors belong on the address row; a hidden field's own
   // errorEl is attached to nothing and an error written there is a save that
   // fails with no visible reason.
+  //
+  // THE THREE COMMENTARY-INPUT FIELDS ARE HERE FOR THE SAME REASON, and they
+  // joined this table the moment the one picker replaced their controls. All
+  // three are hidden inputs written by that picker, and validateConfig can still
+  // refuse two of them on a value the picker itself would never produce:
+  //
+  //   decklinkPersistentId  a stored "0" — the small integer Blackmagic's own
+  //                         tools show beside a card, which the free-text box
+  //                         this control replaced was perfectly happy to accept.
+  //                         It is an enumeration index and names a different
+  //                         card after a replug, so validate.js refuses it.
+  //   audioDeviceId         a stored Windows RENDER (playback) endpoint GUID —
+  //                         the operator's measured failure, saved before the
+  //                         dropdown filter existed to prevent it.
+  //
+  // Both arrive from a config.json written by an older build or edited by hand,
+  // and both render on the picker as "NOT PRESENT — <id>". Without this table
+  // their errors would be written to an errorEl attached to nothing: a Save that
+  // fails, a message saying to fix the highlighted fields, and no highlighted
+  // field anywhere on the screen. Choosing any device clears the offending value
+  // outright, so the row the error lands on is also the row that fixes it.
   const ERROR_SURROGATES = Object.freeze({
     m2lxHost: () => ({ errorEl: liveURLRow.errorEl, input: liveURLInput }),
     eventId: () => ({ errorEl: liveURLRow.errorEl, input: liveURLInput }),
+    audioSourceKind: () => ({ errorEl: audioInputRow.errorEl, input: audioInputSelect }),
+    audioDeviceId: () => ({ errorEl: audioInputRow.errorEl, input: audioInputSelect }),
+    decklinkPersistentId: () => ({ errorEl: audioInputRow.errorEl, input: audioInputSelect }),
   });
 
   function displayErrors(errors) {
     clearAllErrors();
-    liveURLRow.errorEl.hidden = true;
-    liveURLRow.errorEl.textContent = '';
+    // The surrogate rows are cleared BY HAND, because clearAllErrors walks
+    // `fields` and neither of these rows is a field — they are the visible homes
+    // of fields that have none. Missing one here is not a missing clear, it is a
+    // stale error: last save's message left standing under a row the operator
+    // has since corrected.
+    for (const row of [liveURLRow, audioInputRow]) {
+      row.errorEl.hidden = true;
+      row.errorEl.textContent = '';
+    }
     let first = null;
     for (const [key, message] of Object.entries(errors)) {
       const field = ERROR_SURROGATES[key] ? ERROR_SURROGATES[key]() : fields[key];
@@ -2487,7 +2819,14 @@ export function createSettingsView(handlers) {
     // it, and swallowing its own failure, because a device listing that cannot
     // be made must leave the rest of the screen intact — it decides a WARNING,
     // and a warning is not worth a blank form.
-    await refreshVideoDevices();
+    await refreshInputDevices();
+
+    // AND WHAT FORMAT THE FEED IS BEING PRODUCED IN, so the format control can
+    // show the operator when their override disagrees with it. After the config
+    // load, because it renders against the override that load put in the box.
+    // backend.getConformTarget never throws — null is its answer for every way
+    // of not knowing — so it needs no try/catch of its own.
+    await refreshConformTarget();
 
     // The capture pad's width, after the config load so the saved map is in
     // place to be conformed against it, and before everything else because the

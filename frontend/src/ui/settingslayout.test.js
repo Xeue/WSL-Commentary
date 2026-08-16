@@ -261,13 +261,23 @@ test('the widest fields are named by ids settings.js actually creates', () => {
   // exactly as the four text and number fields are, so both belong to this
   // coupling — and leaving the list at two constructors would have meant either
   // a rule that matches nothing or a hint in an 18rem track.
+  // The last form is the plain assignment — `select.id = 'f-…'` — used by the
+  // two controls that are built by hand rather than by a constructor, because
+  // their options are <optgroup>s that a pure planner decides (the commentary
+  // input and the video format). Both are full-row for the same reason as the
+  // rest: the line UNDER them is long. The picker's device names run to
+  // "Blackmagic UltraStudio 4K Mini" inside a group heading, and the format's
+  // readout has to fit "Switcher: 1920x1080p50 · DIVERGES: …" on as few lines as
+  // possible — a divergence warning wrapped four deep in an 18rem track is a
+  // warning nobody reads.
   for (const id of ids) {
     assert.ok(
       js.includes(`textInput('${id}'`) ||
         js.includes(`numberInput('${id}'`) ||
         js.includes(`selectInput(\n      '${id}'`) ||
         js.includes(`selectInput('${id}'`) ||
-        js.includes(`checkboxInput('${id}'`),
+        js.includes(`checkboxInput('${id}'`) ||
+        js.includes(`.id = '${id}'`),
       `main.css marks #${id} full-width but settings.js never creates it: the ` +
         'rule matches nothing and the long hints silently return to a 350px track',
     );

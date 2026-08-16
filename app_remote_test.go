@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,6 +88,101 @@ func TestRemoteHostOnlySet(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("host-only set = %v, want %v", sortedKeys(got), sortedKeys(want))
+	}
+}
+
+// TestRemoteDispatchCoversEveryReachableMethod closes the gap between the two
+// halves of the remote surface: remoteAllowlist says a method is REACHABLE, and
+// remoteInvoke's switch is what actually reaches it. Nothing tied them together,
+// and they had come apart.
+//
+// MEASURED, and this is the whole reason the test exists: GetConformTarget was
+// in the allowlist with a paragraph of reasoning about why a remote seat's VIDEO
+// lamp needs it, and had no case in the switch. Every remote seat that asked for
+// it got
+//
+//	remote: method "GetConformTarget" has no dispatch case
+//
+// — from the switch's own default, whose comment reads "Unreachable: ... every
+// non-host-only allowlisted method has a case above". The assertion was true
+// when it was written and had quietly stopped being true, which is precisely the
+// class of drift TestRemoteAllowlistCoversEveryBoundMethod exists to prevent one
+// step earlier.
+//
+// # Why it reads the source text rather than calling the methods
+//
+// Because calling them is not an option. The reachable set includes Start, Stop,
+// SaveConfig and ApplyPreset; a test that invoked every one of them to see
+// whether it was routed would open capture devices, dial a switcher and rewrite
+// the operator's configuration. Reading which case labels the switch contains is
+// the only way to ask "is it routed" without doing the thing.
+//
+// Reading a Go file's source in a test is an established idiom here rather than
+// a novelty — frontend/src/ui pins internal/gst's two DeviceKind spellings by
+// reading gst.go's source for the same reason: the fact being asserted is the
+// TEXT, and a parse of the text is the only honest way to assert it.
+//
+// It is deliberately crude — a scan for `case "Name":` between the function's
+// opening line and its default branch — because a crude scan that over-reports
+// coverage would have to be defeated by somebody writing a case label for a
+// method they did not route, and a crude scan that under-reports is a failing
+// test somebody reads. Neither failure is silent.
+func TestRemoteDispatchCoversEveryReachableMethod(t *testing.T) {
+	const file = "app_remote.go"
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("reading %s: %v", file, err)
+	}
+	text := string(src)
+
+	// Bound the scan to remoteInvoke's body, so that a case label belonging to
+	// some other switch in this file can never be read as dispatch coverage.
+	start := strings.Index(text, "func (a *App) remoteInvoke(")
+	if start < 0 {
+		t.Fatalf("%s no longer declares remoteInvoke; this test's anchor is stale", file)
+	}
+	end := strings.Index(text[start:], "\n\tdefault:")
+	if end < 0 {
+		t.Fatalf("remoteInvoke in %s has no default branch; this test's anchor is stale", file)
+	}
+	body := text[start : start+end]
+
+	routed := map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `case "`) {
+			continue
+		}
+		// Every label on a `case "A", "B":` line, so a future grouped case is
+		// read correctly rather than half-read.
+		for _, part := range strings.Split(strings.TrimSuffix(line[len("case "):], ":"), ",") {
+			if name, err := strconv.Unquote(strings.TrimSpace(part)); err == nil {
+				routed[name] = true
+			}
+		}
+	}
+
+	// A SOURCE SCAN THAT PARSES NOTHING PASSES EVERYTHING, which would make this
+	// test worse than no test: it would report coverage it never looked for. The
+	// floor is deliberately loose — it is a smoke check on the parse, not a
+	// second frozen list to maintain — and any reformatting that drops the count
+	// below it is exactly the change that should stop and be looked at.
+	if len(routed) < 20 {
+		t.Fatalf("only %d case labels were parsed out of remoteInvoke; the scan has stopped "+
+			"working and would now pass regardless of coverage", len(routed))
+	}
+
+	for name, pol := range remoteAllowlist {
+		if pol.hostOnly {
+			// Refused before dispatch and omitted from Methods(), so a case
+			// would be dead code rather than coverage.
+			continue
+		}
+		if !routed[name] {
+			t.Errorf("remoteAllowlist makes %q remotely reachable but remoteInvoke has no "+
+				"case for it, so every remote call of it fails with \"no dispatch case\". "+
+				"Add the case, or classify the method host-only.", name)
+		}
 	}
 }
 

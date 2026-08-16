@@ -868,11 +868,95 @@ func ListInputDevices() ([]Device, error) {
 			continue
 		}
 		byID[key] = len(out)
-		out = append(out, Device{ID: id, Name: name, Kind: kind})
+		// NormaliseDeviceKind, not kind: Device.Kind's json tag has no omitempty
+		// precisely so the frontend's one dropdown can group on this field, and
+		// that only works if the field always holds one of the two spellings.
+		// captureDeviceID is not supposed to answer "" and every platform seam
+		// today does not, so this is a belt-and-braces conversion at the single
+		// point every offered device passes through rather than a defence
+		// against a known caller.
+		out = append(out, Device{ID: id, Name: name, Kind: NormaliseDeviceKind(kind)})
 	}
 	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped%s",
 		len(out), audioSources, captureSourceFactory, skipped, skipDetail())
+	reportSilentDeckLinkProvider()
 	return out, nil
+}
+
+// reportSilentDeckLinkProvider writes ONE line when the decklink plugin is
+// loaded and nevertheless enumerated no cards, and is silent in every other
+// case.
+//
+// # The failure it exists to name, measured
+//
+// A fitted, working UltraStudio 4K Mini did not appear in the commentary input
+// list of the SHIPPED, SIGNED, NOTARISED bundle, while appearing perfectly in an
+// unsigned build and in gst-device-monitor-1.0 on the same machine one minute
+// later. The whole of the evidence GStreamer offered was this function's
+// caller's own summary line:
+//
+//	gst: ListInputDevices: offered 4 of 4 Audio/Source devices (osxaudiosrc); 0 were skipped
+//
+// — four devices where there are five, no skip, no warning, nothing in the
+// GStreamer debug log at any level. The cause was in the KERNEL log:
+//
+//	AppleMobileFileIntegrity: Library Validation failed: Rejecting
+//	'/Library/Frameworks/DeckLinkAPI.framework/Versions/A/DeckLinkAPI'
+//	(Team ID: 9ZGFBWLSYP) for process 'wslcomms' (Team ID: 5P76UVY5WF),
+//	reason: mapping process and mapped file (non-platform) have different Team IDs
+//
+// libgstdecklink does not LINK the Blackmagic API — it dlopens
+// /Library/Frameworks/DeckLinkAPI.framework at first use — so under the hardened
+// runtime without a library-validation waiver the plugin registers, the device
+// provider registers, the provider probes, the dlopen is refused, and the
+// provider reports zero cards. Every layer above sees a machine with no capture
+// card in it. The frontend then greys the DeckLink option out and says "no
+// DeckLink card was found in this machine" about a card whose tally light is on.
+// See build/darwin/wslcomms.entitlements for the fix and the measurement.
+//
+// # It stays SILENT unless there is something to act on, and the bar is high
+//
+// deckLinkSkipDetail's rule is that a machine with no Blackmagic anything must
+// log exactly what it logged before DeckLink support existed, down to the
+// character, because a permanent line about hardware that was never fitted is a
+// permanent invitation to go looking for it. That rule is kept here, and keeping
+// it took more than the obvious test.
+//
+// THE OBVIOUS TEST IS WRONG ON macOS, and it is worth writing down because it
+// looks right. "Is the decklink element factory registered" reads as "is the
+// driver installed", and on macOS it is not: libgstdecklink.dylib has NO
+// link-time dependency on DeckLinkAPI — measured, its whole reference to
+// Blackmagic is one string, loaded through CFBundle at first use — so the plugin
+// registers, and the elements resolve, on a Mac that has never had Desktop Video
+// on it. Gating the line on the factory alone would print it on every
+// enumeration on every Mac we ship to.
+//
+// So the factory check is only the CHEAP half, and the decision belongs to
+// deckLinkAPIDiagnosis, which measures. It returns false for both of the
+// unremarkable cases — no driver installed, and an API that loads perfectly
+// well on a machine that simply has no card plugged in — and true only when the
+// API is installed and this process could not load it, which is the one state
+// that is invisible from everything else the application prints.
+//
+// It never refuses anything. A missing card is not an error here; it is an error
+// at Start, where preflightCapture can name the field.
+func reportSilentDeckLinkProvider() {
+	if deckLinkDevicesOffered.Load() != 0 {
+		return
+	}
+	// The FACTORY first, because a factory lookup is one registry hash and the
+	// diagnosis below touches the filesystem. Both the elements and the device
+	// provider register in the same plugin_init, so no factory means the plugin
+	// is not in this bundle at all and there is nothing further to ask.
+	if gogst.ElementFactoryFind(videoCaptureFactory) == nil {
+		return
+	}
+	reason, worth := deckLinkAPIDiagnosis()
+	if !worth {
+		return
+	}
+	log.Printf("gst: ListInputDevices: the decklink plugin is loaded but enumerated NO cards. %s",
+		reason)
 }
 
 // structureFieldNames renders a structure's field names for a diagnostic

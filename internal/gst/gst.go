@@ -214,7 +214,27 @@ type Device struct {
 	// never a device-number, and how the two providers are told apart — is in
 	// decklinkdevices.go, which WP-DECKLINK owns. The type itself is directly
 	// below, beside the field that carries it.
-	Kind DeviceKind `json:"kind,omitempty"`
+	//
+	// # The json tag has NO omitempty, and that is now load-bearing
+	//
+	// It had one, and it was wrong in a way that only shows up on the frontend.
+	// The commentary input is ONE dropdown over BOTH kinds, split into optgroups
+	// keyed on this field, so the frontend asks each device which group it
+	// belongs in. With omitempty a Kind of "" is omitted from the frame
+	// ENTIRELY, the frontend's `kind === 'native'` reads undefined, and the
+	// device lands in NEITHER group — it vanishes from the only control that
+	// could select it. That is the original enumeration bug reproduced one layer
+	// up, and the whole reason this field exists is to stop the operator's
+	// microphone disappearing out of a list.
+	//
+	// The Go-side guarantee that pairs with the tag: ListInputDevices passes
+	// every entry through NormaliseDeviceKind before returning, so the wire
+	// carries an explicit "native" or "decklink" and never an empty string. The
+	// tag alone would serialise "", which is honest but is a third spelling for
+	// the frontend to know about; normalising at the source means it has two.
+	// NormaliseDeviceKind stays the rule for anything DECODED — a Device read
+	// back out of a frame written by an older build still carries "".
+	Kind DeviceKind `json:"kind"`
 }
 
 // DeviceKind names which family of capture device a Device belongs to, and

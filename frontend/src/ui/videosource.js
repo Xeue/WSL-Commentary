@@ -111,37 +111,49 @@ export const PREVIEW_KEY = 'decklinkPreviewEnabled';
 export const LAMP_CAMERA = 'CAMERA';
 
 /**
- * VIDEO_SOURCES is the control, in the order it is drawn.
+ * VIDEO_SOURCES is the control, in the order it is drawn: a value and a label,
+ * and deliberately nothing else.
  *
- * `cost` is stated for the reason picturesource.js states one: an operator
- * cannot weigh an option they are told nothing about. Here it earns its place
- * chiefly because the intuition is BACKWARDS — the card is the cheaper leg —
- * and an engineer who assumes otherwise will leave a position on the slate to
- * "protect the machine".
+ * ===================== THE SUMMARY AND COST FIELDS WENT =====================
  *
- * @type {ReadonlyArray<{value: string, label: string, summary: string, cost: string}>}
+ * Each entry used to carry a `summary` and a `cost`, and settings.js rendered
+ * all four of them under the <select> as one 933-character paragraph — the
+ * largest block of prose on the Settings screen and the one the owner named:
+ * "SOO much text bellow controbution info that really isn't appropriate to be
+ * there". Not one word of it was wrong. It was being read by the wrong person.
+ *
+ * IT IS ALL STILL WRITTEN DOWN, here, where whoever edits this application will
+ * find it and the operator picking a source will not:
+ *
+ *   SLATE. The still picture named under Slate is sent, frozen, for the whole
+ *   match — what every commentary position has sent until now. It needs no
+ *   capture hardware, and it costs MORE processor than the card, not less:
+ *   18.5-23.9 % of one core measured, because a still picture is re-encoded
+ *   from nothing fifty times a second.
+ *
+ *   THE CARD. Whatever is on the card's SDI or HDMI input is sent, conformed to
+ *   the format the switcher is configured for, and the slate is not sent at
+ *   all. Measured at 9.3-14.6 % of one core — LESS than the slate. It needs a
+ *   card in this machine with a picture on its input.
+ *
+ * The cost figures are worth keeping precisely because the intuition is
+ * BACKWARDS: an engineer who assumes the camera is the expensive leg will leave
+ * a position on the slate to "protect the machine", and that belief is corrected
+ * by reading this file rather than by a paragraph on a form somebody is using to
+ * pick a microphone. What the operator still gets is the two labels, plus
+ * describeToAir under the control saying which one is going to air — which is
+ * the question they actually have.
+ *
+ * @type {ReadonlyArray<{value: string, label: string}>}
  */
 export const VIDEO_SOURCES = Object.freeze([
   Object.freeze({
     value: VIDEO_SOURCE_SLATE,
     label: 'Slate — a still image',
-    summary:
-      'The still picture named under Slate below is sent, frozen, for the whole match. ' +
-      'This is what every commentary position has sent until now.',
-    cost:
-      'Needs no capture hardware. It costs MORE processor than the card, not less — 18.5-23.9 % ' +
-      'of one core measured — because a still picture is re-encoded from nothing fifty times a ' +
-      'second.',
   }),
   Object.freeze({
     value: VIDEO_SOURCE_DECKLINK,
     label: 'The DeckLink card’s video input',
-    summary:
-      'Whatever is on the card’s SDI or HDMI input is sent, conformed to the format the switcher ' +
-      'is configured for. The slate is not sent at all.',
-    cost:
-      'Measured at 9.3-14.6 % of one core, less than the slate. It needs a card in this machine ' +
-      'with a picture on its input.',
   }),
 ]);
 
@@ -256,23 +268,18 @@ export function deriveVideoSourceEffects(source, devices) {
  * @returns {string}
  */
 export function describeToAir(effects) {
+  // Each of the three is ONE line, and each keeps the half a label cannot say:
+  // what is NOT sent (the operator's real doubt), where to look to tell a live
+  // picture from black, and — for the fault case — when it will fail and what to
+  // do. The explanatory clauses that used to trail each of them said why the
+  // slate exists and how the card is conformed, which is this file's header.
   if (effects.toAir === VIDEO_SOURCE_SLATE) {
-    return (
-      'GOING TO AIR: THE SLATE. The still image is sent for the whole match, and nothing from a ' +
-      'card is sent whatever is plugged into one.'
-    );
+    return 'GOING TO AIR: THE SLATE — nothing from a card, whatever is plugged into one.';
   }
   if (effects.toAir === VIDEO_SOURCE_DECKLINK) {
-    return (
-      'GOING TO AIR: THE CARD. Whatever is on the card’s video input is sent, and the slate is ' +
-      'not sent at all. Watch the CAMERA lamp on the main screen — nothing else in this ' +
-      'application can tell a live picture from black.'
-    );
+    return 'GOING TO AIR: THE CARD — the slate is not sent. Watch the CAMERA lamp.';
   }
-  return (
-    'NOTHING WOULD GO TO AIR. The card is selected and no DeckLink card was found in this ' +
-    'machine, so START will be refused. Choose the slate, or fit the card and re-open Settings.'
-  );
+  return 'NOTHING WOULD GO TO AIR: no card was found, so START will be refused. Choose the slate, or fit the card.';
 }
 
 /**
@@ -294,27 +301,40 @@ export function describeToAir(effects) {
  * @returns {string}
  */
 export function describeCardAvailability(effects) {
+  // ONE LINE EACH. The measurement that justifies warning at all — a capture
+  // from a card that is not there fails in about a ten-thousandth of a second,
+  // naming neither the device nor the cause — is in this file's header, where
+  // the next person to weaken this warning will read it. The operator needs the
+  // state and nothing else.
   if (!effects.cardKnown) {
-    return (
-      'The capture devices on this machine could not be listed, so whether a DeckLink card is ' +
-      'fitted is unknown. The choice above is left exactly as it is rather than second-guessed.'
-    );
+    return 'The capture devices could not be listed, so whether a card is fitted is unknown.';
   }
   if (effects.wantCard && !effects.cardPresent) {
-    return (
-      'NO DECKLINK CARD WAS FOUND IN THIS MACHINE — nothing was enumerated. A capture from a card ' +
-      'that is not there fails in about a ten-thousandth of a second and names neither the device ' +
-      'nor the cause, so it is said here instead of there.'
-    );
+    return 'NO DECKLINK CARD WAS FOUND in this machine.';
   }
   if (!effects.wantCard && effects.cardPresent) {
     return effects.cardCount === 1
-      ? 'A DeckLink card IS fitted to this machine and is not being used for video: the slate is ' +
-          'what goes to air.'
-      : `${effects.cardCount} DeckLink cards are fitted to this machine and none is being used ` +
-          'for video: the slate is what goes to air.';
+      ? 'A DeckLink card IS fitted and is not being used: the slate goes to air.'
+      : `${effects.cardCount} DeckLink cards are fitted and none is being used: the slate goes to air.`;
   }
   return '';
+}
+
+/**
+ * describeCardOptionRefusal is the tooltip on the card <option> when it is
+ * DISABLED — one short line, and only then.
+ *
+ * It exists as its own string because the previous version was set whenever the
+ * card was unavailable, including when the option was unavailable-but-selected —
+ * a configuration that names the card on a machine with none, where the option
+ * is deliberately left enabled so the screen and config.json cannot disagree.
+ * A tooltip saying "no card was found" on an option the operator can still use
+ * is a tooltip that contradicts its own control.
+ *
+ * @returns {string}
+ */
+export function describeCardOptionRefusal() {
+  return 'No DeckLink card was found in this machine.';
 }
 
 /**
@@ -338,29 +358,21 @@ export function describeCardAvailability(effects) {
  * exactly these words.
  */
 export const PREVIEW_AT_START_CAVEAT =
-  'Off by default. It puts a small confidence picture of what the card is capturing beside the ' +
-  'return picture on the main screen; it changes nothing about what is transmitted. IT ONLY ' +
-  'TAKES EFFECT WHEN YOU PRESS START: switching it during a live feed was measured to stop the ' +
-  'picture going to air altogether — permanently, with everything still reporting success — so ' +
-  'this application will not do it. Press STOP, change it, then START.';
+  'Takes effect at START; it changes nothing that is transmitted.';
 
-/**
- * VIDEO_SOURCE_AT_START_CAVEAT is the same rule for the source above the
- * preview, and it is here rather than in the option table because it is true of
- * both options and of neither in particular.
- *
- * The measurement is the one PREVIEW_AT_START_CAVEAT records; what differs is
- * the stake. Changing the preview under a running feed would cost the operator's
- * own window; changing the SOURCE under one would cost the picture the switcher
- * is receiving. Go refuses both — errVideoSourceWhileSending — and this screen
- * disables both rather than offering a control whose refusal the operator would
- * have to discover by pressing it.
- */
-export const VIDEO_SOURCE_AT_START_CAVEAT =
-  'The video leg is built when you press START, so changing this does not move what is on air ' +
-  'now: press STOP, change it, then START. This application will not swap it under a running ' +
-  'feed — doing so was measured to stop the picture going to air permanently, with everything ' +
-  'still reporting success.';
+// VIDEO_SOURCE_AT_START_CAVEAT WAS HERE and is gone. It was the same rule for
+// the source control, rendered as a second 250-character paragraph beside the
+// first, and it is now said in the only place and at the only moment it can be
+// acted on: VIDEO_LEG_WHILE_SENDING, ON the control, while a feed is up. Off
+// air there is nothing to caveat — changing the source then simply works — so
+// the paragraph was a permanent warning about a transient condition.
+//
+// Its content survives in this file. The stake is what differed from the
+// preview's: changing the preview under a running feed would cost the operator's
+// own window; changing the SOURCE under one would cost the picture the switcher
+// is receiving. Go refuses both (errVideoSourceWhileSending,
+// errPreviewChangeWhileSending) and settings.js disables both rather than
+// offering a control whose refusal the operator would discover by pressing it.
 
 /**
  * VIDEO_LEG_WHILE_SENDING is the reason both controls carry while a session is
@@ -377,7 +389,7 @@ export const VIDEO_SOURCE_AT_START_CAVEAT =
  * the control.
  */
 export const VIDEO_LEG_WHILE_SENDING =
-  'Disabled while SENDING: the video leg is built at START. Press STOP, change it, then START.';
+  'Disabled while SENDING. Press STOP, change it, then START.';
 
 /**
  * describePreviewBox is the caption drawn INSIDE the reserved preview box.

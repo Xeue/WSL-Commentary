@@ -1078,6 +1078,110 @@ test('Apply and Delete are gated on the sending state, with the reason on the co
   );
 });
 
+// ---------------------------------------------------------------------------
+// THE PROSE BUDGET
+// ---------------------------------------------------------------------------
+//
+// "far too much waffle in the settings again." — the owner, and it is the
+// headline complaint rather than a cosmetic one. A settings screen is SCANNED
+// and OPERATED, not read: an operator opens it twenty minutes before kick-off to
+// pick a device, and every sentence they must read past to find the control is a
+// cost paid by everybody, every time, for ever.
+//
+// The rendered text of this screen went from 5,980 characters to 2,852 —
+// measured by building the form against a DOM shim and summing the textContent
+// of every node — and the largest single block went from 933 characters (the
+// video-source hint, the one the owner named: "SOO much text bellow
+// controbution info that really isn't appropriate to be there") to 138.
+//
+// ======================= WHAT THIS TEST IS AND IS NOT =======================
+//
+// It is NOT a rule against explaining things. This codebase deliberately has a
+// very high comment-to-code ratio and that is house style: nearly every sentence
+// cut from the screen is still written down, a few lines away, in the source.
+// The individual guards for that are beside each change — videosource.test.js
+// requires the measured processor figures to survive as comments, channelmap's
+// caveat test requires the same of the no-gain-stage argument.
+//
+// What this pins is the SHAPE of a rendered string. A hint earns its place by
+// stopping a mistake an operator would otherwise make: "Default 120.", the four
+// M2L-X output ports, that "Left only" means the left channel in BOTH ears.
+// It does not earn its place by explaining why the field exists, what the
+// failure mode is, or what was measured — and a string long enough to do that is
+// long enough to be caught by a length. The budget is deliberately generous
+// against what is there now (160 characters is the longest), so it fails on a
+// paragraph coming back rather than on an edit.
+
+test('no rendered string on the Settings screen is a paragraph', () => {
+  // Comments stripped first, and that is not incidental: this file and the three
+  // below discuss the culled prose at length, and a guard that a paragraph does
+  // not appear must never be satisfiable — or breakable — by an explanation of
+  // itself.
+  const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  // Concatenated runs count as ONE string, because that is how the waffle was
+  // written: `'…' + '…' + '…'` across five lines reads as five short literals in
+  // a diff and renders as one paragraph on the screen.
+  const RUN = /'(?:[^'\\\n]|\\.)*'(?:\s*\+\s*'(?:[^'\\\n]|\\.)*')*/g;
+  const LIMIT = 200;
+
+  // The three files that render this screen. settings.js builds the form;
+  // videosource.js and channelmap.js own wording it draws.
+  for (const file of ['settings.js', 'videosource.js', 'channelmap.js']) {
+    const runs = [...strip(ui(file)).matchAll(RUN)].map((m) =>
+      m[0].split(/'\s*\+\s*'/).join('').replace(/^'|'$/g, ''),
+    );
+    assert.ok(runs.length > 10, `${file}: the literal scan found only ${runs.length} strings`);
+    for (const run of runs) {
+      assert.ok(
+        run.length <= LIMIT,
+        `${file} renders a ${run.length}-character string:\n\n  ${run.slice(0, 160)}…\n\n` +
+          'A field hint earns its place if it stops a mistake an operator would otherwise make. ' +
+          'It does not earn its place by explaining why the field exists, what the failure mode ' +
+          'is, or what was measured — that belongs in a comment beside the code, which is where ' +
+          'the rest of this screen\'s justifications now live. Move it; do not delete it.',
+      );
+    }
+  }
+});
+
+test('the paragraphs the owner named are gone, and named so they cannot come back', () => {
+  // Tombstones, in the manner of the preset card's scope readout below. Each one
+  // is a specific block that was on the screen and is now a comment; grepping for
+  // its opening words is what stops it being reinstated by somebody who
+  // reasonably thinks the screen is under-explained.
+  //
+  // COMMENTS STRIPPED, and here that is the whole subtlety. The correct edit was
+  // to MOVE this prose into the source beside the code it explains, so several of
+  // these phrases legitimately appear in settings.js — inside the comment that
+  // records what was cut and why. Matching the file's raw text would make the
+  // right fix indistinguishable from the wrong one, and would punish the one
+  // thing this change was supposed to do.
+  const js = ui('settings.js')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  const gone = [
+    // The 933-character video-source hint — the one the owner named.
+    'The still picture named under Slate below is sent',
+    'It costs MORE processor than the card',
+    // The 315-character format hint, which had to teach the grammar of a raster.
+    'width x height, then',
+    // The 280-character card-id hint, on a box that is a dropdown now.
+    'Blank = the card in this machine',
+    // The 203-character capture-subsystem hint, on a control that no longer
+    // exists — the device implies the subsystem now.
+    'Leave this on the computer',
+  ];
+  for (const phrase of gone) {
+    assert.equal(
+      js.includes(phrase),
+      false,
+      `"${phrase}…" is back on the Settings screen. It was moved to a comment, not deleted — ` +
+        'check videosource.js, videoformat.js and audioinput.js before writing it again.',
+    );
+  }
+});
+
 test('the preset card carries no scope readout or machine-fields note', () => {
   // Both were removed at the operator's request — the card is the picker and
   // its buttons only. The safety they narrated (a preset cannot carry a device
@@ -1709,24 +1813,35 @@ test('the video format override defaults to blank, which means derive', () => {
   assert.match(js, /videoFormatOverride: '',/, 'blankConfig must default it to empty');
   assert.match(
     js,
-    /fields\.videoFormatOverride\.input\.value = config\.videoFormatOverride \|\| '';/,
-    'populate must leave it empty rather than substituting a format',
+    /videoFormatOverride: fields\.videoFormatOverride\.input\.value\.trim\(\)/,
+    'collectConfig must still send the STRING — this is a UI change, not a schema change, and ' +
+      'CONTRACT.md argues the string: a struct merges field-by-field, so a preset carrying ' +
+      '{"width":1280} would leave height 1080 and conform the feed to 1280x1080',
   );
+
+  // A SELECTOR, NOT A BOX. The operator's words: "the video format should be a
+  // selector, not a free text field". The free-text box is gone and with it the
+  // 315-character hint that had to teach the grammar of a raster.
+  assert.equal(
+    /textInput\('f-videoFormatOverride'\)/.test(js),
+    false,
+    'the video format is a free-text box again; the raster is not something to type from memory',
+  );
+  assert.match(js, /videoFormatSelect\.id = 'f-videoFormatOverride'/);
   assert.match(
     js,
-    /videoFormatOverride: fields\.videoFormatOverride\.input\.value\.trim\(\)/,
-    'collectConfig must send what the operator typed, trimmed and otherwise verbatim — a form that ' +
-      'rewrote it would answer a different question from the one on screen',
+    /planVideoFormats\(config\.videoFormatOverride \|\| ''\)/,
+    'populate must build the list around what is SAVED — a raster this build does not list must ' +
+      'not be discarded by the <select> it is assigned to',
   );
-  // Ends at the next heading, not at a phrase: "SRT return encryption" appears
-  // in this file's own header prose long before the field, so slicing to it
-  // would produce an empty string and a test that passes on nothing.
-  const field = js.slice(
-    js.indexOf("addField(\n    'videoFormatOverride',"),
-    js.indexOf("statusHeading.textContent = 'Status'"),
+  // FOLLOWING THE SWITCHER IS NOT ONE ENTRY AMONG MANY. It is the ungrouped
+  // option above every group, because deriving is right on almost every seat and
+  // an override is the exception.
+  assert.match(
+    js,
+    /planVideoFormats\(''\)\.follow,/,
+    'the follow option must be passed as the LEADING option, outside the raster groups',
   );
-  assert.ok(field.includes('1920x1080p50'), 'the hint must show the form the field wants');
-  assert.match(field, /[Bb]lank/, 'and say what blank does, or the box reads as "force this format"');
 });
 
 test('Go refuses a video format it cannot parse, and names the field when it does', () => {
@@ -1760,20 +1875,50 @@ test('Go refuses a video format it cannot parse, and names the field when it doe
 });
 
 test('the capture-source control offers exactly the two kinds Go accepts', () => {
-  // A third option here would save cleanly and be refused by Validate at START;
-  // a spelling that differs from Go's would save cleanly and capture from the
+  // A third kind here would save cleanly and be refused by Validate at START; a
+  // spelling that differs from Go's would save cleanly and capture from the
   // wrong subsystem. Both are pinned against config.go's own constants.
   const go = read(repoRoot, 'internal', 'config', 'config.go');
   assert.match(go, /AudioSourceNative = "native"/, 'internal/config no longer spells the native kind "native"');
   assert.match(go, /AudioSourceDeckLink = "decklink"/, 'internal/config no longer spells the card kind "decklink"');
 
+  // THE CONSTANTS MOVED. They were declared in settings.js while the screen was
+  // the only thing that asked the question; the picker's planning module decides
+  // which kind a selection MEANS, so it owns the spelling and settings.js
+  // imports it. A constant owned by the screen that merely renders the answer is
+  // a constant two files have to agree about.
+  const audio = ui('audioinput.js');
+  assert.match(audio, /export const AUDIO_SOURCE_NATIVE = 'native';/);
+  assert.match(audio, /export const AUDIO_SOURCE_DECKLINK = 'decklink';/);
+
   const js = ui('settings.js');
-  assert.match(js, /const AUDIO_SOURCE_NATIVE = 'native';/);
-  assert.match(js, /const AUDIO_SOURCE_DECKLINK = 'decklink';/);
-  assert.match(js, /selectInput\('f-audioSourceKind',/, 'the capture source must be a <select>, not free text');
-  const control = js.slice(js.indexOf("selectInput('f-audioSourceKind',"), js.indexOf("addField(\n    'decklinkPersistentId',"));
-  const options = [...control.matchAll(/value: (AUDIO_SOURCE_[A-Z]+)/g)].map((m) => m[1]);
-  assert.deepEqual(options, ['AUDIO_SOURCE_NATIVE', 'AUDIO_SOURCE_DECKLINK'], 'exactly the two kinds, in that order');
+  assert.match(
+    js,
+    /import \{[^}]*normaliseAudioSourceKind[^}]*\} from '\.\/audioinput\.js'/s,
+    'settings.js must import the kinds rather than restating them',
+  );
+  assert.equal(
+    /const AUDIO_SOURCE_NATIVE = /.test(js),
+    false,
+    'settings.js has its own copy of the kind again; two spellings of "decklink" would file the ' +
+      "card's own microphone under the computer's audio devices with nothing reporting an error",
+  );
+
+  // THERE IS NO "CAPTURE FROM" CONTROL ANY MORE, and that is the change. It was
+  // one of two controls asking one question — the operator's words: "On the mic
+  // input, we should have both the decklink found audio sources and the normal
+  // ones in the same drop down, use optgroup to seperate them. And then do the
+  // correct setup based on what is selected." The kind is DERIVED from the
+  // device now, which is the only order in which it was ever knowable.
+  assert.equal(
+    /selectInput\('f-audioSourceKind',/.test(js),
+    false,
+    'the subsystem is a control again; an operator picking a microphone should not also have to ' +
+      'understand that picking it implies a capture subsystem',
+  );
+
+  // The field is still a field, still normalised both ways, still collected.
+  assert.match(js, /addHiddenField\('audioSourceKind',/);
   assert.match(
     js,
     /audioSourceKind: normaliseAudioSourceKind\(fields\.audioSourceKind\.input\.value\)/,
@@ -1782,9 +1927,30 @@ test('the capture-source control offers exactly the two kinds Go accepts', () =>
   assert.match(
     js,
     /fields\.audioSourceKind\.input\.value = normaliseAudioSourceKind\(config\.audioSourceKind\)/,
-    'and populate must normalise on the way IN too — an unrecognised value assigned to a <select> ' +
-      'shows nothing, and the next Save would write that nothing back',
+    'and populate must normalise on the way IN too — an unrecognised kind would be filed under the ' +
+      'wrong group and then found absent from it',
   );
+});
+
+test('selecting a microphone does the whole setup, and clears what no longer applies', () => {
+  // THE WHOLE POINT OF THE ONE PICKER. Setting one half of the pair and not the
+  // other is a configuration that saves cleanly and captures from the wrong
+  // place: an audioDeviceId left over from the computer's audio stack sitting
+  // beside audioSourceKind "decklink" is two answers to one question, and which
+  // wins is a property of internal/gst rather than of anything on screen.
+  const js = ui('settings.js');
+  const apply = js.slice(
+    js.indexOf('function applyAudioInputSelection()'),
+    js.indexOf("audioInputSelect.addEventListener('change'"),
+  );
+  assert.ok(apply.length > 0, 'settings.js must define applyAudioInputSelection');
+  assert.match(apply, /deriveAudioInputEffects\(audioInputSelect\.value\)/, 'from the pure model');
+  for (const field of ['audioSourceKind', 'audioDeviceId', 'decklinkPersistentId']) {
+    assert.ok(
+      apply.includes(`fields.${field}.input.value = effects.${field}`),
+      `${field} must move with the selection, or half the setup is done`,
+    );
+  }
 });
 
 test('the DeckLink card is named by its persistent id, never by a device number', () => {
@@ -1794,19 +1960,39 @@ test('the DeckLink card is named by its persistent id, never by a device number'
   // and "0" is a different piece of hardware while every config on the machine
   // still says 0.
   const js = ui('settings.js');
-  assert.match(js, /textInput\('f-decklinkPersistentId'\)/);
   assert.match(
     js,
     /decklinkPersistentId: fields\.decklinkPersistentId\.input\.value\.trim\(\)/,
     'collectConfig must restate the card id, or a Save deletes it',
   );
-  const field = js.slice(js.indexOf("addField(\n    'decklinkPersistentId',"), js.indexOf('--- monitor / return'));
-  assert.match(field, /persistent/i, 'the hint must say which kind of id this is');
-  assert.match(field, /device number/i, 'and which kind it is not');
-  assert.match(field, /[Bb]lank/, 'and that blank means the card in this machine, which is the usual answer');
+
+  // IT IS A DROPDOWN NOW, AND THE BOX IS GONE. The owner: "I hate the settings
+  // boxes requires raw device ID's these should be drop downs when they are
+  // avilable." The field's own comment used to concede the point — "It is a text
+  // box today because nothing enumerates the cards across the Wails boundary
+  // yet. When something does, this becomes a dropdown and the box goes." —
+  // and something does: App.ListInputDevices returns both kinds, and a DeckLink
+  // entry's id IS the persistent-id, because it names the CARD and serves the
+  // audio and video entries alike.
+  assert.match(js, /addHiddenField\('decklinkPersistentId',/, 'it is written by the picker now');
+  assert.equal(
+    /addField\(\s*'decklinkPersistentId',/.test(js),
+    false,
+    'the card id has a row of its own again; it is chosen by picking the microphone on it',
+  );
+  // And nothing may put a raw id in front of an operator to be typed. The value
+  // only ever comes off an enumerated device or off the saved configuration.
+  const plan = ui('audioinput.js');
+  assert.match(
+    plan,
+    /encodeAudioInput\(AUDIO_SOURCE_DECKLINK, str\(d\.id\)\)/,
+    "a card option's value must be the enumerated device's own id",
+  );
 
   // No control anywhere may offer a device number instead. There is exactly one
-  // identifier for the card in this application.
+  // identifier for the card in this application, and validateConfig still
+  // refuses the small integer Blackmagic's own tools show beside a card — see
+  // the case above, which is the half that survives the control's removal.
   assert.equal(/f-decklinkDeviceNumber|deviceNumber:/.test(js), false, 'settings.js offers a device number');
 });
 

@@ -472,7 +472,7 @@ build — which is exactly the edit not to make. Lowering the floor an operator
 sees is a matter of building GStreamer against an older SDK, or running the
 release build on an older Mac. It is still not a matter of editing the number.
 
-### Entitlements: one key
+### Entitlements: two keys
 
 `build/darwin/wslcomms.entitlements` is applied to the outer bundle only. The
 48 nested Mach-Os are signed with the hardened runtime and no entitlements.
@@ -481,12 +481,17 @@ The file carries the reasoning for every key taken and every key rejected —
 read it, it is the more complete document. Two results are worth repeating
 here because they are counter-intuitive:
 
-**`com.apple.security.cs.disable-library-validation` is NOT needed**, and that
-was established with a control rather than by it happening to work. With the
-whole bundle signed by one Developer ID team, the bundle's own hardened-runtime
-`gst-inspect` `dlopen`ed `libgstosxaudio.dylib` out of
-`Contents/Resources/gstreamer-1.0` with no waiver at all. Re-signing one plugin
-ad-hoc so it carried a *different* team then produced:
+**`com.apple.security.cs.disable-library-validation` IS needed**, for one load
+that is not in the bundle at all. This section used to say the opposite, on a
+measurement that was correct and incomplete, and the correction is worth
+following because the same trap is waiting for the next externally-installed
+dependency.
+
+The measurement that was right: with the whole bundle signed by one Developer ID
+team, the bundle's own hardened-runtime `gst-inspect` `dlopen`ed
+`libgstosxaudio.dylib` out of `Contents/Resources/gstreamer-1.0` with no waiver
+at all, and re-signing one plugin ad-hoc so it carried a *different* team
+produced:
 
 ```
 module_open failed: dlopen(.../libgstlevel.dylib): code signature not valid for
@@ -495,10 +500,29 @@ Team IDs
 No such element or plugin 'level'
 ```
 
-So library validation is enforced, and what satisfies it is that
-`ship-darwin.sh` signs **every** Mach-O in the bundle with the same team. This
-is a load-bearing dependency between two files: if the signing pass ever stops
-covering part of the payload, the fix is to sign it, not to add the key.
+What it missed: `libgstdecklink.dylib` does not link Blackmagic's API. It holds
+the string `/Library/Frameworks/DeckLinkAPI.framework` and loads it through
+CFBundle at first use. That framework belongs to Desktop Video, is signed by
+Blackmagic (`9ZGFBWLSYP`), and is not ours to sign. Under the hardened runtime
+with no waiver, the load is refused with the same "different Team IDs" message
+— and the decklink device provider then reports zero cards, silently. The
+symptom at the desk was a Settings screen greying out the DeckLink input and
+saying no card was fitted, about a fitted, working UltraStudio 4K Mini.
+
+A/B on this machine, same binary, hardened runtime both times, `dlopen` of
+`/Library/Frameworks/DeckLinkAPI.framework/Versions/A/DeckLinkAPI`:
+
+| entitlements | result |
+| --- | --- |
+| none | `not valid for use in process: ... different Team IDs` |
+| `disable-library-validation` | loads |
+
+**The signing pass is still load-bearing, and is now the only thing enforcing
+itself.** `ship-darwin.sh` signs every Mach-O in the bundle with our team.
+Before this key, a file it missed failed to load and somebody noticed
+immediately; now it loads. If the signing pass ever stops covering part of the
+payload, the fix is still to sign it — the difference is that nothing will tell
+you.
 
 **Neither JIT entitlement helps.** `liborc` — GStreamer's SIMD code generator,
 used by `videoconvert`, `videoscale`, `audioconvert` and `audioresample` —

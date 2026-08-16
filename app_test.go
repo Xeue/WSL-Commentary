@@ -1035,6 +1035,18 @@ func assertBoundSurface(t *testing.T) {
 
 		"GetConformTarget": true,
 
+		// GetSwitcherFormat is GetConformTarget's other half and is a SEPARATE
+		// binding on purpose. GetConformTarget answers "what will WE produce",
+		// which before Start is the operator's own declaration echoed back;
+		// this answers "what is the INSTANCE configured for", read live over
+		// REST. Drawn side by side on the Settings screen they make a
+		// divergence visible — an override typed for last month's venue against
+		// the switcher this position is actually feeding — which is the entire
+		// point and which one merged number could not express. It is not folded
+		// into GetConformTarget for a second reason too: that method is on the
+		// page's startup path and commits to making no network call there.
+		"GetSwitcherFormat": true,
+
 		"GetChannelMap": true,
 		"SetChannelMap": true,
 

@@ -286,15 +286,44 @@ let fakeDeviceError = null;
 // From the console: window.__wslcommsFake.setConformTarget({width: 1280,
 // height: 720, frameRate: 50}) for the 720p50 instance the old constant got
 // wrong, or null for the not-known case.
+//
+// source is "session" and NOT "switcher", which it used to say. app.go's
+// GetConformTarget can only ever stamp "session" or "override" — the third
+// constant, "switcher", belongs to GetSwitcherFormat and that method's doc says
+// in terms that GetConformTarget never returns it. A fake answering with a
+// provenance the real binding cannot produce is a dev session in which every
+// readout that reads `source` is exercised down a branch the product does not
+// have; videoformat.js's describeConformTarget reads exactly that field, so the
+// dev session would have shown "not read yet (press START)" for ever while the
+// shipped build showed the raster, or the reverse. Fake below, real fake for the
+// switcher's own setting.
 let fakeConformTarget = {
   width: 1920,
   height: 1080,
   frameRate: 50,
-  source: 'switcher',
+  source: 'session',
   node: 'cam4',
   agreeing: 1,
   disagreeing: [],
   raw: 'codec="h264" width=1920 height=1080 frame_rate="50" scan_type="P"',
+};
+
+// The fake instance's OWN CONFIGURED FORMAT, answered by getSwitcherFormat().
+//
+// It is a separate variable from fakeConformTarget on purpose, and the two are
+// deliberately allowed to disagree: that disagreement is the only way a dev
+// session can see the divergence readout the Settings screen exists to show.
+// Set it to null from the console for the unreachable-instance case, which is
+// what every seat sees before it has signed in.
+//
+// From the console: window.__wslcommsFake.setSwitcherFormat({width: 1280,
+// height: 720, frameRate: 50}) or setSwitcherFormat(null).
+let fakeSwitcherFormat = {
+  width: 1920,
+  height: 1080,
+  frameRate: 50,
+  source: 'switcher',
+  raw: '1920x1080p50',
 };
 
 // FAKE_EVENTS is what a `npm run dev` session lists through listEvents(). ONE
@@ -473,6 +502,13 @@ function installFakeConsoleHandle() {
     // impossible.
     setConformTarget: (format) => {
       fakeConformTarget = format && typeof format === 'object' ? { ...format } : null;
+    },
+    // Drive the Settings screen's SWITCHER readout and its divergence marking,
+    // which is a different question from the lamp's and has its own binding.
+    // setSwitcherFormat(null) is the state every seat is in before it has
+    // signed in, and the one the readout has to be honest about.
+    setSwitcherFormat: (format) => {
+      fakeSwitcherFormat = format && typeof format === 'object' ? { ...format } : null;
     },
     // Drive the DeckLink routing screen without a card.
     //
@@ -793,6 +829,60 @@ export async function getConformTarget() {
     }
   }
   return fakeConformTarget ? { ...fakeConformTarget } : null;
+}
+
+/** GetSwitcherFormat's bound method name. One place, so a rename is one edit. */
+const SWITCHER_FORMAT_METHOD = 'GetSwitcherFormat';
+
+/**
+ * The video format THE M2L-X INSTANCE IS CONFIGURED FOR, read live from the
+ * instance, or null when that cannot be established.
+ *
+ * ===================== WHY THIS IS NOT getConformTarget =====================
+ *
+ * They answer two different questions and the Settings screen wants both at
+ * once, side by side:
+ *
+ *   getConformTarget    what will WE produce?   (the running pipeline's target,
+ *                                                or the operator's declaration)
+ *   getSwitcherFormat   what does the SWITCHER  (the instance's own setting,
+ *                       require?                 read over REST)
+ *
+ * The whole value of showing them together is that a DIVERGENCE is visible: an
+ * override typed for last month's venue against a switcher configured for this
+ * one. getConformTarget cannot stand in for this, and the reason is not
+ * squeamishness — with no session it reports the operator's own
+ * videoFormatOverride back, stamped source="override". A readout built on that
+ * would quote the operator's own setting back to them under the heading "what
+ * M2L-X is configured for", which is the screen inventing a confirmation, and a
+ * divergence warning that can invent a confirmation is worse than none.
+ *
+ * IT NEEDS NO SESSION, which is the entire point: the Settings screen is opened
+ * an hour before kick-off with nothing running, and that is exactly when the
+ * operator wants to see whether their override disagrees with the facility.
+ *
+ * NULL IS A NORMAL ANSWER, for every way of not knowing — no Wails runtime, an
+ * older build without the binding, no host, not signed in, an instance that is
+ * not up, a raster this build cannot render. The caller renders nothing rather
+ * than a wrong number.
+ *
+ * NEVER THROWS, for the reason getConformTarget does not.
+ *
+ * @returns {Promise<{width: number, height: number, frameRate: number,
+ *   source?: string, raw?: string}|null>}
+ */
+export async function getSwitcherFormat() {
+  if (hasWails()) {
+    try {
+      const got = await callGoBound(SWITCHER_FORMAT_METHOD);
+      return got && typeof got === 'object' ? got : null;
+    } catch {
+      // BindingMissingError, a signed-out client, a REST failure: all of them
+      // mean "not known", and the caller renders nothing for all of them alike.
+      return null;
+    }
+  }
+  return fakeSwitcherFormat ? { ...fakeSwitcherFormat } : null;
 }
 
 // subscribe wires cb to event, using the real Wails runtime's EventsOn/

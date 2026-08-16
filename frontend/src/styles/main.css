@@ -1744,16 +1744,30 @@ input[type='range'] {
   grid-column: 1 / -1;
 }
 
-/* The video source control and the preview tick box are full-row for their
-   HINTS: the source's names both options and states what each costs, and the
-   preview's is the measured reason it cannot be switched live. In a 350px track
-   both would run to a column two words wide.
+/* Full-row for the LINE UNDER THEM, which in every case here is longer than the
+   control it belongs to.
+
+   The video source and the preview tick box no longer carry the ~500-character
+   hints this rule was first written for — those went back to being comments in
+   videosource.js — but the source still has the "GOING TO AIR" sentence and the
+   card note beneath it, and both belong on the same measure as the control they
+   describe.
+
+   The commentary input and the video format are here for the same reason and a
+   sharper one. The picker's options are device names inside group headings
+   ("Blackmagic UltraStudio 4K Mini" under "Audio on the capture card
+   (SDI/HDMI)"), and the format's readout is the DIVERGENCE warning — "Switcher:
+   1920x1080p50 · DIVERGES: …" — which is the one line on this screen that has
+   to be legible at a glance to somebody who does not know there is a rule. A
+   warning wrapped four deep in an 18rem track is a warning nobody reads.
 
    Selected by id, like the four full-row fields above, and settingslayout.test.js
    asserts that settings.js still creates each id named here — which is what stops
-   a rename silently returning a ~500-character hint to an 18rem track. */
+   a rename silently returning one of these to an 18rem track. */
 .field:has(> #f-videoSource),
-.field:has(> #f-decklinkPreviewEnabled) {
+.field:has(> #f-decklinkPreviewEnabled),
+.field:has(> #f-commentaryInput),
+.field:has(> #f-videoFormatOverride) {
   grid-column: 1 / -1;
 }
 
@@ -1783,6 +1797,49 @@ input[type='range'] {
 .video-card-note--missing {
   color: var(--red);
   font-weight: 700;
+}
+
+/* WHAT THE SWITCHER IS SET TO, under the format control that can disagree with
+   it. It is a readout rather than guidance, so it is not dimmed the way a
+   .field-hint is: an operator scanning past it should be able to read the
+   raster, which is the number the whole control is judged against. */
+.video-format-note {
+  color: var(--text);
+}
+
+/* AND WHEN THIS SEAT DIVERGES FROM IT. Every source feeding an M2L-X instance
+   must be produced in the instance's format; one that is not is refused. So a
+   divergence is a feed that will not be accepted, and it must be visible to
+   somebody who does not know that rule and is not reading the line.
+
+   Marked with a BORDER as well as a colour, exactly as the unstartable video
+   source above is, so the warning survives a colour-blind reader and a
+   washed-out gallery projector. The mark is on the ROW, not on the note, so the
+   control itself is what catches the eye — the note is the explanation, the
+   <select> is the thing to change. */
+.video-format-note--diverges {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.field--diverges {
+  border-left: 3px solid var(--red);
+  padding-left: 0.6rem;
+}
+
+/* A SAVED DEVICE THAT IS NOT PLUGGED IN TODAY. The picker keeps it selected and
+   marked rather than silently moving to device #1 — see planAudioInputs — so
+   the screen and config.json cannot disagree about what this seat captures
+   from. Same border-and-colour pair as the divergence above, for the same
+   reason: it has to be findable without being read. */
+.audio-input-note {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.field--absent {
+  border-left: 3px solid var(--red);
+  padding-left: 0.6rem;
 }
 
 /* The one tick box on the Settings form. Laid out as [box] Label, which is what

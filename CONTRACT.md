@@ -771,6 +771,7 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetRemoteState()` | `RemoteState` | WP-5b | **host-only** |
 | `SetRemoteListener(enabled, bind, httpPort, httpsPort)` | `error` | WP-5b | **host-only** |
 | `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
+| `GetSwitcherFormat()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
 | `GetChannelMap()` | `channelMapPayload {inputChannels, map, isDefault}` | WP-3a | open |
 | `SetChannelMap(map)` | `error` | WP-3a | open |
 | `SetVideoSource(source)` | `error` | none — see below | **host-only** |
@@ -836,6 +837,35 @@ there is no feed for the lamp to judge. It is `open` for remote because a remote
 same status row: refusing it would leave that seat's VIDEO lamp red on a correctly conforming
 720p50 feed while the desk's reads green, and two seats disagreeing about a lamp is worse than
 either answer alone.
+
+`GetSwitcherFormat` is added 2026-08-16 with the Settings screen's format selector, and it is a
+**second binding rather than a branch inside `GetConformTarget`** for two reasons that point the
+same way.
+
+They answer different questions. `GetConformTarget` is *what will we produce* — the running
+pipeline's target, or before Start the operator's own `videoFormatOverride` echoed back.
+`GetSwitcherFormat` is *what is the instance configured for*, read live from
+`/api/v1/switcher_configuration`. The Settings screen draws them **side by side** so a divergence
+is visible; merging them into one number destroys the only comparison that screen exists to make.
+
+**It needs no session, which is the point.** The format comes from the switcher's **setting**, not
+from a node's detected format — `internal/m2lx/configuration.go`'s tombstone has the measurement
+that killed the detected-format version, a live 720p50 feed reported as `frame_rate="0"` — so it
+answers on the Settings screen, which is exactly where there is no session. It needs only the
+control-plane client and a sign-in.
+
+It **does** dial, which `GetConformTarget` deliberately does not, and the budget is the difference:
+`GetConformTarget` is on the page's startup path behind the status lamps, where up to
+`conformFetchTimeout` of stall for a lamp is a bad trade; this is called when the Settings screen
+opens, which is not the air path. The answer is cached for `switcherFmtTTL` (30 s) **including the
+nil**, so an instance that is not up yet costs one three-second wait rather than one per open.
+
+Every way of not knowing is `null`: no host, not signed in, instance down, a format block this
+build cannot read. The frontend renders nothing rather than a wrong number. Shape is
+`ConformTargetView` — the same `{width, height, frameRate, source, raw}` — with `source` the new
+constant `"switcher"` and `raw` the operator's spelling of the raster (`"1920x1080p50"`), produced
+by the same `ConformTarget.String()` that writes the format into the log at Start, so the readout
+and the log cannot disagree.
 
 **Two changes to `Start` itself, 2026-08-15, rule 3.**
 
