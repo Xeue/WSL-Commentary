@@ -2317,3 +2317,152 @@ export async function setPreviewVisible(visible) {
 export function fakePreviewSurface() {
   return { rect: fakePreviewRect, visible: fakePreviewVisible };
 }
+
+// ---------------------------------------------------------------------------
+// The cough mute
+// ---------------------------------------------------------------------------
+//
+// The operator: "I also want a cough mute buttons, with a push to mute style and
+// a latch mute mode."
+//
+// ===================== THE MUTE IS AT THE SEND PATH =========================
+//
+// These bindings mute the COMMENTARY GOING TO THE SWITCHER — app.go writes a
+// property on a volume element inside the running contribution pipeline, between
+// the resampler and the programme meter. Nothing on this side may substitute for
+// them: muting the monitor element, the Web Audio gain, or the return path makes
+// this desk quieter while the cough goes to air, with a green light on it.
+//
+// ==================== THE NAMES, AND THE ORDERING STAMP =====================
+//
+// MUTE_METHODS is the ONLY place these strings appear in the frontend, so
+// aligning with the Go side is one edit in one object rather than a grep. Both
+// are in app_remote.go's remoteAllowlist: GetCommentaryMute as a read, and
+// SetCommentaryMute as MUTATING and deliberately reachable — a remote seat may
+// mute, and the payload's By/ByAddr are the price of allowing it. This side must
+// therefore NOT gate the controls on isRemoteClient(); availability is the
+// payload's own answer.
+//
+// SetCommentaryMute takes a SEQ, and it is not optional bookkeeping. Wails runs
+// each bound call on its own goroutine with no ordering between them, so the
+// key-down and the key-up of one press can arrive in either order — and a
+// key-up applied before its own key-down leaves the feed muted with nobody
+// holding a key, which is a dead microphone on air that nothing will ever clear.
+// app.go drops a request older than the last one applied and returns the state
+// actually in force, so the caller is still told the truth. nextMuteSeq below is
+// what this side owes that mechanism.
+const MUTE_METHODS = Object.freeze({
+  set: 'SetCommentaryMute',
+  get: 'GetCommentaryMute',
+});
+
+/**
+ * EVENT_MUTE is the AUTHORITATIVE report of the send path's mute state,
+ * mirroring app.go's EventMute constant exactly. The payload is a mutePayload:
+ *
+ *   {muted, available, reason, by, byAddr, seq}
+ *
+ * It exists because the mute can change without this page asking: a second seat,
+ * a session ending (which takes the mute with it), or a reconciliation finding
+ * the pipeline disagreeing with what was last published. A control drawn from
+ * its own last click is right almost always and catastrophically wrong in
+ * exactly those cases.
+ */
+export const EVENT_MUTE = 'mute';
+
+/**
+ * MUTE_UNAVAILABLE is the payload this side invents when there is nothing to
+ * ask — no Wails runtime, or a build without the bindings.
+ *
+ * It is UNAVAILABLE and it says why. The alternative, an available-and-unmuted
+ * payload, would draw a live green control that does nothing, and the operator
+ * would trust it. Every field the real payload has is present, so no caller has
+ * to branch on which kind of answer it got.
+ */
+export const MUTE_UNAVAILABLE = Object.freeze({
+  muted: false,
+  available: false,
+  reason:
+    'this build has no cough mute binding, so nothing on this screen can mute the commentary',
+  by: '',
+  byAddr: '',
+  seq: 0,
+});
+
+/**
+ * coughMuteAvailable reports whether this build can mute the commentary at all.
+ *
+ * BOTH methods, not just the setter, for the reason srtReturnAvailable's comment
+ * records: the getter is called on a path that has already assumed availability
+ * — the adopt-on-startup that stops the control disagreeing with the pipeline —
+ * and a build with one and not the other throws from inside the recovery rather
+ * than from the check.
+ *
+ * This is the BUILD's answer, not the session's. "There is no session to mute"
+ * is a different fact with a different sentence and it comes back on the
+ * payload's `available` and `reason`; conflating the two would tell an operator
+ * who has simply not pressed START that their application cannot mute.
+ */
+export function coughMuteAvailable() {
+  return Object.values(MUTE_METHODS).every(hasBinding);
+}
+
+/**
+ * lastMuteSeq is the high-water mark of the stamps this page has issued.
+ *
+ * Date.now() is what app.go asks for — it survives a reload, unlike a counter —
+ * but it is not strictly increasing: two calls inside the same millisecond get
+ * the same value, and a push-to-mute's down and up genuinely can land in one.
+ * Equal stamps would let the pair be reordered, which is the failure the stamp
+ * exists to prevent, so each stamp is at least one more than the last.
+ */
+let lastMuteSeq = 0;
+
+function nextMuteSeq() {
+  lastMuteSeq = Math.max(lastMuteSeq + 1, Date.now());
+  return lastMuteSeq;
+}
+
+/**
+ * setCommentaryMute mutes or unmutes the commentary at the send path and returns
+ * the state IN FORCE — which is not always what was asked for: a request older
+ * than the last one applied is dropped, and dropped is not an error.
+ *
+ * Rejects rather than resolving when there is no runtime: cough.js turns a
+ * rejection into a red MUTE FAILED, which is the truth, whereas a resolved
+ * promise would paint a calm MUTED over a live microphone.
+ *
+ * @param {boolean} muted
+ * @returns {Promise<{muted: boolean, available: boolean, reason: string, by: string, byAddr: string, seq: number}>}
+ */
+export async function setCommentaryMute(muted) {
+  if (!hasWails()) {
+    // The fake backend does NOT pretend to mute. There is no send path in a
+    // browser tab, and a dev session that showed MUTED would be teaching the
+    // wrong reflex against the one control whose whole risk is being believed.
+    throw new Error(
+      'wslcomms: there is no send path on the fake backend, so nothing can be muted. ' +
+        'The cough mute works only against a real build.',
+    );
+  }
+  return callGoBound(MUTE_METHODS.set, muted === true, nextMuteSeq());
+}
+
+/**
+ * getCommentaryMute reads the send path's current mute state.
+ *
+ * Never throws for the ordinary "this build cannot" case — it answers
+ * MUTE_UNAVAILABLE — because the caller is the startup adopt, and a rejection
+ * there would be an error banner on every dev session.
+ *
+ * @returns {Promise<{muted: boolean, available: boolean, reason: string, by: string, byAddr: string, seq: number}>}
+ */
+export async function getCommentaryMute() {
+  if (!coughMuteAvailable()) return MUTE_UNAVAILABLE;
+  return callGoBound(MUTE_METHODS.get);
+}
+
+/** Subscribes to the "mute" event. Returns an unsubscribe function. */
+export function onCommentaryMute(cb) {
+  return subscribe(EVENT_MUTE, cb);
+}

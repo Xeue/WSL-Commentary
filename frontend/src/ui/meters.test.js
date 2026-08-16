@@ -215,22 +215,28 @@ test('the peak-hold is per channel and reset() forgets everything', () => {
 /* Wiring guards                                                             */
 /* ------------------------------------------------------------------------ */
 
-test('home.js draws the meters OUTSIDE the tile, beside it in the stage', () => {
+test('home.js draws the meters OUTSIDE the tile — now in the side column', () => {
   // The native SRT overlay is an opaque child window covering exactly the
   // tile's rectangle (measurePictureRect measures .pgm-tile), so a meter
   // appended inside the tile is invisible for as long as the good picture is
   // up — precisely when it is needed. The meters must be a SIBLING in
   // .pgm-stage.
   const src = ui('home.js');
-  // The list is open-ended: the stage now also carries the card's confidence
-  // preview box, which is a SECOND native surface and is a sibling for the very
-  // same reason the meters are. What this pins is the two things that matter —
-  // metersEl goes into the stage, and it goes in after the tile — not how many
-  // other boxes stand beside it.
+  // WHERE they are has changed; WHY has not. The meters used to sit beside the
+  // tile in .pgm-stage. They now sit in the side column, because the operator
+  // asked for a main area holding the picture, one overall indicator and the
+  // cough controls and nothing else: "The rest can live in some form of settings
+  // tray or something like that."
+  //
+  // The property this test exists for is untouched by the move and is asserted
+  // below: the meters are never a CHILD of .pgm-tile, because that rectangle is
+  // covered by an opaque native child window and anything drawn inside it is
+  // invisible exactly when a commentator is mid-match. The column is outside
+  // that rectangle, as .pgm-stage was.
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, metersEl[,)]/,
-    'the meters container must be appended to pgmStage beside the tile',
+    /makeRailSection\('Status', lampsEl, metersEl\)/,
+    'the meters container must be built into the side column',
   );
   assert.ok(
     !/pgmTile\.(?:append|appendChild)\([^)]*metersEl/.test(src),

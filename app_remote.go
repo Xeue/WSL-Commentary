@@ -128,6 +128,8 @@ func remoteEventNames() []string {
 		EventSignal,
 		EventConfig,
 		EventRemote,
+		EventMute,
+		EventPreview,
 	}
 }
 
@@ -200,6 +202,16 @@ var remoteAllowlist = map[string]methodPolicy{
 	"GetMixerGolden":         {},
 	"GetPictureState":        {},
 	"GetReturnState":         {},
+	// GetCommentaryMute and GetPreviewState are reads, and both are reachable for
+	// the same shape of reason GetConformTarget is: a remote seat draws the same
+	// two panels, and a seat that could not ask would draw them from its own last
+	// click and from nothing at all respectively. The mute one matters more than
+	// most reads on this table — a mute is SILENT, so a seat showing an unmuted
+	// commentator who is not being heard is wrong in the one direction that costs
+	// a match. Neither reaches hardware; one returns a boolean and a sentence,
+	// the other a boolean and a sentence.
+	"GetCommentaryMute": {},
+	"GetPreviewState":   {},
 	// GetChannelMap is a read and is reachable, for the same shape of reason
 	// GetConformTarget is: it returns what the capture pad negotiated and the
 	// routing in force, and a remote seat that could not ask would draw the
@@ -234,6 +246,46 @@ var remoteAllowlist = map[string]methodPolicy{
 	// damage with Stop, and internal/gst refuses any map that does not fit the
 	// negotiated width before a byte reaches the element.
 	"SetChannelMap": {mutating: true},
+
+	// SetCommentaryMute is REACHABLE, and this is the row to argue with if you
+	// think it should not be. It is audit-logged, like every other live control
+	// here.
+	//
+	// # The case against, stated first because it is the frightening one
+	//
+	// A remote seat that can mute can take the commentary off air silently. There
+	// is no login on this listener, the network is the access control, and a mute
+	// makes no sound: the meters at the desk fall, every lamp stays green, and
+	// the operator's own control has not moved. That is a worse failure mode than
+	// anything else on this table, because every other remote action is either
+	// visible (the feed stops) or audible (the routing changes).
+	//
+	// # The case for, which wins
+	//
+	// Three things decide it.
+	//
+	// FIRST, THE SURFACE IS ALREADY WIDER THAN THIS. A remote seat may call Stop,
+	// which takes the whole feed off air, and SetChannelMap, which can route the
+	// commentator's microphone to nothing. Refusing the mute while allowing those
+	// two would not be caution, it would be incoherence — a seat trusted to end
+	// the match denied the ability to cover a cough.
+	//
+	// SECOND, A PRODUCER MUTING A COUGHING COMMENTATOR IS THE POINT OF A REMOTE
+	// SEAT. It is the same argument SetChannelMap's row above makes and it is
+	// sharper here: the seat that hears the cough is often the one on talkback,
+	// and a seat that can hear a problem and not fix it is a seat watching.
+	//
+	// THIRD, AND THIS IS THE CONDITION RATHER THAN A REASON, THE DESK ALWAYS
+	// KNOWS. mutePayload carries WHO muted and FROM WHERE, the "mute" event goes
+	// to every seat on every change, and the frontend is required to draw the
+	// remote seat's address beside a mute it did not make. A mute the desk cannot
+	// account for is the nightmare; a mute the desk can see, attribute and
+	// release is a colleague helping.
+	//
+	// The release half is not left to goodwill either: a remote seat that
+	// disconnects while holding the mute has it cleared from the connected-clients
+	// poll below, because nothing else ever would.
+	"SetCommentaryMute": {mutating: true},
 
 	// ---- the arm-gated write path and its baseline (audit-logged) ----
 	// SendMixerCommands is still additionally gated on the caller being the seat
@@ -389,6 +441,10 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetPictureState()
 	case "GetReturnState":
 		return a.GetReturnState()
+	case "GetCommentaryMute":
+		return a.GetCommentaryMute(), nil
+	case "GetPreviewState":
+		return a.GetPreviewState(), nil
 	case "GetChannelMap":
 		return a.GetChannelMap()
 	case "IsSRTReturnSelected":
@@ -475,6 +531,23 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 			return nil, err
 		}
 		return nil, a.SetChannelMap(m)
+	case "SetCommentaryMute":
+		var muted bool
+		var seq float64
+		if err := decodeArg(args, 0, &muted); err != nil {
+			return nil, err
+		}
+		if err := decodeArg(args, 1, &seq); err != nil {
+			return nil, err
+		}
+		// Routed to the seat-carrying variant, exactly as SaveConfig and the two
+		// mixer writes are. What is carried is not a permission — this method is
+		// reachable, see its row — but the ATTRIBUTION: the source address is the
+		// only identity an unauthenticated listener has, and it is what lets the
+		// desk account for a mute it did not make. A remote mute is therefore
+		// stamped "remote" plus where it came from, and the payload the desk
+		// receives says so.
+		return a.setCommentaryMuteFrom(muteSeatRemote, client.RemoteAddr, muted, seq)
 
 	// -------- mixer --------
 	case "SendMixerCommands":
@@ -704,6 +777,21 @@ func (a *App) watchRemoteClients(ctx context.Context, srv *remote.Server) {
 		}
 		last = fp
 		a.events.send(EventRemote, remoteClientPayloads(clients))
+
+		// A SEAT THAT LEFT WHILE HOLDING THE COUGH MUTE. This poll is the only
+		// thing in the application that ever learns a remote seat has gone — the
+		// transport exposes no disconnect hook, deliberately — so it is the only
+		// place the mute could be released, and nothing else ever would: the seat
+		// that set it cannot, and the operator at the desk is looking at a red
+		// badge naming a machine that is no longer answering. A producer's laptop
+		// losing wifi mid-cough would otherwise leave the commentary silent for
+		// the rest of the match. See App.releaseMuteHeldByGoneSeat, which acts
+		// only on a REMOTE mute whose address is not in this set.
+		connected := make(map[string]bool, len(clients))
+		for _, c := range clients {
+			connected[c.RemoteAddr] = true
+		}
+		a.releaseMuteHeldByGoneSeat(connected)
 	}
 	emit() // publish the initial (empty) set so a page that just loaded is in step
 

@@ -300,6 +300,8 @@ function Get-PluginEntries {
             -Why 'audioconvert to S16LE ahead of mfaacenc (spec section 5).'
         New-BundleEntry -Kind Plugin -Names 'libgstaudioresample.dll' `
             -Why 'audioresample. Also absorbs the Dante-vs-system-clock drift caused by pinning the system clock (spec section 6.1).'
+        New-BundleEntry -Kind Plugin -Names 'libgstvolume.dll' `
+            -Why 'volume: the COUGH MUTE, one element in the audio leg on every seat. Not optional and not conditional - without this plugin gst_parse_launch fails at Start on every machine.'
         New-BundleEntry -Kind Plugin -Names 'libgstimagefreeze.dll' `
             -Why 'imagefreeze is-live=true turns the slate into a live 1080p50 source. Mandatory per spec section 5.'
         New-BundleEntry -Kind Plugin -Names 'libgstpng.dll' `
@@ -528,7 +530,7 @@ function Assert-ManifestSane {
     # 2026-08-16.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
-        'audioresample', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
+        'audioresample', 'volume', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
         'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11',
         'level', 'decklink', 'videorate', 'deinterlace'
     )

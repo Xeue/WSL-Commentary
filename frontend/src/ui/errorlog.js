@@ -32,6 +32,11 @@ import {
   PICTURE_STATE_BACKOFF,
   PICTURE_STATE_CONNECTING,
 } from './picturesource.js';
+// The severity vocabulary, and the decisions about which messages are worth an
+// operator's attention mid-match. It lives in ./alerts.js because it is a
+// judgement about the PRODUCT, not about this list's bookkeeping, and because
+// app.js has to classify a monitor error before it ever reaches this module.
+import { SEVERITY, normaliseSeverity } from './alerts.js';
 
 /**
  * ERROR_LOG_LIMIT caps the history. Fifty distinct errors is far beyond any
@@ -45,30 +50,76 @@ export const ERROR_LOG_LIMIT = 50;
  * createErrorLog builds the model.
  *
  * `now` is injectable for tests and defaults to the real clock. Entries are
- * plain objects: { message, count, firstAt, lastAt }, newest first.
+ * plain objects: { message, severity, count, firstAt, lastAt }, newest first.
+ *
+ * ============================ SEVERITY =====================================
+ *
+ * Every entry carries one, defaulting to ALERT for the reason alerts.js's
+ * normaliseSeverity records: a caller that forgets to classify should
+ * over-report. It is part of the REPEAT KEY as well as of the row: a NOTE and an
+ * ALERT that happen to share a sentence are different events, and merging them
+ * would let a note's count hide an alert or the reverse. That has never happened
+ * and the rule costs nothing; the alternative is a silent merge in the one
+ * surface whose whole job is not to lose things.
  */
 export function createErrorLog(now = () => new Date()) {
-  /** @type {Array<{message: string, count: number, firstAt: Date, lastAt: Date}>} */
+  /** @type {Array<{message: string, severity: string, count: number, firstAt: Date, lastAt: Date}>} */
   const entries = [];
 
   return {
     /**
      * record adds a message (or counts a repeat of the newest) and returns the
      * entry it landed in.
+     *
+     * @param {unknown} message
+     * @param {string} [severity] one of alerts.js's SEVERITY; ALERT by default.
      */
-    record(message) {
+    record(message, severity) {
       const text = String(message);
+      const level = normaliseSeverity(severity);
       const at = now();
       const newest = entries[0];
-      if (newest && newest.message === text) {
+      if (newest && newest.message === text && newest.severity === level) {
         newest.count += 1;
         newest.lastAt = at;
         return newest;
       }
-      const entry = { message: text, count: 1, firstAt: at, lastAt: at };
+      const entry = { message: text, severity: level, count: 1, firstAt: at, lastAt: at };
       entries.unshift(entry);
       if (entries.length > ERROR_LOG_LIMIT) entries.length = ERROR_LOG_LIMIT;
       return entry;
+    },
+
+    /**
+     * dismiss removes ONE entry by identity — the column's per-row ✕.
+     *
+     * By identity rather than by index or by message: the list re-renders on
+     * every arrival, so an index captured when a row was drawn can point at a
+     * different row by the time it is clicked, and dismissing the wrong alert
+     * mid-match is how a real one disappears unread.
+     */
+    dismiss(entry) {
+      const i = entries.indexOf(entry);
+      if (i >= 0) entries.splice(i, 1);
+      return i >= 0;
+    },
+
+    /**
+     * dismissMatching removes every entry with this exact message, whatever its
+     * severity or position. This is the RESOLUTION path: the SRT picture coming
+     * back takes its own complaint down without touching anything else, which
+     * the old single-message banner could not do.
+     */
+    dismissMatching(message) {
+      const text = String(message);
+      let removed = 0;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (entries[i].message === text) {
+          entries.splice(i, 1);
+          removed += 1;
+        }
+      }
+      return removed;
     },
 
     /** clear empties the history. The banner's "Clear history" button. */

@@ -46,6 +46,34 @@
 
   --radius: 10px;
   --radius-lg: 14px;
+
+  /* ---------------------------------------------------------------- */
+  /* The side column's width, and why it is a CONSTANT.                */
+  /*                                                                    */
+  /* THE GOVERNING RULE OF THE MAIN SCREEN: the programme picture must  */
+  /* never move. The operator: "For the comentators watching a live     */
+  /* match, anything casuing their video to move is a massive no."      */
+  /*                                                                    */
+  /* .pgm-tile's width is computed from the height of .pgm-stage, and   */
+  /* .pgm-stage gets whatever .home-main is given, which is the window  */
+  /* less this. So this value — not the column's CONTENT — is the only  */
+  /* thing on the alert side of the screen that can reach the picture.  */
+  /* An `auto` or `fit-content` column would be sized by its widest     */
+  /* child, and one long alert sentence would then narrow the picture.  */
+  /* That is the original bug rebuilt sideways, and it is what          */
+  /* homelayout.test.js refuses to let back in.                         */
+  --rail-w: 22rem;
+
+  /* The COLLAPSED width. Never zero: an alert nobody can see because   */
+  /* the column was folded away is an alert that did not happen, so the */
+  /* strip keeps the attention count and the way back.                  */
+  --rail-w-collapsed: 2.75rem;
+
+  /* The match bar's height, fixed for the same reason the column's     */
+  /* width is: it sits UNDER the stage, so a bar that grew a line would */
+  /* shorten the picture. Everything in it is a single non-wrapping     */
+  /* line and the long forms live in title attributes.                  */
+  --match-bar-h: 84px;
 }
 
 /* ------------------------------------------------------------------ */
@@ -134,11 +162,208 @@ button {
   flex: 0 0 auto;
 }
 
-/* auto, not hidden: when everything fits there is no scrollbar, and when the
-   window is too short to hold the controls the operator can still reach them
-   instead of losing them under the bottom edge. */
+/* HIDDEN, and that is a change. It used to be `overflow-y: auto`, because the
+   controls were stacked under the picture in one long column and a short window
+   pushed them off the bottom edge. They are not any more: everything that is not
+   the picture, the one overall indicator and the cough controls is in the side
+   column, which has its own scroll. A page-level scrollbar here would mean the
+   PICTURE could be scrolled out of view, and would let the appearance of a
+   scrollbar re-narrow the layout — which is a layout shift with extra steps. */
 .view-home {
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------ */
+/* The two columns                                                     */
+/*                                                                      */
+/* This is the whole answer to "the alerts must not move the video".    */
+/* The operator, correcting a first attempt that proposed overlays:     */
+/*                                                                      */
+/*   "The solution to not shifting is done make them banners?????       */
+/*    We could look at having a column on the side that has the         */
+/*    allerts and all the settings, so we make more use of vertical     */
+/*    space etc"                                                        */
+/*                                                                      */
+/* He is right, and it is better than any overlay: an overlay is still  */
+/* something that appears, and it would in any case be INVISIBLE over   */
+/* the programme picture, because the native SRT window is an opaque    */
+/* child window that no z-index in this page reaches above. A permanent */
+/* column has nothing to shift by construction and is never underneath  */
+/* anything.                                                            */
+/*                                                                      */
+/* It also uses the space this app was wasting: the picture is 16:9 in  */
+/* a window that is not, so on the operator's 3840x2088 there was a     */
+/* height-limited picture with dead width either side while banners     */
+/* stacked above and below and pushed it around.                        */
+/* ------------------------------------------------------------------ */
+
+.home-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  /* NEVER wrap. A column that becomes a stacked banner at 900px has
+     reintroduced the whole problem on the machine most likely to be a laptop at
+     a venue — and it would do it by re-flowing while the operator dragged the
+     window, which is the worst possible moment. The column narrows at 1100px
+     (see the media query below) and stops narrowing; it never goes above or
+     below the picture at any width. */
+  flex-wrap: nowrap;
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.home-main {
+  flex: 1 1 auto;
+  /* Without this a wide child — a <select> holding "Blackmagic UltraStudio 4K
+     Mini (DeckLink)" — sets the flex base size and pushes the column off the
+     right edge instead of being ellipsised. */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* THE COLUMN. flex-basis is a constant; flex-grow and flex-shrink are BOTH
+   zero, so neither the window nor the content can move it. See --rail-w. */
+.home-rail {
+  flex: 0 0 var(--rail-w);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Its own scroll, so ten alerts and every setting can coexist without either
+     pushing the other out of the application. */
   overflow-y: auto;
+  /* And never a horizontal one: a long word in an alert wraps inside the fixed
+     width rather than widening anything. */
+  overflow-x: hidden;
+  /* Reserve the scrollbar's width always, so gaining the eleventh alert does not
+     re-flow the column's own contents. It cannot reach the picture either way —
+     the border box is fixed — but a column that twitches is a column the
+     operator learns to distrust. */
+  scrollbar-gutter: stable;
+  padding: 0 0 1rem;
+  border-left: 1px solid var(--border);
+  padding-left: 0.9rem;
+}
+
+.rail-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  /* OPAQUE. mixer.css:407 records this exact trap: a sticky element with a
+     translucent background is not a header, it is a window, and the column
+     scrolls visibly through it. */
+  background: var(--bg);
+  padding: 0.6rem 0 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.rail-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The attention marker: a count, not a colour alone. It is the one thing that
+   has to survive the column being collapsed, so the same number is drawn on the
+   strip as well. */
+.rail-attention,
+.rail-strip-attention {
+  min-width: 1.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: #fecaca;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.rail-collapse,
+.rail-expand {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 0.1rem 0.5rem;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.rail-section {
+  padding: 0.9rem 0 0;
+  border-top: 1px solid var(--border);
+  margin-top: 0.9rem;
+}
+
+.rail-section-title {
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+/* The strip is hidden while the column is open; the column is hidden while the
+   strip is up. Exactly one of the two is ever laid out, which is what keeps the
+   collapsed width a single constant rather than a sum. */
+.rail-strip {
+  display: none;
+}
+
+.view-home.home-rail-collapsed .home-rail {
+  flex-basis: var(--rail-w-collapsed);
+  padding-left: 0;
+  align-items: center;
+  overflow: hidden;
+}
+
+.view-home.home-rail-collapsed .home-rail > *:not(.rail-strip) {
+  display: none;
+}
+
+.view-home.home-rail-collapsed .rail-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding-top: 0.6rem;
+}
+
+.rail-strip-label {
+  writing-mode: vertical-rl;
+  font-size: 0.65rem;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+}
+
+/* ================= NARROW WINDOWS: NARROWER, NEVER STACKED ==============
+ *
+ * One breakpoint, and it changes a WIDTH rather than a direction. At 900px a
+ * 22rem column leaves 548px of picture; 17rem leaves 628px, which is a
+ * materially better picture on the laptop this case exists for.
+ *
+ * It is reachable only by the operator resizing the window, and resizing the
+ * window already resizes the picture — so this is not the class of movement the
+ * governing rule forbids. What the rule forbids is an ALERT changing the
+ * geometry, and no alert can reach a media query.
+ *
+ * There is deliberately no width at which the column stacks. Below this the
+ * picture simply gets small; a 17rem column and a 400px picture is still a
+ * commentator watching a match, whereas a banner that reappears above the
+ * picture is the bug this whole change removes. */
+@media (max-width: 1100px) {
+  :root {
+    --rail-w: 17rem;
+  }
 }
 
 [hidden] {
@@ -282,89 +507,110 @@ input[type='range'] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Dismissible error banner                                             */
+/* The alert list, inside the column                                    */
+/*                                                                      */
+/* IT IS NOT A BANNER ANY MORE. .error-banner and its history panel are */
+/* gone: both were in normal document flow with margins, so every       */
+/* appearance and every dismissal reflowed the page and shoved the      */
+/* programme picture. The list below lives inside .home-rail, whose     */
+/* border-box width is a constant, so nothing it contains can reach     */
+/* .pgm-tile — however many rows arrive and however long their          */
+/* sentences are.                                                       */
+/*                                                                      */
+/* The history is not a panel behind a button any more either. There is */
+/* no banner to hide it behind, and a column has the vertical space the */
+/* banner never did, which is precisely the space the operator pointed  */
+/* at: "so we make more use of vertical space etc".                     */
 /* ------------------------------------------------------------------ */
 
-.error-banner {
+.rail-alerts {
+  flex: 0 0 auto;
+  /* Capped, with its own scroll. Ten alerts must not bury START and the
+     device pickers under them — the column scrolls, but a section that can
+     grow without limit turns "scroll down for the settings" into a search. */
+  max-height: 15rem;
+  overflow-y: auto;
+  padding-top: 0.5rem;
+}
+
+.alert-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-top: 0.85rem;
-  padding: 0.65rem 1rem;
-  border-radius: var(--radius);
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+/* "No alerts" is a ROW, not an absence. An empty state that collapses is an
+   empty state that moves everything below it when the first alert lands, and
+   the operator then learns the column by watching it jump. */
+.alert-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  padding: 0.35rem 0.1rem;
+}
+
+.alert-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 8px;
   background: var(--danger-bg);
   border: 1px solid var(--danger-border);
   color: #fecaca;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
-/* The message grows; the two buttons keep their size. */
-.error-banner > span {
+/* A NOTE explains; it does not warn. Grey, and it does not count towards the
+   attention marker. See alerts.js for which messages are which and why. */
+.alert-row--note {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.alert-when {
+  flex: 0 0 auto;
+  /* The HH:MM:SS column stays a column. */
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  font-size: 0.78rem;
+  padding-top: 0.08rem;
+}
+
+/* The message wraps INSIDE the fixed width, and breaks inside a word if it has
+   to. This is the rule that stops a URL or an unbroken device id from setting
+   the column's intrinsic width — which, in a column sized by content rather
+   than by --rail-w, would be the picture moving because of an alert. Both
+   defences are kept: the width is a constant AND nothing here pushes. */
+.alert-text {
   flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-.error-dismiss {
+.alert-dismiss {
+  flex: 0 0 auto;
   background: transparent;
   border: none;
   color: inherit;
-  font-size: 1.1rem;
+  font-size: 0.95rem;
   line-height: 1;
   cursor: pointer;
-  padding: 0.25rem 0.4rem;
+  padding: 0.1rem 0.25rem;
   border-radius: 6px;
 }
 
-.error-dismiss:hover {
+.alert-dismiss:hover {
   background: rgba(255, 255, 255, 0.08);
 }
 
-/* The History button appears only when the log holds more than the banner is
-   already showing. Same visual family as the dismiss ✕, but bordered, because
-   it opens something rather than closing it. */
-.error-history-toggle {
-  flex: 0 0 auto;
-  background: transparent;
-  border: 1px solid var(--danger-border);
-  color: inherit;
-  font-size: 0.8rem;
-  cursor: pointer;
-  padding: 0.25rem 0.6rem;
-  border-radius: 6px;
-  white-space: nowrap;
-}
-
-.error-history-toggle:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-/* The history list: the banner's colours at a whisper, so it reads as part of
-   the same surface and cannot be mistaken for a second live error. */
-.error-history {
-  margin-top: 0.35rem;
-  padding: 0.5rem 1rem 0.6rem;
-  border-radius: var(--radius);
-  background: var(--panel);
-  border: 1px solid var(--danger-border);
-}
-
-.error-history-list {
-  margin: 0 0 0.5rem;
-  padding: 0;
-  list-style: none;
-  max-height: 9rem;
-  overflow-y: auto;
-}
-
-.error-history-list li {
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  line-height: 1.5;
-  /* The row starts with an HH:MM:SS column; tabular digits keep it a column. */
-  font-variant-numeric: tabular-nums;
-  white-space: pre-wrap;
-}
-
-.error-history-clear {
+.alert-clear {
+  align-self: flex-start;
+  margin-top: 0.45rem;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--text-muted);
@@ -374,7 +620,7 @@ input[type='range'] {
   border-radius: 6px;
 }
 
-.error-history-clear:hover {
+.alert-clear:hover {
   background: var(--panel-alt);
   color: var(--text);
 }
@@ -776,15 +1022,20 @@ input[type='range'] {
   }
 }
 
-.status-unavailable-banner {
-  margin: 0 0 0.75rem;
-  padding: 0.55rem 0.9rem;
-  border-radius: 8px;
-  background: #241a06;
-  border: 1px solid #6b4a06;
-  color: #fbbf24;
-  font-size: 0.9rem;
-}
+/* THE ORANGE SWITCHER BANNER IS GONE, and its rule with it. The operator: "the
+   orrange status banner at the bottom about switcher status is VERY annoying and
+   keeps cauing layout shifts and causing concerns when everything is fine."
+
+   Two faults, and the column would only have fixed one. It also fired when
+   nothing was wrong: a quiet telemetry WebSocket says nothing about the
+   contribution feed, which is a different socket to a different port with its
+   own lamp — and the three lamps it duplicated already say STATUS UNAVAILABLE in
+   glyph, text and colour. See src/ui/alerts.js, which records the decision, and
+   home.js, where the element used to be built.
+
+   Named here in prose only. homelayout.test.js asserts this stylesheet no longer
+   declares a rule for it, so a re-introduced banner has nothing to be styled by
+   and is visible in review. */
 
 /* The .honest-line rule that used to live here is gone with the element it
    styled: the permanent caveat under the lamps was withdrawn from the GUI at
@@ -1927,4 +2178,316 @@ input[type='range'] {
   text-transform: uppercase;
   color: var(--text-muted);
   pointer-events: none;
+}
+
+/* ==================================================================== */
+/* THE MATCH BAR: the picture, one indicator, the cough controls        */
+/*                                                                      */
+/* (appended block — see the note on the input-meters block above for   */
+/* why new work is appended rather than threaded into the middle of     */
+/* this file)                                                           */
+/*                                                                      */
+/* The operator: "During the match we only really need an overall       */
+/* status, single green/red indicator and the cough mute buttons. The   */
+/* rest can live in some form of settings tray or something like that." */
+/*                                                                      */
+/* So .home-main holds exactly two things: .pgm-stage, which grows, and */
+/* this, which does not.                                                */
+/*                                                                      */
+/* ITS HEIGHT IS FIXED AND THAT IS LOAD-BEARING. .pgm-tile's width is   */
+/* computed from .pgm-stage's height (see the one rule that does the    */
+/* work, above), so anything under the stage that can grow a line       */
+/* SHORTENS THE PICTURE — the same defect as a banner, wearing a        */
+/* control's clothes. Every text in here is one non-wrapping line that  */
+/* ellipsises, the long forms are on title attributes, and the bar is   */
+/* --match-bar-h whatever it contains.                                  */
+/* ==================================================================== */
+
+.match-bar {
+  flex: 0 0 auto;
+  height: var(--match-bar-h);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  /* Never wrap to a second line: wrapping is how a fixed height becomes a
+     clipped control instead of a moved picture, so the children shrink and
+     ellipsise instead. */
+  flex-wrap: nowrap;
+  margin: 0.6rem 0 0;
+  min-width: 0;
+}
+
+/* ---------------- the one overall indicator ---------------- */
+/*                                                                      */
+/* An honest reduction of the six lamps, whose rule is written down in  */
+/* src/ui/overall.js. Level is encoded FOUR ways here — glyph shape,    */
+/* word, word length, colour — because this is read from further away   */
+/* than any lamp: the operator asked for something they can take in     */
+/* without looking away from the pitch.                                 */
+
+.overall {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--panel);
+  height: 100%;
+}
+
+.overall-glyph {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.overall-words {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.15;
+}
+
+.overall-text {
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  /* One line, always. The bar's height is a constant and .pgm-tile is sized
+     against what is left after it, so a word that wrapped would shorten the
+     picture — which is the defect this whole layout exists to remove. */
+  white-space: nowrap;
+}
+
+/* ONE LINE, ellipsised. It names the lamp the verdict came from — "AUDIO: NO
+   AUDIO (DROPPED?)" — and a summary that could not say which lamp it was is a
+   summary the operator has to distrust. It must never wrap: two lines here is
+   the match bar growing, which is the picture shrinking. */
+.overall-detail {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-height: 1.2em;
+}
+
+.overall-green .overall-glyph,
+.overall-green .overall-text {
+  color: var(--green);
+}
+
+.overall-amber .overall-glyph,
+.overall-amber .overall-text {
+  color: var(--amber);
+}
+
+.overall-red .overall-glyph,
+.overall-red .overall-text {
+  color: var(--red);
+}
+
+.overall-grey .overall-glyph,
+.overall-grey .overall-text {
+  color: var(--grey);
+}
+
+/* The same slow pulse the amber lamps use, and switched off under the same
+   preference. Nothing else on this screen animates. */
+.overall-amber .overall-glyph {
+  animation: lamp-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overall-amber .overall-glyph {
+    animation: none;
+  }
+}
+
+/* ---------------- the cough mute ---------------- */
+
+.cough {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  height: 100%;
+}
+
+.cough-readout {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.cough-state {
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: var(--green);
+  /* One line, for the same reason .overall-text is. "MUTED (REMOTE)" is the
+     longest thing it says. */
+  white-space: nowrap;
+}
+
+.cough-reason {
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  min-height: 1.1em;
+}
+
+.cough--muted .cough-state,
+.cough--failed .cough-state {
+  color: var(--red);
+}
+
+.cough--muting .cough-state,
+.cough--unmuting .cough-state {
+  color: var(--amber);
+}
+
+.cough-btn {
+  flex: 0 0 auto;
+  min-height: 60px;
+  min-width: 11rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  /* The push button is held down. touch-action: none stops a drag on a
+     touchscreen turning the hold into a scroll gesture and swallowing the
+     release — which would leave the microphone muted. */
+  touch-action: none;
+  /* And a hold must never turn into a text selection, which on some platforms
+     also eats the pointerup. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.cough-btn-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+}
+
+/* The bound key, PRINTED ON THE BUTTON. This control exists for the moment when
+   looking at the screen is what the operator cannot do, and a keyboard shortcut
+   nobody can see is a keyboard shortcut nobody uses. */
+.keycap {
+  padding: 0.05rem 0.45rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* A control that is holding a mute is red and PRESSED-looking, so which of the
+   two is doing it is legible from the buttons as well as from the readout. */
+.cough-btn-on {
+  background: var(--red);
+  border-color: var(--red);
+  color: #2a0505;
+}
+
+.cough-btn-on .keycap {
+  border-color: rgba(0, 0, 0, 0.35);
+  background: rgba(0, 0, 0, 0.18);
+  color: #2a0505;
+}
+
+/* ============ THE MUTED STATE, ON THE THING THEY ARE WATCHING ==========
+ *
+ * A heavy red outline around the programme picture for as long as the
+ * commentary is muted.
+ *
+ * An OUTLINE, specifically, and both properties matter:
+ *
+ *   - it is not part of the box model, so it costs NO LAYOUT. A border here
+ *     would change .pgm-tile's content box and move the video by its own width,
+ *     which is the one thing this screen may not do.
+ *   - it is drawn OUTSIDE the border box, so it falls outside the rectangle the
+ *     native SRT child window covers. An inset shadow would be erased by the
+ *     good picture — invisible in exactly the case that matters most.
+ *
+ * Colour is not the only signal: the readout says MUTED, names which control is
+ * holding it, and both buttons go red. This is the fourth. */
+.view-home.is-muted .pgm-tile {
+  outline: 5px solid var(--red);
+  outline-offset: 4px;
+}
+
+/* ---------------- the controls, now that they live in the column ------ */
+/*                                                                      */
+/* .controls was a wrapping ROW under the picture, because every         */
+/* vertical pixel it did not use went to the picture. In a fixed-width   */
+/* column that reasoning inverts: the column's width is spent whether    */
+/* the controls use it or not, and the vertical space is the whole point */
+/* of the column. So one control per line, full width, no wrapping.      */
+
+.home-rail .controls {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 0.7rem;
+  margin: 0;
+}
+
+.home-rail .control-group,
+.home-rail .control-group-return,
+.home-rail .control-group-channel,
+.home-rail .control-group-source,
+.home-rail .control-group-level {
+  flex: 0 0 auto;
+  width: 100%;
+}
+
+/* START/STOP first in the column, full width, and still the biggest control in
+   the application. It is not needed DURING a match — which is why it left the
+   main area — but it is the first thing reached before one. */
+.home-rail .action-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.7rem;
+  margin: 0;
+}
+
+.home-rail .btn-start {
+  width: 100%;
+}
+
+.home-rail .lamps {
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.home-rail .preset-indicator {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  align-items: stretch;
+}
+
+/* The input meters were a slim vertical pair beside the picture. In the column
+   they are a labelled block of their own, and they keep their height: a meter
+   too short to show the difference between -18 and -6 is decoration. */
+.home-rail .input-meters {
+  height: 8rem;
+  /* The 8px left margin and the align-self: stretch were both about standing
+     beside the picture. Neither means anything in a block, and the margin just
+     indents the bars out of line with the lamps above them. */
+  margin: 0.6rem 0 0;
+  align-self: auto;
 }

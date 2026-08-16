@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>measure-home</title>
+    <link rel="stylesheet" href="../src/styles/main.css" />
+    <style>
+      /* The harness itself must not touch the layout under test: the results are
+         written into a detached element and read out of the DOM by the runner. */
+      #measure-out {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="measure-out"></pre>
+    <script type="module">
+      import { createHomeView } from '../src/ui/home.js';
+
+      // Every handler is a no-op: this harness drives LAYOUT, and a handler that
+      // did anything would be this file having an opinion about behaviour.
+      const noop = () => {};
+      const home = createHomeView({
+        onSettings: noop,
+        onMixer: noop,
+        onStartStop: noop,
+        onInputChange: noop,
+        onHeadphoneChange: noop,
+        onReturnChange: noop,
+        onReturnChannelChange: noop,
+        onPictureSourceChange: noop,
+        onLevelChange: noop,
+        onPresetChange: noop,
+        onMutePress: noop,
+        onMuteRelease: noop,
+        onMuteLatchToggle: noop,
+        onCoughModeChange: noop,
+      });
+      document.getElementById('app').appendChild(home.el);
+
+      // A realistic screen: devices in the dropdowns, presets in the picker,
+      // lamps lit. An empty page would be a page whose column has no content to
+      // push with, which is the one thing this measurement must not assume.
+      home.setInputDevices(
+        [
+          { id: 'a', name: 'Microphone (Focusrite Scarlett 2i2 USB)' },
+          { id: 'b', name: 'Blackmagic UltraStudio 4K Mini (DeckLink)' },
+          { id: 'c', name: 'DVS Receive  1-2 (Dante Virtual Soundcard)' },
+        ],
+        'a',
+      );
+      home.setHeadphoneDevices([{ id: 'h', name: 'Headphones (Focusrite Scarlett 2i2 USB)' }], 'h');
+      home.setPresets([
+        { id: 'matchA', name: 'Match A — Stadium of Light' },
+        { id: 'matchH', name: 'Match H — Kingsmeadow' },
+      ]);
+      home.setActivePreset('matchH');
+      home.setRunning(true);
+      home.lamps.SENDING.update({ level: 'green', text: 'SENDING' });
+      home.lamps.CAMERA.update({ level: 'grey', text: 'SLATE' });
+      home.lamps['SWITCHER SEES FEED'].update({ level: 'green', text: 'STREAMING' });
+      home.lamps.VIDEO.update({ level: 'green', text: '1080P50' });
+      home.lamps.AUDIO.update({ level: 'green', text: 'AAC 48K STEREO' });
+      home.lamps.MONITOR.update({ level: 'green', text: 'CONNECTED' });
+
+      const rail = home.el.querySelector('.home-rail');
+
+      /**
+       * measure reports .pgm-tile's box the way home.js's measurePictureRect
+       * does — raw CSS pixels, no rounding — because that is the number handed to
+       * Go for the native overlay's rectangle. If this moves, the commentator's
+       * picture moved.
+       */
+      function measure() {
+        const r = home.pictureEl.getBoundingClientRect();
+        return {
+          x: +r.left.toFixed(3),
+          y: +r.top.toFixed(3),
+          width: +r.width.toFixed(3),
+          height: +r.height.toFixed(3),
+        };
+      }
+
+      // A deliberately hostile alert: one unbroken 180-character token, which is
+      // what a WASAPI endpoint id or a URL looks like to an intrinsic-width
+      // calculation. If the column were content-sized this is what would widen it.
+      const HOSTILE =
+        '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}-' +
+        'aVeryLongUnbrokenTokenThatNoLayoutEngineMayBreakWithoutBeingToldTo-' +
+        'andAnotherOneJustToBeSureOfIt';
+
+      const scenarios = [];
+      const record = (name, note) => scenarios.push({ name, note, rect: measure() });
+
+      record('column empty', 'no alerts at all — the "No alerts" row only');
+
+      home.showError('The SRT return picture is not arriving; retrying.');
+      record('one alert', 'a single ordinary alert row');
+
+      for (let i = 2; i <= 10; i++) {
+        home.showError(`Alert number ${i}: ${i === 6 ? HOSTILE : 'the mixer refused a write'}`);
+      }
+      record('ten alerts', 'ten rows, one of them an unbroken 180-character token');
+
+      home.showNote(
+        'Monitor: the browser will not change the audio output device until someone interacts ' +
+          'with the window.',
+      );
+      record('ten alerts + a note', 'a NOTE row added under them');
+
+      // "The settings open" for this layout means the tray being read: the column
+      // scrolled to the bottom, where the picture control is.
+      rail.scrollTop = rail.scrollHeight;
+      record('settings open (column scrolled to the end)', 'rail.scrollTop = scrollHeight');
+
+      home.setMuteReadout({
+        state: 'muted',
+        text: 'MUTED',
+        muted: true,
+        reason: 'LATCHED',
+        held: false,
+        latched: true,
+        available: true,
+        mode: 'push',
+        detail: 'muted at the send path',
+      });
+      record('muted', 'the red outline around the picture — an outline costs no layout');
+
+      home.setMuteReadout({
+        state: 'live',
+        text: 'LIVE',
+        muted: false,
+        reason: 'PUSH MODE',
+        held: false,
+        latched: false,
+        available: true,
+        mode: 'push',
+      });
+      home.clearError();
+      record('back to empty', 'every alert dismissed again');
+
+      // The one thing that IS allowed to move the picture, and only from the
+      // operator's own hand. Reported separately so the difference is visible
+      // rather than hidden inside the "identical" set.
+      const collapse = home.el.querySelector('.rail-collapse');
+      collapse.click();
+      const collapsed = measure();
+      home.el.querySelector('.rail-expand').click();
+      const reexpanded = measure();
+
+      document.getElementById('measure-out').textContent = JSON.stringify(
+        {
+          viewport: { w: window.innerWidth, h: window.innerHeight },
+          scenarios,
+          operatorActions: [
+            { name: 'column collapsed by the operator', rect: collapsed },
+            { name: 're-expanded', rect: reexpanded },
+          ],
+        },
+        null,
+        2,
+      );
+      document.title = 'measure-home:done';
+    </script>
+  </body>
+</html>

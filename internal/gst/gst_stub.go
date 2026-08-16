@@ -79,6 +79,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -264,6 +265,11 @@ type StubCounters struct {
 	ForceKeyUnits int
 	// Stops is the number of Stop calls, including the idempotent repeats.
 	Stops int
+	// CommentaryMutes is the number of SetCommentaryMute calls, successful or
+	// not — including the refused ones, because a UI that calls it on a pipeline
+	// that has not started is a bug worth being able to count at Gate A rather
+	// than one that shows up as a cough button doing nothing.
+	CommentaryMutes int
 }
 
 // StubPipeline is the pure-Go Pipeline returned by New in a non-cgo build.
@@ -318,6 +324,18 @@ type StubPipeline struct {
 	// for the picker's bars to drift against the programme meter's.
 	levelStop chan struct{}
 	levelDone chan struct{}
+
+	// muted is the cough mute, and it is an ATOMIC OUTSIDE p.mu for the same
+	// reason the real twin's is: CommentaryMuted is a UI-facing read that must
+	// never block, and in the real build the lock it would otherwise take is
+	// held for the whole of ReplaceSink. A stub whose read took the mutex would
+	// let a caller be written against a cheapness the shipped build cannot
+	// offer.
+	//
+	// It survives Stop, exactly as the real twin's does, so that a caller
+	// rebuilding a session that died muted can read the state off the pipeline
+	// it is discarding. See gst_cgo.go's teardownLocked.
+	muted atomic.Bool
 
 	counters StubCounters
 }
@@ -473,6 +491,15 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 		p.channelMap = opts.ChannelMap
 		p.matrixWritten = true
 	}
+
+	// The cough mute, applied at exactly the point the real twin applies it: with
+	// the pipeline still notionally in NULL, before it can be said to be
+	// carrying anything. The stub has no element to write, so the "read back
+	// what the element said" discipline collapses to storing the value — but the
+	// STATE MACHINE around it is the same one, and that is what Gate A is for. A
+	// pipeline started with MuteCommentary reports CommentaryMuted immediately,
+	// and never through a route that Start could have raced.
+	p.muted.Store(opts.MuteCommentary)
 
 	p.opts = opts
 	p.state = StubStateRunning
@@ -697,6 +724,38 @@ func (p *StubPipeline) ChannelMap() (ChannelMap, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.channelMap, p.matrixWritten
+}
+
+// SetCommentaryMute mutes the commentary on the send path, or unmutes it, with
+// the identical refusals the real twin makes: stopped, and not started.
+//
+// The pre-Start refusal is the one that matters at Gate A. It is not defensive
+// tidiness — it is the design decision coughmute.go argues, that the mute has
+// exactly one route before Start (PipelineOpts.MuteCommentary) and exactly one
+// after it, so that no two places can hold disagreeing memories of whether the
+// microphone is open. A stub that quietly accepted the call and latched it would
+// let a caller be written against a second route the real build does not have.
+func (p *StubPipeline) SetCommentaryMute(mute bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.counters.CommentaryMutes++
+
+	if p.closed {
+		return errStubStopped
+	}
+	if p.state == StubStateStopped {
+		return errors.New("gst: pipeline has not been started, so there is no element to mute; " +
+			"a pipeline that must begin muted is started with PipelineOpts.MuteCommentary, which " +
+			"is applied before it can produce a buffer")
+	}
+	p.muted.Store(mute)
+	return nil
+}
+
+// CommentaryMuted reports the mute state, without taking p.mu. See the field.
+func (p *StubPipeline) CommentaryMuted() bool {
+	return p.muted.Load()
 }
 
 // Errors returns the asynchronous error channel. It is closed by Stop.

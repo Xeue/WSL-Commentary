@@ -1039,6 +1039,30 @@ type PipelineOpts struct {
 	// audioconvert cannot resolve on its own. Start logs which of the two it
 	// found.
 	ChannelMap ChannelMap
+
+	// MuteCommentary starts the pipeline with the commentary muted on the SEND
+	// PATH: the volume element named coughmute is written while the pipeline is
+	// still in NULL, so a pipeline that is meant to be born muted never carries
+	// one buffer of live commentary. coughmute.go carries the whole argument for
+	// the mechanism and the measurements behind it.
+	//
+	// THE ZERO VALUE IS UNMUTED, which is what every seat that has never touched
+	// a cough button gets, and it renders the identical property write the
+	// element already has in the parse string.
+	//
+	// It exists because a Pipeline is SINGLE-USE. A reconnect does not need it —
+	// an SRT drop swaps the sink and never touches the audio leg, so a live mute
+	// survives it by construction — but the latched-fatal path discards the whole
+	// pipeline, and the next one has no memory of anything. A caller that holds a
+	// cough mute across such a rebuild reads CommentaryMuted off the pipeline it
+	// is discarding and passes it here, and the replacement is muted BEFORE its
+	// first buffer instead of a moment after it.
+	//
+	// It is the ONLY way to set the mute before Start. SetCommentaryMute refuses
+	// on a pipeline that has not started rather than latching a second copy of
+	// the same intent; see coughmute.go for why one control with two memories is
+	// the failure this design is avoiding.
+	MuteCommentary bool
 }
 
 // refuseWrongAudioSource is the WHOLE RULE about which element opens the
@@ -1288,6 +1312,71 @@ type Pipeline interface {
 	// a pipeline to change, and installing one live would renegotiate the very
 	// caps the feed is running on.
 	SetChannelMap(m ChannelMap) error
+
+	// SetCommentaryMute takes the commentary off the SEND PATH, or puts it back,
+	// WHILE THE PIPELINE IS PLAYING. It is what the cough buttons drive — both
+	// the push-to-mute one, which sets true on press and false on release, and
+	// the latching one, which toggles. Neither mode is a concept this package
+	// has: they are two ways of calling one boolean, and keeping it that way is
+	// what makes the answer to "is the microphone open" a single fact.
+	//
+	// It is a property write on a volume element sitting between the resampler's
+	// capsfilter and the programme meter. No state change, no renegotiation, no
+	// element added to or removed from a running graph, and NOTHING SHARED with
+	// the channel map: the routing and the mute are separate properties on
+	// separate elements and cannot disagree. coughmute.go holds the argument
+	// against the two alternatives — zeroing the mix matrix, and a valve — and
+	// the measurements that settle it.
+	//
+	// MEASURED ON THE SHIPPED PIPELINE with the fitted card on 2026-08-16: the
+	// mute write took 109.792 us and the unmute 101 us, the pipeline was PLAYING
+	// with nothing pending across both, no bus message was posted, and the
+	// programme meter went from -57.0538 dBFS to -100.0000 — the clamped
+	// digital-silence floor — and back, at an unchanged thirty frames a window.
+	//
+	// WHAT THE FAR END SEES IS A CONTINUOUS STREAM THAT HAPPENS TO BE SILENT.
+	// Measured through the shipped encoder chain into mpegtsmux on 2026-08-16,
+	// muted and unmuted: 473 AAC access units either way, the same first PTS,
+	// the same last PTS, and the same largest gap between packets — one AAC
+	// frame, which is the floor. There is no discontinuity to recover from.
+	//
+	// THE PROGRAMME METER TELLS THE TRUTH THROUGHOUT, because the mute is
+	// upstream of it: OnLevels goes on arriving at its own rate and reads
+	// digital silence rather than freezing. A frozen meter and a silent one look
+	// the same on screen for the first second and mean opposite things.
+	//
+	// It returns an error, and writes nothing, on a pipeline that is stopped or
+	// that has not been started. The pre-Start case is deliberately a refusal
+	// rather than a latch — PipelineOpts.MuteCommentary is that route, and one
+	// control with two memories is the failure mode this design exists to avoid.
+	//
+	// It survives a reconnect by construction. internal/sender's reconnect is
+	// RemoveSink, backoff, ReplaceSink; none of the three goes near the audio
+	// leg, and everything upstream of srtq stays in PLAYING for the life of the
+	// process.
+	SetCommentaryMute(mute bool) error
+
+	// CommentaryMuted reports whether the commentary is muted on the send path.
+	//
+	// IT IS AN OBSERVATION, NOT A RECOLLECTION. The value returned is the one
+	// READ BACK OFF THE ELEMENT after the last successful write — the volume
+	// element's mute property is readable, and both Start and SetCommentaryMute
+	// re-read it immediately after setting it, so a write that did not take
+	// cannot leave the application believing it did. That is the property that
+	// disqualified zeroing the mix matrix, which does not marshal back out of
+	// audioconvert at any price.
+	//
+	// It takes no lock and never blocks, which is why it is safe to call from a
+	// UI poll and from a status assembly that runs while a reconnect is in
+	// flight: the reads come off an atomic mirror rather than out of the
+	// GStreamer graph, and ReplaceSink can hold the pipeline lock for seconds.
+	//
+	// Before Start it reports the pipeline's configured PipelineOpts.MuteCommentary
+	// only once Start has applied it; on a pipeline that has never started it is
+	// false, and on a stopped one it is the last state the element confirmed —
+	// which is what a caller rebuilding after a fatal reads and hands to the
+	// replacement's PipelineOpts.MuteCommentary.
+	CommentaryMuted() bool
 
 	// Errors returns the pipeline's asynchronous error channel, carrying
 	// GST_ELEMENT_ERROR messages from the bus — in practice, srtout losing its

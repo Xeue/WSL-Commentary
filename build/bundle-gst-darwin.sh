@@ -361,7 +361,7 @@ WANTED_ELEMENTS="
 filesrc queue capsfilter fakesink typefindfunctions
 pngdec imagefreeze
 videoconvert videoscale videorate deinterlace
-audioconvert audioresample
+audioconvert audioresample volume
 h264parse h265parse aacparse
 level
 mpegtsmux tsdemux

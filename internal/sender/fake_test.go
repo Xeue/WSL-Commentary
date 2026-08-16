@@ -125,6 +125,10 @@ type fakePipeline struct {
 	removeErr  error
 	removeErrN int
 
+	// muted is the cough mute this fake was last told to set. Nothing in the
+	// reconnect machine writes it; see SetCommentaryMute.
+	muted bool
+
 	// sinkResults are handed to successive ReplaceSink calls in order. Once
 	// exhausted, sinkDefault is returned for every further call.
 	sinkResults []error
@@ -250,6 +254,26 @@ func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 // positioned capture device: no negotiated width, no matrix to change.
 func (p *fakePipeline) InputChannels() int                 { return 0 }
 func (p *fakePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
+
+// The cough mute is inert here for the reason the routing above it is: the
+// reconnect state machine neither reads it nor writes it. It is recorded rather
+// than discarded so that a future test asserting "a reconnect does not touch the
+// mute" has something to assert against — and the recording is what makes the
+// claim checkable at all, since the real answer to that question is structural
+// (nothing in RemoveSink or ReplaceSink goes near the audio leg) rather than
+// something the state machine could get right by accident.
+func (p *fakePipeline) SetCommentaryMute(mute bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.muted = mute
+	return nil
+}
+
+func (p *fakePipeline) CommentaryMuted() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.muted
+}
 
 // ForceKeyUnit records the request, runs onForceKeyUnit if one is installed,
 // and then — if a gate is installed — blocks until the test releases it. Both

@@ -343,31 +343,63 @@ export function createReturnAudio({
       appliedSinkId = null;
 
       // Note 4: WKWebView refuses this without transient activation. Queue it
-      // behind the same one-shot listener autoplay uses and say so, once. The
-      // condition is the error alone — WebView2 does not impose the
-      // requirement, so on Windows this branch is unreachable and the Windows
-      // behaviour is byte-for-byte what it was.
+      // behind the same one-shot listener autoplay uses. The condition is the
+      // error alone — WebView2 does not impose the requirement, so on Windows
+      // this branch is unreachable and the Windows behaviour is byte-for-byte
+      // what it was.
+      //
+      // ================= AND IT SAYS NOTHING, DELIBERATELY ==================
+      //
+      // This branch used to report SINK_ID_DEFERRED: "the browser will not
+      // change the audio output device until someone interacts with the window —
+      // the chosen headphone output will be applied on the next click." Every
+      // word of that is true, and the operator screenshotted it as a thing that
+      // alarmed him.
+      //
+      // It is an explanation of a state that is about to end. hookGesture arms a
+      // one-shot listener on the next interaction ANYWHERE in the document —
+      // pointerdown, keydown, touchstart — and re-applies the sink from inside
+      // it, so in the ordinary case the operator would be reading an alarm about
+      // something that fixed itself while they read it. An alert that fires when
+      // everything is fine trains people to ignore the surface it appears on,
+      // and that cost is paid by the NEXT message on that surface, which is
+      // real.
+      //
+      // What is NOT silenced is the case where the retry also fails: the fall
+      // through below reports SINK_ID_FAILED, loudly, because a device that is
+      // refused from inside a gesture is a device that will never be permitted
+      // and the return really is on the wrong output. sinkGestureSpent is what
+      // separates the two, and it is unchanged — one silent retry, then the
+      // truth.
+      //
+      // The residual risk, stated: if nobody ever interacts with the window at
+      // all, the return plays on the system default device and nothing says so.
+      // It is small and it is bounded — the SAME gesture is what autoplay is
+      // waiting on, and a monitor that has never been clicked is a monitor
+      // playing nothing at all, which is louder than any banner — and it is the
+      // price of not crying wolf on every configuration load.
+      //
+      // MonitorErrorCode.SINK_ID_DEFERRED is kept in errors.js, and alerts.js
+      // still classifies it as a NOTE, so a future caller that chooses to
+      // surface it does not have to re-derive how loud it should be.
       if (!closed && err && err.name === 'NotAllowedError' && !sinkGestureSpent) {
         sinkGestureSpent = true;
         sinkAwaitingGesture = true;
-        report(
-          new MonitorError(
-            MonitorErrorCode.SINK_ID_DEFERRED,
-            'the browser will not change the audio output device until someone ' +
-              'interacts with the window — the chosen headphone output will be ' +
-              'applied on the next click',
-            err,
-          ),
-        );
         hookGesture();
         return;
       }
 
       sinkAwaitingGesture = false;
+      // The wording names what the commentator will actually experience and what
+      // to do about it. "could not route the return to output device
+      // {guid}" described the call that failed; this describes the consequence,
+      // which is the thing the person reading it has to act on.
       report(
         toMonitorError(
           MonitorErrorCode.SINK_ID_FAILED,
-          `could not route the return to output device "${requestedSinkId}"`,
+          'the return is playing on the system default output, not the headphones chosen ' +
+            `on this screen — the browser refused device "${requestedSinkId}". Choose a ` +
+            'different output, or set it in the operating system.',
           err,
         ),
       );

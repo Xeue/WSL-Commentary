@@ -1886,6 +1886,24 @@ export function createSettingsView(handlers) {
   addHiddenField('audioSourceKind', textInput('f-audioSourceKind'));
   addHiddenField('decklinkPersistentId', textInput('f-decklinkPersistentId'));
 
+  // THE COUGH MUTE MODE IS NOT A SETTING ON THIS FORM, but it must survive one
+  // being saved.
+  //
+  // It is chosen on the MAIN SCREEN, in the column beside the picture, because
+  // it is a match-time preference and not a configuration: the operator decides
+  // between a held cough key and a latched one where they are sitting when they
+  // decide it. Putting a second copy of the control here would give one value
+  // two owners.
+  //
+  // Registered hidden for the reason the device ids above are: saveConfig
+  // REPLACES the whole document, so a field this form does not restate is a
+  // field this form DELETES. An operator who set latch and then saved a port
+  // number would find their cough button back on push — discovered mid-match, by
+  // pressing it. Go carries the field forward when a page omits it as well
+  // (app.go's carryForwardUIOnlyFields), and that belt is not a reason to drop
+  // this brace: the two guards fail in different directions.
+  addHiddenField('coughMuteMode', textInput('f-coughMuteMode'));
+
   /**
    * applyAudioInputSelection is the "and then do the correct setup based on what
    * is selected" half. All three fields move together, with the one that no
@@ -2481,6 +2499,12 @@ export function createSettingsView(handlers) {
     renderChannelMapGroup();
     fields.headphoneDeviceId.input.value = config.headphoneDeviceId || '';
     fields[DEVICE_KEY_SRT].input.value = config[DEVICE_KEY_SRT] || '';
+    // The cough mute's mode: read so that it can be restated, never normalised
+    // here. An EMPTY value is documented on the Go side as "not chosen" and is
+    // what carryForwardUIOnlyFields keys off; substituting the default in this
+    // form would turn "the operator has not chosen" into "the operator chose
+    // push", which is a preference this screen has no business inventing.
+    fields.coughMuteMode.input.value = config.coughMuteMode || '';
     fields.returnMid.input.value = String(
       isValidReturnMid(config.returnMid) ? config.returnMid : DEFAULT_RETURN_MID,
     );
@@ -2584,6 +2608,13 @@ export function createSettingsView(handlers) {
       decklinkChannelMap: channelMapView.collect(),
       headphoneDeviceId: fields.headphoneDeviceId.input.value.trim(),
       [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
+      // The cough mute's mode. Chosen on the MAIN SCREEN, restated here, for the
+      // reason every hidden field on this form exists: saveConfig REPLACES the
+      // stored document, so a field this form does not restate is a field this
+      // form deletes. An operator who set latch and then saved a port number
+      // would find their cough button back on push — mid-match, discovered by
+      // pressing it.
+      coughMuteMode: fields.coughMuteMode.input.value.trim(),
       returnMid: Number(fields.returnMid.input.value),
       returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
       srtReturnPort: Number(fields.srtReturnPort.input.value),

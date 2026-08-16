@@ -878,7 +878,12 @@ test('the preview is a second native surface, positioned the way the picture alr
   // TWO BOXES, NEVER ONE. Two opaque native windows told to occupy overlapping
   // rectangles erase one another, and neither side reports anything wrong.
   const home = codeOnly(ui('home.js'));
-  assert.match(home, /pgmStage\.append\(pgmTile, metersEl, previewTile\)/);
+  // The stage holds the two PICTURES and nothing else now: the input meters
+  // moved into the side column when the main area was reduced to the picture,
+  // one overall indicator and the cough controls. What this assertion is FOR is
+  // unchanged and is the second half of the line — the preview box is a sibling
+  // of the tile, never a child of it.
+  assert.match(home, /pgmStage\.append\(pgmTile, previewTile\)/);
   assert.ok(
     !/pgmTile\.appendChild\(previewTile\)/.test(home),
     'the preview box must never be inside the box the picture overlay is measured from',
@@ -969,18 +974,65 @@ test('the video source is adopted from every path that adopts a configuration', 
   // rectangle cannot end up describing different configurations. The three paths
   // are the startup load, a save (Settings, and an applied preset through
   // applyConfigLive) and another seat's save.
+  //
+  // The second argument is WHOSE HAND IT WAS, and it is the whole of the rule
+  // below: only a local action may resize this desk's picture.
   const app = codeOnly(ui('app.js'));
-  assert.match(app, /function adoptVideoConfig\(config\) \{/);
+  assert.match(app, /function adoptVideoConfig\(config, local\) \{/);
   for (const fn of ['function applyConfigLive(config)', 'function applyRemoteConfig(config)']) {
     const at = app.indexOf(fn);
     assert.ok(at > 0, `app.js must still have ${fn}`);
     const body = app.slice(at, app.indexOf('\n  }', at));
-    assert.ok(
-      body.includes('adoptVideoConfig(config)'),
+    assert.match(
+      body,
+      /adoptVideoConfig\(config, (?:true|false)\)/,
       `${fn} must adopt the video leg, or this desk's CAMERA lamp goes on reading SLATE after the ` +
         'position has been moved onto the card',
     );
   }
   const init = app.slice(app.indexOf('(async function init()'));
-  assert.match(init, /adoptVideoConfig\(currentConfig\)/, 'and the startup load must too');
+  assert.match(init, /adoptVideoConfig\(currentConfig, true\)/, 'and the startup load must too');
+});
+
+test("another seat's save never moves this commentator's picture", () => {
+  // ==================== THE RULE, IN THE OPERATOR'S WORDS ====================
+  //
+  //   "For the comentators watching a live match, anything casuing their video
+  //    to move is a massive no."
+  //
+  // Reserving the preview box is a LAYOUT CHANGE: .pgm-tile is sized against
+  // what is left in the stage. Measured at 1600x900, turning the preview on took
+  // the picture from x=70.172 y=85.781 w=1076.656 h=605.609 to x=20 y=126.422
+  // w=932.141 h=524.328 — a 144.5px (13.4%) width loss and a 40.6px vertical
+  // shift. Acceptable when the operator at THIS desk asked for it; not
+  // acceptable at all when the config arrived over the wire, because then the
+  // commentator's picture jumps mid-match at a stranger's keystroke.
+  //
+  // So the remote path adopts the readouts and stops short of the layout.
+  const app = codeOnly(ui('app.js'));
+
+  const remoteAt = app.indexOf('function applyRemoteConfig(config)');
+  const remote = app.slice(remoteAt, app.indexOf('\n  }', remoteAt));
+  assert.match(remote, /adoptVideoConfig\(config, false\)/, 'a remote save is not a local one');
+
+  const liveAt = app.indexOf('function applyConfigLive(config)');
+  const live = app.slice(liveAt, app.indexOf('\n  }', liveAt));
+  assert.match(live, /adoptVideoConfig\(config, true\)/, "this desk's own save may resize it");
+
+  // And the flag has to REACH the layout call, not merely be accepted.
+  const adoptAt = app.indexOf('function adoptVideoConfig(config, local)');
+  const adopt = app.slice(adoptAt, app.indexOf('\n  }', adoptAt));
+  assert.match(adopt, /if \(local\) renderPreview\(\);/, 'renderPreview is the one that reserves');
+  assert.match(adopt, /else renderPreviewCaptionOnly\(\);/);
+
+  // The caption-only path must not reserve, and must not sync overlays: it has
+  // moved nothing, so there is nothing to re-measure.
+  const capAt = app.indexOf('function renderPreviewCaptionOnly()');
+  assert.ok(capAt > 0, 'app.js must define renderPreviewCaptionOnly');
+  const cap = app.slice(capAt, app.indexOf('\n  }', capAt));
+  assert.match(cap, /home\.setPreviewCaption\(/, 'it still tells the truth about the state');
+  assert.ok(
+    !cap.includes('setPreviewReserved'),
+    'reserving is the layout change this whole path exists to avoid',
+  );
 });

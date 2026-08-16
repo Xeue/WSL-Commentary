@@ -33,7 +33,13 @@ export const LEVEL = Object.freeze({
 // or a monochrome monitor a metre away is left with (spec section 10 design
 // note). The glyph is decorative — screen readers get the text state via
 // aria-label, not the glyph.
-const GLYPH = Object.freeze({
+//
+// EXPORTED so that the single overall indicator on the main screen draws from
+// this table rather than from a second one. It summarises these six lamps and is
+// read from further away than any of them; an operator who has learnt ● ▲ ✕ ○
+// here must not have to learn a different alphabet for the summary, and two
+// tables that agree today is precisely the shape ./returns.js exists to record.
+export const GLYPH = Object.freeze({
   [LEVEL.GREEN]: '●', // ● filled circle
   [LEVEL.AMBER]: '▲', // ▲ triangle
   [LEVEL.RED]: '✕', // ✕ heavy cross

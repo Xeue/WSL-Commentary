@@ -123,6 +123,49 @@
 // than to the preview, and allow-not-linked=true is what makes a tee with one
 // consumer legal.
 //
+// # "CAN WE SEE THE PICTURE BEFORE GOING LIVE?" — YES, AND IT NEEDS NOTHING NEW
+//
+// This is the question the paragraph above looks like it forecloses, and it does
+// not. The answer was measured on 2026-08-16 on the fitted card
+// (TestLivePreviewBeforeStartNeedsNoNewPipeline in coughmute_live_test.go) and
+// it is worth stating here, because the two designs a reader will reach for are
+// both dangerous and NEITHER IS NECESSARY.
+//
+// The two dangerous ones first, so nobody re-derives them:
+//
+//   - A PREVIEW-ONLY PIPELINE THAT START TAKES THE CARD FROM. The card is
+//     exclusive — two decklinkvideosrc in one process fail 3/3, two processes
+//     fail 3/3 — so there is no atomic handover, and a failed reacquire is NO
+//     FEED, which is far worse than no preview. (It would probably work:
+//     TestLiveCardReleaseAndReacquire measured 12 of 12 clean release-and-retake
+//     cycles in one process, 56-98 ms each. "Probably" is not the bar for the
+//     thing that carries the match, and the design is not needed anyway.)
+//   - ATTACHING THE ENCODER AND MUX BRANCH AT START to a graph already running.
+//     That is the live add/remove this file's previous section measured taking
+//     the on-air leg to 0 fps permanently.
+//
+// And now the reason neither is needed. START ALREADY BRINGS THE WHOLE CAPTURE
+// CHAIN TO PLAYING WITH NO SINK INSTALLED. That is the documented contract of
+// gst.Pipeline.Start, not an accident of it: the pipeline runs, srtq's src pad
+// is held by a blocking probe, and NOTHING LEAVES THE PROCESS until ReplaceSink
+// is called. This branch hangs off the video capture tee, upstream of the
+// encoder and far upstream of srtq, so it is rendering in precisely that state.
+//
+// Measured in that state — Start called, ReplaceSink never called:
+//
+//	programme meter frames in 2.5 s   49   (the full 20 a second)
+//	capture channels negotiated       16   (the card's own, matrix written)
+//	cough mute settable               yes
+//	pipeline                          PLAYING, nothing pending
+//
+// So "see and hear before starting" is not a pipeline problem. It is the
+// application calling gst.Start when a capture device is configured and NOT
+// calling ReplaceSink until the operator says go — a split that internal/sender
+// already makes internally and that the frozen Pipeline interface already
+// exposes as two separate methods. Nothing in internal/gst has to change, and
+// nothing in internal/gst was changed for it, which is why there is no
+// half-built preview lifecycle in this package to go wrong.
+//
 // # A DEAD PREVIEW MUST NOT BE ABLE TO TAKE THE FEED DOWN
 //
 // Two mechanisms, because there are two ways it could:

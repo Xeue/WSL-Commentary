@@ -663,9 +663,9 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 5 {
-		t.Fatalf("domReady queued %d events, want the sender, return, picture, signal and "+
-			"channel-map replays: %+v", len(queued), queued)
+	if len(queued) != 7 {
+		t.Fatalf("domReady queued %d events, want the sender, return, picture, signal, "+
+			"channel-map, mute and preview replays: %+v", len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[0], EventSender, sender.StateConnected)
@@ -693,6 +693,36 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 		t.Fatalf("domReady queued %+v, want no negotiated channels and an empty, non-nil map",
 			gotMap)
 	}
+
+	// The SIXTH is the cough mute, and it needs the replay for a reason none of
+	// the five above it share: a mute is SILENT. Every other lamp recovers by
+	// itself or is merely a display; a page that came back showing an unmuted
+	// commentator who is not being heard is wrong in the only direction that
+	// costs a match. Like the routing grid it is read from the record and never
+	// from the pipeline, because this runs on the Wails main thread.
+	gotMute, ok := queued[5].data.(mutePayload)
+	if queued[5].name != EventMute || !ok {
+		t.Fatalf("domReady queued %+v, want a %s carrying a mutePayload", queued[5], EventMute)
+	}
+	if gotMute.Muted || gotMute.Available || gotMute.Reason == "" {
+		t.Fatalf("domReady queued %+v, want unmuted, unavailable and a sentence saying why: a "+
+			"control drawn as switched off with no explanation is the defect Reason exists to remove",
+			gotMute)
+	}
+
+	// And the SEVENTH is the preview panel's explanation. For most of the time
+	// this application is open the honest answer is "not yet, and here is what
+	// that means"; a page with no way to ask draws an empty black rectangle
+	// instead, which reads as a fault on a machine that is working perfectly.
+	gotPrev, ok := queued[6].data.(previewStatePayload)
+	if queued[6].name != EventPreview || !ok {
+		t.Fatalf("domReady queued %+v, want a %s carrying a previewStatePayload",
+			queued[6], EventPreview)
+	}
+	if gotPrev.Running || gotPrev.BeforeStart || gotPrev.Reason == "" {
+		t.Fatalf("domReady queued %+v, want not running, not available before START, and a "+
+			"reason the operator can read", gotPrev)
+	}
 }
 
 func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
@@ -702,9 +732,9 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 5 {
-		t.Fatalf("domReady queued %+v, want a sender, a return, a picture, a signal and a "+
-			"channel-map replay", queued)
+	if len(queued) != 7 {
+		t.Fatalf("domReady queued %+v, want a sender, a return, a picture, a signal, a "+
+			"channel-map, a mute and a preview replay", queued)
 	}
 	if queued[0].data != sender.StateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any session has run", queued, sender.StateStopped)
@@ -1061,6 +1091,19 @@ func assertBoundSurface(t *testing.T) {
 		"SetDeckLinkPreviewEnabled": true,
 		"SetPreviewRect":            true,
 		"SetPreviewVisible":         true,
+
+		// The cough mute, and the one read that exists to keep the preview panel
+		// honest. SetCommentaryMute is the only method on this surface that is
+		// called on a key DOWN and again on the key UP, dozens of times in a
+		// match — everything unusual about its signature follows from that, and
+		// its ordering stamp is what stops a key-up overtaking its own key-down
+		// and leaving a microphone dead. It is NOT host-only, unlike the four
+		// above it; remoteAllowlist argues that at length and states the
+		// condition it depends on, which is that the desk can always see that it
+		// is muted and by whom.
+		"SetCommentaryMute": true,
+		"GetCommentaryMute": true,
+		"GetPreviewState":   true,
 	}
 
 	got := exportedMethodsOfApp()

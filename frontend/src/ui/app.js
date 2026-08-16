@@ -7,6 +7,13 @@ import { createSettingsView } from './settings.js';
 // line is what puts the whole drawer and its stylesheet in the bundle. A
 // dynamic import would build and would ship nothing until a code path ran.
 import { createMixerHost } from './mixerhost.js';
+// The cough mute's state machine. Pure, DOM-free and testable: it owns the OR of
+// the two behaviours, the latest-wins serialisation of the calls, and the rule
+// that a refused mute is never drawn as a mute that landed.
+import { createCoughMute, normaliseMuteMode } from './cough.js';
+// What is worth the operator's attention mid-match. classifyMonitorError is why
+// the deferred output-device message no longer arrives as an alarm.
+import { classifyMonitorError } from './alerts.js';
 import {
   RETURN_SOURCE_SRT,
   RETURN_SOURCE_WEBRTC,
@@ -170,11 +177,81 @@ export function mountApp(root) {
     onReturnChannelChange: onReturnChannelChange,
     onPictureSourceChange: onPictureSourceChange,
     onLevelChange: onLevelChange,
-    // Switching instance from the header indicator. It reuses the SAME apply
-    // sequence the Settings preset UI does — no second apply path — see
+    // Switching instance from the column's Session block. It reuses the SAME
+    // apply sequence the Settings preset UI does — no second apply path — see
     // onHomePresetChange.
     onPresetChange: onHomePresetChange,
+    // The cough mute's three gestures. They go STRAIGHT to the model below and
+    // nowhere else: there is no branch here that could decide the mute means
+    // something different when it arrives from a key rather than from a button.
+    onMutePress: () => coughMute.press(),
+    onMuteRelease: () => coughMute.release(),
+    onMuteLatchToggle: () => coughMute.toggleLatch(),
+    onCoughModeChange: onCoughModeChange,
   });
+
+  // --- the cough mute -------------------------------------------------------
+  //
+  // ================= IT MUTES THE SEND PATH OR IT MUTES NOTHING ==============
+  //
+  // `apply` is backend.setCommentaryMute and nothing else. Muting the monitor
+  // element, the return path or the Web Audio gain would make this desk quieter
+  // while the cough went to air — the exact failure inverted, with a green light
+  // on it. The state machine is cough.js; this file supplies the call and the
+  // readout wire, and holds no copy of "muted".
+  const coughMute = createCoughMute({
+    apply: (muted) => backend.setCommentaryMute(muted),
+    onChange: (readout) => home.setMuteReadout(readout),
+    // The BUILD's answer only. "There is no session to mute yet" is a different
+    // fact with a different sentence and it arrives on the payload's `available`
+    // and `reason` — conflating the two would tell an operator who has simply
+    // not pressed START that their application cannot mute at all.
+    //
+    // NOT gated on isRemoteClient(). A remote seat MAY mute: app_remote.go
+    // classifies SetCommentaryMute as reachable-and-mutating deliberately, and
+    // the payload's By/ByAddr are what the desk is shown so that a red badge is
+    // never unaccountable. Disabling the control here would be this file
+    // overruling that decision by omission.
+    available: backend.coughMuteAvailable(),
+  });
+  home.setMuteReadout(coughMute.readout);
+
+  // ADOPT WHAT GO ACTUALLY HAS, rather than assuming the send path starts live.
+  // A page reload mid-cough, a session ending (which takes the mute with it), or
+  // a second seat is enough to make "this control has not been pressed yet" a
+  // false statement about the microphone. app.go emits EventMute on every
+  // accepted change, at both session boundaries, on a reconciliation that finds
+  // the pipeline disagreeing, and replays it at domReady.
+  //
+  // Never fatal: getCommentaryMute answers MUTE_UNAVAILABLE rather than throwing
+  // when this build has no bindings.
+  Promise.resolve()
+    .then(() => backend.getCommentaryMute())
+    .then((payload) => coughMute.adopt(payload))
+    .catch((err) => {
+      console.error('wslcomms: could not read the commentary mute state', err);
+    });
+  backend.onCommentaryMute((payload) => coughMute.adopt(payload));
+
+  /**
+   * onCoughModeChange saves which cough behaviour is primary.
+   *
+   * The model is told FIRST and unconditionally, so the screen follows the
+   * operator's press even if the save is slow or fails — this is a preference
+   * about emphasis, and a picker that springs back while a match is starting is
+   * worse than one whose saved value is a moment behind. persistConfig is the
+   * same single-field write the picture source uses.
+   */
+  async function onCoughModeChange(mode) {
+    const next = normaliseMuteMode(mode);
+    coughMute.setMode(next);
+    home.setCoughMode(next);
+    try {
+      await persistConfig({ coughMuteMode: next });
+    } catch (err) {
+      home.showError(`Could not save the cough mute mode: ${err?.message || err}`);
+    }
+  }
 
   // The drawer mounts at the TOP LEVEL, not inside home.el.
   //
@@ -362,6 +439,18 @@ export function mountApp(root) {
    * covers it when there is a picture, so what the operator sees is either their
    * camera or a sentence explaining why it is not there.
    */
+  /**
+   * renderPreviewCaptionOnly is renderPreview's half that cannot move anything:
+   * the words, and not the box they sit in.
+   *
+   * It exists for the remote-save path. See adoptVideoConfig for why a producer
+   * on another seat pressing Save must never resize this commentator's picture.
+   */
+  function renderPreviewCaptionOnly() {
+    const running = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
+    home.setPreviewCaption(describePreviewBox(running));
+  }
+
   function renderPreview() {
     const effects = deriveVideoSourceEffects(currentVideoSource, currentInputDevices);
     const reserved = previewBindingsPresent && effects.wantCard && currentPreviewEnabled;
@@ -398,11 +487,41 @@ export function mountApp(root) {
    * seat's save — so the lamp and the preview box cannot end up describing
    * different configurations.
    */
-  function adoptVideoConfig(config) {
+  /**
+   * adoptVideoConfig takes another page's video settings.
+   *
+   * `local` says whether this desk made the change. It decides ONE thing, and it
+   * is the most important rule on this screen: A REMOTE SAVE MAY NOT MOVE THIS
+   * COMMENTATOR'S PICTURE.
+   *
+   * renderPreview reserves the preview box, and reserving is a LAYOUT change —
+   * .pgm-tile is sized against what is left in the stage, so the programme
+   * picture resizes and shifts. Measured at 1600x900: reserving took the tile
+   * from x=70.2 w=1076.7 to x=20 w=932.1, a 13.4 % width loss and a 40.6 px
+   * jump. Done by the operator's own hand that is fine — they asked for it, the
+   * same way collapsing the rail is allowed to. Done because a producer on
+   * another seat pressed Save, it is the picture moving under somebody who is
+   * mid-sentence and has no idea why, which is the exact thing the side column
+   * was built to end.
+   *
+   * This is the same asymmetry applyRemoteConfig already applies below it — no
+   * SRT-return rebuild for a remote save, because "re-dialling it for a remote
+   * save would only risk a glitch for no gain". A layout change is a bigger
+   * glitch than a re-dial.
+   *
+   * The READOUTS are adopted either way, and must be: a CAMERA lamp on this desk
+   * still reading SLATE after somebody else moved this position onto the card is
+   * the worse half of the same coin. So a remote save changes what the page
+   * SAYS, and never where the picture IS. The next thing this desk does that
+   * legitimately re-runs renderPreview — a local save, a Start, a device change —
+   * picks the reservation up.
+   */
+  function adoptVideoConfig(config, local) {
     currentVideoSource = normaliseVideoSource(config?.videoSource);
     currentPreviewEnabled = normalisePreviewEnabled(config?.decklinkPreviewEnabled);
     renderCameraLamp();
-    renderPreview();
+    if (local) renderPreview();
+    else renderPreviewCaptionOnly();
   }
 
   const mixerHost = createMixerHost({
@@ -554,14 +673,23 @@ export function mountApp(root) {
   }
 
   function renderStatusLamps() {
-    const { switcher, video, audio, unavailable } = deriveStatusLamps(
-      currentStatus,
-      currentConformTarget,
-    );
+    // `unavailable` is deliberately not read. deriveStatusLamps still computes
+    // it and still greys all three lamps with STATUS UNAVAILABLE across them —
+    // that half is untouched and is the honest rendering of a status feed this
+    // application cannot see. What is gone is the SECOND rendering: the orange
+    // banner under the lamps that said the same thing a fourth time, in the one
+    // form that reflowed the page and moved the picture.
+    //
+    // The operator: "the orrange status banner at the bottom about switcher
+    // status is VERY annoying and keeps cauing layout shifts and causing
+    // concerns when everything is fine." A quiet telemetry WebSocket is not a
+    // fault in the feed — that is a different socket to a different port with
+    // its own lamp — and an alert that fires when everything is fine trains an
+    // operator to ignore the surface it appears on. See ui/alerts.js.
+    const { switcher, video, audio } = deriveStatusLamps(currentStatus, currentConformTarget);
     home.lamps['SWITCHER SEES FEED'].update(switcher);
     home.lamps.VIDEO.update(video);
     home.lamps.AUDIO.update(audio);
-    home.setStatusUnavailable(unavailable);
   }
 
   /**
@@ -743,7 +871,8 @@ export function mountApp(root) {
     // question for the Go side and not for this line: App.SaveConfig is
     // remote-mutating and carries the whole document, so the refusal, if there is
     // to be one, belongs there. See the note in the tier-3 handover.
-    adoptVideoConfig(config);
+    // FALSE: another seat saved this. Adopt the readouts, never the layout.
+    adoptVideoConfig(config, false);
 
     // The conform target IS re-read for a remote save, unlike the return path
     // above, and the asymmetry is deliberate. Rebuilding the return risks a
@@ -1248,7 +1377,8 @@ export function mountApp(root) {
     // that is running: the video leg is read once, at Start, so this moves a lamp
     // and a reserved rectangle and not one byte the switcher receives. The
     // Settings hint and the preview's own caption are what say the rest.
-    adoptVideoConfig(config);
+    // TRUE: this desk saved or applied it, so it may resize its own picture.
+    adoptVideoConfig(config, true);
 
     // The conform target last, because both things that can change it are in
     // the config that just arrived: videoFormatOverride directly, and m2lxHost
@@ -1509,7 +1639,14 @@ export function mountApp(root) {
       monitor.on('state', (state) => home.lamps.MONITOR.update(deriveMonitorLamp(state)));
       monitor.on('error', (err) => {
         console.error('wslcomms: monitor error event', err);
-        home.showError(`Monitor: ${err?.message || err}`);
+        // CLASSIFIED, not all shouted. The one the operator screenshotted — the
+        // browser refusing setSinkId without a user gesture — is true and is an
+        // explanation of something about to fix itself, not an alarm. audio.js
+        // no longer reports the first deferral at all; if one ever reaches here
+        // it lands as a grey NOTE in the column rather than as a red row. See
+        // ui/alerts.js for the whole list and the reasoning.
+        const severity = classifyMonitorError(err);
+        home.showError(`Monitor: ${err?.message || err}`, severity);
       });
     } catch (err) {
       console.error('wslcomms: monitor.on() threw — MONITOR lamp will not update', err);
@@ -1604,12 +1741,24 @@ export function mountApp(root) {
     // WHAT THIS SEAT SENDS, drawn before anything is started: the CAMERA lamp
     // and, if it was asked for, the preview box. It costs no IPC and it is the
     // one lamp on the row that is about this desk rather than about the far end.
-    adoptVideoConfig(currentConfig);
+    // TRUE: startup on this desk establishing its own layout.
+    adoptVideoConfig(currentConfig, true);
 
     home.setTile(currentConfig.monitorTile || { x: 0, y: 360, w: 640, h: 360 });
     home.setReturnMid(currentConfig.returnMid || 2);
     home.setReturnChannel(normaliseChannelMode(currentConfig.returnChannel));
     home.setLevel(1);
+
+    // Which cough behaviour is primary, from the operator's saved preference.
+    // Both the model and the picker are told, from ONE normalisation, so a
+    // hand-edited or absent value cannot leave them showing different things.
+    // The MUTE ITSELF is never adopted from configuration — there is no
+    // coughMuted field, deliberately (internal/presets/fields.go argues it), and
+    // a session that began muted because of a flag left behind by the last one
+    // is a commentator nobody can hear.
+    const coughModeNow = normaliseMuteMode(currentConfig.coughMuteMode);
+    coughMute.setMode(coughModeNow);
+    home.setCoughMode(coughModeNow);
 
     // The header preset indicator, at startup: which instance is running, shown
     // at a glance. Fire-and-forget — it must not delay putting the commentator

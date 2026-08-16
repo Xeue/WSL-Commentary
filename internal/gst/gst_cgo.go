@@ -454,6 +454,15 @@ var requiredElements = append([]requiredElement{
 	{"videoscale", "videoconvertscale"},
 	{"audioconvert", "audioconvert"},
 	{"audioresample", "audioresample"},
+	// volume is the COUGH MUTE, and it belongs in this list rather than in one
+	// of the conditional ones below it because it is in the audio leg
+	// unconditionally, on every seat, whatever the commentary source is. A
+	// bundle without it is a bundle where gst_parse_launch fails at Start on
+	// every machine, which is precisely the failure this list converts into a
+	// named plugin at launch. It is gst-plugins-base's own plugin, under the
+	// same factory and plugin name on both ports — checked against Homebrew's
+	// GStreamer 1.26.10 on macOS arm64 on 2026-08-16.
+	{"volume", "volume"},
 	{"h264parse", "videoparsersbad"},
 	{"aacparse", "audioparsers"},
 	{"level", "level"},
@@ -1289,6 +1298,33 @@ type cgoPipeline struct {
 	// where a field engineer looks anyway.
 	matrixWidth int
 
+	// cough is the volume element the cough mute writes, and muted is the
+	// answer CommentaryMuted gives. coughmute.go carries the argument for the
+	// mechanism; what matters here is why there are two fields rather than one.
+	//
+	// cough is reached only under mu, exactly as aconv is, because writing it is
+	// a cgo property set on an element the teardown may be dropping. muted is an
+	// ATOMIC and is read WITHOUT mu, which is the point of it: "is the
+	// microphone open" is asked by the status assembly and by the UI many times
+	// a second, and mu is held for the whole of ReplaceSink — seconds, during a
+	// reconnect. A mute lamp that stops answering while the socket is down is a
+	// mute lamp nobody can trust at the moment they most need it.
+	//
+	// It is NOT a record of what was requested. Both writers — Start's first
+	// application and SetCommentaryMute afterwards — set the property and then
+	// READ IT BACK OFF THE ELEMENT, and it is the read-back value that is
+	// stored. That is what makes CommentaryMuted an observation, and it is the
+	// property zeroing the mix matrix could never have offered: mix-matrix does
+	// not marshal back out of audioconvert, as matrixWidth's comment says.
+	//
+	// muted deliberately SURVIVES teardownLocked while cough does not. A caller
+	// rebuilding after a latched fatal reads the mute off the pipeline it is
+	// discarding and hands it to the replacement as PipelineOpts.MuteCommentary;
+	// zeroing it at Stop would answer "unmuted" for a session that ended muted
+	// and put the commentator back on air across the rebuild.
+	cough gogst.Element
+	muted atomic.Bool
+
 	// sigWatch is the video signal watchdog, or nil when this pipeline has no
 	// element with a "signal" property to poll — every native capture, and the
 	// slate-only video leg shipping today. The nil is usable: Stop on it does
@@ -1789,6 +1825,30 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 		return abort(errors.New("gst: " + nameAudioConv + " has no sink pad"))
 	}
 	if err := p.applyStartChannelMapLocked(asrc, opts.ChannelMap); err != nil {
+		return abort(err)
+	}
+
+	// THE COUGH MUTE, resolved and applied while the pipeline is STILL IN NULL.
+	//
+	// The order matters in one direction only, and it is this one: a pipeline
+	// asked to start muted must be muted before it can produce a buffer. Doing
+	// it after PLAYING would put however many milliseconds of live commentary on
+	// air, which for the one case this option exists for — rebuilding a session
+	// that was muted when it died — is the exact failure it is meant to prevent.
+	//
+	// A missing element ABORTS, and that is a deliberate departure from the way
+	// armChannelMeterLocked survives a missing chlevel. A meter that does not
+	// move is a diagnosis problem; a cough button that does nothing is a
+	// commentator who believes they are off air and is not. There is no safe way
+	// to carry a feed whose mute control is absent, so the pipeline refuses to
+	// start and says which element it could not find.
+	p.cough = pipeline.GetByName(nameCoughMute)
+	if p.cough == nil {
+		return abort(errors.New("gst: parsed pipeline has no element named " + nameCoughMute +
+			", so there is no cough mute on this feed and the buttons that drive it would do " +
+			"nothing while reporting success"))
+	}
+	if err := p.applyCoughMuteLocked(opts.MuteCommentary); err != nil {
 		return abort(err)
 	}
 
@@ -2403,6 +2463,104 @@ func (p *cgoPipeline) SetChannelMap(m ChannelMap) error {
 	return nil
 }
 
+// SetCommentaryMute takes the commentary off the send path, or puts it back, on
+// a pipeline that is already PLAYING.
+//
+// It is a single gboolean write on a volume element that has been in the graph
+// since gst_parse_launch ran, followed by a read of the same property. Nothing
+// changes state, nothing renegotiates, nothing is added to or removed from the
+// running graph, and the far end receives a continuous stream that is silent
+// rather than an interrupted one — coughmute.go has the packet-level
+// measurement that settles that, and the two rejected alternatives.
+//
+// # Why it refuses instead of latching before Start
+//
+// PipelineOpts.MuteCommentary is the pre-Start route and this is the live one,
+// and there are two rather than one for a reason that is the whole of the design:
+// a control with two memories is a control whose two memories can disagree. If
+// this method latched an intent, a caller could set the mute here, then pass a
+// different MuteCommentary to Start, and which one won would be a property of
+// the order of two lines in this file rather than of anything anyone can see.
+// That is exactly the charge coughmute.go lays against zeroing the mix matrix,
+// and it would be incoherent to convict that mechanism of it and then build it.
+func (p *cgoPipeline) SetCommentaryMute(mute bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return errors.New("gst: pipeline is stopped")
+	}
+	if !p.started || p.cough == nil {
+		return errors.New("gst: pipeline has not been started, so there is no element to mute; " +
+			"a pipeline that must begin muted is started with PipelineOpts.MuteCommentary, which " +
+			"is applied before it can produce a buffer")
+	}
+	if err := p.applyCoughMuteLocked(mute); err != nil {
+		return err
+	}
+	log.Printf("gst: commentary %s on the send path", map[bool]string{
+		true:  "MUTED",
+		false: "unmuted",
+	}[mute])
+	return nil
+}
+
+// CommentaryMuted reports what the element said, not what anybody asked for.
+//
+// It takes NO LOCK. p.mu is held for the whole of ReplaceSink, which on a
+// reconnect is seconds; a caller assembling a status line, or a UI polling the
+// mute lamp, must not be able to block behind a socket. The atomic it reads is
+// written only by applyCoughMuteLocked, and only from the value read back off
+// the element, so a lock-free read here still cannot report a write that did
+// not happen.
+func (p *cgoPipeline) CommentaryMuted() bool {
+	return p.muted.Load()
+}
+
+// applyCoughMuteLocked writes the mute and then reads it back, storing what the
+// ELEMENT said in the atomic that CommentaryMuted answers from. p.mu is held.
+//
+// It has two callers — startBuiltLocked with the pipeline still in NULL, and
+// SetCommentaryMute with it PLAYING — and it is deliberately identical for both.
+// The property write is the same write at either state: volume's mute is a plain
+// gboolean, live-settable, and there is no preroll or negotiation consequence to
+// setting it early or late.
+//
+// # The read-back is the whole function
+//
+// Setting a property in GObject is a void call. Every other guarantee this
+// package makes about the audio path is checkable — the level element posts, the
+// pad publishes caps, the sink returns a handshake result — but a mute that
+// silently did not take looks exactly like a mute that did, and the operator's
+// only evidence would be that the far end heard them cough. So the value is read
+// straight back out of the element and compared, and a disagreement is an ERROR
+// rather than a log line: at Start it refuses the pipeline, and live it leaves
+// the caller's control showing the state that is actually in force.
+//
+// hasProperty first, for the reason applyEncoderProperties and
+// armChannelMeterLocked keep it: a write against a property an element does not
+// have is a GLib CRITICAL on stderr, where no shipped build is looking, and the
+// setter returns as if it had worked.
+func (p *cgoPipeline) applyCoughMuteLocked(mute bool) error {
+	if !hasProperty(p.cough, propMute) {
+		return fmt.Errorf("gst: %s has no %s property, so the commentary cannot be muted on the "+
+			"send path", nameCoughMute, propMute)
+	}
+	p.cough.SetObjectProperty(propMute, mute)
+
+	got, ok := p.cough.ObjectProperty(propMute).(bool)
+	if !ok {
+		return fmt.Errorf("gst: %s.%s did not read back as a boolean, so there is no way to say "+
+			"whether the commentary is muted", nameCoughMute, propMute)
+	}
+	if got != mute {
+		return fmt.Errorf("gst: %s.%s was set to %t and read back as %t; the mute did not take and "+
+			"the application must not report that it did", nameCoughMute, propMute, mute, got)
+	}
+	p.muted.Store(got)
+	return nil
+}
+
 // drainStartupError takes one error off the asynchronous channel, so that a
 // failure during Start can be reported by Start rather than left for a consumer
 // that may never read it. It never blocks.
@@ -2989,6 +3147,41 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 		// exactly as it did before it had a name.
 		" ! audioconvert name=" + nameAudioConv + " ! audioresample" +
 		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
+		// THE COUGH MUTE, and its position between the capsfilter above and the
+		// programme meter below is the whole of what makes it honest.
+		//
+		// It is a `volume` element whose `mute` property is written live. It
+		// changes nothing about negotiation: its sink template accepts S16LE
+		// interleaved, which is exactly what the capsfilter above has just
+		// pinned, so it is a passthrough in the literal sense and the caps
+		// either side of it are the same caps. mute=false is written here so
+		// that the parse string states the shipped default rather than relying
+		// on the element's; Start overwrites it from PipelineOpts.MuteCommentary
+		// before the pipeline leaves NULL.
+		//
+		// ABOVE alevel, NOT BELOW IT. The long note on alevel below says it
+		// measures the exact signal entering the encoder so that no meter can
+		// keep moving while silence goes to air. A mute placed below that meter
+		// would rebuild that exact failure by hand — the commentator coughs, the
+		// mute engages, and the programme meter bounces on to a voice nobody is
+		// receiving. Above it, the meter reads digital silence and goes on
+		// posting at its own rate: measured, 89 level messages either way, rms
+		// -12.006563271339424 unmuted and -699.99999984363217 muted.
+		//
+		// BELOW chlevel, which is the other half of the same decision. The
+		// per-channel picker measures the capture device's own channels before
+		// any routing or muting has been applied, so the operator can still see
+		// which of a card's sixteen inputs the commentator is on while they are
+		// coughing. That question's answer does not change because they are off
+		// air for two seconds.
+		//
+		// WHAT IT COSTS THE FAR END IS NOTHING, and that was measured rather
+		// than assumed. Through this exact encoder chain into mpegtsmux, muted
+		// and unmuted: 473 AAC access units both times, identical first and last
+		// PTS, identical largest inter-packet gap of 21.344 ms — one AAC frame.
+		// The stream is continuous and silent, not interrupted. coughmute.go
+		// carries the same measurement for the valve, which produces zero bytes.
+		" ! volume name=" + nameCoughMute + " " + propMute + "=false" +
 		" ! level name=alevel interval=50000000" +
 		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
@@ -4530,6 +4723,16 @@ func (p *cgoPipeline) teardownLocked() error {
 	p.srtqSinkPad = nil
 	p.aconv = nil
 	p.aconvSinkPad = nil
+	// The cough mute's ELEMENT goes, and its STATE deliberately stays. Dropping
+	// the reference is the same hygiene as every line above it; leaving
+	// p.muted alone is a decision. A caller rebuilding a session that died
+	// muted — the latched-fatal path, which is the only thing that ever
+	// discards a Pipeline mid-match — reads CommentaryMuted off this corpse and
+	// hands it to the replacement as PipelineOpts.MuteCommentary. Zeroing it
+	// here would answer "unmuted" for a session that ended muted, and put the
+	// commentator back on air across the rebuild without anyone touching a
+	// button.
+	p.cough = nil
 	// matrixWidth goes back to zero with the pad it described. Leaving it set
 	// would make SetChannelMap on a torn-down pipeline get as far as reading a
 	// nil pad rather than being refused by the started/stopped guards above it,

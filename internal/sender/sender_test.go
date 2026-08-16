@@ -1970,6 +1970,11 @@ func (p *rudePipeline) ForceKeyUnit() error            { return nil }
 func (p *rudePipeline) InputChannels() int                 { return 0 }
 func (p *rudePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
 
+// The cough mute, inert for the same reason: internal/sender never mutes
+// anything, and a reconnect must not go near the audio leg at all.
+func (p *rudePipeline) SetCommentaryMute(bool) error { return nil }
+func (p *rudePipeline) CommentaryMuted() bool        { return false }
+
 func (p *rudePipeline) Errors() <-chan error { return p.errs }
 func (p *rudePipeline) Stop() error          { return nil }
 

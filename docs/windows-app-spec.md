@@ -104,11 +104,11 @@ GStreamer installation elsewhere on the machine is invisible to the app, and vic
 **Plugin allowlist** — an explicit file list, never a directory copy, because a directory copy drags
 GPL `x264enc` and LGPL-plus-patent-encumbered `gst-libav` into a commercial deliverable:
 `coreelements`, `typefindfunctions`, `videoconvertscale`, `audioconvert`, `audioresample`,
-`imagefreeze`, `png`, `audioparsers`, `videoparsersbad`, `wasapi2`, `mediafoundation`, `mpegtsmux`,
-**`mpegtsdemux`**, `srt`, **`d3d11`**, **`level`**, **`decklink`**, **`videorate`**,
-**`deinterlace`** — nineteen.
+**`volume`**, `imagefreeze`, `png`, `audioparsers`, `videoparsersbad`, `wasapi2`, `mediafoundation`,
+`mpegtsmux`, **`mpegtsdemux`**, `srt`, **`d3d11`**, **`level`**, **`decklink`**, **`videorate`**,
+**`deinterlace`** — twenty.
 
-Six of those nineteen were added after this section was first written, and they are marked here
+Seven of those twenty were added after this section was first written, and they are marked here
 rather than folded in silently, because `build\bundle-gst.ps1` **throws** when its file list and this
 paragraph disagree: adding a plugin is a specification change, so the two move together or the build
 stops. `mpegtsdemux` is the return monitor's demuxer, `d3d11` the picture's HEVC decoder and video
@@ -117,6 +117,17 @@ capture path added on 2026-08-16 — before which the shipped app could not use 
 either platform, whatever the Go side did. The same three are in the macOS bundler's
 `WANTED_ELEMENTS`, where the cost was measured rather than reasoned: three plugin files, 0.5 MB, and
 not one new library — see `build\README-darwin.md` §9.
+
+`volume` is the seventh, added on 2026-08-16 for the **cough mute** (§5's audio leg). It is
+unconditional and on every seat, so a bundle without it is not a seat lacking a cough button — it is
+`gst_parse_launch` failing at Start on every machine.
+
+One correction to the paragraph above, because it overstates its own guard: `bundle-gst.ps1` does
+**not** read this file. Its `Assert-ManifestSane` compares two PowerShell arrays *inside the script*,
+so a plugin added to the bundler and not to this list will build clean and leave the specification
+quietly stale. The forcing function that does fire is `TestTheVolumePluginIsStagedByBothBundlers`
+(Gate A, `internal/gst/coughmute_test.go`), which fails by name if either bundler stops staging the
+plugin. Keeping this paragraph correct is still a manual step.
 
 ---
 
@@ -210,6 +221,7 @@ wasapi2src name=asrc device="<IMMDevice endpoint id>" low-latency=true
   ! audio/x-raw,rate=48000,channels=2
   ! audioconvert ! audioresample
   ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved
+  ! volume name=coughmute mute=false
   ! mfaacenc bitrate=128000
   ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts
   ! queue max-size-time=1000000000 ! mux.

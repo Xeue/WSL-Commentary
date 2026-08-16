@@ -108,6 +108,18 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 // true — a missing device or an absent card does not go on air at all — whereas
 // a routing from another building starts perfectly, shows every lamp green, and
 // carries the wrong channel or silence until somebody listens.
+//
+// The fourth UI field is coughMuteMode: whether the cough control is held down
+// or latched. It is one step FURTHER from the wire than the other three — it
+// changes neither what is transmitted nor what is monitored, only what a button
+// does under a finger — and a preset carrying it would change the behaviour of
+// a control somebody is about to use under pressure without changing anything
+// they can see.
+//
+// It is also the field to read this file's UIFields comment beside, because the
+// paragraph under it is where the decision NOT to have a "coughMuted" field at
+// all is argued. The mute is live state, it is false on every path that begins
+// a session, and it is on none of these four tables on purpose.
 func TestClassificationCounts(t *testing.T) {
 	if got := len(InstanceFields); got != 14 {
 		t.Errorf("len(InstanceFields) = %d, want 14", got)
@@ -115,8 +127,8 @@ func TestClassificationCounts(t *testing.T) {
 	if got := len(MachineFields); got != 8 {
 		t.Errorf("len(MachineFields) = %d, want 8", got)
 	}
-	if got := len(UIFields); got != 3 {
-		t.Errorf("len(UIFields) = %d, want 3", got)
+	if got := len(UIFields); got != 4 {
+		t.Errorf("len(UIFields) = %d, want 4", got)
 	}
 	if got := len(DiscoveredFields); got != 1 {
 		t.Errorf("len(DiscoveredFields) = %d, want 1", got)

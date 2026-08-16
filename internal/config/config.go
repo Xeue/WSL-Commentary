@@ -435,6 +435,40 @@ type Config struct {
 	// the cost above is a cost on the leg that is going to air.
 	DeckLinkPreviewEnabled bool `json:"decklinkPreviewEnabled"`
 
+	// CoughMuteMode is how the cough-mute control BEHAVES for this operator:
+	// CoughMuteModePush (the default) or CoughMuteModeLatch.
+	//
+	// # This is the MODE, and emphatically not the mute
+	//
+	// The two are easy to conflate and must not be. Whether the commentator is
+	// muted RIGHT NOW is live operational state and is not in this file at all —
+	// it lives on the running pipeline and is published on the "mute" event; see
+	// the argument in internal/presets/fields.go, which is where the decision is
+	// recorded because that is where a reader looking for the field will go. A
+	// mute that survived a restart would be a commentator whose microphone is
+	// dead when they sit down, with a green lamp beside it.
+	//
+	// What IS a setting is how the operator likes to work. Push-to-mute is a
+	// key held down for the length of a cough; latch is a press to mute and a
+	// second press to unmute. Some operators want one, some the other, and the
+	// preference belongs to the person at the desk in exactly the sense
+	// ReturnSource and DeckLinkPreviewEnabled do — so it is a UI field, and a
+	// preset applied from a configuration screen must never change it.
+	//
+	// # Why the default is PUSH
+	//
+	// Because of which way each mode fails. A push-to-mute that loses its
+	// key-up unmutes on the next key-up, on any release, and the operator's
+	// hand is already on the key; a latch left down is silent until somebody
+	// notices. The mode that recovers by itself is the one a machine that has
+	// never been configured should come up in.
+	//
+	// An empty string means "the operator has not chosen" and resolves to the
+	// default through EffectiveCoughMuteMode, as ReturnSource's does; so does
+	// any value this package does not recognise, because an unreadable mode
+	// must not leave the cough button doing nothing at all.
+	CoughMuteMode string `json:"coughMuteMode"`
+
 	// HeadphoneDeviceID is the browser mediaDeviceId of the commentator's
 	// headphone output, written by the output dropdown and consumed only by the
 	// frontend's setSinkId call on the WEBRTC return path.
@@ -790,6 +824,22 @@ const (
 	// DefaultReturnChannel passes the return through unchanged.
 	DefaultReturnChannel = ReturnChannelStereo
 
+	// The two cough-mute modes. CoughMuteModePush is a control held down for as
+	// long as the mute is wanted — the physical cough key a commentator already
+	// knows — and CoughMuteModeLatch is press to mute, press again to unmute.
+	//
+	// They are values of CoughMuteMode, which is the operator's PREFERENCE and
+	// not the mute itself. Nothing in this package knows whether anybody is
+	// muted; that is live state on the running pipeline.
+	CoughMuteModePush  = "push"
+	CoughMuteModeLatch = "latch"
+
+	// DefaultCoughMuteMode is CoughMuteModePush, because of the direction each
+	// mode fails in: a push-to-mute that misses a release is cleared by the next
+	// one, and a latch left down is silence nobody is holding a key for. See the
+	// CoughMuteMode field comment.
+	DefaultCoughMuteMode = CoughMuteModePush
+
 	// DefaultSRTReturnPort is Output 1 on the measured instance: src=pgm, the
 	// DIRTY programme feed, which is the picture a commentator watches. See the
 	// field comment for why this is not the clean feed.
@@ -884,6 +934,10 @@ func Defaults() *Config {
 		// default IS, and "the operator's confidence monitor starts off" is a
 		// decision about what appears on somebody's screen, not an absence of one.
 		DeckLinkPreviewEnabled: false,
+		// "push" is a real value rather than the zero value, so a fresh
+		// config.json says which way the cough control behaves instead of
+		// carrying an empty string only EffectiveCoughMuteMode makes sense of.
+		CoughMuteMode: DefaultCoughMuteMode,
 		// videoFormatOverride and decklinkPersistentId are deliberately absent.
 		// Both are documented as MEANINGFUL when empty — "derive the format from
 		// the switcher" and "the only card in this machine" — so unlike
@@ -1032,6 +1086,27 @@ func (c *Config) EffectiveReturnChannel() string {
 		return s
 	}
 	return DefaultReturnChannel
+}
+
+// EffectiveCoughMuteMode returns how the cough control behaves, substituting
+// DefaultCoughMuteMode for an empty value AND FOR AN UNRECOGNISED ONE.
+//
+// The second half is the difference from EffectiveReturnSource, which passes an
+// unknown string through for Validate to reject later. Nothing validates this
+// field, deliberately — the same decision decklinkPreviewEnabled records, for
+// the same reason: a cough button is not a thing to refuse a match over. So a
+// value this package has never heard of has to resolve HERE, to a mode that
+// works, rather than reaching the frontend as a mode with no behaviour attached
+// and leaving the operator pressing a control that does nothing.
+func (c *Config) EffectiveCoughMuteMode() string {
+	switch strings.TrimSpace(c.CoughMuteMode) {
+	case CoughMuteModePush:
+		return CoughMuteModePush
+	case CoughMuteModeLatch:
+		return CoughMuteModeLatch
+	default:
+		return DefaultCoughMuteMode
+	}
 }
 
 // EffectiveSRTReturnPort returns the port the SRT return dials, substituting

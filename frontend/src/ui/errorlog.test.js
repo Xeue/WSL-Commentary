@@ -164,3 +164,68 @@ test('normal healthy states never raise and never clear when there is no episode
   assert.equal(ep.track('showing'), null);
   assert.equal(ep.track(''), null);
 });
+
+// ---------------------------------------------------------------------------
+// Severity, and the per-row dismissal the COLUMN made possible.
+//
+// The banner could only ever show one line and could only ever be dismissed
+// whole. A list can retire the right row wherever it has got to, which is what
+// lets an error that RESOLVES take its own complaint down without eating an
+// unrelated one that arrived in between.
+// ---------------------------------------------------------------------------
+
+test('every entry carries a severity, and the default is the loud one', () => {
+  const log = createErrorLog(fakeClock().now);
+  log.record('something went wrong');
+  assert.equal(
+    log.entries[0].severity,
+    'alert',
+    'a caller that forgets to classify must over-report: being told about something harmless is ' +
+      'a nuisance, not being told about something real is the failure this surface prevents',
+  );
+  log.record('an explanation', 'note');
+  assert.equal(log.entries[0].severity, 'note');
+});
+
+test('a note and an alert with the same sentence are different events', () => {
+  const log = createErrorLog(fakeClock().now);
+  log.record('Monitor: the output device could not be applied', 'note');
+  log.record('Monitor: the output device could not be applied', 'alert');
+  assert.equal(
+    log.size,
+    2,
+    'merging them would let a note\'s count hide an alert, in the one surface whose whole job is ' +
+      'not to lose things',
+  );
+});
+
+test('dismiss removes one row BY IDENTITY, not by position', () => {
+  const log = createErrorLog(fakeClock().now);
+  const a = log.record('A');
+  log.record('B');
+  log.record('C');
+  // The list re-renders on every arrival, so an index captured when a row was
+  // drawn can point at a different row by the time it is clicked — and
+  // dismissing the wrong alert mid-match is how a real one disappears unread.
+  assert.equal(log.dismiss(a), true);
+  assert.deepEqual(
+    log.entries.map((e) => e.message),
+    ['C', 'B'],
+  );
+  assert.equal(log.dismiss(a), false, 'dismissing something already gone is not an error');
+});
+
+test('dismissMatching retires a resolved error wherever it has got to', () => {
+  // The SRT picture coming back must take its own complaint down without eating
+  // whatever unrelated error arrived while it was failing.
+  const log = createErrorLog(fakeClock().now);
+  log.record('the SRT picture is not arriving');
+  log.record('the mixer refused a write');
+  assert.equal(log.dismissMatching('the SRT picture is not arriving'), 1);
+  assert.deepEqual(
+    log.entries.map((e) => e.message),
+    ['the mixer refused a write'],
+    'the unrelated error survives, which the single-message banner could not manage',
+  );
+  assert.equal(log.dismissMatching('never happened'), 0);
+});

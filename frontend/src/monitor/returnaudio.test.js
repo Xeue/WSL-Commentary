@@ -503,12 +503,25 @@ test('a setSinkId refused for want of a gesture is queued, not lost', async () =
   assert.equal(g.ra.getState().sinkAwaitingGesture, true, 'and the retry is armed');
   assert.ok(g.doc.armed, 'a gesture listener is waiting');
 
-  const deferred = g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED');
-  assert.equal(deferred.length, 1, 'the operator is told once, not per attempt');
-  assert.equal(
-    g.errors.filter((e) => e.code === 'SINK_ID_FAILED').length,
-    0,
-    'and not told it failed, because it has not',
+  // AND NOTHING IS SAID. This assertion is inverted from what it used to be, at
+  // the operator's request: he screenshotted the sentence this branch used to
+  // report — "the browser will not change the audio output device until someone
+  // interacts with the window" — as a thing that alarmed him.
+  //
+  // Every word of it was true. It was also an explanation of a state that is
+  // about to end: the listener armed above fires on the next interaction
+  // ANYWHERE in the document and re-applies, so the operator was reading an
+  // alarm about something that fixed itself while they read it. An alert that
+  // fires when everything is fine trains people to ignore the surface it appears
+  // on, and that cost is paid by the next message on that surface, which is
+  // real.
+  //
+  // What is NOT silenced is the retry failing — that is the test below, and it
+  // is the reason silence here is safe rather than merely quieter.
+  assert.deepEqual(
+    g.errors.map((e) => e.code),
+    [],
+    'a deferral that is about to fix itself must say nothing at all',
   );
 
   await g.doc.gesture();
@@ -541,20 +554,22 @@ test('a device refused a second time from inside a gesture is reported as a fail
   // match — that is the same silent-failure shape this whole change removes,
   // wearing a friendlier message.
   const g = await buildWithGraph({ sinkId: 'headphones-1', sinkRefusals: 2 });
-  assert.equal(g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED').length, 1);
+  assert.equal(g.errors.length, 0, 'the first refusal is silent — it is about to be retried');
 
   await g.doc.gesture();
 
   assert.equal(g.audioEl.sinkId, null, 'still refused');
   assert.equal(
     g.errors.filter((e) => e.code === 'SINK_ID_DEFERRED').length,
-    1,
-    'no second promise of a click',
+    0,
+    'and still no promise of a click: one silent retry, then the truth',
   );
-  assert.equal(
-    g.errors.filter((e) => e.code === 'SINK_ID_FAILED').length,
-    1,
-    'the refusal is reported for what it is',
+  const failures = g.errors.filter((e) => e.code === 'SINK_ID_FAILED');
+  assert.equal(failures.length, 1, 'the refusal is reported for what it is');
+  assert.match(
+    failures[0].message,
+    /system default output/i,
+    'and it describes the CONSEQUENCE the commentator will experience, not the call that failed',
   );
   assert.equal(g.ra.getState().sinkAwaitingGesture, false);
 });

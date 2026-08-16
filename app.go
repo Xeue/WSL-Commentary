@@ -131,6 +131,35 @@
 // the two configuration fields. Without it the classification would be a
 // decoration.
 //
+// and the three added for the COUGH MUTE and for telling the page the truth
+// about the preview. These are the newest, and two of the three are unlike
+// anything above them:
+//
+//	SetCommentaryMute(muted, seq)       mutePayload             caller: WP-5b
+//	GetCommentaryMute()                 mutePayload             caller: WP-5b
+//	GetPreviewState()                   previewStatePayload     caller: WP-5b
+//
+// SetCommentaryMute is the ONLY method on this surface that is called on a key
+// DOWN and again on the key UP, dozens of times in a match, from a control the
+// operator is holding while talking over it. Everything unusual about it follows
+// from that: it takes an ordering stamp so that a key-up which overtakes its own
+// key-down cannot leave the microphone dead, it returns the state ACTUALLY in
+// force rather than the state that was asked for, and it is cheap enough to call
+// at that rate. The reasoning is with the method.
+//
+// It is NOT host-only, which is the one deliberate decision on this surface that
+// could be argued the other way, and the argument is in remoteAllowlist beside
+// the row. What is not arguable is the consequence: because a remote seat may
+// mute, the "mute" event carries WHO muted and from where, and the desk is never
+// left looking at a red badge it cannot account for.
+//
+// GetPreviewState is a read with no side effect at all, and it exists because
+// the honest answer to "can I see my own camera before pressing START" is NOT
+// YET IN THIS BUILD — a different sentence from "no", and previewStatePayload
+// carries the measurement that separates them. A page that cannot ask draws a
+// dead black panel instead of a sentence, which reads as a fault on a machine
+// that is working perfectly.
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
@@ -515,6 +544,42 @@ const (
 	// state of every machine with no capture card in it, which is every machine
 	// running this application today.
 	EventSignal = "signal"
+
+	// EventMute carries a mutePayload: whether the commentary is muted RIGHT
+	// NOW, whether a mute is even possible, and — when it is muted — which seat
+	// did it.
+	//
+	// # It exists so the screen shows the truth rather than the last request
+	//
+	// A cough control that drew itself from its own last click would be right
+	// almost always and catastrophically wrong in the cases that matter. Three
+	// of them are real here. The mute lives on the contribution pipeline, and a
+	// pipeline that has gone — Stop, or a capture chain that died and stopped
+	// itself — takes the mute with it, so a latched button drawn from a click
+	// would stay red over a session that no longer exists. A SECOND SEAT may
+	// mute (see remoteAllowlist), so the desk's own click is not the only thing
+	// that changes the state. And a stale key-down that lost its race with the
+	// key-up is dropped on this side, so the page that sent it must be told what
+	// actually happened.
+	//
+	// It is emitted on every accepted change, on every session start and end,
+	// and whenever a reconciliation finds the pipeline disagreeing with what was
+	// last published. domReady replays the current value, for the reason the
+	// sender and signal replays exist: a mute is silent by nature, and a page
+	// that reloaded while one was latched must not come back showing an unmuted
+	// commentator who is not being heard.
+	EventMute = "mute"
+
+	// EventPreview carries a previewStatePayload: whether the operator's own
+	// confidence monitor is running, and — much more often — why it is not.
+	//
+	// The reason half is the point. The preview is a branch of the contribution
+	// pipeline and cannot exist before START (previewStatePayload says why, in
+	// the words the operator gets), so for most of the time this application is
+	// open the honest answer is "not yet, and here is what that means". A page
+	// with no way to ask draws an empty black panel instead, which reads as a
+	// fault in a machine that is working perfectly.
+	EventPreview = "preview"
 )
 
 const (
@@ -1132,6 +1197,62 @@ type App struct {
 	// every seat that is sending a slate.
 	prevRunning bool
 
+	// THE COUGH MUTE takes TWO locks, and the split is the same one the picture
+	// path makes between picMu and picStateMu — for the same reason, which is
+	// the Wails main thread.
+	//
+	//	muteApplyMu  →  muteMu
+	//
+	// muteApplyMu SERIALISES THE WRITE. It is held across the call into
+	// internal/gst, which takes a lock that package also holds across state
+	// changes, so a mute arriving during a reconnect waits behind it. That is
+	// correct for a write — two mutes racing must land in a defined order — and
+	// it is exactly why the state a page reads must not be behind this lock.
+	muteApplyMu sync.Mutex
+
+	// muteMu guards the four fields below: everything the screen is told. It is a
+	// LEAF and it is NEVER held across a call into internal/gst, so domReady —
+	// which runs on the Wails main thread and may not block on a pipeline state
+	// change — can replay the mute in the same breath as the channel map.
+	muteMu sync.Mutex
+
+	// muted is whether the commentary is muted right now, muteBy is which KIND
+	// of seat did it (muteSeatDesk or muteSeatRemote, empty when nothing is
+	// muted) and muteByAddr is that seat's source address when it was a remote
+	// one — the only identity there is, because the listener has no login.
+	//
+	// They are NOT persisted and there is no config field behind them. See
+	// internal/presets/fields.go, where that decision is argued: a mute that
+	// survived a restart is a commentator whose microphone is dead when they
+	// arrive, with every lamp green.
+	muted      bool
+	muteBy     string
+	muteByAddr string
+
+	// muteAvailable and muteReason are whether a mute is POSSIBLE and, when it
+	// is not, the sentence the operator is shown. They are RECORDED here rather
+	// than derived from the running session on every read, and that is a lock
+	// discipline rather than a cache: deriving them means asking whether there is
+	// a session, which means sessMu, which is held across the whole of Start and
+	// Stop — so a page reloading during a reconnect would freeze the window on
+	// the main thread. domReady replays the mute, so this side must be readable
+	// without touching the session at all. They are written at the two session
+	// boundaries and nowhere else.
+	//
+	// The zero value is correct for a machine that has never pressed START:
+	// unavailable, with muteStateLocked supplying the "nothing is being sent
+	// yet" sentence for an empty reason.
+	muteAvailable bool
+	muteReason    string
+
+	// muteSeq is the ordering stamp of the last mute request that was APPLIED,
+	// and muteSeqAt is when it was applied. Together they are what stops a
+	// push-to-mute key-up that overtook its own key-down from leaving the
+	// microphone dead. setCommentaryMuteFrom explains the rule and why the
+	// staleness window is bounded in real time rather than by the stamp alone.
+	muteSeq   float64
+	muteSeqAt time.Time
+
 	// pictureDial builds the picture monitor, and overlayDial builds the native
 	// overlay window. Both are gst's real constructors in the application and
 	// fakes in the tests, which is the only way to exercise the wire-up without a
@@ -1183,6 +1304,18 @@ type App struct {
 	remote          atomic.Pointer[remote.Server]
 	remoteRunCancel context.CancelFunc
 	remoteWG        sync.WaitGroup
+
+	// sessionUp is whether a contribution session is running, readable WITHOUT
+	// sessMu.
+	//
+	// It exists for one reason: GetPreviewState is replayed to a page on the
+	// Wails MAIN THREAD, and sessMu is held for the whole of Start and Stop
+	// including their blocking waits. A read that took it would freeze the
+	// window for the length of a reconnect — the same hazard the channel-map
+	// replay avoids by reading its cache. It is written at the two session
+	// boundaries, beside the mute's, and it is never the authority for anything
+	// that ACTS on a session; sessMu remains that.
+	sessionUp atomic.Bool
 
 	// closing is raised by teardown before it stops anything, so that a bound
 	// method already running on a Wails message-handler goroutine cannot build a
@@ -1426,6 +1559,21 @@ func (a *App) domReady(ctx context.Context) {
 	chanWidth, chanMap := a.lastInputChannels, a.lastChannelMap
 	a.chanMu.Unlock()
 	a.events.send(EventChannelMap, channelMapPayloadFrom(chanWidth, chanMap))
+
+	// The cough mute, and this one has to be replayed for a reason none of the
+	// others share: a mute is SILENT. A reloaded page that came back showing an
+	// unmuted commentator who is not being heard would be wrong in the one
+	// direction that costs a match, and the mute emits only on change, so
+	// without this line a page that reloaded while a mute was latched would
+	// never learn about it. It reads muteMu, which is a leaf that is never held
+	// across a call into internal/gst — the property that makes it safe to read
+	// from the main thread at all.
+	a.events.send(EventMute, a.GetCommentaryMute())
+
+	// And the preview panel, so a page that has just loaded draws the sentence
+	// about why there is no picture rather than an empty black rectangle while
+	// it waits for a session that may be an hour away.
+	a.publishPreview()
 }
 
 // secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
@@ -1761,6 +1909,10 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 			return err
 		}
 	}
+	// Before the write, so what is persisted and what is broadcast are the same
+	// object. See carryForwardUIOnlyFields for why this is one field and not a
+	// merge.
+	a.carryForwardUIOnlyFields(c)
 	if err := c.Save(); err != nil {
 		return err
 	}
@@ -1776,7 +1928,46 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 	}
 
 	a.events.send(EventConfig, configEvent{Config: &saved, Origin: originClientID})
+
+	// The preview panel's explanation is derived from decklinkPreviewEnabled and
+	// videoSource, so a save can change what it should be saying without changing
+	// anything about a session. Republished here rather than left to the page to
+	// re-derive, so that BOTH seats' panels agree — the same reason SetChannelMap
+	// republishes its grid.
+	a.publishPreview()
 	return nil
+}
+
+// carryForwardUIOnlyFields copies fields that NO SCREEN WRITES YET out of the
+// live configuration into an incoming save that left them empty.
+//
+// # Why this exists, and why it is exactly one field
+//
+// SaveConfig is a WHOLE-OBJECT write from a page cache with no field-level merge
+// — that is stated in this file and in EventConfig's comment, and it is the
+// right design for fields a screen owns. It is the wrong behaviour for a field
+// the screen does not know about: the page sends the object it has, the field is
+// absent, and the value is silently erased by a save the operator made about
+// something else entirely.
+//
+// coughMuteMode is in that position today. It is the operator's choice between
+// a held cough key and a latched one, it is written by the cough control rather
+// than by the Settings form, and an operator who set latch and then saved a port
+// number would find their cough button back on push — mid-match, discovered by
+// pressing it. Empty is documented as "not chosen", so the only thing this can
+// do is preserve a choice somebody made; it cannot overwrite one.
+//
+// It is NOT a general merge and must not become one. Every other field on this
+// object is written by a screen that knows about it, and a merge over those
+// would make "the operator cleared this" indistinguishable from "the page did
+// not mention it" — which for a credential target or a status key is a setting
+// nobody can turn off.
+func (a *App) carryForwardUIOnlyFields(c *config.Config) {
+	if strings.TrimSpace(c.CoughMuteMode) != "" {
+		return
+	}
+	live := a.snapshotConfig()
+	c.CoughMuteMode = live.CoughMuteMode
 }
 
 // configEvent is the EventConfig payload: the freshly-saved configuration and
@@ -2112,6 +2303,24 @@ func (a *App) startSession() error {
 		WindowHandle: previewHandle,
 	}
 
+	// THE MUTE IS FALSE HERE, EXPLICITLY, AND IT MUST STAY THAT WAY.
+	//
+	// internal/gst offers PipelineOpts.MuteCommentary so a caller can rebuild a
+	// pipeline after a fatal and have the replacement born muted rather than
+	// muted a moment after its first buffer. That is the right facility and this
+	// is the wrong caller for it: nothing in this application continues a session
+	// across a rebuild. A capture chain that dies stops the sender, the forwarder
+	// exits, forgetMute runs, and the operator presses START again — which is a
+	// NEW session, begun by somebody who is about to speak.
+	//
+	// So the only thing carrying a mute in here could ever do is put a position
+	// on air silent because of a key pressed before the last failure. It is
+	// written out rather than left to the zero value precisely so that the next
+	// reader who finds MuteCommentary and thinks "we should carry the mute
+	// across" finds this paragraph first. Coming on air muted because of a stale
+	// flag is as bad as coughing on air.
+	opts.Pipeline.MuteCommentary = false
+
 	if err := snd.Start(opts); err != nil {
 		// sender.Start leaves the pipeline it was given untouched on failure,
 		// and a gst.Pipeline is single-use, so this one is stopped here rather
@@ -2142,6 +2351,24 @@ func (a *App) startSession() error {
 	// therefore sizes itself without being reopened.
 	a.publishChannelMap(pipe)
 
+	// THE MUTE IS PUT INTO ITS DEFINED STATE — off — and published. This is the
+	// line that stops a position coming on air muted because of something
+	// pressed before the last Stop, and it is deliberately here rather than in
+	// Stop alone: a session that ended by dying takes no orderly path out, and
+	// the only moment that is guaranteed to happen before anybody is heard is
+	// this one.
+	a.armMuteForSession(pipe)
+
+	// The lock-free record of "a session is running", raised here and lowered in
+	// the forwarder's exit — the one place that covers the self-stop path as well
+	// as the operator-Stop one. See the field comment for why a read of sessMu
+	// would not do.
+	a.sessionUp.Store(true)
+
+	// And the preview panel is told what it now is. The page has been drawing a
+	// sentence about why there is no picture; this is the moment there is one.
+	a.publishPreview()
+
 	// The forwarder is started only after sender.Start has succeeded. On failure
 	// sender.run never launches, so the states channel is never closed, and a
 	// forwarder ranging over it would be a goroutine leaked per failed Start.
@@ -2151,7 +2378,7 @@ func (a *App) startSession() error {
 	sess.wg.Add(1)
 	go func() {
 		defer sess.wg.Done()
-		a.forwardSenderStates(snd.States())
+		a.forwardSenderStates(pipe, snd.States())
 		// The session is over — the sender closed its states channel, on the
 		// operator-Stop path and the self-stop path alike — so the meters get
 		// one final all-silence frame. Without it they freeze at the last
@@ -2193,6 +2420,20 @@ func (a *App) startSession() error {
 		// insisted on for the same reason: take the surface away first and the
 		// video sink is presenting into a handle that no longer names anything.
 		a.stopSessionPreview()
+		// Lowered BEFORE the two publishes below, so neither of them describes a
+		// session that has ended as though it were still running.
+		a.sessionUp.Store(false)
+		// And the panel that was drawing it is told, so it goes back to the
+		// sentence about pressing START rather than to a black rectangle.
+		a.publishPreview()
+		// And the cough mute goes back to "nothing to mute", for the reason
+		// forgetChannelMap and forgetSignal go back to theirs, with the sharpest
+		// consequence of the three: a latched cough button left drawn over a
+		// session that has gone is a control the operator cannot release,
+		// because there is nothing left for it to act on. This runs on the
+		// self-stop path as well as the operator-Stop one, which is the whole
+		// reason it is here and not in App.Stop.
+		a.forgetMute()
 	}()
 	a.session = sess
 
@@ -4369,14 +4610,618 @@ func (a *App) forgetSignal() {
 // Each state is also recorded as the current one, so that domReady can replay it
 // to a page that has just loaded. The record is taken before the send, so a
 // reload racing a transition sees the newer value rather than the older.
-func (a *App) forwardSenderStates(states <-chan sender.State) {
+//
+// # It is HANDED the pipeline, and that is a deadlock fix rather than a style
+//
+// THIS GOROUTINE MAY NEVER TAKE sessMu. App.Stop holds sessMu for its whole
+// duration, INCLUDING the join of this very goroutine (sess.wg.Wait), so a
+// transition being forwarded while a Stop is in flight would park here on a
+// lock the Stop will not release until this goroutine has exited. That is not a
+// hypothetical: reconcileMute was written to look the pipeline up through
+// currentPipeline, and the app suite hung for ten minutes on the first Stop that
+// raced a transition. The pipeline is therefore passed in from startSession —
+// the same reason publishChannelMap takes one rather than asking — and
+// reconcileMute reads gst's atomic mirror, which takes no lock at all.
+func (a *App) forwardSenderStates(pipe gst.Pipeline, states <-chan sender.State) {
 	for state := range states {
 		a.senderMu.Lock()
 		a.lastSender = state
 		a.senderMu.Unlock()
 
 		a.events.send(EventSender, state)
+
+		// Every transition is a chance for the mute to have been cleared
+		// underneath us — a sink swap, a reconnect, anything internal/gst does to
+		// recover — and this side cannot know without asking. Asking is free:
+		// CommentaryMuted reads an atomic mirror, takes no lock and never blocks,
+		// which is what makes it safe from a goroutine that App.Stop is holding
+		// sessMu to join. A state that still agrees publishes no event at all.
+		a.reconcileMute(pipe)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// THE COUGH MUTE
+// ---------------------------------------------------------------------------
+//
+// Three facts shape everything below, and each of them rules out the obvious
+// implementation.
+//
+//  1. IT IS PRESSED, NOT SET. The frontend has a push-to-mute: a key DOWN calls
+//     this with true and a key UP calls it with false, dozens of times in a
+//     match, while the operator is talking over the control. So the call has to
+//     be cheap, it has to be safe to make at that rate, and — the part that is
+//     easy to miss — the two halves of one press can arrive in the wrong order.
+//     Wails runs each bound call on a goroutine of its own; there is no ordering
+//     between them. A key-up applied before its own key-down leaves the mute ON
+//     with nobody holding a key, which is a dead microphone on air that nothing
+//     will ever clear. muteSeq is the answer, and setCommentaryMuteFrom argues
+//     the rule.
+//
+//  2. IT IS LIVE STATE, NOT CONFIGURATION. There is no coughMuted field in
+//     config.json, deliberately; the argument is written out in
+//     internal/presets/fields.go because that is where a reader looking for the
+//     classification will go. Start clears it and Stop clears it, so no session
+//     can ever begin muted because of a flag left behind by the last one.
+//
+//  3. THE SCREEN MUST FOLLOW THE PIPELINE, NOT ITS OWN LAST CLICK. The mute
+//     lives on the contribution pipeline, so it can change without anybody
+//     clicking anything: a session that ends takes it away, a second seat can
+//     set it, and a stale request is dropped here rather than applied. EventMute
+//     is what carries the truth back, and reconcileMute is what notices a
+//     divergence rather than waiting to be told about one.
+
+// THE SEAM WITH internal/gst, stated here because this side depends on three
+// properties of it that are not obvious from the call:
+//
+//   - SetCommentaryMute is a PROPERTY WRITE on a volume element between the
+//     resampler and the programme meter. No state change, no renegotiation,
+//     nothing added to or removed from a running graph — which is what makes it
+//     safe to call on a key-down and again on a key-up, at that rate, on a
+//     pipeline that is on air. It shares nothing with the channel map, so the
+//     routing and the mute cannot disagree.
+//
+//   - CommentaryMuted IS AN OBSERVATION, NOT A RECOLLECTION. internal/gst reads
+//     the element's own property back after every successful write, so a write
+//     that did not take cannot leave this side believing it did. That is what
+//     makes reconcileMute meaningful; against a mechanism that could only
+//     remember what it was asked, this side would be keeping an unfalsifiable
+//     account, which is precisely what chanMu's comment refuses to do for the
+//     channel map. It also takes no lock and never blocks.
+//
+//   - THE MUTE IS UPSTREAM OF THE METER, so the meters keep moving and read
+//     digital silence rather than freezing. A frozen meter and a silent one look
+//     identical for the first second and mean opposite things.
+//
+// Both methods are on gst.Pipeline itself, so there is nothing to assert and no
+// build in which the control exists but does nothing.
+
+// The two kinds of seat a mute can come from. They are kinds and not identities
+// because the local seat has no address and a remote one has no name: the
+// listener is unauthenticated, so where a connection came from is the only
+// identity there is (app_remote.go).
+const (
+	muteSeatDesk   = "desk"
+	muteSeatRemote = "remote"
+)
+
+// muteStaleWindow bounds how long a newer mute request suppresses an older one.
+//
+// # Why the ordering stamp alone is not enough
+//
+// Dropping every request whose stamp is not the highest yet seen is correct
+// against reordering and WRONG against everything else. A page reload that
+// restarts a counter, a clock that steps, a second seat whose stamp happens to
+// run behind — any of them would leave the mute stuck in whatever state the
+// high-water mark was set in, with every subsequent press ignored. That is the
+// precise failure this whole mechanism exists to prevent, arrived at from the
+// other direction.
+//
+// So staleness EXPIRES. Reordering between two halves of one keypress happens on
+// a millisecond scale, and two seconds is three orders of magnitude of headroom;
+// beyond it, any request is applied whatever its stamp says. The worst a broken
+// stamp can therefore do is ignore a press for up to two seconds, after which
+// the control works again — as against forever.
+const muteStaleWindow = 2 * time.Second
+
+// mutePayload is the "mute" event's wire shape and the return value of both
+// mute methods, so a caller is told the state IN FORCE by the same shape however
+// it learns it.
+//
+// Muted is the state now. Available says whether a mute is possible at all —
+// false with no session, and false on a build whose pipeline has no mechanism —
+// and Reason is a sentence for the operator whenever it is false, never a code.
+//
+// By and ByAddr are how the desk accounts for a mute it did not make. By is
+// muteSeatDesk or muteSeatRemote and is empty when nothing is muted; ByAddr is
+// the remote seat's source address and is empty for the desk. THE FRONTEND MUST
+// DRAW THEM when By is muteSeatRemote: a remote seat silently muting the feed
+// with nobody at the desk knowing is the failure that made this decision
+// arguable in the first place, and this pair is the price of allowing it.
+//
+// Seq echoes the stamp of the request that produced this state, so a page can
+// tell its own accepted request from somebody else's change.
+type mutePayload struct {
+	Muted     bool    `json:"muted"`
+	Available bool    `json:"available"`
+	Reason    string  `json:"reason"`
+	By        string  `json:"by"`
+	ByAddr    string  `json:"byAddr"`
+	Seq       float64 `json:"seq"`
+}
+
+// muteUnavailableNoSession is the one reason a mute cannot happen, in the
+// operator's words rather than the program's.
+//
+// It is the SAME TEXT errMuteNoSession carries, because the operator can meet
+// either — the sentence on a disabled button and the sentence in a failed call —
+// and two descriptions of one fact are one description too many.
+const muteUnavailableNoSession = "nothing is being sent yet, so there is nothing to mute. " +
+	"The cough control acts on the commentary going out; it becomes live when you press START."
+
+var errMuteNoSession = errors.New("wslcomms: " + muteUnavailableNoSession)
+
+// SetCommentaryMute mutes or unmutes the commentary on the running feed.
+//
+// seq is an ORDERING STAMP the caller supplies, and it is what makes a
+// push-to-mute safe. The frontend must pass a value that only ever increases —
+// Date.now() is exactly right and is what the page should use, because unlike a
+// counter it survives a reload — and the same stamp scale must be used by every
+// control that calls this, the latch button included. A caller with nothing to
+// offer may pass 0, which is read as "stamp this on arrival": the wall clock in
+// milliseconds, the same scale Date.now() is on, so an unstamped call still
+// orders correctly against stamped ones instead of sitting outside the ordering.
+//
+// A request older than the last one APPLIED is dropped, and dropped is not an
+// error: the method returns the state actually in force with no error, and the
+// caller — whose key-up already won the race — is right about the outcome even
+// though its key-down was ignored. Staleness expires after muteStaleWindow; see
+// there for why a permanent high-water mark would be the bug rather than the fix.
+//
+// It returns the state IN FORCE rather than nothing, so a caller never has to
+// infer the result of its own call from an event that may or may not arrive.
+//
+// It refuses when nothing is sending. That is deliberate and it is the other
+// half of "Start must leave the mute in a defined state": a mute accepted before
+// START would have to be either forgotten (a control that lies) or carried into
+// the session (a commentator who comes on air muted because of something pressed
+// twenty minutes earlier). Neither is acceptable, so there is no third state to
+// hold.
+func (a *App) SetCommentaryMute(muted bool, seq float64) (mutePayload, error) {
+	return a.setCommentaryMuteFrom(muteSeatDesk, "", muted, seq)
+}
+
+// setCommentaryMuteFrom is SetCommentaryMute's body, carrying WHICH SEAT asked.
+//
+// The bound method passes muteSeatDesk; the remote dispatcher passes
+// muteSeatRemote and the connection's source address (app_remote.go). The seat
+// is not a permission — a remote seat may mute, and remoteAllowlist argues why —
+// it is what the desk is shown, so that a red badge is never unaccountable.
+func (a *App) setCommentaryMuteFrom(seat, addr string, muted bool, seq float64) (mutePayload, error) {
+	// The pipeline is resolved BEFORE either lock is taken, because that goes
+	// through sessMu and the order in this file is sessMu → muteApplyMu → muteMu.
+	pipe := a.currentPipeline()
+	if pipe == nil {
+		return a.muteSnapshot(), errMuteNoSession
+	}
+
+	// Stamped on arrival if the caller offered nothing, on the same millisecond
+	// scale Date.now() produces, so that stamped and unstamped calls share one
+	// ordering instead of living in two.
+	if seq <= 0 {
+		seq = float64(time.Now().UnixMilli())
+	}
+
+	a.muteApplyMu.Lock()
+	defer a.muteApplyMu.Unlock()
+
+	// Stale? Read the bookkeeping under the leaf lock and release it again: the
+	// write below calls into internal/gst, and muteMu is never held across that.
+	a.muteMu.Lock()
+	stale := seq < a.muteSeq && time.Since(a.muteSeqAt) < muteStaleWindow
+	a.muteMu.Unlock()
+	if stale {
+		// NOT an error. The request lost a race it was always going to lose, and
+		// the caller is handed the state that won it.
+		return a.muteSnapshot(), nil
+	}
+
+	if err := pipe.SetCommentaryMute(muted); err != nil {
+		// Nothing is recorded and nothing is published: the mute in force is
+		// whatever it was, and this side must not claim otherwise. The caller gets
+		// the unchanged state alongside the error.
+		return a.muteSnapshot(), fmt.Errorf("wslcomms: the cough mute could not be applied: %w", err)
+	}
+
+	// READ BACK rather than assumed. internal/gst re-reads the element's own
+	// property after every successful write, so this is what is actually in
+	// force; recording the value we ASKED for would be the one way this side
+	// could end up confidently wrong about whether a microphone is open.
+	inForce := pipe.CommentaryMuted()
+
+	a.muteMu.Lock()
+	a.muted = inForce
+	a.muteSeq = seq
+	a.muteSeqAt = time.Now()
+	a.muteAvailable, a.muteReason = true, ""
+	if inForce {
+		a.muteBy, a.muteByAddr = seat, addr
+	} else {
+		// Cleared with the mute. "Who muted" is a fact about a mute that exists;
+		// keeping the last muter's name against an unmuted feed would put a
+		// remote seat's address on the desk's screen with nothing to explain.
+		a.muteBy, a.muteByAddr = "", ""
+	}
+	out := a.muteStateLocked()
+	a.muteMu.Unlock()
+
+	// Published so the OTHER seat follows. Two seats disagreeing about whether
+	// the commentator is audible is worse than either answer alone — the same
+	// rule SetChannelMap republishes for.
+	a.events.send(EventMute, out)
+	return out, nil
+}
+
+// GetCommentaryMute reports the mute state, including whether a mute is possible
+// at all and why not when it is not.
+//
+// It reads THIS SIDE'S record rather than the pipeline, and there are two
+// separate reasons, either of which would be enough.
+//
+// The first is the LOCK. This is replayed to a page from domReady, on the Wails
+// main thread; asking the pipeline means sessMu and then internal/gst's own
+// lock, both of which are held across state changes, so a page reloading during
+// a reconnect would freeze the window. That is the hazard GetChannelMap's
+// comment describes and answers the same way.
+//
+// The second is that the record cannot drift silently anyway: it is written only
+// after a write that succeeded, it is reset at both session boundaries, and
+// reconcileMute asks the pipeline on every sender transition — on a goroutine
+// where blocking costs nothing — and republishes if the two ever disagree.
+func (a *App) GetCommentaryMute() mutePayload {
+	return a.muteSnapshot()
+}
+
+// muteSnapshot is the current state as the wire sees it. It takes muteMu ONLY —
+// no sessMu, no call into internal/gst — which is what makes it safe on the main
+// thread.
+func (a *App) muteSnapshot() mutePayload {
+	a.muteMu.Lock()
+	defer a.muteMu.Unlock()
+	return a.muteStateLocked()
+}
+
+// muteStateLocked projects the guarded fields into the wire shape. a.muteMu must
+// be held.
+//
+// An unavailable state with no recorded reason gets the "nothing is being sent
+// yet" sentence, which is the truth for the zero value: a machine that has never
+// pressed START. A payload that said Available=false with an empty Reason would
+// be a disabled control with no explanation, which is the exact defect the
+// Reason field exists to remove.
+func (a *App) muteStateLocked() mutePayload {
+	reason := a.muteReason
+	if !a.muteAvailable && reason == "" {
+		reason = muteUnavailableNoSession
+	}
+	if a.muteAvailable {
+		reason = ""
+	}
+	return mutePayload{
+		Muted:     a.muted,
+		Available: a.muteAvailable,
+		Reason:    reason,
+		By:        a.muteBy,
+		ByAddr:    a.muteByAddr,
+		Seq:       a.muteSeq,
+	}
+}
+
+// armMuteForSession puts the mute into its DEFINED START STATE: off, owned by
+// nobody, with the ordering high-water mark reset so the first press of the new
+// session cannot be dropped as stale against the last press of the old one.
+//
+// It is called from startSession under sessMu, after the pipeline is running.
+//
+// It WRITES the unmuted state rather than assuming it. A fresh pipeline is
+// unmuted by construction, so the write is expected to be a no-op — and a no-op
+// is precisely what makes it safe to do, against the case where it is not: this
+// is the one line that stops "coming on air muted because of a stale flag",
+// which is the failure it exists for. Its failure is logged and spared, on the
+// same principle the preview's failures are: a mute that could not be cleared
+// must not take a working feed off air, and the reconciliation that follows
+// every sender transition will publish the truth either way.
+func (a *App) armMuteForSession(pipe gst.Pipeline) {
+	if err := pipe.SetCommentaryMute(false); err != nil {
+		log.Printf("wslcomms: could not clear the cough mute at the start of the session (%v); "+
+			"the feed is unaffected, and the state published below is the one read back off the "+
+			"element rather than the one asked for", err)
+	}
+
+	// READ BACK, and published as read. If the write above failed, or failed to
+	// take, this publishes MUTED — which is a startling thing to see on a fresh
+	// session and is exactly right: the alternative is a commentator who is on
+	// air and inaudible under a control that says they are not muted.
+	inForce := pipe.CommentaryMuted()
+	if inForce {
+		log.Printf("wslcomms: the session started with the commentary MUTED, which is not what " +
+			"START asks for; the cough control is published as muted so the desk can clear it")
+	}
+
+	a.muteMu.Lock()
+	a.muted = inForce
+	a.muteBy, a.muteByAddr = "", ""
+	a.muteSeq = 0
+	a.muteSeqAt = time.Time{}
+	a.muteAvailable = true
+	a.muteReason = ""
+	out := a.muteStateLocked()
+	a.muteMu.Unlock()
+
+	a.events.send(EventMute, out)
+}
+
+// forgetMute publishes the end-of-session state — nothing to mute, nobody
+// holding it — and clears the record with it.
+//
+// Both halves matter, exactly as they do in forgetChannelMap and forgetSignal.
+// Without the EVENT a latched cough button stays red over a session that has
+// gone, and the operator has a control that will not release because there is
+// nothing left for it to act on. Without the RECORD CLEAR the next Start would
+// begin with this side believing the commentator is muted, which armMuteForSession
+// would correct — but a page loaded in between would be told the old answer, and
+// an answer that is wrong and freshly delivered is worse than one that is absent.
+func (a *App) forgetMute() {
+	a.muteMu.Lock()
+	a.muted = false
+	a.muteBy, a.muteByAddr = "", ""
+	a.muteSeq = 0
+	a.muteSeqAt = time.Time{}
+	a.muteAvailable = false
+	a.muteReason = muteUnavailableNoSession
+	out := a.muteStateLocked()
+	a.muteMu.Unlock()
+
+	a.events.send(EventMute, out)
+}
+
+// reconcileMute asks the pipeline what is ACTUALLY in force and publishes it if
+// it disagrees with what was last published.
+//
+// It is called from the sender-state forwarder, on every transition, which is
+// where a divergence is both possible and cheap to catch: a sink swap, a
+// reconnect, or anything internal/gst does to recover leaves a mute either
+// carried or cleared, and this side has no way to know which without asking.
+//
+// THE PIPELINE IS AN ARGUMENT AND MUST STAY ONE. Looking it up through
+// currentPipeline would take sessMu on a goroutine App.Stop joins while holding
+// it — a deadlock that hung the app suite for ten minutes the first time this
+// was written that way. See forwardSenderStates.
+//
+// It corrects the RECORD as well as publishing, so a subsequent read agrees with
+// the event rather than repeating the stale answer.
+func (a *App) reconcileMute(pipe gst.Pipeline) {
+	if pipe == nil {
+		return
+	}
+	// Free: internal/gst reads this off an atomic mirror, takes no lock and never
+	// blocks, so it is safe even while a ReplaceSink is holding the pipeline lock
+	// and safe from a goroutine that a Stop holding sessMu is waiting on.
+	actual := pipe.CommentaryMuted()
+
+	a.muteMu.Lock()
+	if a.muted == actual {
+		a.muteMu.Unlock()
+		return
+	}
+	a.muted = actual
+	if !actual {
+		a.muteBy, a.muteByAddr = "", ""
+	}
+	a.muteAvailable, a.muteReason = true, ""
+	out := a.muteStateLocked()
+	a.muteMu.Unlock()
+
+	log.Printf("wslcomms: the cough mute is %v on the pipeline and was published as %v; "+
+		"republishing the pipeline's answer", actual, !actual)
+	a.events.send(EventMute, out)
+}
+
+// releaseMuteHeldByGoneSeat clears a mute that a REMOTE seat is holding once
+// that seat is no longer connected.
+//
+// This is the mute's worst case and it is worth stating plainly: a producer's
+// laptop holds the mute for a cough, the laptop's wifi drops, and the
+// commentator is off air for the rest of the match with a red badge naming an
+// address nobody can reach. Nothing else in the system would ever clear it —
+// the seat that set it is gone, and this side is deliberately not in the
+// business of guessing what a live control should be.
+//
+// So it is cleared HERE, from the connected-clients poll that already runs
+// (app_remote.go), and only in the one case where the answer is unambiguous:
+// the mute is held, it is held by a REMOTE seat, and that seat's address is not
+// among the connected ones. A desk mute is never touched — the operator is
+// sitting in front of it — and a mute held by a seat that is still connected is
+// that seat's to release.
+//
+// connected is the set of source addresses currently connected.
+func (a *App) releaseMuteHeldByGoneSeat(connected map[string]bool) {
+	a.muteMu.Lock()
+	held := a.muted && a.muteBy == muteSeatRemote
+	addr := a.muteByAddr
+	a.muteMu.Unlock()
+	if !held || connected[addr] {
+		return
+	}
+
+	log.Printf("wslcomms: the remote seat at %s disconnected while holding the cough mute; "+
+		"releasing it so the commentary is not left silent by a seat that has gone", addr)
+	// Through the ordinary path, so the write, the record and the event all
+	// happen in the one order they always do. A stamp of 0 is stamped on arrival,
+	// which is later than anything that seat sent, so this cannot be dropped as
+	// stale. An error here means there is no session any more, in which case the
+	// mute is gone with it and forgetMute has already said so.
+	if _, err := a.setCommentaryMuteFrom(muteSeatDesk, "", false, 0); err != nil {
+		log.Printf("wslcomms: releasing the abandoned cough mute: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE PREVIEW, AND THE TRUTH ABOUT IT
+// ---------------------------------------------------------------------------
+
+// previewStatePayload is the "preview" event's wire shape and GetPreviewState's
+// return: whether the operator's own confidence monitor is running, and why not
+// when it is not.
+//
+// # Why "why not" is the important field
+//
+// The owner asked for the preview and the monitoring to be live before START, so
+// that a position can be seen and heard before it is on air. HALF of that is
+// already true and the other half cannot be made true, and a page that cannot
+// tell the two apart draws one dead panel for both.
+//
+//   - THE PROGRAMME RETURN IS ALREADY INDEPENDENT OF START. The WebRTC/KVS
+//     monitor is attached by the frontend at init and owes nothing to the
+//     contribution pipeline. A commentator can watch and hear the programme
+//     before anybody presses anything.
+//
+//   - THE OPERATOR'S OWN CAMERA IS NOT, TODAY, AND THE REASON IS THIS
+//     APPLICATION RATHER THAN THE MEDIA LAYER. That distinction is worth being
+//     exact about, because the obvious explanation is wrong and a reader who
+//     adopts it will close the question for good.
+//
+// The obvious explanation — the card is exclusive, so a preview holding it
+// before START would have to hand it over and there is no atomic handover — is
+// TRUE about the two designs somebody would reach for first, and internal/gst
+// measured both and rejected both (a preview-only pipeline START takes the card
+// from; attaching the encoder and mux branch live to a running graph, which took
+// the on-air leg to 0 fps permanently). It is NOT true as a statement about
+// whether the preview can run before the feed does.
+//
+// internal/gst/preview.go measured the answer on the fitted card on 2026-08-16:
+// gst.Pipeline.Start brings the WHOLE CAPTURE CHAIN to PLAYING WITH NO SINK
+// INSTALLED — that is Start's documented contract, with srtq's src pad held by a
+// blocking probe and nothing leaving the process until ReplaceSink is called —
+// and in exactly that state the preview renders, the programme meter runs at its
+// full rate, the capture channels negotiate and the cough mute is settable.
+// "See and hear before going live" is therefore not a pipeline problem at all:
+// it is this application calling Start when a capture device is configured and
+// not calling ReplaceSink until the operator says go.
+//
+// THAT SPLIT IS NOT WIRED HERE YET. App.Start still does both halves in one
+// press, through internal/sender, so today the preview does appear at START and
+// not before — and BeforeStart says FALSE because it reports what this build
+// does, not what the media layer could support. It is a field rather than a
+// constant in the frontend precisely so that the day the split is made, the page
+// follows without being rewritten. What it must never become is a claim that the
+// thing is impossible, because it is not.
+//
+// Reason is non-empty exactly when Running is false, and is written for the
+// operator rather than for a log. It says what happens and when, and it
+// deliberately does NOT explain itself with the card-exclusivity argument, which
+// would be an engineering claim the measurements do not support.
+type previewStatePayload struct {
+	// Running is whether this session actually has a preview branch AND a
+	// surface for it. It is the only field that says something is on screen.
+	Running bool `json:"running"`
+
+	// Enabled is what the configuration asks for: decklinkPreviewEnabled.
+	Enabled bool `json:"enabled"`
+
+	// Sending is whether a contribution session is up at all, so the page can
+	// distinguish "not yet" from "not for this configuration".
+	Sending bool `json:"sending"`
+
+	// BeforeStart is whether a preview can exist WITHOUT a session. It is false,
+	// and it is a field rather than a constant in the frontend so that the day
+	// internal/gst can do it safely, the page follows without being rewritten.
+	BeforeStart bool `json:"beforeStart"`
+
+	// Reason is why the preview is not running, in a sentence. Empty when it is.
+	Reason string `json:"reason"`
+}
+
+// The four reasons a preview is not on screen, in the operator's words. They are
+// constants because the same sentence is used by the event and by the direct
+// read, and a control whose explanation changed depending on how it was asked
+// would be worse than one with no explanation.
+const (
+	previewReasonOff = "the confidence preview is switched off. Turn it on in Settings, before you " +
+		"press START — it is built into the pipeline at START and cannot be attached to a running feed."
+
+	previewReasonSlate = "this position is sending the slate, so there is nothing to preview. " +
+		"The preview shows what the capture card is seeing; select the camera as the video source " +
+		"to use it."
+
+	previewReasonNotSending = "your own picture appears when you press START. The programme return " +
+		"above is not waiting for anything — it is live already and owes nothing to START, so you " +
+		"can watch and hear the match before you go on air."
+
+	previewReasonNoSurface = "the preview could not get a window on this screen, so the session is " +
+		"running without it. Nothing about what is being transmitted has changed."
+)
+
+// GetPreviewState reports whether the operator's confidence monitor is on
+// screen, and why not when it is not.
+//
+// It is a pure read, and it takes NO LOCK THAT ANYTHING BLOCKS UNDER: cfgMu
+// through snapshotConfig, prevViewMu (under which nothing may block, by
+// construction — see the field comment), and the sessionUp atomic instead of
+// sessMu. That last substitution is the load-bearing one: this is replayed from
+// domReady on the Wails main thread, and sessMu is held across the whole of
+// Start and Stop, so reading it here would freeze the window for the length of a
+// reconnect. It reaches no hardware and starts nothing.
+//
+// It is REACHABLE rather than host-only, unlike every method that MOVES the
+// preview. A remote seat draws the same panel and must be able to say the same
+// true sentence; refusing it there would leave that operator looking at a blank
+// where the desk sees an explanation — which is the shape of fault
+// GetConformTarget's row in remoteAllowlist argues against at length.
+func (a *App) GetPreviewState() previewStatePayload {
+	cfg := a.snapshotConfig()
+
+	sending := a.sessionUp.Load()
+
+	a.prevViewMu.Lock()
+	running := a.prevRunning && a.prevOverlay != nil
+	a.prevViewMu.Unlock()
+
+	out := previewStatePayload{
+		Running: running,
+		Enabled: cfg.DeckLinkPreviewEnabled,
+		Sending: sending,
+		// FALSE, and it is a fact about THIS BUILD rather than about the card.
+		// internal/gst/preview.go measured that the preview renders perfectly
+		// with the pipeline started and no sink installed; what is missing is
+		// this application splitting Start into "bring the capture up" and "go on
+		// air". Until that split exists this is false, and the day it does, this
+		// is where it becomes true — one line, and the page follows.
+		BeforeStart: false,
+	}
+	switch {
+	case running:
+	case !cfg.DeckLinkPreviewEnabled:
+		out.Reason = previewReasonOff
+	case cfg.EffectiveVideoSource() != config.VideoSourceDeckLink:
+		out.Reason = previewReasonSlate
+	case !sending:
+		out.Reason = previewReasonNotSending
+	default:
+		// Enabled, on the camera, sending — and no surface. The one remaining
+		// case is a window that could not be created, whose failure startSession
+		// spares deliberately so the feed goes out without it.
+		out.Reason = previewReasonNoSurface
+	}
+	return out
+}
+
+// publishPreview emits the current preview state. It is called at both ends of a
+// session and whenever the configuration behind it changes, so that a page never
+// has to poll to find out that the panel it is drawing has become live — or has
+// stopped being.
+func (a *App) publishPreview() {
+	a.events.send(EventPreview, a.GetPreviewState())
 }
 
 // emitError publishes err on the "error" event and logs it.

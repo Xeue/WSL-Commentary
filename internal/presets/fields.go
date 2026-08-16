@@ -224,6 +224,53 @@ var UIFields = []string{
 	// the picture the commentator is watching. That is the same defect
 	// returnSource is on this list for, in the other sense.
 	"decklinkPreviewEnabled",
+	// HOW THE COUGH CONTROL BEHAVES: held down for the length of a cough, or
+	// pressed once to mute and once again to unmute. It is a property of how the
+	// person at this desk likes to work — the same class as returnSource, one
+	// step further from the wire, because it changes neither what is transmitted
+	// nor what is monitored but only what a button does under a finger.
+	//
+	// A preset carrying it would reach into another building and change the
+	// behaviour of a control somebody is about to use under pressure, without
+	// changing its appearance: the operator presses to mute a cough, lets go,
+	// and finds out which mode they are in from whether the commentator is still
+	// audible. That is the same defect decklinkPreviewEnabled is here for, with
+	// the failure landing on air instead of on a screen.
+	//
+	// ===================================================================
+	// WHY THE MUTE ITSELF IS NOT A CONFIG FIELD AT ALL — and therefore not
+	// on any of these four tables
+	// ===================================================================
+	//
+	// A reader will come here looking for "coughMuted" beside this tag, find
+	// nothing, and reasonably wonder whether somebody forgot to classify it.
+	// Nobody did: the field does not exist, and this is the argument for that.
+	//
+	// The classification tables answer WHO OWNS A VALUE — the facility, this PC,
+	// the operator, or the M2L-X. Whether the commentator is muted right now is
+	// not owned by any of them, because it is not a value that is remembered at
+	// all. It is the position of a control being held, in the same class as
+	// returnChannel's live Web Audio state or the channel map in force on the
+	// running pipeline: internal/gst deliberately keeps no persistent copy of
+	// that either, and app.go's chanMu comment says why — an account nobody can
+	// falsify is worse than no account.
+	//
+	// The decisive half is what PERSISTENCE would do. config.json is read at
+	// launch and applied before anybody is at the desk, so a remembered mute is
+	// a commentator arriving to a microphone that is already dead — with every
+	// lamp green, the feed up, and the one control that would explain it drawn
+	// in whatever state the last operator left it three days ago. The failure is
+	// silent, it is on air, and it is discovered by somebody in a gallery asking
+	// why commentary never came up. A cough mute must be true only for as long
+	// as somebody is holding it and must be FALSE on every path that begins a
+	// session; app.go's Start and Stop are where that is enforced, and the
+	// "mute" event is how the screen learns the truth rather than what it last
+	// asked for.
+	//
+	// The mode above is the opposite case and that is exactly why the two are
+	// separated: forgetting the MODE across a restart costs an operator one
+	// press to re-choose, and remembering the MUTE costs a match.
+	"coughMuteMode",
 }
 
 // DiscoveredFields are the json tags of values the application LEARNS from the

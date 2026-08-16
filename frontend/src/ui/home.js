@@ -1,4 +1,4 @@
-import { createLampRow } from './lamps.js';
+import { createLampRow, GLYPH } from './lamps.js';
 // The dropdowns' pure logic: display order and the saved-but-missing marker.
 // It lives in its own module so `node --test` can drive it without a DOM —
 // this file is wiring, devices.test.js is where the behaviour is proved.
@@ -16,6 +16,31 @@ import {
   normalisePictureState,
 } from './picturesource.js';
 import { createErrorLog, createBackoffEpisode, describeEntry, formatErrorTime } from './errorlog.js';
+// The severity vocabulary and the judgements about what is worth an operator's
+// attention mid-match. This file decides where a message is DRAWN; alerts.js
+// decides how loud it is, and records why the switcher-status banner is gone.
+import { SEVERITY, normaliseSeverity, describeAttention } from './alerts.js';
+// The single indicator's reduction rule. Pure: lamps in, one state out. This
+// file feeds it the SAME lamp objects it paints on the row (see wrapLamps), so
+// the summary and the detail cannot disagree — there is one derivation of each
+// lamp and it happens in app.js, exactly as it did before.
+import { deriveOverallStatus, describeOverall, OVERALL_LEVELS } from './overall.js';
+// The cough mute's vocabulary: which keys are bound, what they are called on
+// screen, and which targets a keystroke means a character rather than a command.
+// The STATE MACHINE is not here and must not be — app.js owns it, because the
+// mute is a call into Go and this file has no backend knowledge. This file draws
+// the readout it is handed and raises the three gestures.
+import {
+  MUTE_KEY_PUSH,
+  MUTE_KEY_LATCH,
+  MUTE_MODE,
+  DEFAULT_MUTE_MODE,
+  describeMuteKey,
+  describeMuteMode,
+  normaliseMuteMode,
+  isTypingTarget,
+  isSpaceActivated,
+} from './cough.js';
 // The CAMERA lamp's name. The lamp's DERIVATION is not here and must not be —
 // this file holds no backend knowledge and no state machine — app.js derives it
 // from the "signal" event and the saved video source and pushes it into
@@ -142,20 +167,42 @@ const LAMP_NAMES = ['SENDING', LAMP_CAMERA, 'SWITCHER SEES FEED', 'VIDEO', 'AUDI
  *                                       the preset selector (switching is
  *                                       refused server-side while SENDING)
  *   setBusy(busy)                       disables the button while a call is in flight
- *   setStatusUnavailable(unavailable)   shows/hides the transient banner (Status.Stale)
- *   showError(message) / clearError()   the dismissible error banner. Every
- *                                       message is also kept in a history
- *                                       (errorlog.js) with timestamps and
- *                                       repeat counts, opened from the
- *                                       banner's History button; dismissing
- *                                       hides the banner, not the history
+ *   setMuteReadout(readout)             paints the cough mute from ONE object,
+ *                                       cough.js's describeMute output. app.js
+ *                                       owns the state machine; this file owns
+ *                                       no part of whether audio is going out
+ *   showError(message, severity)        adds a row to the alert column. Every
+ *   showNote(message)                   message is kept with timestamps and
+ *   clearError()                        repeat counts (errorlog.js); dismissing
+ *                                       one row means "I have seen this"
+ *
+ * There is no setStatusUnavailable. The switcher-status banner is withdrawn —
+ * see the block above the match bar, and alerts.js for why staleness raises
+ * nothing at all.
  *
  * handlers = {
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
  *   onLevelChange(fraction), onPresetChange(id),
+ *   onMutePress(), onMuteRelease(), onMuteLatchToggle(),
  * }
+ *
+ * ================== THE PICTURE'S GEOMETRY IS INDEPENDENT ===================
+ *
+ * The governing rule of this screen, in the operator's words: "For the
+ * comentators watching a live match, anything casuing their video to move is a
+ * massive no."
+ *
+ * So the layout is two columns. .home-main grows and holds the picture and the
+ * match bar; .home-rail is a fixed-width flex child with its own scroll and
+ * holds the alerts AND the tray. Nothing that can arrive — an alert, ten alerts,
+ * a note, a section of settings being read — is in the main column, and the rail
+ * cannot change width because its flex-basis is a constant rather than its
+ * content. The match bar under the picture is a fixed height for the same
+ * reason. The only things that may resize .pgm-tile are the WINDOW changing size
+ * and the operator collapsing the column, both of which are that operator's own
+ * hand. See main.css and homelayout.test.js.
  *
  * ===================== THE PICTURE AREA IS NOW A RESERVATION ================
  *
@@ -250,7 +297,13 @@ export function createHomeView(handlers) {
   settingsBtn.className = 'btn btn-ghost';
   settingsBtn.textContent = 'Settings';
   settingsBtn.addEventListener('click', () => handlers.onSettings());
-  headerBtns.append(presetIndicator, mixerBtn, settingsBtn);
+  // The preset indicator is NOT here any more. It moved into the column with the
+  // rest of the tray at the operator's request — "The rest can live in some form
+  // of settings tray or something like that" — and a preset picker is exactly
+  // that: something chosen before kick-off, refused server-side while SENDING,
+  // and never touched mid-match. The topbar keeps the two buttons that open the
+  // other surfaces, and the column sits directly underneath them.
+  headerBtns.append(mixerBtn, settingsBtn);
   header.append(titleWrap, headerBtns);
 
   function setDevBadge(visible) {
@@ -346,102 +399,165 @@ export function createHomeView(handlers) {
     remoteIndicator.hidden = false;
   }
 
-  // --- error banner (dismissible; NOT the honest line) ----------------
+  // --- the alert feed, which lives in the COLUMN and nowhere else ----------
   //
-  // The banner shows the NEWEST error; the log behind it (./errorlog.js) keeps
-  // every one, so a second problem no longer destroys the evidence of the
-  // first. When there is more than one row, a History button appears and opens
-  // the list — timestamps, messages, repeat counts. Dismissing the banner
-  // keeps the history: dismissal means "I have seen this", not "unhappen it".
+  // ===================== THIS IS NO LONGER A BANNER =========================
+  //
+  // It was two of them: .error-banner above the picture and
+  // .status-unavailable-banner below it, both in normal document flow with
+  // margins, so every appearance and every dismissal reflowed the page and
+  // shoved the programme picture mid-sentence. The operator, verbatim:
+  //
+  //   "We should move the errors/alerts to not be banners above and bellow
+  //    that cause layout shifts. For the comentators watching a live match,
+  //    anything casuing their video to move is a massive no."
+  //
+  // and, correcting a first attempt that proposed floating overlays instead:
+  //
+  //   "The solution to not shifting is done make them banners????? We could
+  //    look at having a column on the side that has the allerts and all the
+  //    settings, so we make more use of vertical space etc"
+  //
+  // He is right and it is the better design. An overlay is still something that
+  // appears; a PERMANENT COLUMN has nothing to shift by construction. This list
+  // is drawn inside .home-rail, which is a fixed-width flex child with its own
+  // scroll, so the number of rows in it — nought, one, ten — cannot change the
+  // width of .home-main and therefore cannot change one pixel of .pgm-tile.
+  //
+  // The list is ALWAYS RENDERED, including when it is empty: "No alerts" is a
+  // row, not an absence. An empty state that collapses is an empty state that
+  // moves everything below it when the first alert arrives, and the operator
+  // then learns the column by watching it jump.
+  //
+  // The log behind it (./errorlog.js) keeps every message with timestamps and
+  // repeat counts, so a second problem does not destroy the evidence of the
+  // first. Dismissing a row means "I have seen this", not "unhappen it": the
+  // history stays until it is cleared.
   const errorLog = createErrorLog();
   const backoffEpisode = createBackoffEpisode();
-  let bannerMessage = '';
 
-  const errorBanner = document.createElement('div');
-  errorBanner.className = 'error-banner';
-  errorBanner.setAttribute('role', 'alert');
-  errorBanner.hidden = true;
-  const errorText = document.createElement('span');
-  const errorHistoryBtn = document.createElement('button');
-  errorHistoryBtn.type = 'button';
-  errorHistoryBtn.className = 'error-history-toggle';
-  errorHistoryBtn.hidden = true;
-  errorHistoryBtn.setAttribute('aria-expanded', 'false');
-  errorHistoryBtn.addEventListener('click', () => {
-    setErrorHistoryOpen(errorHistoryPanel.hidden);
-  });
-  const errorDismiss = document.createElement('button');
-  errorDismiss.type = 'button';
-  errorDismiss.className = 'error-dismiss';
-  errorDismiss.setAttribute('aria-label', 'Dismiss');
-  errorDismiss.textContent = '✕';
-  errorDismiss.addEventListener('click', () => clearError());
-  errorBanner.append(errorText, errorHistoryBtn, errorDismiss);
-
-  // The history list, drawn directly under the banner when opened.
-  const errorHistoryPanel = document.createElement('div');
-  errorHistoryPanel.className = 'error-history';
-  errorHistoryPanel.hidden = true;
-  const errorHistoryList = document.createElement('ul');
-  errorHistoryList.className = 'error-history-list';
-  const errorHistoryClear = document.createElement('button');
-  errorHistoryClear.type = 'button';
-  errorHistoryClear.className = 'error-history-clear';
-  errorHistoryClear.textContent = 'Clear history';
-  errorHistoryClear.addEventListener('click', () => {
+  const alertsRegion = document.createElement('div');
+  alertsRegion.className = 'rail-alerts';
+  const alertsList = document.createElement('ul');
+  alertsList.className = 'alert-list';
+  // Polite, not assertive: this region can gain a row while the commentator is
+  // mid-sentence, and an assertive live region interrupts a screen reader
+  // immediately. The one place that IS urgent is the mute readout, which has
+  // its own.
+  alertsList.setAttribute('aria-live', 'polite');
+  alertsList.setAttribute('aria-label', 'Alerts');
+  const alertsEmpty = document.createElement('li');
+  alertsEmpty.className = 'alert-empty';
+  alertsEmpty.textContent = 'No alerts';
+  const alertsClear = document.createElement('button');
+  alertsClear.type = 'button';
+  alertsClear.className = 'alert-clear';
+  alertsClear.textContent = 'Clear all';
+  alertsClear.hidden = true;
+  alertsClear.addEventListener('click', () => {
     errorLog.clear();
-    clearError();
+    renderAlerts();
   });
-  errorHistoryPanel.append(errorHistoryList, errorHistoryClear);
+  alertsRegion.append(alertsList, alertsClear);
 
-  function setErrorHistoryOpen(open) {
-    errorHistoryPanel.hidden = !open;
-    errorHistoryBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    if (open) renderErrorHistory();
-  }
+  // The header's attention marker. It is the ONE thing that has to be legible
+  // when the column is collapsed, so it is rendered into both places from the
+  // same call.
+  const alertsCount = document.createElement('span');
+  alertsCount.className = 'rail-attention';
+  const railStripCount = document.createElement('span');
+  railStripCount.className = 'rail-strip-attention';
 
-  function renderErrorHistory() {
-    // The History button exists whenever the log holds more than the line the
-    // banner is already showing — a second row, or the one row repeating.
-    const worthShowing = errorLog.size > 1 || (errorLog.entries[0]?.count ?? 0) > 1;
-    errorHistoryBtn.hidden = !worthShowing;
-    errorHistoryBtn.textContent = `History (${errorLog.size})`;
-    if (!worthShowing) setErrorHistoryOpen(false);
+  function renderAlerts() {
+    const entries = errorLog.entries;
+    const attention = describeAttention(entries);
 
-    if (errorHistoryPanel.hidden) return;
-    errorHistoryList.textContent = '';
-    for (const entry of errorLog.entries) {
+    for (const el2 of [alertsCount, railStripCount]) {
+      el2.textContent = attention.attention ? String(attention.alerts) : '';
+      el2.hidden = !attention.attention;
+      el2.title = attention.label;
+    }
+    alertsCount.setAttribute('aria-label', attention.label);
+
+    alertsList.textContent = '';
+    if (entries.length === 0) {
+      alertsList.appendChild(alertsEmpty);
+      alertsClear.hidden = true;
+      return;
+    }
+    alertsClear.hidden = false;
+
+    for (const entry of entries) {
       const li = document.createElement('li');
-      li.textContent = describeEntry(entry);
-      if (entry.count > 1) {
-        li.title = `first at ${formatErrorTime(entry.firstAt)}, ${entry.count} times in all`;
-      }
-      errorHistoryList.appendChild(li);
+      li.className = `alert-row alert-row--${entry.severity}`;
+      const when = document.createElement('span');
+      when.className = 'alert-when';
+      when.textContent = formatErrorTime(entry.lastAt);
+      const text = document.createElement('span');
+      text.className = 'alert-text';
+      text.textContent = entry.count > 1 ? `${entry.message} (×${entry.count})` : entry.message;
+      // describeEntry is the one-line form, kept as the hover text so the row's
+      // full sentence is reachable when the column has ellipsised it, together
+      // with when the run started.
+      li.title =
+        entry.count > 1
+          ? `${describeEntry(entry)}\nfirst at ${formatErrorTime(entry.firstAt)}, ${entry.count} times in all`
+          : describeEntry(entry);
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.className = 'alert-dismiss';
+      dismiss.setAttribute('aria-label', `Dismiss: ${entry.message}`);
+      dismiss.textContent = '✕';
+      // BY IDENTITY, not by index: the list re-renders on every arrival, so an
+      // index captured when this row was drawn can point at a different row by
+      // the time it is clicked. See errorlog.js's dismiss().
+      dismiss.addEventListener('click', () => {
+        errorLog.dismiss(entry);
+        renderAlerts();
+      });
+      li.append(when, text, dismiss);
+      alertsList.appendChild(li);
     }
   }
 
-  function showError(message) {
-    const entry = errorLog.record(message);
-    bannerMessage = entry.message;
-    errorText.textContent = entry.count > 1 ? `${entry.message} (×${entry.count})` : entry.message;
-    errorBanner.hidden = false;
-    renderErrorHistory();
-  }
-  function clearError() {
-    errorBanner.hidden = true;
-    errorText.textContent = '';
-    bannerMessage = '';
-    setErrorHistoryOpen(false);
-    renderErrorHistory();
-  }
   /**
-   * clearErrorIf takes the banner down only if it is still showing `message`.
+   * showError records a message and draws it in the column.
+   *
+   * The second argument is the SEVERITY (alerts.js). It defaults to ALERT
+   * because a caller that forgets to classify should over-report; NOTE is for
+   * the things that explain rather than warn, and the only one today is the
+   * deferred output-device switch.
+   */
+  function showError(message, severity) {
+    errorLog.record(message, normaliseSeverity(severity));
+    renderAlerts();
+  }
+
+  /** showNote is showError at NOTE severity, named so call sites read. */
+  function showNote(message) {
+    showError(message, SEVERITY.NOTE);
+  }
+
+  /** clearError empties the whole feed. The column's "Clear all". */
+  function clearError() {
+    errorLog.clear();
+    renderAlerts();
+  }
+
+  /**
+   * clearErrorIf takes down every row carrying `message` and nothing else.
+   *
    * For errors that RESOLVE — the SRT picture coming back — where clearing
-   * unconditionally would eat whatever unrelated error arrived in between.
+   * unconditionally would eat whatever unrelated error arrived in between. This
+   * used to be possible only for the single newest message, because there was
+   * one banner and it showed one line; a list can retire the right row wherever
+   * it has got to.
    */
   function clearErrorIf(message) {
-    if (bannerMessage === message) clearError();
+    if (errorLog.dismissMatching(message) > 0) renderAlerts();
   }
+
+  renderAlerts();
 
   // --- the picture area -------------------------------------------------
   //
@@ -490,8 +606,16 @@ export function createHomeView(handlers) {
   // and no z-index in this page reaches above it. Anything drawn inside that
   // rectangle is invisible for as long as the overlay is up, which is exactly
   // when a commentator is mid-match and most needs to see their input. So the
-  // meters live in .pgm-stage BESIDE the tile: visible over both pictures,
-  // never under either, and the measured rectangle is untouched.
+  // meters are never a child of the tile: visible over both pictures, never
+  // under either, and the measured rectangle is untouched.
+  //
+  // THEY NOW LIVE IN THE COLUMN, not beside the tile in .pgm-stage. The operator
+  // asked for a main area holding the picture, one overall indicator and the
+  // cough controls, with everything else in the tray: "During the match we only
+  // really need an overall status, single green/red indicator and the cough mute
+  // buttons. The rest can live in some form of settings tray or something like
+  // that." The column is outside .pgm-tile exactly as .pgm-stage was, so the
+  // reason above is satisfied by the new home as well as by the old one.
   //
   // The bar is the RMS — the loudness a listener would report — and the thin
   // marker riding above it is the peak-hold, ~1.5 s of the highest recent
@@ -573,7 +697,10 @@ export function createHomeView(handlers) {
   previewCaption.className = 'preview-caption';
   previewTile.appendChild(previewCaption);
 
-  pgmStage.append(pgmTile, metersEl, previewTile);
+  // The stage holds the two PICTURES and nothing else. The meters moved to the
+  // column (see above); everything that is not a picture is either in the match
+  // bar under the stage or in the column beside it.
+  pgmStage.append(pgmTile, previewTile);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -853,12 +980,15 @@ export function createHomeView(handlers) {
   headphoneLabel.textContent = 'Headphones/output';
   headphoneRow.append(headphoneLabel, headphoneSelect);
 
+  // The AUDIO controls only. sourceGroup — which PICTURE — gets its own block in
+  // the column, because it is not an audio control and grouping it with four of
+  // them is how a commentator came to believe the old "Return Source" selector
+  // changed what they could see rather than what they could hear.
   controls.append(
     makeRow('Commentary input', 'input-select', inputSelect),
     headphoneRow,
     returnGroup,
     channelGroup,
-    sourceGroup,
     levelGroup,
   );
 
@@ -876,22 +1006,367 @@ export function createHomeView(handlers) {
 
   actionRow.append(startStopBtn, lampsEl);
 
-  const statusUnavailableBanner = document.createElement('p');
-  statusUnavailableBanner.className = 'status-unavailable-banner';
-  statusUnavailableBanner.textContent =
-    'STATUS UNAVAILABLE — the switcher status feed has been silent for over 15 seconds.';
-  statusUnavailableBanner.hidden = true;
+  // ======================= THE STATUS BANNER IS GONE =========================
+  //
+  // .status-unavailable-banner — "STATUS UNAVAILABLE — the switcher status feed
+  // has been silent for over 15 seconds" — is deleted, not re-homed. The
+  // operator: "the orrange status banner at the bottom about switcher status is
+  // VERY annoying and keeps cauing layout shifts and causing concerns when
+  // everything is fine."
+  //
+  // Two faults, and the column only fixes one. The second is that it was a
+  // FOURTH copy of a fact the lamp row already states three times: staleness
+  // greys SWITCHER SEES FEED, VIDEO and AUDIO and writes STATUS UNAVAILABLE
+  // across all three, in glyph, text and colour. The overall indicator folds the
+  // same fact in and can never read GOOD over it. And it never meant what it
+  // looked like it meant: the telemetry WebSocket going quiet says nothing about
+  // the contribution feed, which is a different socket to a different port and
+  // has its own lamp. See alerts.js, which records the decision and why.
+  //
+  // setStatusUnavailable is withdrawn with it, so app.js cannot call a setter
+  // that silently does nothing.
 
-  el.append(
-    header,
-    errorBanner,
-    errorHistoryPanel,
-    pgmStage,
-    audioEl,
-    controls,
-    actionRow,
-    statusUnavailableBanner,
+  // --- the match bar: one indicator and the cough controls ------------------
+  //
+  // Under the picture, in the MAIN area, and the only two things allowed there.
+  //
+  // ITS HEIGHT IS A CONSTANT, and that is load-bearing. .pgm-tile is sized from
+  // the height left in .pgm-stage, so anything under the stage that can grow a
+  // line moves the picture — which is the whole defect this work exists to
+  // remove, reintroduced by a control instead of by a banner. So the bar is a
+  // fixed height in the stylesheet, every text inside it is a single
+  // non-wrapping line, and the long forms live in title attributes. See
+  // main.css's .match-bar and homelayout.test.js, which asserts it.
+  const matchBar = document.createElement('div');
+  matchBar.className = 'match-bar';
+
+  // ----- the one overall indicator -----
+  const overallEl = document.createElement('div');
+  overallEl.className = 'overall';
+  overallEl.setAttribute('role', 'status');
+  const overallGlyph = document.createElement('span');
+  overallGlyph.className = 'overall-glyph';
+  overallGlyph.setAttribute('aria-hidden', 'true');
+  const overallWords = document.createElement('span');
+  overallWords.className = 'overall-words';
+  const overallText = document.createElement('span');
+  overallText.className = 'overall-text';
+  const overallDetail = document.createElement('span');
+  overallDetail.className = 'overall-detail';
+  overallWords.append(overallText, overallDetail);
+  overallEl.append(overallGlyph, overallWords);
+
+  // ----- the cough mute -----
+  //
+  // The control whose state being misread puts a cough on air or leaves a
+  // commentator talking into a dead microphone. Everything about it is drawn
+  // from ONE readout object (cough.js's describeMute) handed in by app.js, so
+  // the words, the colour and the pressed states cannot disagree about whether
+  // audio is going out.
+  //
+  // NOTHING HERE MUTES ANYTHING. The three gestures raise handlers; app.js calls
+  // the Go binding that mutes the SEND path. Muting a monitor element here would
+  // make this desk quieter while the cough went to air.
+  const coughEl = document.createElement('div');
+  coughEl.className = 'cough';
+
+  const coughReadout = document.createElement('div');
+  coughReadout.className = 'cough-readout';
+  // Assertive, and it is the only assertive region on the screen: this is the
+  // one state change a commentator must not miss, and it is the one they cannot
+  // check by listening.
+  coughReadout.setAttribute('role', 'status');
+  coughReadout.setAttribute('aria-live', 'assertive');
+  const coughState = document.createElement('span');
+  coughState.className = 'cough-state';
+  const coughReason = document.createElement('span');
+  coughReason.className = 'cough-reason';
+  coughReadout.append(coughState, coughReason);
+
+  const pushBtn = document.createElement('button');
+  pushBtn.type = 'button';
+  pushBtn.className = 'btn cough-btn cough-push';
+  const latchBtn = document.createElement('button');
+  latchBtn.type = 'button';
+  latchBtn.className = 'btn cough-btn cough-latch';
+
+  /**
+   * keyCap builds the printed key legend on a button. The bound key has to be
+   * OBVIOUS — this control exists for the moment when looking at the screen is
+   * what the operator cannot do, and a shortcut nobody can see is a shortcut
+   * nobody uses — so it is drawn on the button, not hidden in a tooltip.
+   */
+  function keyCap(label, code) {
+    const wrap = document.createElement('span');
+    wrap.className = 'cough-btn-label';
+    const text = document.createElement('span');
+    text.textContent = label;
+    const cap = document.createElement('kbd');
+    cap.className = 'keycap';
+    cap.textContent = describeMuteKey(code);
+    wrap.append(text, cap);
+    return wrap;
+  }
+  pushBtn.append(keyCap('PUSH TO MUTE', MUTE_KEY_PUSH));
+  latchBtn.append(keyCap('LATCH MUTE', MUTE_KEY_LATCH));
+
+  // PUSH is pointer-held, and every way of losing the release is covered:
+  // pointerup, pointercancel, pointerleave, and the window-level blur and
+  // visibilitychange below. A hold whose release is never seen is a dead
+  // microphone for the rest of the match.
+  pushBtn.addEventListener('pointerdown', (ev) => {
+    // Keep the pointer's events coming to this element even if it slides off,
+    // where the runtime supports it; the leave/cancel handlers are the belt to
+    // that brace, not a substitute for it.
+    if (typeof pushBtn.setPointerCapture === 'function' && ev.pointerId !== undefined) {
+      try {
+        pushBtn.setPointerCapture(ev.pointerId);
+      } catch {
+        /* not supported; the leave handler still covers it */
+      }
+    }
+    handlers.onMutePress();
+  });
+  for (const type of ['pointerup', 'pointercancel', 'pointerleave']) {
+    pushBtn.addEventListener(type, () => handlers.onMuteRelease());
+  }
+  latchBtn.addEventListener('click', () => handlers.onMuteLatchToggle());
+
+  coughEl.append(coughReadout, pushBtn, latchBtn);
+  matchBar.append(overallEl, coughEl);
+
+  // ----- the keyboard bindings -----
+  //
+  // Document-level and capturing, because the operator's hands are not
+  // guaranteed to be anywhere near this button, and because the default action
+  // has to be suppressed: Space activates whatever is focused and scrolls.
+  // isTypingTarget keeps a passphrase field in Settings from muting the
+  // commentary on every word.
+  //
+  // repeat is ignored: holding a key fires keydown at the platform's repeat
+  // rate, and each one would re-issue a mute that is already held.
+  //
+  // pushKeyHeld records whether THIS binding owns the current Space press. It
+  // decides one thing only: whether the keyup may be cancelled. A <button> is
+  // activated by Space on the KEYUP, so cancelling that edge unconditionally is
+  // what silenced every button in the app — see isSpaceActivated.
+  let pushKeyHeld = false;
+  function onKeyDown(ev) {
+    if (ev.repeat || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    if (isTypingTarget(ev.target)) return;
+    if (ev.code === MUTE_KEY_PUSH) {
+      // The focused control already answers to Space: it keeps it. PUSH TO MUTE
+      // is the exception, because its activation is this mute, and because a
+      // click gives one event where a hold needs a press and a release.
+      if (ev.target !== pushBtn && isSpaceActivated(ev.target)) return;
+      ev.preventDefault();
+      pushKeyHeld = true;
+      handlers.onMutePress();
+      return;
+    }
+    if (ev.code === MUTE_KEY_LATCH) {
+      ev.preventDefault();
+      handlers.onMuteLatchToggle();
+    }
+  }
+  function onKeyUp(ev) {
+    if (ev.code !== MUTE_KEY_PUSH) return;
+    // The RELEASE is not gated on where the key came up: a keydown that started
+    // outside a field and a keyup delivered inside one must still release, and
+    // release() is a no-op when nothing is held and never touches the latch. The
+    // release path is deliberately harder to block than the press path.
+    //
+    // The DEFAULT is cancelled only when the press was ours, so a Space that
+    // went to a focused button still activates it on this edge.
+    if (pushKeyHeld) ev.preventDefault();
+    pushKeyHeld = false;
+    handlers.onMuteRelease();
+  }
+  document.addEventListener('keydown', onKeyDown, { capture: true });
+  document.addEventListener('keyup', onKeyUp, { capture: true });
+  // The window losing focus, or the page being hidden, means the keyup may be
+  // delivered somewhere else and never arrive. Release rather than hold: the
+  // latch is untouched by both, because a latch is a deliberate choice and
+  // dropping it would put a live microphone up without anybody asking.
+  // Both also drop pushKeyHeld: the keyup for this press is now never coming, so
+  // leaving the flag set would arm a preventDefault on some later, unrelated
+  // Space — which is the button-stealing bug arriving by the back door.
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('blur', () => {
+      pushKeyHeld = false;
+      handlers.onMuteRelease();
+    });
+  }
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        pushKeyHeld = false;
+        handlers.onMuteRelease();
+      }
+    });
+  }
+
+  // --- the column ----------------------------------------------------------
+  //
+  // Fixed width, permanently present, its own scroll. It carries the alerts and
+  // everything the main area no longer does: START/STOP and the preset picker,
+  // the six lamps, the input meters, the device and return controls, the picture
+  // selector.
+  //
+  // WHY THE RIGHT-HAND SIDE.
+  //
+  //   - DOM order is reading order. The picture and the mute controls come
+  //     first, for a screen reader and for a keyboard, and the tray after them.
+  //     A left-hand column reverses that on the one screen where the urgent
+  //     control must be reached first.
+  //   - The two buttons that used to lead to configuration — Mixer and Settings
+  //     — are already at the top RIGHT of the topbar. The tray belongs under the
+  //     things that used to open it, not across the screen from them.
+  //   - The picture is centred in what is left either way, so neither side is
+  //     better for the picture; this is decided on where the operator's hand and
+  //     eye already are.
+  //
+  // WHY IT IS FIXED-WIDTH AND NOT INTRINSIC. `flex: 0 0 var(--rail-w)` with the
+  // basis a constant. An `auto`-width column would be sized by its CONTENT, so
+  // an alert with a long sentence in it would widen the column, narrow the main
+  // area and move the picture — the original bug, rebuilt sideways. That is what
+  // homelayout.test.js pins, and it is why the alert text is allowed to wrap and
+  // to break inside a word rather than to push.
+  const rail = document.createElement('aside');
+  rail.className = 'home-rail';
+  rail.setAttribute('aria-label', 'Alerts and settings');
+
+  const railHeader = document.createElement('div');
+  railHeader.className = 'rail-header';
+  const railTitle = document.createElement('span');
+  railTitle.className = 'rail-title';
+  railTitle.textContent = 'ALERTS & SETTINGS';
+  const railCollapse = document.createElement('button');
+  railCollapse.type = 'button';
+  railCollapse.className = 'btn btn-ghost rail-collapse';
+  railHeader.append(railTitle, alertsCount, railCollapse);
+
+  // The collapsed strip. It is a THIRD fixed width, never zero: an alert that
+  // cannot be seen because the operator folded the column away is an alert that
+  // did not happen, so the strip keeps the attention count and the way back.
+  const railStrip = document.createElement('div');
+  railStrip.className = 'rail-strip';
+  const railExpand = document.createElement('button');
+  railExpand.type = 'button';
+  railExpand.className = 'btn btn-ghost rail-expand';
+  railExpand.textContent = '‹';
+  railExpand.title = 'Show alerts and settings';
+  railExpand.setAttribute('aria-label', 'Show alerts and settings');
+  const railStripLabel = document.createElement('span');
+  railStripLabel.className = 'rail-strip-label';
+  railStripLabel.textContent = 'ALERTS';
+  railStrip.append(railExpand, railStripCount, railStripLabel);
+
+  /**
+   * makeRailSection is one labelled block in the column.
+   *
+   * The column is scrolled and read at leisure, unlike the main area, so it can
+   * afford headings — and it needs them: six lamps, two meters, five controls
+   * and a preset picker with no structure is a list nobody finds anything in.
+   */
+  function makeRailSection(titleText, ...children) {
+    const section = document.createElement('section');
+    section.className = 'rail-section';
+    const h = document.createElement('h2');
+    h.className = 'rail-section-title';
+    h.textContent = titleText;
+    section.append(h, ...children);
+    return section;
+  }
+
+  // The MODE selector: which of the two cough behaviours is primary. It is in
+  // the column, not in Settings, because it is a match-time preference chosen
+  // where the operator is sitting when they choose it — and not in the match
+  // bar, because the main area holds the picture, one indicator and the mute
+  // controls themselves and nothing else. Both behaviours stay reachable
+  // whichever is chosen; see cough.js's MUTE_MODE for why that is not a fudge.
+  const coughModeSegmented = makeSegmented(
+    'cough-mute-mode',
+    [
+      {
+        value: MUTE_MODE.PUSH,
+        label: 'Push',
+        hint: `Hold ${describeMuteKey(MUTE_KEY_PUSH)} or the button to mute; release to go live.`,
+      },
+      {
+        value: MUTE_MODE.LATCH,
+        label: 'Latch',
+        hint: `Press ${describeMuteKey(MUTE_KEY_LATCH)} or the button to mute until pressed again.`,
+      },
+    ],
+    (mode) => handlers.onCoughModeChange(mode),
   );
+  coughModeSegmented.set(DEFAULT_MUTE_MODE);
+
+  const coughModeGroup = document.createElement('div');
+  coughModeGroup.className = 'control-group control-group-cough-mode';
+  const coughModeLabel = document.createElement('span');
+  coughModeLabel.className = 'control-label';
+  coughModeLabel.textContent = 'Primary cough control';
+  coughModeGroup.append(coughModeLabel, coughModeSegmented.el);
+
+  rail.append(
+    railHeader,
+    alertsRegion,
+    makeRailSection('Cough mute', coughModeGroup),
+    makeRailSection('Session', actionRow, presetIndicator),
+    makeRailSection('Status', lampsEl, metersEl),
+    makeRailSection('Audio', controls),
+    makeRailSection('Picture', sourceGroup),
+    railStrip,
+  );
+
+  // --- collapsing, which is an OPERATOR ACTION and only that ---------------
+  //
+  // Collapsing narrows the column to the strip and gives the width to the
+  // picture, so it DOES move the picture. That is allowed and nothing else is:
+  // an operator who asks for a bigger picture is choosing to resize it, which is
+  // categorically different from an alert resizing it for them. Nothing in this
+  // file, and nothing app.js can call, collapses or expands the column — there
+  // is no setter for it on the returned view, deliberately, so no event can
+  // reach it. The only writers are these two buttons.
+  //
+  // The class goes on the VIEW, not on the column, because the main area's width
+  // is what actually changes and CSS has no parent selector.
+  let railCollapsed = false;
+  function renderRail() {
+    el.classList.toggle('home-rail-collapsed', railCollapsed);
+    rail.setAttribute('aria-expanded', railCollapsed ? 'false' : 'true');
+    railCollapse.textContent = '›';
+    railCollapse.title = 'Hide alerts and settings (the picture gets the space)';
+    railCollapse.setAttribute('aria-label', 'Hide alerts and settings');
+    // app.js re-measures the native overlays off a ResizeObserver on the picture
+    // element, so nothing has to be told: .pgm-tile changing size IS the event.
+  }
+  railCollapse.addEventListener('click', () => {
+    railCollapsed = true;
+    renderRail();
+  });
+  railExpand.addEventListener('click', () => {
+    railCollapsed = false;
+    renderRail();
+  });
+  renderRail();
+
+  // --- the two-column body -------------------------------------------------
+  //
+  // .home-main grows and .home-rail does not. min-width: 0 on the main column is
+  // what stops a wide child (a long device name in a <select>) from forcing the
+  // flex line wider than the window and pushing the column off the edge.
+  const homeMain = document.createElement('div');
+  homeMain.className = 'home-main';
+  homeMain.append(pgmStage, matchBar);
+
+  const homeBody = document.createElement('div');
+  homeBody.className = 'home-body';
+  homeBody.append(homeMain, rail);
+
+  el.append(header, homeBody, audioEl);
 
   // --- setters --------------------------------------------------------
 
@@ -1199,15 +1674,161 @@ export function createHomeView(handlers) {
     // header must be disabled with the reason on it rather than left to fail.
     presetSendingNow = running === true;
     renderPresetIndicator();
+    // And the overall indicator, from the SAME state: "STANDBY" and "the button
+    // says START" are the same fact, and they arrive here together so they
+    // cannot drift apart. See overall.js, case 1.
+    overallRunning = running === true;
+    renderOverall();
   }
 
   function setBusy(busy) {
     startStopBtn.disabled = busy;
   }
 
-  function setStatusUnavailable(unavailable) {
-    statusUnavailableBanner.hidden = !unavailable;
+  // --- the one overall indicator -------------------------------------------
+  //
+  // ===================== IT IS NOT A SEVENTH DERIVATION ======================
+  //
+  // Every lamp on the row is derived in app.js from backend state, exactly as it
+  // was before this screen had a summary. This file does not re-derive any of
+  // them and holds no backend knowledge, per its header. What it does is
+  // REMEMBER what it was told to paint, and reduce that with overall.js's pure
+  // rule. So the indicator is a function of the six values the operator can also
+  // read on the row two feet away, and the two cannot disagree — which is the
+  // only way a summary is worth having.
+  const lampState = {};
+  for (const name of LAMP_NAMES) lampState[name] = { level: 'grey', text: 'NOT STARTED' };
+
+  let overallRunning = false;
+
+  function renderOverall() {
+    const overall = deriveOverallStatus(
+      LAMP_NAMES.map((name) => ({ name, lamp: lampState[name] })),
+      { running: overallRunning },
+    );
+    for (const level of Object.values(OVERALL_LEVELS)) {
+      overallEl.classList.toggle(`overall-${level}`, level === overall.level);
+    }
+    overallGlyph.textContent = GLYPH[overall.level];
+    overallText.textContent = overall.text;
+    // The reason, on ONE line that is allowed to ellipsise. A detail that could
+    // wrap to two lines would change the match bar's height, and the match bar's
+    // height is what .pgm-tile is sized against. The full sentence is on the
+    // title, and the six lamps it came from are in the column.
+    overallDetail.textContent = overall.detail;
+    const described = describeOverall(overall);
+    overallEl.title = described;
+    overallEl.setAttribute('aria-label', `Overall status: ${described}`);
   }
+
+  // The lamps handed to app.js are WRAPPERS: they paint the row exactly as
+  // before and additionally record what they were told, so renderOverall has
+  // something to reduce. The shape is unchanged ({el, update}), so app.js's
+  // existing calls — home.lamps.MONITOR.update(...) and the rest — are untouched.
+  const wrappedLamps = {};
+  for (const name of LAMP_NAMES) {
+    const lamp = lamps[name];
+    wrappedLamps[name] = {
+      el: lamp.el,
+      update(value) {
+        lampState[name] = value || { level: 'grey', text: '' };
+        lamp.update(value);
+        renderOverall();
+      },
+    };
+  }
+
+  renderOverall();
+
+  // --- the cough mute readout ----------------------------------------------
+  //
+  // ONE object in, everything on the screen out. app.js owns the state machine
+  // (cough.js) and hands its describeMute() output here; there is no second
+  // place in this file where "muted" is decided, and no branch that can leave
+  // the buttons saying one thing and the readout another.
+  function setMuteReadout(readout) {
+    const r = readout || {};
+    const muted = r.muted === true;
+
+    coughState.textContent = r.text || '';
+    // The reason is drawn only when there is one, and it is a SHAPE as well as
+    // words: "MUTED · LATCHED" reads differently at a glance from "MUTED ·
+    // HOLDING", and only the first survives letting go of the key.
+    coughReason.textContent = r.reason ? `· ${r.reason}` : '';
+    coughReadout.title = r.detail || '';
+
+    for (const state of ['live', 'muted', 'muting', 'unmuting', 'failed', 'unavailable']) {
+      coughEl.classList.toggle(`cough--${state}`, r.state === state);
+    }
+
+    // WHICH BEHAVIOUR IS PRIMARY. Drawn from the readout's own `mode`, so the
+    // emphasis on the buttons and the "PUSH MODE" line under the state come from
+    // one value. The order is CSS, not DOM: the tab order and the screen
+    // reader's order stay push-then-latch whatever the preference, because a
+    // control's identity moving with a setting is how a key gets pressed by
+    // muscle memory and does the other thing.
+    const mode = normaliseMuteMode(r.mode);
+    coughEl.classList.toggle('cough--mode-latch', mode === MUTE_MODE.LATCH);
+    pushBtn.classList.toggle('cough-btn-primary', mode === MUTE_MODE.PUSH);
+    latchBtn.classList.toggle('cough-btn-primary', mode === MUTE_MODE.LATCH);
+
+    // ================== THE MUTED STATE IS UNMISSABLE =======================
+    //
+    // A class on the VIEW, so the treatment is not confined to a control in the
+    // corner: main.css draws a heavy red OUTLINE around the programme picture
+    // while the commentary is muted. An outline, specifically — it is painted
+    // outside the border box, so it costs no layout at all and it falls OUTSIDE
+    // the rectangle the native SRT overlay covers, which means it is visible
+    // over the good picture as well as over the mosaic. A border or an inset
+    // shadow would fail both of those tests.
+    //
+    // Colour is not the only signal: the readout says the word MUTED, names
+    // which control is holding it, and the outline is a shape change around the
+    // one thing the commentator is already looking at.
+    el.classList.toggle('is-muted', muted);
+
+    pushBtn.setAttribute('aria-pressed', String(r.held === true));
+    latchBtn.setAttribute('aria-pressed', String(r.latched === true));
+    pushBtn.classList.toggle('cough-btn-on', r.held === true);
+    latchBtn.classList.toggle('cough-btn-on', r.latched === true);
+
+    // A build without the binding must not offer a mute that silently does
+    // nothing — that is worse than having no button at all, because the operator
+    // would trust it. Disabled, with the reason on the control.
+    const unavailable = r.available === false;
+    pushBtn.disabled = unavailable;
+    latchBtn.disabled = unavailable;
+    if (unavailable) {
+      pushBtn.title = r.detail || '';
+      latchBtn.title = r.detail || '';
+    } else {
+      pushBtn.title = `Hold to mute the commentary at the send path. Bound to ${describeMuteKey(MUTE_KEY_PUSH)}.`;
+      latchBtn.title = `Mute until pressed again. Bound to ${describeMuteKey(MUTE_KEY_LATCH)}.`;
+    }
+  }
+
+  /**
+   * setCoughMode selects the saved preference on the column's control. It does
+   * NOT change the readout — the readout's `mode` comes from the model, which
+   * app.js has already been told — so there is one owner of the value and this
+   * is only the picker agreeing with it.
+   */
+  function setCoughMode(mode) {
+    coughModeSegmented.set(normaliseMuteMode(mode));
+  }
+
+  // Drawn once at construction so the control is never blank, and so the first
+  // thing it says is the truth: nothing is muted until something mutes it. The
+  // mode shown is the documented default until a configuration says otherwise.
+  setMuteReadout({
+    state: 'live',
+    text: 'LIVE',
+    muted: false,
+    reason: `${describeMuteMode(DEFAULT_MUTE_MODE)} MODE`,
+    held: false,
+    latched: false,
+    mode: DEFAULT_MUTE_MODE,
+  });
 
   return {
     el,
@@ -1221,7 +1842,9 @@ export function createHomeView(handlers) {
     // precisely so the two rectangles can never overlap, which would erase one
     // window with the other and report nothing.
     previewEl: previewTile,
-    lamps,
+    // The WRAPPED lamps: same {el, update} shape, same paint, and each update
+    // also feeds the one overall indicator. See renderOverall.
+    lamps: wrappedLamps,
     setDevBadge,
     setRemoteClients,
     setTile,
@@ -1243,8 +1866,10 @@ export function createHomeView(handlers) {
     setActivePreset,
     setRunning,
     setBusy,
-    setStatusUnavailable,
+    setMuteReadout,
+    setCoughMode,
     showError,
+    showNote,
     clearError,
   };
 }
