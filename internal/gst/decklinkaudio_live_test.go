@@ -81,25 +81,17 @@ const (
 	digitalSilenceDB = -95.0
 )
 
-// liveDeckLinkInit resolves the bundled GStreamer inside the .app and calls
-// Init, skipping on a machine that has not run the bundler.
+// liveDeckLinkInit resolves a macOS GStreamer and calls Init.
 //
-// It uses bundlePluginDir rather than a written-out path so that the check is
-// the package's own answer to "where are the plugins" on whichever platform this
-// is compiled for, and cannot drift from what Init will actually look at.
+// THE DEFAULT IS NO LONGER THE SHIPPED .app, and pointing it back at one will
+// segfault this binary rather than fail it: the bundle's plugins now resolve the
+// GStreamer core through @loader_path, so loading them beside the Homebrew core
+// this test is linked against puts two GObject type systems in one process.
+// liveInitDarwin in kindprobe_live_test.go has the full diagnosis and the
+// symlink farm to set WSLCOMMS_LIVE_APP_DIR to.
 func liveDeckLinkInit(t *testing.T) {
 	t.Helper()
-	appDir, err := filepath.Abs(env("WSLCOMMS_LIVE_APP_DIR",
-		"../../build/bin/WSL Commentary.app/Contents/MacOS"))
-	if err != nil {
-		t.Fatalf("resolving the app directory: %v", err)
-	}
-	if _, err := os.Stat(bundlePluginDir(appDir)); err != nil {
-		t.Skipf("no bundled GStreamer under %s: %v", bundlePluginDir(appDir), err)
-	}
-	if err := Init(appDir); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	liveInitDarwin(t)
 }
 
 // meterWatch accumulates the loudest peak each channel reached over a run, from
