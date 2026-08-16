@@ -123,17 +123,58 @@ test('and the mirror image: a 1080p50 feed into a 720p50 instance is RED', () =>
     frameRate: 50,
   });
   assert.equal(lamps.video.level, LEVEL.RED);
-  assert.equal(lamps.video.text, VIDEO_1080P50.raw, 'and it shows what arrived, verbatim');
+  assert.equal(lamps.video.text, 'WRONG FORMAT');
+  assert.match(lamps.video.detail, /1920/, 'and the detail still shows what arrived, verbatim');
 });
 
-test('a mismatch shows Raw and never a verdict — the reason the lamp has text', () => {
+test('a frame rate M2L-X does not report is UNKNOWN, not WRONG', () => {
+  // THE BUG THIS EXISTS TO STOP, and it was on screen. MEASURED on matchH,
+  // 2026-08-15, with a feed the switcher was ingesting perfectly — stream_state
+  // "streaming", zero error packets, stable across 45 s:
+  //
+  //	codec="h264" width=1920 height=1080 frame_rate="0" scan_type="P" ...
+  //
+  // The raster matched, the codec matched, and the lamp went RED because
+  // 0 !== 50. The operator is told their good feed is broken, which is worse
+  // than saying nothing: it sends them hunting for a fault in the one part that
+  // is working. normaliseConformTarget already reasons about a zero rate on the
+  // TARGET side; this is the same argument on the OBSERVED side, where it bit.
+  const noRate = {
+    codec: 'h264',
+    width: 1920,
+    height: 1080,
+    frameRate: 0,
+    raw: 'codec="h264" width=1920 height=1080 frame_rate="0" scan_type="P"',
+  };
+  const lamps = deriveStatusLamps(healthyStatus(noRate), { width: 1920, height: 1080, frameRate: 50 });
+  assert.equal(lamps.video.level, LEVEL.GREEN, 'an unreported rate must not read as a mismatch');
+
+  // And the guard on the guard: a rate that IS reported and IS wrong is still a
+  // fault, which is the whole reason this comparison exists.
+  const wrongRate = { ...noRate, frameRate: 25 };
+  assert.equal(
+    deriveStatusLamps(healthyStatus(wrongRate), { width: 1920, height: 1080, frameRate: 50 }).video.level,
+    LEVEL.RED,
+    'a reported rate that disagrees is still red',
+  );
+});
+
+test('a mismatch keeps Raw, on the DETAIL rather than the badge', () => {
   // "1080P50 expected" tells the operator nothing about what they are actually
   // sending. Raw names the fields M2L-X reported, which is the only thing on
-  // screen that can start a diagnosis.
+  // screen that can start a diagnosis — so it must still reach them.
+  //
+  // But it is not a MESSAGE. The badge used to read
+  // 'codec="h264" width=1920 height=1080 frame_rate="0" scan_type="P"
+  // bit_depth=8 color_space="YCbCr" sample_format="420"', which is a list to
+  // be parsed under pressure and is unreadable at the only distance a lamp is
+  // ever read from. The badge says the STATE; createLamp hangs the detail off
+  // the element's title.
   const wrong = { codec: 'h264', width: 1920, height: 1080, frameRate: 25, raw: 'frame_rate="25"' };
   const lamps = deriveStatusLamps(healthyStatus(wrong));
   assert.equal(lamps.video.level, LEVEL.RED);
-  assert.equal(lamps.video.text, 'frame_rate="25"');
+  assert.equal(lamps.video.text, 'WRONG FORMAT', 'the badge is a state, not a property dump');
+  assert.match(lamps.video.detail, /frame_rate="25"/, 'and Raw survives, where it can be read');
 
   // And when there is no format at all — a stopped node, where M2L-X sends
   // format: null and format.go renders Raw as "" — the lamp still says
@@ -156,7 +197,8 @@ test('the CODEC is absolute: h264 whatever raster is targeted', () => {
     codec: 'h265', // present in the real payload, and deliberately ignored
   });
   assert.equal(lamps.video.level, LEVEL.RED, 'a codec that is not h264 is never green');
-  assert.equal(lamps.video.text, 'codec="h265"');
+  assert.equal(lamps.video.text, 'WRONG FORMAT');
+  assert.match(lamps.video.detail, /codec="h265"/);
 });
 
 test('normaliseConformTarget replaces bad fields ONE AT A TIME', () => {

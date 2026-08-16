@@ -334,16 +334,50 @@ export function deriveStatusLamps(status, conformTarget) {
 
   const want = normaliseConformTarget(conformTarget);
   const v = status.video || {};
-  const videoGood =
-    v.codec === CONFORM_CODEC &&
-    v.width === want.width &&
-    v.height === want.height &&
-    v.frameRate === want.frameRate;
+
+  // A REPORTED FRAME RATE OF ZERO MEANS "NOT MEASURED", NOT "WRONG".
+  //
+  // normaliseConformTarget above already reasons about this for the TARGET side
+  // — "no real format has frameRate 0, so the lamp would sit red forever with
+  // nothing on screen explaining why" — and the same is true of the OBSERVED
+  // side, which is where it actually bit. MEASURED on matchH, 2026-08-15, with a
+  // feed the switcher was ingesting perfectly:
+  //
+  //	codec="h264" width=1920 height=1080 frame_rate="0" scan_type="P" ...
+  //
+  // Stable across 45 s of continuous streaming. The raster matches, the codec
+  // matches, M2L-X reports stream_state "streaming" with zero error packets, and
+  // the lamp went RED because 0 !== 50. The operator is told their good feed is
+  // broken, which is worse than saying nothing: it sends them looking for a
+  // fault in the one thing that is working.
+  //
+  // So an unreported rate is not a mismatch. Everything else still has to agree,
+  // and a rate that is present and WRONG is still red — that is a real fault and
+  // the reason this comparison exists.
+  const rateReported = Number.isFinite(v.frameRate) && v.frameRate > 0;
+  const rasterGood =
+    v.codec === CONFORM_CODEC && v.width === want.width && v.height === want.height;
+  const videoGood = rasterGood && (!rateReported || v.frameRate === want.frameRate);
+
+  // THE BADGE IS A STATE, NOT A PROPERTY DUMP. It used to render v.raw —
+  // 'codec="h264" width=1920 height=1080 frame_rate="0" scan_type="P"
+  // bit_depth=8 color_space="YCbCr" sample_format="420"' — into the lamp
+  // itself. That is not a message: it is a list an operator has to parse under
+  // pressure to work out which field is the problem, and it is unreadable at a
+  // glance, which is the only way a lamp is ever read. Raw is still the most
+  // useful thing we have when something IS wrong, so it moves to `detail`,
+  // which createLamp hangs off the element's title.
   const video = videoGood
-    ? { level: LEVEL.GREEN, text: describeConformTarget(want) }
-    : // Raw, verbatim — what M2L-X says it received, not what it should have
-      // been. This is the whole reason the lamp carries text at all.
-      { level: LEVEL.RED, text: v.raw || 'NO VIDEO' };
+    ? { level: LEVEL.GREEN, text: describeConformTarget(want), detail: v.raw || '' }
+    : !v.raw
+      ? { level: LEVEL.RED, text: 'NO VIDEO', detail: 'M2L-X reports no video format on this input.' }
+      : {
+          level: LEVEL.RED,
+          text: 'WRONG FORMAT',
+          detail:
+            `M2L-X reports ${v.raw}\nThis feed must be ${describeConformTarget(want)} to be ` +
+            `accepted: every source has to match the switcher's configured format.`,
+        };
 
   const audioList = Array.isArray(status.audio) ? status.audio : [];
   let audio;
@@ -358,9 +392,19 @@ export function deriveStatusLamps(status, conformTarget) {
       a0.codec === GOOD_AUDIO.codec &&
       a0.sampleRate === GOOD_AUDIO.sampleRate &&
       a0.channels === GOOD_AUDIO.channels;
+    // Same rule as the video lamp: a STATE on the badge, the format object
+    // behind the pointer. a0.raw is 'codec="aac" sample_rate=48000
+    // channel_count=2 bit_depth=0' and reads as a property list rather than a
+    // message wherever it is put.
     audio = audioGood
-      ? { level: LEVEL.GREEN, text: 'AAC 48K STEREO' }
-      : { level: LEVEL.RED, text: a0.raw || 'BAD FORMAT' };
+      ? { level: LEVEL.GREEN, text: 'AAC 48K STEREO', detail: a0.raw || '' }
+      : {
+          level: LEVEL.RED,
+          text: 'WRONG FORMAT',
+          detail: a0.raw
+            ? `M2L-X reports ${a0.raw}\nThis feed must be AAC, 48 kHz, stereo.`
+            : 'M2L-X reports no audio format on this input.',
+        };
   }
 
   return { switcher, video, audio, unavailable: false };
@@ -439,11 +483,20 @@ export function createLamp(name, initial = { level: LEVEL.GREY, text: 'NOT START
   function update(lamp) {
     const level = lamp?.level || LEVEL.GREY;
     const text = lamp?.text || '';
+    // DETAIL IS FOR HOVER, NEVER FOR THE BADGE. A lamp is read at a glance, so
+    // its text is a STATE — two words, the same shape every time, legible from
+    // across a gallery. Anything longer belongs behind the pointer: the badge
+    // used to carry M2L-X's whole format object and it was unreadable exactly
+    // when it mattered. aria-label carries both so a screen reader is not
+    // limited to the short form.
+    const detail = lamp?.detail || '';
     el.classList.remove('lamp-green', 'lamp-amber', 'lamp-red', 'lamp-grey');
     el.classList.add(`lamp-${level}`);
     glyph.textContent = GLYPH[level] || GLYPH[LEVEL.GREY];
     stateEl.textContent = text;
-    el.setAttribute('aria-label', `${name}: ${text}`);
+    if (detail) el.title = `${name}: ${text}\n${detail}`;
+    else el.removeAttribute('title');
+    el.setAttribute('aria-label', detail ? `${name}: ${text}. ${detail}` : `${name}: ${text}`);
   }
 
   update(initial);
