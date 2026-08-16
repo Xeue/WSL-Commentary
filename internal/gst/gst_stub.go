@@ -381,14 +381,13 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	if opts.SlatePath == "" {
 		return errors.New("gst: PipelineOpts.SlatePath is required")
 	}
-	if opts.AudioDeviceID == "" {
-		return errors.New("gst: PipelineOpts.AudioDeviceID is required")
-	}
-	// The identical render-endpoint refusal the real twin applies, through the
+	// The identical commentary-source rule the real twin applies, through the
 	// same shared helper, so the two builds cannot drift on either the rule or
-	// the wrapped ErrNotACaptureDevice sentinel. See device_id.go for the rule
-	// and its deliberate asymmetry.
-	if err := refuseRenderEndpoint(opts.AudioDeviceID); err != nil {
+	// the wrapped ErrNotACaptureDevice sentinel: exactly one of AudioDeviceID and
+	// AudioCaptureID, a DeckLink id that converts, and no render endpoint. See
+	// refuseWrongAudioSource in gst.go, and device_id.go for the render half and
+	// its deliberate asymmetry.
+	if err := refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); err != nil {
 		return err
 	}
 	// The identical refusal the real twin makes of a video capture id that is
@@ -406,6 +405,22 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 				"input becomes the video leg, and it must be a DeckLink persistent-id rather "+
 				"than an audio device id: %w", err)
 		}
+	}
+	// ONE CARD when both legs are on one, the identical refusal the real twin
+	// makes and for the identical reason: a DeckLink drives audio capture off
+	// the VIDEO clock, so a commentary leg on one card cannot be clocked by
+	// another card's video, and the card is exclusive so no third element is
+	// available to clock it. The real build discovers this as a seat that will
+	// not preroll and names neither card; here it is a sentence, at Gate A,
+	// before any hardware is involved.
+	if opts.AudioCaptureID != "" && opts.VideoCaptureID != "" &&
+		opts.AudioCaptureID != opts.VideoCaptureID {
+		return fmt.Errorf("gst: PipelineOpts.VideoCaptureID is card %s and "+
+			"PipelineOpts.AudioCaptureID is card %s. A DeckLink drives audio capture off the "+
+			"VIDEO clock, so a commentary leg on one card cannot be clocked by another card's "+
+			"video, and the card is exclusive so a third element is not available to clock it. "+
+			"Both legs must name the same card, or the video leg must be the slate",
+			opts.VideoCaptureID, opts.AudioCaptureID)
 	}
 
 	if opts.VideoBitrateKbps == 0 {
@@ -437,6 +452,20 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	// matrix exists for. Two channels or one behave as they always did: no
 	// matrix, and SetChannelMap refuses with the same message the real twin
 	// gives for a positioned device.
+	// A DECKLINK COMMENTARY SEAT NEGOTIATES SIXTEEN, and the stub says so rather
+	// than leaving the fake pad at its stereo default. decklinkaudiosrc is built
+	// with channels=16 and there is no configuration in which it presents a pair,
+	// so a Gate A test that started a DeckLink seat and got two channels would be
+	// exercising a shape the shipped build cannot produce — no matrix written, no
+	// per-channel meter armed, and a routing UI able to depend on both.
+	//
+	// A caller that has ALREADY widened the pad keeps its own number: 8 is a real
+	// card setting and a test that asked for it means it. Only the stereo default
+	// — the one value a DeckLink audio seat can never have — is replaced.
+	if opts.AudioCaptureID != "" && p.inputChannels <= ChannelMapOutputs {
+		p.inputChannels = deckLinkAudioChannels
+	}
+
 	if p.inputChannels > ChannelMapOutputs {
 		if _, err := opts.ChannelMap.MixMatrix(p.inputChannels); err != nil {
 			return err

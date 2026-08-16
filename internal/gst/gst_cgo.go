@@ -315,6 +315,24 @@ const (
 	nameVideoCapQueue = "vcapq"     // the broadcast branch's head queue
 )
 
+// nameVideoCaptureClockSink is the fakesink the CLOCK COMPANION feeds: the
+// decklinkvideosrc that exists only so decklinkaudiosrc can preroll, on a seat
+// whose picture is the slate.
+//
+// It begins with videoCaptureNamePrefix like everything else in that leg, and
+// that is load-bearing rather than tidy. classifyBusError decides by name; an
+// unprefixed sink would rejoin the FATAL default, so a fakesink erroring on a
+// seat whose commentary is fine would take the commentary off air. With the
+// prefix it is classVideoCapture, which — because the commentary IS clocked by
+// this element on every pipeline that has it — is then upgraded to
+// classAudioCapture by the second stage in onBusMessage. Both answers are
+// correct and the difference between them is the difference between a named
+// audio fault and a nameless pipeline death.
+//
+// The companion source itself is nameVideoCaptureClock, declared in
+// capturefault.go beside the classifier that reads it.
+const nameVideoCaptureClockSink = "vcapclocksink"
+
 // videoCaptureFactory is the element that opens the card's video input.
 //
 // It is NOT in elements_windows.go / elements_darwin.go, and its absence from
@@ -325,6 +343,21 @@ const (
 // putting an identical constant in both halves would be two places to change a
 // name that can only ever change in one.
 const videoCaptureFactory = "decklinkvideosrc"
+
+// audioCaptureFactory is the element that opens the card's EMBEDDED AUDIO: the
+// sixteen channels a DeckLink presents alongside its video input.
+//
+// It is beside videoCaptureFactory and NOT in the elements_*.go platform seam,
+// for the identical reason: one upstream plugin, built against Blackmagic's own
+// SDK, with the same factory name on both ports. The seam exists for the
+// elements that genuinely differ — the platform's own capture source and AAC
+// encoder — and this is not one of them.
+//
+// It never appears in the parse string with a `connection` property. See
+// pipelineDescription: connection PERSISTENTLY RECONFIGURES THE CARD and
+// overrides Blackmagic Desktop Video Setup, and it has had to be undone by hand
+// twice. If the card is silent the answer is never another connection value.
+const audioCaptureFactory = "decklinkaudiosrc"
 
 // propMixMatrix is audioconvert's routing matrix: the property that says which
 // input channel reaches which output, and at what gain. It is the whole of the
@@ -459,6 +492,29 @@ var videoCaptureRequiredElements = []requiredElement{
 	{"deinterlace", "deinterlace"},
 	{"videorate", "videorate"},
 	{"tee", "coreelements"},
+}
+
+// audioCaptureRequiredElements are the factories a DECKLINK COMMENTARY seat
+// needs, and it is a separate list for the same two-registers reason
+// videoCaptureRequiredElements is: Init reports, Start refuses.
+//
+// decklinkvideosrc IS IN IT, and that is the entry a reader will want to
+// delete. It is here because a DeckLink audio seat cannot start without one —
+// measured, decklinkaudiosrc produces zero buffers with no video element in the
+// pipeline — whether the operator asked for a picture from the card or not. A
+// bundle with the decklink plugin present has both, so this can only ever fire
+// together with the video leg's entry; listing it anyway is what makes the list
+// answer "what does THIS seat need" without the reader having to know that the
+// audio drags a video element in with it.
+//
+// fakesink is coreelements and cannot be missing from a GStreamer that has queue
+// in it. It is listed for videoCaptureRequiredElements' reason about tee: the
+// value of the list is that it is exhaustive, and an entry that is always
+// present costs one registry lookup at Init.
+var audioCaptureRequiredElements = []requiredElement{
+	{audioCaptureFactory, "decklink"},
+	{videoCaptureFactory, "decklink"},
+	{"fakesink", "coreelements"},
 }
 
 // initEnvVar is one environment variable that has to be in place before
@@ -643,6 +699,18 @@ func doInit(appDir string) error {
 		log.Printf("gst: Init: the bundled GStreamer in %q cannot build a live video capture leg: "+
 			"%s. The slate leg is unaffected and this seat will go on air normally; a seat "+
 			"configured for a DeckLink video input will be refused at Start (check the %s allowlist)",
+			pluginDir, strings.Join(missing, ", "), bundleAllowlistNoun)
+	}
+
+	// And the same again for the COMMENTARY coming off the card, reported
+	// separately because it is a separate seat with a separate refusal: a bundle
+	// can be missing the decklink plugin and be perfectly able to carry a
+	// microphone seat, which is every seat shipping today.
+	if missing := missingFrom(audioCaptureRequiredElements); len(missing) > 0 {
+		log.Printf("gst: Init: the bundled GStreamer in %q cannot build a DeckLink commentary "+
+			"capture leg: %s. A seat whose commentary input is a microphone is unaffected and will "+
+			"go on air normally; a seat configured for a DeckLink commentary input will be refused "+
+			"at Start (check the %s allowlist)",
 			pluginDir, strings.Join(missing, ", "), bundleAllowlistNoun)
 	}
 
@@ -1315,19 +1383,27 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if opts.SlatePath == "" {
 		return errors.New("gst: PipelineOpts.SlatePath is required")
 	}
-	if opts.AudioDeviceID == "" {
-		return errors.New("gst: PipelineOpts.AudioDeviceID is required")
-	}
-	// Refuse a RENDER (playback) endpoint here, synchronously, before anything
-	// is built. wasapi2src accepts such an id at construction and fails
+	// WHICH ELEMENT OPENS THE COMMENTARY, decided and refused here,
+	// synchronously, before anything is built.
+	//
+	// It replaces the bare "AudioDeviceID is required" this check used to be,
+	// and the replacement is not a relaxation: exactly one of the two source
+	// fields must be given, so the state that check existed to prevent — a
+	// platform capture element with an empty device, which is the SYSTEM DEFAULT
+	// INPUT and not an error — is still unreachable, and the DeckLink seat that
+	// used to be unexpressible now is.
+	//
+	// refuseWrongAudioSource also carries the RENDER (playback) endpoint refusal
+	// unchanged, and it stays synchronous and up front for the reason it always
+	// was: wasapi2src accepts such an id at construction and fails
 	// ASYNCHRONOUSLY — error 1551 on the bus, after Start has returned success —
-	// and the sender then misreads a local device fault as a network failure
-	// and retries the SRT link forever. The rule and its deliberate asymmetry
-	// (only a POSITIVE render identification refuses; unknown shapes pass) live
-	// in device_id.go, shared with the stub twin so the two cannot drift.
-	// NEVER "fix" this by setting wasapi2src's loopback property instead: that
-	// opens the operator's own monitor mix as the commentary source.
-	if err := refuseRenderEndpoint(opts.AudioDeviceID); err != nil {
+	// and the sender then misreads a local device fault as a network failure and
+	// retries the SRT link forever. The rule and its deliberate asymmetry (only
+	// a POSITIVE render identification refuses; unknown shapes pass) live in
+	// device_id.go, shared with the stub twin so the two cannot drift. NEVER
+	// "fix" it by setting wasapi2src's loopback property instead: that opens the
+	// operator's own monitor mix as the commentary source.
+	if err := refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); err != nil {
 		return err
 	}
 	if opts.VideoBitrateKbps == 0 {
@@ -1373,6 +1449,53 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		}
 		log.Printf("gst: Start: the video leg is a LIVE CAPTURE from DeckLink card %s; "+
 			"the slate is not built", opts.VideoCaptureID)
+	}
+
+	// THE COMMENTARY LEG'S SOURCE, refused here on the same terms and before
+	// anything is built. The id itself has already been converted by
+	// refuseWrongAudioSource, so what is left is the two questions that need
+	// more than the string.
+	if opts.AudioCaptureID != "" {
+		// The bundle contract for this seat. Init logged it and did not refuse,
+		// so that a seat with no card could still go on air; this is the seat
+		// that does have one. Unlike the video leg there is nothing to fall back
+		// to — the commentary IS the product — so the message says to change the
+		// input rather than to clear a setting.
+		if missing := missingFrom(audioCaptureRequiredElements); len(missing) > 0 {
+			return fmt.Errorf("gst: the commentary input is a DeckLink card but this build's "+
+				"GStreamer cannot build the capture leg: %s. Choose a microphone in the Commentary "+
+				"input dropdown to start this seat", strings.Join(missing, ", "))
+		}
+		// ONE CARD, and this is the refusal that keeps the clock companion
+		// honest. When the video leg is also a card, THAT decklinkvideosrc is
+		// what clocks this audio — the card is exclusive and a second source
+		// fails — so the two ids naming different cards describes a pipeline
+		// whose audio would be clocked by the WRONG CARD's video. That does not
+		// fail loudly: the audio source would wait for a clock that never starts
+		// for it, and the seat would die in negotiation naming neither card.
+		//
+		// config.json carries ONE decklinkPersistentId for both legs, so the
+		// application cannot produce this; a caller that hand-built it is
+		// describing a two-card rig that would need a THIRD decklink element,
+		// which nothing here has ever run. Refusing by name beats building a
+		// shape nobody has measured.
+		if opts.VideoCaptureID != "" && opts.VideoCaptureID != opts.AudioCaptureID {
+			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID is card %s and "+
+				"PipelineOpts.AudioCaptureID is card %s. A DeckLink drives audio capture off the "+
+				"VIDEO clock, so a commentary leg on one card cannot be clocked by another card's "+
+				"video, and the card is exclusive so a third element is not available to clock it. "+
+				"Both legs must name the same card, or the video leg must be the slate",
+				opts.VideoCaptureID, opts.AudioCaptureID)
+		}
+		if opts.VideoCaptureID != "" {
+			log.Printf("gst: Start: the commentary is captured from DeckLink card %s, clocked by "+
+				"the SAME card's video leg; no clock companion is built", opts.AudioCaptureID)
+		} else {
+			log.Printf("gst: Start: the commentary is captured from DeckLink card %s while the "+
+				"video leg is the slate, so a %s named %s is built to clock it — measured at "+
+				"0.6-2.4%% of one core, and it feeds nothing but a fakesink",
+				opts.AudioCaptureID, videoCaptureFactory, nameVideoCaptureClock)
+		}
 	}
 
 	// The conform target is resolved HERE and nowhere else, so that the string
@@ -1497,7 +1620,7 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	encoderName, preview string) error {
 	desc := pipelineDescription(encoderName, opts.AudioBitrateBps, conform,
-		opts.VideoCaptureID, preview)
+		opts.VideoCaptureID, opts.AudioCaptureID, preview)
 	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
 	element, err := gogst.ParseLaunch(desc)
@@ -1536,6 +1659,28 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 		}
 		if err := setStringProperty(slate, "location", opts.SlatePath); err != nil {
 			return abort(err)
+		}
+
+		// THE CLOCK COMPANION, on the one configuration that has one: the
+		// picture is a still and the commentary comes off the card. It is
+		// pointed at the card by the SAME configureDeckLinkSource the other two
+		// decklink elements go through, because it must open the SAME CARD as
+		// the audio source — a companion on a different card would clock
+		// nothing and the audio would never preroll.
+		//
+		// It sits inside this branch rather than beside it because the condition
+		// is exactly the condition pipelineDescription used, so the element
+		// looked up is always the element the string put there.
+		if opts.AudioCaptureID != "" {
+			clock := pipeline.GetByName(nameVideoCaptureClock)
+			if clock == nil {
+				return abort(errors.New("gst: parsed pipeline has no element named " +
+					nameVideoCaptureClock + ", so there is nothing to clock the DeckLink " +
+					"commentary capture and it would never produce a buffer"))
+			}
+			if err := configureDeckLinkSource(clock, opts.AudioCaptureID); err != nil {
+				return abort(err)
+			}
 		}
 	} else {
 		vsrc := pipeline.GetByName(nameVideoCaptureSrc)
@@ -1601,14 +1746,26 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	// osxaudiosrc will accept it, and this line is what says which id the
 	// resolution was asked to find. In both cases it is the only record of the
 	// value that came out of config.json.
-	log.Printf("gst: Start: %s capture device id: %s", captureSourceFactory, opts.AudioDeviceID)
-	// Everything below the log line about WHICH element gets WHAT is platform
-	// knowledge and lives in deviceprovider_windows.go / deviceprovider_darwin.go:
-	// the two platforms do not even agree on the TYPE of the device property.
-	// See the darwin file — this is the single most important structural
-	// difference in the port.
-	if err := configureCaptureSource(asrc, opts.AudioDeviceID); err != nil {
-		return abort(err)
+	if opts.AudioCaptureID != "" {
+		// THE CARD. The same setter the video source and the clock companion go
+		// through, on purpose: the card publishes ONE persistent-id for its audio
+		// and video entries alike, and routing every decklink element through one
+		// function is what stops three of them growing different rules about the
+		// identical saved string. Note what is NOT called anywhere near here:
+		// nothing sets `connection`. See pipelineDescription.
+		if err := configureDeckLinkSource(asrc, opts.AudioCaptureID); err != nil {
+			return abort(err)
+		}
+	} else {
+		log.Printf("gst: Start: %s capture device id: %s", captureSourceFactory, opts.AudioDeviceID)
+		// Everything below the log line about WHICH element gets WHAT is platform
+		// knowledge and lives in deviceprovider_windows.go / deviceprovider_darwin.go:
+		// the two platforms do not even agree on the TYPE of the device property.
+		// See the darwin file — this is the single most important structural
+		// difference in the port.
+		if err := configureCaptureSource(asrc, opts.AudioDeviceID); err != nil {
+			return abort(err)
+		}
 	}
 
 	// The channel map, and it has to happen HERE — after the capture source has
@@ -1766,8 +1923,43 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	stopWatchdog()
 	if !stateChangeOK(ret) {
 		err := fmt.Errorf("gst: pipeline would not go to PLAYING (%s)", ret)
-		if busErr := p.drainStartupError(); busErr != nil {
+
+		// THE THREE RUNGS BELOW EXIST SO THAT A CARD FAILURE IS NAMED HERE,
+		// rather than reaching the operator as "not-negotiated (-4)" twenty
+		// seconds after START with a commentator waiting.
+		//
+		// MEASURED: DeckLink contention produces "Internal data stream error /
+		// not-negotiated (-4)" in about 100 microseconds, and it names neither
+		// the device nor the cause. At the GStreamer level that message is
+		// identical for a card another application is holding, a card that has
+		// been unplugged and a card with nothing on its input — three problems
+		// with three completely different fixes. capturefault.go tells them
+		// apart from the card's own evidence, and this is the path that was not
+		// yet using it.
+		// A bus error arrived during the transition and onBusMessage has ALREADY
+		// diagnosed it — classAudioCapture goes through captureFatalError, and
+		// on a DeckLink seat a video-element error is upgraded to that class
+		// because the commentary is clocked by it. So the named sentence already
+		// exists. %v and not %w deliberately: this is a Start failure the caller
+		// handles by not starting, and putting ErrPipelineFatal at the head of
+		// it would tell internal/sender it had a running pipeline whose chain
+		// had died.
+		fatal := p.fatalError()
+		busErr := p.drainStartupError()
+		switch {
+		case fatal != nil:
+			err = fmt.Errorf("%w: %v", err, fatal)
+		case busErr != nil:
+			// Kept exactly as it was: a Start that loses an asynchronous error
+			// entirely is worse than one that reports it undiagnosed.
 			err = fmt.Errorf("%w: %v", err, busErr)
+		case opts.AudioCaptureID != "" || opts.VideoCaptureID != "":
+			// The state change failed with nothing on the bus at all, and a card
+			// is in this graph. The evidence is still there to be read — the
+			// card's own signal property above all — so the diagnosis runs here
+			// too. It degrades to naming the three things to check, in order,
+			// which is what an operator can act on and "(failure)" is not.
+			err = fmt.Errorf("%w: %v", err, captureFatalError(asrc, nameAudioSrc, err))
 		}
 		return abort(err)
 	}
@@ -1838,19 +2030,31 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	// is every native capture and the slate-only video leg shipping today — means
 	// no goroutine, no ticker and nothing paid for the life of the pipeline.
 	//
-	// NOTE FOR WHOEVER LANDS THE DECKLINK VIDEO LEG: neither name below exists in
-	// pipelineDescription yet, so on today's pipeline both lookups return nil,
-	// signalWatchWanted is never even asked, and this costs one nil check at
-	// Start. It becomes live the day the capture leg lands under those names,
-	// which are capturefault.go's and are already used by the fault classifier.
+	// BOTH NAMES NOW EXIST IN pipelineDescription, which is what makes this
+	// live: vcapsrc when the video leg is the card, and vcapclock when the
+	// picture is the slate and the element is there only to clock a DeckLink
+	// COMMENTARY. On a seat with neither — every native microphone with a slate,
+	// which is the whole of the on-air Windows path — both lookups return nil,
+	// signalWatchWanted is never even asked, and this costs one nil check.
+	//
+	// The clock companion case is the one where this watchdog earns the most.
+	// There the card's lock is not a property of the PICTURE at all: a DeckLink
+	// drives audio capture off the video clock, so losing signal means losing the
+	// COMMENTARY, silently, with the muxer still fed and the sender still
+	// CONNECTED. Watching vcapclock is the only reading in this process that can
+	// say so, and it is why videoCaptureElement looks for it by name.
 	if vsrc := videoCaptureElement(pipeline); vsrc != nil {
 		probe := boolPropertyTriState(vsrc, propSignal)
 		if signalWatchWanted(opts.OnSignal, probe) {
+			watched := nameVideoCaptureSrc
+			if opts.VideoCaptureID == "" {
+				watched = nameVideoCaptureClock
+			}
 			p.sigWatch = startSignalWatch(probe,
 				func() triState { return boolPropertyTriState(vsrc, propSignal) },
 				opts.OnSignal)
 			log.Printf("gst: Start: watching %s for input lock every %v; the card's own signal "+
-				"property is the only thing in this process that can tell", nameVideoCaptureSrc,
+				"property is the only thing in this process that can tell", watched,
 				signalPollInterval)
 		}
 	}
@@ -2232,9 +2436,11 @@ func (p *cgoPipeline) drainStartupError() error {
 // is the ALREADY-RESOLVED raster and rate the video leg is conformed to: Start
 // resolves it and logs what it resolved, so this function never sees a zero or
 // a nonsense one and does not check. videoCapture is non-empty when the video
-// leg is a LIVE CAPTURE rather than the slate; its VALUE is not used here — the
-// persistent-id is set with g_object_set for the same reason the slate path and
-// the device id are — only whether it is empty.
+// leg is a LIVE CAPTURE rather than the slate, and audioCapture when the
+// COMMENTARY comes off a card rather than off the platform's own audio stack.
+// Neither VALUE is used here — both persistent-ids are set with g_object_set for
+// the same reason the slate path and the device id are — only whether each is
+// empty, and, for the clock companion, whether they are empty TOGETHER.
 //
 // # Exactly two element names in it are per-platform
 //
@@ -2305,6 +2511,58 @@ func (p *cgoPipeline) drainStartupError() error {
 // to 0 PERMANENTLY, with the pipeline still reporting PLAYING and no error
 // anywhere. The source is therefore decided at Start, from configuration, and
 // never afterwards.
+//
+// # The third conditional: which SOURCE the AUDIO leg has, and its companion
+//
+// This is the second axis and it needs its own argument, because it does two
+// things the video axis did not: it varies the element on the leg that IS the
+// product, and it adds a CHAIN that feeds no output at all.
+//
+// THE SOURCE SWAP IS THE SAME KIND OF CHOICE the paragraphs above license, and
+// it is the older of the two: the audio leg has been pointed at a different
+// device on every seat since the first build, and nothing downstream has ever
+// known or cared. What must not vary is the format everything below the mix
+// matrix sees, and it does not — audioresample, the S16LE/48000/2ch capsfilter,
+// alevel, the AAC encoder, aacparse and the aq queue are written ONCE, below the
+// branch, for both sources. A DeckLink presents sixteen unpositioned channels
+// instead of a positioned pair, and the NAMED audioconvert is what turns that
+// into the same two; channelmap.go holds the model and applyStartChannelMapLocked
+// decides, from the pad rather than from configuration, whether a matrix is
+// needed at all. On a microphone seat nothing is written and the leg is byte for
+// byte what ships today.
+//
+// THE CLOCK COMPANION IS THE PART THAT IS GENUINELY NEW, and it exists because
+// of one measured fact: decklinkaudiosrc CANNOT PREROLL without a
+// decklinkvideosrc in the SAME pipeline. The card drives audio capture off the
+// video clock, and with no video element the audio branch produced ZERO buffers
+// — 0 level messages against 160. It is not a defensive addition; without it the
+// feature does not start.
+//
+// So there are four shapes, and the choice between them is made HERE, from the
+// two ids and nothing else:
+//
+//	video    audio      decklinkvideosrc built            why
+//	slate    native     none                              today's pipeline, byte for byte
+//	card     native     vcapsrc, feeding the encoder      the video leg that landed already
+//	card     card       vcapsrc ONLY — it serves both     the card is EXCLUSIVE. Two sources
+//	                                                      in one process fail 3/3 and two
+//	                                                      processes fail 3/3, so a second one
+//	                                                      is impossible, not merely wasteful
+//	slate    card       vcapclock, feeding fakesink       the only way to clock the audio when
+//	                                                      the picture is a still
+//
+// THE SLATE-PLUS-CARD SHAPE IS THE ONE THAT COULD DO HARM, so what it costs was
+// measured rather than reasoned about: the companion source straight into
+// fakesink is 0.6-2.4 % of one core, and it is a chain of its own with no pad
+// linked to anything the slate leg touches. sync=false async=false is what keeps
+// it out of the way of everything else — it never participates in the pipeline's
+// preroll latching and never paces itself against the clock, so a card with no
+// signal cannot delay or stall a state change the slate leg is also making.
+//
+// THE ALTERNATIVE WAS decklinkaudiosrc ALONE, and it is not a trade-off that was
+// balanced — it does not work. The next alternative was a second process holding
+// the card for the clock, which the exclusivity measurement rules out. There is
+// no third.
 //
 // # What the capture leg is, element by element, and what breaks without each
 //
@@ -2420,7 +2678,7 @@ func (p *cgoPipeline) drainStartupError() error {
 // (peak -36.0 dBFS, RMS -59.2 dBFS) rather than the digital silence a
 // mis-negotiated AAC path produces.
 func pipelineDescription(encoderName string, audioBitrateBps int, conform ConformTarget,
-	videoCapture, preview string) string {
+	videoCapture, audioCapture, preview string) string {
 	// alignment=7 gives 7 x 188 = 1316-byte buffers, exactly one SRT payload,
 	// so nothing fragments. pcr-interval=3600 is the specification's value.
 	// leaky=downstream means output produced during an outage is dropped rather
@@ -2533,6 +2791,53 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 			" max-size-time=1000000000 max-size-bytes=0 max-size-buffers=0"
 	}
 
+	// THE COMMENTARY CAPTURE SOURCE. Exactly one element, and everything below
+	// it in the return statement is written once for both.
+	//
+	// The persistent-id is absent for the same reason it is absent from the
+	// video leg and the audio device id: Start sets it with g_object_set,
+	// through the same configureDeckLinkSource, so one saved string reaches
+	// every decklink element by one route and never through the parser's
+	// quoting rules.
+	//
+	// channels is the ONE property set here, and deckLinkAudioChannels says why
+	// it is 16 and why 2 — which would negotiate a positioned pair and need no
+	// matrix at all — is the wrong answer. `connection` is NOT set. It never is.
+	audioSource := captureSourceFactory + " name=" + nameAudioSrc
+	if audioCapture != "" {
+		audioSource = audioCaptureFactory + " name=" + nameAudioSrc +
+			" channels=" + strconv.Itoa(deckLinkAudioChannels)
+	}
+
+	// THE CLOCK COMPANION, and it is built ONLY when the commentary comes off the
+	// card AND the picture does not.
+	//
+	// When the picture DOES, the videoLeg above already put a decklinkvideosrc in
+	// this pipeline and that one is the clock: the card is exclusive, so a second
+	// source is not an option to weigh, it is a pipeline that fails. The
+	// condition below is therefore an AND of both ids and not a test of the audio
+	// one alone, and getting that wrong is not a wasted element — it is a seat
+	// with a camera and a card microphone that will not start at all.
+	//
+	// It is its own chain, linked to nothing, and it carries a leading newline
+	// the way the preview branch does so that the return below does not have to
+	// know whether it is there.
+	clockLeg := ""
+	if audioCapture != "" && videoCapture == "" {
+		clockLeg = "\n" + videoCaptureFactory + " name=" + nameVideoCaptureClock +
+			// mode=auto and drop-no-signal-frames=false for the reasons the video
+			// leg gives — and the second one matters MORE here, because this
+			// element's whole job is to keep producing a clock. A card that
+			// dropped its no-signal frames would stop the commentary rather than
+			// merely blank a picture nobody is watching.
+			" mode=auto drop-no-signal-frames=false" +
+			// sync=false async=false: this sink must not participate in preroll
+			// latching and must not pace against the clock. It exists so the CARD
+			// runs, not so anything downstream of it does, and every frame it is
+			// handed is thrown away.
+			" ! fakesink name=" + nameVideoCaptureClockSink + " sync=false async=false"
+	}
+
 	return "" +
 		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
 		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
@@ -2570,7 +2875,13 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 		// the exact value of each const in elements_windows.go and
 		// elements_darwin.go, so neither port can be silently repointed at a
 		// different encoder.
-		captureSourceFactory + " name=" + nameAudioSrc +
+		//
+		// audioSource is one of those two consts or audioCaptureFactory,
+		// resolved above; the element NAME is nameAudioSrc either way, because
+		// capturefault.go classifies the commentary capture by that name and a
+		// second name would return a DeckLink audio failure to the nameless
+		// fatal default.
+		audioSource +
 		// The PER-CHANNEL PICKER meter, and everything about where it sits is
 		// deliberate. It is UPSTREAM of the audioconvert below, so it measures
 		// the capture device's OWN channels — all sixteen of a DeckLink card's
@@ -2682,6 +2993,12 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "." +
+
+		// THE CLOCK COMPANION, appended whole or not at all, for exactly the
+		// reason the preview below is: the empty string is the ordinary answer
+		// and leaves this description character for character the one that ships
+		// today. It is a chain of its own and links to nothing above it.
+		clockLeg +
 
 		// THE CONFIDENCE MONITOR, appended whole or not at all. previewBranchFor
 		// has already decided; the empty string is the ordinary answer and leaves

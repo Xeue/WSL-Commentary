@@ -2048,8 +2048,9 @@ func (a *App) startSession() error {
 	// Every hardware question this session's two legs raise, answered before a
 	// single element is built: which video source, which audio subsystem, which
 	// card, and whether the machine actually has it. It returns the DeckLink
-	// persistent-id the video leg is to open, empty for the slate.
-	videoCaptureID, err := a.preflightCapture(cfg)
+	// persistent-id each leg is to open — empty for the slate, and empty for a
+	// commentary input that is an ordinary microphone.
+	plan, err := a.preflightCapture(cfg)
 	if err != nil {
 		return err
 	}
@@ -2063,9 +2064,9 @@ func (a *App) startSession() error {
 	// leg is a camera. It is built HERE, before the pipeline, because the preview
 	// is a branch of that pipeline and its handle is a build-time option: there is
 	// no attaching one to a running graph. Its failures are SPARED — a preview
-	// that cannot get a window leaves videoCaptureID untouched and the feed goes
+	// that cannot get a window leaves plan.VideoCaptureID untouched and the feed goes
 	// out without it — which is the whole rule for this path.
-	previewHandle := a.startSessionPreview(cfg, videoCaptureID != "")
+	previewHandle := a.startSessionPreview(cfg, plan.VideoCaptureID != "")
 
 	pipe, err := gst.New()
 	if err != nil {
@@ -2083,12 +2084,22 @@ func (a *App) startSession() error {
 	snd := a.newSender(pipe)
 	opts := a.senderOpts(cfg, passphrase)
 
-	// The two options the PRE-FLIGHT decided rather than the configuration, and
-	// the reason they are set here instead of inside senderOpts: one is a card id
-	// resolved against what this machine is actually offering, the other a native
-	// window handle. Neither is a function of the configuration alone, and
+	// The options the PRE-FLIGHT decided rather than the configuration, and the
+	// reason they are set here instead of inside senderOpts: two are card ids
+	// resolved against what this machine is actually offering, the third a native
+	// window handle. None is a function of the configuration alone, and
 	// senderOpts is deliberately a pure reading of it — see its comment.
-	opts.Pipeline.VideoCaptureID = videoCaptureID
+	//
+	// THE PAIRING WITH senderOpts' AudioDeviceID IS THE WHOLE SAFETY PROPERTY OF
+	// THIS FEATURE and the two lines have to be read together: senderOpts sets
+	// AudioDeviceID only for a NATIVE seat, and this sets AudioCaptureID only for
+	// a card one, so exactly one of them is ever non-empty and internal/gst's
+	// refuseWrongAudioSource refuses the pipeline if that is ever untrue. An
+	// empty device id on osxaudiosrc or wasapi2src is not an error — it is the
+	// SYSTEM DEFAULT INPUT — so "a DeckLink seat that reached the platform
+	// element" is the failure both halves exist to make unreachable.
+	opts.Pipeline.VideoCaptureID = plan.VideoCaptureID
+	opts.Pipeline.AudioCaptureID = plan.AudioCaptureID
 	opts.Pipeline.Preview = gst.PreviewOpts{
 		// Enabled is the operator's request AND the pre-flight's verdict, ANDed
 		// here rather than left to internal/gst, so that a seat which asked for a
@@ -2097,7 +2108,7 @@ func (a *App) startSession() error {
 		// monitor is switched on and has no surface, which is a true sentence
 		// about a machine that has nothing to preview and would send the operator
 		// looking for a window fault that is not there.
-		Enabled:      cfg.DeckLinkPreviewEnabled && videoCaptureID != "",
+		Enabled:      cfg.DeckLinkPreviewEnabled && plan.VideoCaptureID != "",
 		WindowHandle: previewHandle,
 	}
 
@@ -2513,9 +2524,30 @@ func (a *App) preflightAudioDevice(id string) error {
 		id, len(devices))
 }
 
+// capturePlan is what the pre-flight decided: which DeckLink card, if any, each
+// leg of this session is to open.
+//
+// It is a struct rather than two returned strings because the two are decided
+// TOGETHER and are usually the same value — config.json carries ONE
+// decklinkPersistentId, because one persistent-id names the CARD and serves its
+// audio and video entries alike — and two bare strings of the same type, in one
+// order, is the shape that gets transposed at a call site and produces a seat
+// whose picture and commentary have swapped cards.
+type capturePlan struct {
+	// VideoCaptureID is gst.PipelineOpts.VideoCaptureID: the card whose input
+	// becomes the picture. Empty means the still slate.
+	VideoCaptureID string
+
+	// AudioCaptureID is gst.PipelineOpts.AudioCaptureID: the card whose embedded
+	// audio becomes the commentary. Empty means the platform's own capture
+	// source, reading audioDeviceId — which is every seat shipping today.
+	AudioCaptureID string
+}
+
 // preflightCapture answers every hardware question this session's two legs
 // raise, BEFORE a single element is built, and returns the DeckLink
-// persistent-id the VIDEO leg is to open — empty for the still slate.
+// persistent-id each leg is to open — empty for the still slate, and empty for
+// a commentary input that is an ordinary microphone.
 //
 // # Why any of this is here rather than left to GStreamer
 //
@@ -2544,67 +2576,133 @@ func (a *App) preflightAudioDevice(id string) error {
 // receiving their camera. That is a wrong-source failure with every lamp green,
 // which is the class of defect this application exists to make impossible, so
 // it refuses.
-func (a *App) preflightCapture(cfg *config.Config) (string, error) {
-	// ============ THE DECKLINK AUDIO LEG IS NOT BUILT IN THIS REVISION ======
-	//
-	// The VIDEO leg is: gst.PipelineOpts.VideoCaptureID opens the card and
-	// conforms its input in place of the slate. The AUDIO leg is not —
-	// PipelineOpts still carries AudioDeviceID alone and pipelineDescription
-	// still builds the platform's own source unconditionally — so the two halves
-	// of this feature landed apart and this gate is what keeps the unbuilt half
-	// from being reachable.
-	//
-	// WITHOUT IT THAT COMBINATION IS A SILENT WRONG-DEVICE FAILURE.
-	// config.Validate stopped requiring audioDeviceId for a DeckLink seat —
-	// correctly, since its commentary never touches CoreAudio or WASAPI — so a
-	// seat set to "decklink" passes validation with that field EMPTY, and an
-	// empty device on osxaudiosrc or wasapi2src is not an error: it is the SYSTEM
-	// DEFAULT INPUT. The match would go out from the laptop's built-in microphone
-	// with every lamp green.
-	//
-	// THIS BLOCK, AND THE `if` BELOW IT, ARE WHAT TO DELETE WHEN THE AUDIO LEG
-	// LANDS. Nothing else in this function is temporary. The guard below is
-	// already written the way it has to be afterwards — a DeckLink seat must not
-	// be pre-flighted against a CoreAudio endpoint it never opens — so removing
-	// this refusal is a deletion and not a rewrite.
-	if cfg.UsesDeckLinkAudio() {
-		return "", fmt.Errorf("wslcomms: cannot start: audioSourceKind is %q, so the commentary "+
-			"input is a Blackmagic DeckLink card — and this version cannot capture AUDIO from one "+
-			"yet. The card is offered in the device list and its VIDEO can now be sent, but the "+
-			"audio capture leg for it is not built. Set the commentary input back to the computer "+
-			"sound input on the Settings screen and choose the device there; videoSource is a "+
-			"separate setting and is unaffected",
-			config.AudioSourceDeckLink)
-	}
+func (a *App) preflightCapture(cfg *config.Config) (capturePlan, error) {
+	// A DeckLink seat must NOT be pre-flighted against a CoreAudio or WASAPI
+	// endpoint it never opens: its commentary comes off the card, audioDeviceId
+	// is meaningless to it, and config.Validate correctly stopped requiring the
+	// field. Asking the device monitor whether an endpoint it does not use is
+	// present would be a new way to be unable to start.
 	if !cfg.UsesDeckLinkAudio() {
 		if err := a.preflightAudioDevice(cfg.AudioDeviceID); err != nil {
-			return "", err
+			return capturePlan{}, err
 		}
 	}
 
-	if !cfg.UsesDeckLinkVideo() {
-		// The slate: no card, no enumeration, nothing to resolve. A seat that has
-		// configured nothing must reach the pipeline having done exactly what it
-		// did before this function existed, which includes not having asked the
-		// device monitor a question.
-		return "", nil
+	seat := deckLinkSeat{video: cfg.UsesDeckLinkVideo(), audio: cfg.UsesDeckLinkAudio()}
+	if !seat.wantsCard() {
+		// The slate and a microphone: no card, no enumeration, nothing to
+		// resolve. A seat that has configured nothing must reach the pipeline
+		// having done exactly what it did before this function existed, which
+		// includes not having asked the device monitor a question.
+		return capturePlan{}, nil
 	}
 
-	return a.resolveDeckLinkCard(cfg)
+	// ONE RESOLUTION FOR BOTH LEGS, because there is one field. decklinkPersistentId
+	// names the CARD and a card publishes the same persistent-id for its audio
+	// and its video entries (measured: the fitted UltraStudio 4K Mini publishes
+	// 2747401380 for both), so resolving it twice would be two enumerations that
+	// could disagree — and a seat whose picture and commentary came off
+	// different cards is a shape internal/gst refuses, correctly, because a
+	// DeckLink clocks its audio off its own video.
+	//
+	// The seat is passed so that a refusal names the setting the operator
+	// actually has to change. "videoSource is decklink" is the wrong sentence to
+	// show somebody whose picture is the slate and whose microphone is the card.
+	card, err := a.resolveDeckLinkCard(cfg, seat)
+	if err != nil {
+		return capturePlan{}, err
+	}
+
+	plan := capturePlan{}
+	if seat.video {
+		plan.VideoCaptureID = card
+	}
+	if seat.audio {
+		plan.AudioCaptureID = card
+	}
+	return plan, nil
 }
 
-// resolveDeckLinkCard turns "the operator wants the camera" into the one
-// persistent-id gst.PipelineOpts.VideoCaptureID can be given, or into a refusal
-// that names the field and the hardware.
+// deckLinkSeat says WHICH legs of this session want the card, and is what lets
+// one resolution produce a refusal an operator can act on.
+//
+// The two settings are INDEPENDENT — audioSourceKind says where the commentary
+// comes from and videoSource says where the picture comes from — so all four
+// combinations are real rigs, and three of them want the card. A message that
+// named the wrong one of the two would send the operator to a box that is
+// already correct.
+type deckLinkSeat struct{ video, audio bool }
+
+// wantsCard reports whether anything in this session needs a card resolved.
+func (s deckLinkSeat) wantsCard() bool { return s.video || s.audio }
+
+// because renders the reason this session needs a card, as the clause a refusal
+// opens with. It names the setting, spelled as config.json spells it, because
+// that is the string the operator will search the Settings screen for.
+func (s deckLinkSeat) because() string {
+	switch {
+	case s.video && s.audio:
+		return fmt.Sprintf("videoSource is %q and audioSourceKind is %q, so both the picture and "+
+			"the commentary come from a Blackmagic card",
+			config.VideoSourceDeckLink, config.AudioSourceDeckLink)
+	case s.audio:
+		return fmt.Sprintf("audioSourceKind is %q, so the commentary is captured from a "+
+			"Blackmagic card", config.AudioSourceDeckLink)
+	default:
+		return fmt.Sprintf("videoSource is %q, so the video leg is a Blackmagic card",
+			config.VideoSourceDeckLink)
+	}
+}
+
+// instead renders the way OUT of the refusal: what to set so this seat can go on
+// air without the card. It is the second half of every message below, because a
+// refusal with no route out of it is a refusal an operator reads twice.
+func (s deckLinkSeat) instead() string {
+	switch {
+	case s.video && s.audio:
+		return fmt.Sprintf("set videoSource back to %q and choose a microphone in the Commentary "+
+			"input dropdown", config.VideoSourceSlate)
+	case s.audio:
+		return "choose a microphone in the Commentary input dropdown"
+	default:
+		return fmt.Sprintf("set videoSource back to %q to send the slate", config.VideoSourceSlate)
+	}
+}
+
+// capturing renders what the card is about to be used FOR, for the log line that
+// records which card an empty decklinkPersistentId resolved to. "which card did
+// it pick" is the first question anybody asks when the picture or the commentary
+// is not the one they expected, and "for what" is the second.
+func (s deckLinkSeat) capturing() string {
+	switch {
+	case s.video && s.audio:
+		return "capturing the picture AND the commentary"
+	case s.audio:
+		return "capturing the commentary"
+	default:
+		return "capturing the picture"
+	}
+}
+
+// resolveDeckLinkCard turns "the operator wants the card" into the one
+// persistent-id gst.PipelineOpts can be given, or into a refusal that names the
+// field and the hardware.
+//
+// seat says which legs asked for it, and is used for nothing but the WORDING:
+// the resolution is identical whether the card is wanted for the picture, for
+// the commentary or for both, because there is one card and one field. What
+// changes is which setting a refusal tells the operator to look at, and getting
+// that wrong sends somebody to a box that is already correct.
 //
 // # The empty id is a real answer and it has to be resolved, not passed through
 //
 // decklinkPersistentId is documented as MEANINGFUL when empty — "the card this
 // machine has" — and that is right for a commentary position, which has one. But
-// an empty VideoCaptureID means THE SLATE to internal/gst, which is the opposite
-// instruction, so the emptiness cannot simply be forwarded. This is the one
-// place the two vocabularies meet and it is where the translation belongs: ask
-// the machine which card it has, and hand the leg that card's id.
+// an empty VideoCaptureID means THE SLATE to internal/gst, and an empty
+// AudioCaptureID means the platform's own microphone, which are both the
+// opposite instruction — so the emptiness cannot simply be forwarded. This is
+// the one place the two vocabularies meet and it is where the translation
+// belongs: ask the machine which card it has, and hand the legs that card's id.
 //
 // # The id that comes back is the ENUMERATED spelling, not the typed one
 //
@@ -2614,7 +2712,7 @@ func (a *App) preflightCapture(cfg *config.Config) (string, error) {
 // judgement preflightAudioDevice records: refusing a card that is plainly
 // present, over the case of a hex digit, would be this function causing the
 // outage it exists to prevent.
-func (a *App) resolveDeckLinkCard(cfg *config.Config) (string, error) {
+func (a *App) resolveDeckLinkCard(cfg *config.Config, seat deckLinkSeat) (string, error) {
 	want := strings.TrimSpace(cfg.DeckLinkPersistentID)
 
 	devices, err := a.ListInputDevices()
@@ -2622,18 +2720,18 @@ func (a *App) resolveDeckLinkCard(cfg *config.Config) (string, error) {
 		if want == "" {
 			// The enumeration was the ONLY thing that could have said which card,
 			// so there is nothing to carry on with. Starting anyway would send the
-			// slate to a switcher the operator believes is receiving their camera.
+			// slate to a switcher the operator believes is receiving their camera,
+			// or put the laptop microphone on air in place of the commentator's.
 			return "", fmt.Errorf(
-				"wslcomms: cannot start: videoSource is %q, so the video leg is a Blackmagic card, "+
-					"but decklinkPersistentId is empty and this machine's capture devices could not be "+
-					"listed, so there is nothing to say WHICH card. Set decklinkPersistentId on the "+
-					"Settings screen, or set videoSource back to %q to send the slate",
-				config.VideoSourceDeckLink, config.VideoSourceSlate)
+				"wslcomms: cannot start: %s — but decklinkPersistentId is empty and this machine's "+
+					"capture devices could not be listed, so there is nothing to say WHICH card. Set "+
+					"decklinkPersistentId on the Settings screen, or %s",
+				seat.because(), seat.instead())
 		}
 		// A card WAS named, so the enumeration is not the only source of truth
 		// and a monitor hiccup must not be a new way to be unable to start. The
 		// element gets the operator's id and says its own piece if it is wrong.
-		log.Printf("wslcomms: could not list capture devices during the video pre-flight (%v, %d "+
+		log.Printf("wslcomms: could not list capture devices during the capture pre-flight (%v, %d "+
 			"devices); starting anyway with the configured decklinkPersistentId %q",
 			err, len(devices), want)
 		return want, nil
@@ -2653,39 +2751,38 @@ func (a *App) resolveDeckLinkCard(cfg *config.Config) (string, error) {
 			}
 		}
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: videoSource is %q and decklinkPersistentId is %s, which is not "+
-				"a Blackmagic card on this machine — %s. A persistent-id is minted by the card and "+
-				"survives a reboot, so an id that no longer resolves means a different card, or none. "+
-				"Choose the card on the Settings screen, clear decklinkPersistentId if this machine "+
-				"has only one, or set videoSource back to %q to send the slate",
-			config.VideoSourceDeckLink, want, describeDeckLinkCards(cards, len(devices)),
-			config.VideoSourceSlate)
+			"wslcomms: cannot start: %s, and decklinkPersistentId is %s, which is not a Blackmagic "+
+				"card on this machine — %s. A persistent-id is minted by the card and survives a "+
+				"reboot, so an id that no longer resolves means a different card, or none. Choose "+
+				"the card on the Settings screen, clear decklinkPersistentId if this machine has "+
+				"only one, or %s",
+			seat.because(), want, describeDeckLinkCards(cards, len(devices)), seat.instead())
 	}
 
 	switch len(cards) {
 	case 1:
 		// The ordinary case at a commentary position, and it is logged because
 		// "which card did it pick" is the first question anybody asks when the
-		// picture is not the one they expected.
-		log.Printf("wslcomms: video leg: decklinkPersistentId is empty and this machine has one "+
-			"Blackmagic card, %q (%s); capturing from it", cards[0].Name, cards[0].ID)
+		// picture or the commentary is not the one they expected.
+		log.Printf("wslcomms: capture pre-flight: decklinkPersistentId is empty and this machine "+
+			"has one Blackmagic card, %q (%s); %s from it",
+			cards[0].Name, cards[0].ID, seat.capturing())
 		return cards[0].ID, nil
 	case 0:
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: videoSource is %q, so the video leg is a Blackmagic card, but "+
-				"there is no Blackmagic capture card on this machine — %d capture devices were found "+
-				"and none of them is one. Without the Desktop Video driver installed the card is not "+
-				"offered at all, even when it is plugged in. Set videoSource back to %q on the "+
-				"Settings screen to send the slate",
-			config.VideoSourceDeckLink, len(devices), config.VideoSourceSlate)
+			"wslcomms: cannot start: %s, but there is no Blackmagic capture card on this machine — "+
+				"%d capture devices were found and none of them is one. Without the Desktop Video "+
+				"driver installed the card is not offered at all, even when it is plugged in. On "+
+				"the Settings screen, %s",
+			seat.because(), len(devices), seat.instead())
 	default:
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: videoSource is %q and decklinkPersistentId is empty, which means "+
-				"\"the card this machine has\" — but this machine has %d: %s. The card is EXCLUSIVE, "+
-				"so guessing would take a card another application may be holding and would send "+
-				"whichever one the driver happened to enumerate first. Name the one you want in "+
+			"wslcomms: cannot start: %s, and decklinkPersistentId is empty, which means \"the card "+
+				"this machine has\" — but this machine has %d: %s. The card is EXCLUSIVE, so guessing "+
+				"would take a card another application may be holding and would use whichever one "+
+				"the driver happened to enumerate first. Name the one you want in "+
 				"decklinkPersistentId on the Settings screen",
-			config.VideoSourceDeckLink, len(cards), describeDeckLinkCards(cards, len(devices)))
+			seat.because(), len(cards), describeDeckLinkCards(cards, len(devices)))
 	}
 }
 
@@ -3236,9 +3333,27 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 
 	return sender.Opts{
 		Pipeline: gst.PipelineOpts{
-			SlatePath:     a.slatePath(cfg),
-			AudioDeviceID: cfg.AudioDeviceID,
-			ConformTo:     conformTo,
+			SlatePath: a.slatePath(cfg),
+
+			// THE PLATFORM ENDPOINT, AND ONLY ON A SEAT THAT OPENS ONE.
+			//
+			// It is cleared for a DeckLink commentary seat rather than passed
+			// through, and that clearing is half of the safety property this
+			// whole area is built around; startSession's AudioCaptureID line is
+			// the other half. A saved audioDeviceId sitting beside
+			// audioSourceKind "decklink" is two answers to one question — an
+			// ordinary state in a hand-edited config.json, and one the single
+			// picker cannot produce — and internal/gst refuses a PipelineOpts
+			// carrying both, by name, before anything is built.
+			//
+			// It is still a PURE READING of the configuration, which is what
+			// keeps this function what its comment says it is: which subsystem
+			// captures the commentary is a field in the document, and no
+			// hardware is consulted to decide it. Only WHICH CARD needs an
+			// enumeration, and that is the pre-flight's answer, not this one's.
+			AudioDeviceID: nativeAudioDeviceID(cfg),
+
+			ConformTo: conformTo,
 			// The AUDIO bitrate is left at zero so that internal/gst applies
 			// its own documented constant of 128000 bps (specification section
 			// 5); the codec is likewise not exposed to the user. The VIDEO
@@ -3287,6 +3402,24 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 		// presses STOP and START has told us they want to be told again.
 		OnConnectError: reporter.report,
 	}
+}
+
+// nativeAudioDeviceID is the platform capture endpoint this seat opens, or the
+// empty string when its commentary comes off a card and no platform element is
+// built at all.
+//
+// It is a function rather than a conditional expression inside senderOpts for
+// one reason: it is the place the rule is WRITTEN DOWN, and the rule is the one
+// that stops a match going out down the laptop's built-in microphone. An empty
+// audioDeviceId is not an error on wasapi2src or osxaudiosrc — it is the SYSTEM
+// DEFAULT INPUT — so the field must never reach a pipeline whose commentary is a
+// card, and a saved value beside audioSourceKind "decklink" is stale rather than
+// meaningful. See gst.PipelineOpts.AudioDeviceID and refuseWrongAudioSource.
+func nativeAudioDeviceID(cfg *config.Config) string {
+	if cfg.UsesDeckLinkAudio() {
+		return ""
+	}
+	return cfg.AudioDeviceID
 }
 
 // connectErrorReporter forwards the sender's connection failures to the

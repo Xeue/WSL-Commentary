@@ -1595,14 +1595,19 @@ func TestPreflightSlateNeverConsultsTheDeviceMonitorForACard(t *testing.T) {
 	a, _ := newTestApp(t)
 	withStubDeviceError(t, errors.New("the device monitor is unavailable"))
 
-	id, err := a.preflightCapture(a.snapshotConfig())
+	plan, err := a.preflightCapture(a.snapshotConfig())
 	if err != nil {
 		t.Fatalf("preflightCapture() error = %v; a slate seat must be unaffected by the device "+
 			"monitor, which is every seat shipping today", err)
 	}
-	if id != "" {
+	if plan.VideoCaptureID != "" {
 		t.Errorf("preflightCapture() resolved %q for a slate seat; an empty id is what tells "+
-			"internal/gst to build the slate leg", id)
+			"internal/gst to build the slate leg", plan.VideoCaptureID)
+	}
+	if plan.AudioCaptureID != "" {
+		t.Errorf("preflightCapture() resolved %q for the COMMENTARY on a microphone seat; an "+
+			"empty id is what tells internal/gst to build the platform capture source",
+			plan.AudioCaptureID)
 	}
 }
 
@@ -1663,14 +1668,19 @@ func TestPreflightResolvesTheOnlyCard(t *testing.T) {
 	cfg := a.snapshotConfig()
 	cfg.VideoSource = config.VideoSourceDeckLink
 
-	id, err := a.preflightCapture(cfg)
+	plan, err := a.preflightCapture(cfg)
 	if err != nil {
 		t.Fatalf("preflightCapture() error = %v; one card and no id named is the ordinary case at "+
 			"a commentary position", err)
 	}
-	if id != fitted {
-		t.Errorf("preflightCapture() = %q, want %q — an empty result would build the slate leg on "+
-			"a seat the operator has pointed at a camera", id, fitted)
+	if plan.VideoCaptureID != fitted {
+		t.Errorf("preflightCapture() video = %q, want %q — an empty result would build the slate "+
+			"leg on a seat the operator has pointed at a camera", plan.VideoCaptureID, fitted)
+	}
+	if plan.AudioCaptureID != "" {
+		t.Errorf("preflightCapture() audio = %q on a seat whose commentary is a MICROPHONE; the "+
+			"two settings are independent and a card resolved for the picture must not move the "+
+			"commentary onto it", plan.AudioCaptureID)
 	}
 }
 
@@ -1713,13 +1723,13 @@ func TestPreflightCarriesOnWithANamedCardWhenEnumerationFails(t *testing.T) {
 	cfg.VideoSource = config.VideoSourceDeckLink
 	cfg.DeckLinkPersistentID = "0x0000000000AB12CD"
 
-	id, err := a.preflightCapture(cfg)
+	plan, err := a.preflightCapture(cfg)
 	if err != nil {
 		t.Fatalf("preflightCapture() error = %v; the card was named, so a failing enumeration is "+
 			"not the only thing that could have answered", err)
 	}
-	if id != "0x0000000000AB12CD" {
-		t.Errorf("preflightCapture() = %q, want the configured id", id)
+	if plan.VideoCaptureID != "0x0000000000AB12CD" {
+		t.Errorf("preflightCapture() = %q, want the configured id", plan.VideoCaptureID)
 	}
 }
 

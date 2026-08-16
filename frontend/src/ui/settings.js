@@ -60,7 +60,6 @@ import {
 // because that is the only kind with anything extra to show.
 import {
   AUDIO_SOURCE_DECKLINK,
-  DECKLINK_AUDIO_NOT_BUILT,
   normaliseAudioSourceKind,
   planAudioInputs,
   deriveAudioInputEffects,
@@ -1900,13 +1899,14 @@ export function createSettingsView(handlers) {
     fields.decklinkPersistentId.input.value = effects.decklinkPersistentId;
     // The routing grid belongs to the card, so it follows the kind. Called here
     // rather than listened for, because these fields are hidden inputs and
-    // assigning one from script fires nothing at all. The note under the picker
-    // follows the kind too — a DeckLink selection is refused at START and the
-    // operator has to be told at the moment they make it, not at kick-off.
+    // assigning one from script fires nothing at all.
     //
-    // `false` for absent: a selection the operator has just made came from the
-    // list, so it is by construction present. The absent state is only ever
-    // reached by LOADING a configuration, which is renderAudioInput's path.
+    // The note is cleared in the same breath, with `false` for absent: a
+    // selection the operator has just made came from the list, so it is by
+    // construction present, and any "not connected" line left over from the
+    // PREVIOUS selection is now about a device nobody has chosen. The absent
+    // state is only ever reached by LOADING a configuration, which is
+    // renderAudioInput's path.
     renderAudioInputNote(false);
     renderChannelMapGroup();
   }
@@ -1941,27 +1941,29 @@ export function createSettingsView(handlers) {
    * 'change' listener is a thing that works until it does not. Only the note
    * depends on the selection; the list does not.
    *
-   * TWO THINGS CAN BE WRONG and only one line is spent on them. The device not
-   * being plugged in is about THIS selection and is reported first, because it
-   * is the one the operator can fix by choosing again. The DeckLink audio leg
-   * not being built is about the whole subsystem, is true of every entry in that
-   * group, and is what Start will refuse — see DECKLINK_AUDIO_NOT_BUILT for why
-   * it is said here rather than by greying the group out.
+   * ONE THING CAN BE WRONG HERE NOW, and that is the point.
+   *
+   * There used to be two, and the second was DECKLINK_AUDIO_NOT_BUILT: a line
+   * saying that a DeckLink commentary input would be refused at START because
+   * the capture leg for it did not exist. IT EXISTS. decklinkaudiosrc opens the
+   * card, a decklinkvideosrc clocks it, the mix matrix routes the commentator's
+   * channels into the feed, and a seat set to the card starts and goes on air —
+   * so the line, the constant and the test that pinned its presence all went
+   * with the gate in app.go's preflightCapture that they were about.
+   *
+   * What is left is about THIS SELECTION and nothing else: the saved device is
+   * not plugged in today. That is the one the operator can fix by choosing
+   * again, which is why it is worth a line under the control they would choose
+   * with.
    */
   function renderAudioInputNote(absent) {
-    const decklinkSelected =
-      normaliseAudioSourceKind(fields.audioSourceKind.input.value) === AUDIO_SOURCE_DECKLINK;
-    const note = absent
-      ? 'This device is not connected. Choose another, or plug it back in.'
-      : decklinkSelected
-        ? DECKLINK_AUDIO_NOT_BUILT
-        : '';
+    const note = absent ? 'This device is not connected. Choose another, or plug it back in.' : '';
     audioInputNote.hidden = note === '';
     audioInputNote.textContent = note;
     // Marked as well as worded for the reason the format row is: a sentence says
     // what is wrong and the mark is what makes it findable on a form two
-    // screenfuls deep. Both states refuse to start, so both mark.
-    audioInputRow.wrap.classList.toggle('field--absent', absent || decklinkSelected);
+    // screenfuls deep.
+    audioInputRow.wrap.classList.toggle('field--absent', absent);
   }
 
   // --- the DeckLink routing grid ------------------------------------------

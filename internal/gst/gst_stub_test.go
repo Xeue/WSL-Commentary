@@ -1973,7 +1973,7 @@ func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 	lines := strings.Split(startSequence(t, fset, file), "\n")
 
 	refuse := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "refuseRenderEndpoint(opts.AudioDeviceID)")
+		return strings.Contains(s, "refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID)")
 	})
 	parse := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "ParseLaunch(")
@@ -1989,8 +1989,10 @@ func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 	})
 
 	if refuse < 0 {
-		t.Error("Start never calls refuseRenderEndpoint(opts.AudioDeviceID); a playback endpoint " +
-			"reaches wasapi2src and fails asynchronously as a fake network error")
+		t.Error("Start never calls refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); " +
+			"a playback endpoint reaches wasapi2src and fails asynchronously as a fake network " +
+			"error, and a seat with NEITHER source reaches osxaudiosrc with an empty device, " +
+			"which is the SYSTEM DEFAULT INPUT and not an error")
 	}
 	if parse < 0 {
 		t.Fatal("Start never calls ParseLaunch")

@@ -54,7 +54,6 @@ import {
   DECKLINK_GROUP_LABEL,
   DEFAULT_INPUT_LABEL,
   ANY_CARD_LABEL,
-  DECKLINK_AUDIO_NOT_BUILT,
   normaliseAudioSourceKind,
   encodeAudioInput,
   decodeAudioInput,
@@ -550,64 +549,78 @@ test('the picker is redrawn from populate and from the device listing, and never
   assert.match(refresh.slice(0, refresh.indexOf('\n  }')), /renderAudioInput\(\)/);
 });
 
-test('the picker says that a DeckLink commentary input is refused at START, on the row', () => {
-  // ===================== THE HALF THAT IS NOT BUILT ==========================
+test('the DeckLink commentary leg is BUILT, and nothing on the row says otherwise', () => {
+  // ===================== THE HALF THAT WAS NOT BUILT, AND NOW IS =============
   //
-  // app.go's preflightCapture refuses a DeckLink COMMENTARY seat outright — the
-  // block marked "THE DECKLINK AUDIO LEG IS NOT BUILT IN THIS REVISION". The
-  // enumeration half landed and the pipeline half did not. The owner asked for
-  // both kinds in one dropdown and got them; without this line the refusal moves
-  // from a greyed-out option in Settings to an error at START, twenty minutes
-  // before kick-off with a commentator waiting, which is strictly worse than the
-  // complaint that started all this.
+  // This test replaces the one that pinned DECKLINK_AUDIO_NOT_BUILT — a line on
+  // the picker row saying a DeckLink commentary input would be refused at START.
+  // It was true, and it was said here rather than by greying the group out so
+  // that the operator met the refusal at the moment of choosing. The leg exists
+  // now, so the line is gone and this pins the new truth in both directions: the
+  // Go gate is deleted, and no frontend module renders a sentence about it.
   //
-  // GO'S REFUSAL IS THE SUBJECT, so it is read out of app.go. When the audio leg
-  // lands, that block is DELETED — its own comment says so — and this test fails
-  // by name, which is what stops a line about an unbuilt feature outliving it.
+  // THE GO SIDE IS THE SUBJECT and is read out of app.go, exactly as the old
+  // test read it. The two must move together or the screen and the application
+  // disagree about what pressing START will do.
   const go = read(repoRoot, 'app.go');
-  assert.match(
+  assert.doesNotMatch(
     go,
     /THE DECKLINK AUDIO LEG IS NOT BUILT IN THIS REVISION/,
-    'the staging gate is gone from app.go: delete DECKLINK_AUDIO_NOT_BUILT and this test with it',
+    'the staging gate is back in app.go; if the audio leg has been reverted, the line on the ' +
+      'picker row has to come back with it, or the operator meets the refusal at kick-off',
   );
-  assert.match(go, /cannot capture AUDIO from one/, 'and it still refuses in those words');
+  assert.doesNotMatch(go, /cannot capture AUDIO from one/, 'and so does its refusal');
 
-  // THE LINE ITSELF. Short, because it is a field hint on a screen that is
-  // scanned; the argument for it is in audioinput.js beside the constant.
-  assert.ok(
-    DECKLINK_AUDIO_NOT_BUILT.length < 200,
-    `the line is ${DECKLINK_AUDIO_NOT_BUILT.length} characters and sits under a control an ` +
-      'operator is using to pick a microphone',
-  );
-  assert.match(DECKLINK_AUDIO_NOT_BUILT, /START/, 'it must name when the refusal happens');
+  // AND THE PIPELINE REALLY BUILDS IT. Deleting a refusal without building the
+  // leg is the one change this test must not be able to pass: an empty
+  // audioDeviceId on osxaudiosrc or wasapi2src is the SYSTEM DEFAULT INPUT, so a
+  // DeckLink seat that reached the platform element would put the match on air
+  // off the laptop's built-in microphone with every lamp green.
+  const gst = read(repoRoot, 'internal', 'gst', 'gst_cgo.go');
   assert.match(
-    DECKLINK_AUDIO_NOT_BUILT,
-    /video/i,
-    "and that the card's VIDEO leg is unaffected — videoSource is a separate setting and works",
+    gst,
+    /audioCaptureFactory/,
+    'internal/gst does not build a DeckLink commentary source, so removing the warning would ' +
+      'leave the operator with a seat that silently captures the wrong microphone',
+  );
+  assert.match(
+    read(repoRoot, 'app.go'),
+    /AudioCaptureID = plan\.AudioCaptureID/,
+    'app.go never hands the resolved card to the pipeline, so audioSourceKind "decklink" would ' +
+      'build the platform source with no device — the system default input',
   );
 
-  // AND IT IS RENDERED FROM BOTH PATHS: loading a configuration that already
-  // names the card, and choosing it now. Assigning a hidden input from script
-  // fires nothing, so the change handler has to call it by hand.
+  // NOTHING ON THE SCREEN SAYS THE FEATURE IS MISSING. The constant is gone from
+  // the module that owned it and from the screen that rendered it; a leftover
+  // sentence about an unbuilt feature outliving the feature is exactly what the
+  // old test was written to prevent, in the other direction.
   const js = ui('settings.js');
-  assert.match(js, /DECKLINK_AUDIO_NOT_BUILT/, 'settings.js must render it');
+  assert.doesNotMatch(codeOnly(js), /DECKLINK_AUDIO_NOT_BUILT/, 'settings.js must not render it');
+  assert.doesNotMatch(
+    codeOnly(ui('audioinput.js')),
+    /DECKLINK_AUDIO_NOT_BUILT/,
+    'audioinput.js must not export it',
+  );
+
+  // THE ONE NOTE LEFT is about THIS SELECTION — a saved device that is not
+  // plugged in — and it must still be rendered from both paths: loading a
+  // configuration that names an absent device, and choosing now.
   const apply = js.slice(js.indexOf('function applyAudioInputSelection()'));
   assert.match(
     apply.slice(0, apply.indexOf('\n  }')),
     /renderAudioInputNote\(false\)/,
-    'choosing a DeckLink entry must say so at the moment it is chosen',
+    'choosing an entry must clear a note left over from the previous selection',
   );
   const render = js.slice(js.indexOf('function renderAudioInput()'));
   assert.match(
     render.slice(0, render.indexOf('\n  }')),
     /renderAudioInputNote\(plan\.absent\)/,
-    'and so must opening a configuration that already names the card',
+    'opening a configuration that names a device this machine does not have must say so',
   );
 
-  // THE OPTION IS STILL OFFERED. Disabling the group would be the owner's
-  // original complaint back again ("The declink input is grayed out in
-  // settings?") and would be indistinguishable from the enumeration bug it was
-  // actually caused by. The refusal is said, not enforced by removal.
+  // THE OPTION IS STILL OFFERED, and now it is offered because it WORKS.
+  // Disabling the group would be the owner's original complaint back again
+  // ("The declink input is grayed out in settings?").
   assert.doesNotMatch(
     js,
     /decklinkOptions[\s\S]{0,200}disabled = true/,

@@ -113,38 +113,35 @@ export const DEFAULT_INPUT_LABEL = 'Default input';
 export const ANY_CARD_LABEL = 'The card in this machine';
 
 /**
- * THE HALF OF THIS FEATURE THAT IS NOT BUILT YET, said on the screen where the
- * selection is made rather than at START where it is refused.
+ * THE LINE THAT USED TO LIVE HERE, and why its absence is the deliverable.
  *
- * ===================== WHY THE OPTION IS STILL OFFERED ======================
+ * DECKLINK_AUDIO_NOT_BUILT was one sentence on the picker row, shown whenever a
+ * DeckLink entry was selected: "This version cannot capture audio from the card
+ * yet — START will refuse it. The card's video still works." It existed because
+ * app.go's preflightCapture REFUSED a DeckLink commentary seat outright, and it
+ * was said here rather than by greying the group out so that the operator met
+ * the refusal at the moment of choosing rather than at kick-off.
  *
- * app.go's preflightCapture REFUSES a DeckLink COMMENTARY seat outright — the
- * block marked "THE DECKLINK AUDIO LEG IS NOT BUILT IN THIS REVISION". The
- * enumeration half landed and the pipeline half did not: gst.PipelineOpts
- * carries AudioDeviceID alone and the pipeline always builds osxaudiosrc /
- * wasapi2src for audio, so a seat set to "decklink" would otherwise pass
- * validation with an EMPTY audioDeviceId — and an empty device on those elements
- * is not an error, it is the SYSTEM DEFAULT INPUT. The match would go out from
- * the laptop's built-in microphone with every lamp green. That gate is what
- * stops it, and it is a staging gate rather than a bug.
+ * THE LEG IS BUILT. gst.PipelineOpts.AudioCaptureID puts decklinkaudiosrc in the
+ * pipeline with sixteen channels, a decklinkvideosrc clocks it — the card drives
+ * audio capture off the video clock, so one is required even when the picture is
+ * the slate — and the mix matrix this screen's routing grid writes is what turns
+ * those sixteen unpositioned channels into the pair that goes to air. The gate
+ * in preflightCapture is gone, its own comment having said exactly when to
+ * delete it, and this constant went with it.
  *
- * So the refusal exists and cannot be argued with. The only question is WHERE
- * the operator meets it, and there are three answers:
+ * SO THERE IS NOTHING TO SAY ON THE ROW ANY MORE, and saying nothing is correct
+ * rather than merely tidy: a note under a control that is working is a note an
+ * operator has to read and dismiss every time they open the screen. The one
+ * thing that can still be wrong with a selection — the saved device is not
+ * plugged in — is renderAudioInputNote's only remaining case.
  *
- *   grey the option out   — which is the owner's original complaint back again
- *                           ("The declink input is grayed out in settings?"),
- *                           and it was greyed out for a completely different
- *                           reason, so the two would be indistinguishable
- *   say nothing           — the operator meets it at START, twenty minutes
- *                           before kick-off, with a commentator waiting
- *   say it HERE           — this
- *
- * It is one line, on the row, only when a DeckLink entry is actually selected.
- * The card's VIDEO leg is unaffected and works: videoSource is a separate
- * setting, which is why the line says "audio".
+ * What DOES still refuse, and where: a DeckLink commentary seat on a machine
+ * with no card, or with two and none named, is refused by App.preflightCapture,
+ * naming audioSourceKind or decklinkPersistentId. Those are refusals about THIS
+ * MACHINE RIGHT NOW rather than about the build, they cannot be known when the
+ * screen is drawn, and a machine question belongs at START.
  */
-export const DECKLINK_AUDIO_NOT_BUILT =
-  'This version cannot capture audio from the card yet — START will refuse it. The card’s video still works.';
 
 /**
  * The separator between the kind and the id inside an <option> value.

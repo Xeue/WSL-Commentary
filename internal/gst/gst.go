@@ -81,6 +81,29 @@
 // fixed format forever, and the conform chain is what guarantees it whatever
 // the camera is doing. See PipelineOpts.VideoCaptureID and pipelineDescription.
 //
+// # The audio leg has a second form too, and it drags a video element in with it
+//
+// When PipelineOpts.AudioCaptureID names a card, the platform capture source is
+// replaced by the card's embedded audio and NOTHING BELOW THE MIX MATRIX
+// CHANGES:
+//
+//	decklinkaudiosrc name=asrc channels=16
+//	  ! audioconvert ! level name=chlevel ...        <- unchanged
+//	  ! audioconvert name=aconv                      <- the mix matrix, unchanged
+//	  ! audioresample ! audio/x-raw,...,channels=2   <- unchanged
+//	  ! level name=alevel ! <aac> ! aacparse ! queue ! mux.
+//
+// MEASURED: decklinkaudiosrc cannot preroll without a decklinkvideosrc in the
+// SAME pipeline, because the card drives audio capture off the video clock. So
+// when the video leg is the SLATE, one more chain appears and clocks it:
+//
+//	decklinkvideosrc name=vcapclock mode=auto drop-no-signal-frames=false
+//	  ! fakesink name=vcapclocksink sync=false async=false
+//
+// and when the video leg is the SAME CARD, that chain is absent because vcapsrc
+// already is it. The card is exclusive; there is never more than one
+// decklinkvideosrc. See PipelineOpts.AudioCaptureID and pipelineDescription.
+//
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true
 //	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
 //	  ! mfaacenc bitrate=128000
@@ -703,11 +726,75 @@ type PipelineOpts struct {
 	// position.
 	SlatePath string
 
-	// AudioDeviceID is the capture endpoint to open. Required; it is Device.ID,
-	// never Device.Name, and the whole of what that means — including the fact
-	// that macOS has to resolve it before the element will take it — is
-	// documented on Device.ID.
+	// AudioDeviceID is the PLATFORM capture endpoint to open — the WASAPI or
+	// CoreAudio device that wasapi2src / osxaudiosrc is pointed at. It is
+	// Device.ID, never Device.Name, and the whole of what that means —
+	// including the fact that macOS has to resolve it before the element will
+	// take it — is documented on Device.ID.
+	//
+	// IT IS REQUIRED WHENEVER AudioCaptureID IS EMPTY, and forbidden when it is
+	// not. The two fields are the two answers to one question and exactly one of
+	// them is given; refuseWrongAudioSource is the whole rule and both twins
+	// call it before anything is built.
+	//
+	// The emptiness is the dangerous half and is why the rule is a refusal
+	// rather than a convention. An empty device on wasapi2src or osxaudiosrc is
+	// NOT an error: it is THE SYSTEM DEFAULT INPUT. So a DeckLink seat that
+	// reached the platform element with this field empty would put the match on
+	// air off the laptop's built-in microphone with every lamp green — which is
+	// why the native element is built only when this field is non-empty, and
+	// why "the platform source exists and has no device" is unreachable by
+	// construction rather than merely unlikely.
 	AudioDeviceID string
+
+	// AudioCaptureID, when non-empty, turns the COMMENTARY CAPTURE into a
+	// DeckLink card's embedded audio: decklinkaudiosrc opens the card it names,
+	// presents its sixteen unpositioned channels, and the mix matrix on the
+	// named audioconvert routes the commentator's pair into the feed. It is a
+	// persistent-id, the same string VideoCaptureID takes, because one
+	// persistent-id names the CARD and serves its audio and video entries alike
+	// (measured: the fitted UltraStudio 4K Mini publishes 2747401380 for both).
+	//
+	// THE ZERO VALUE IS THE PLATFORM MICROPHONE, and that is the whole
+	// compatibility statement. A seat that leaves it empty builds byte-for-byte
+	// the audio leg the on-air Windows build has always run — captureSourceFactory
+	// pointed at AudioDeviceID — because the source is chosen by whether this
+	// field is empty and by nothing else.
+	//
+	// # It brings a decklinkvideosrc with it, and that is not an implementation detail
+	//
+	// MEASURED: decklinkaudiosrc CANNOT PREROLL ALONE. The card drives audio
+	// capture off the VIDEO clock, so with no decklinkvideosrc in the same
+	// pipeline the audio branch produces ZERO buffers — 0 level messages against
+	// 160 — and the leg never starts. So this field always builds a decklink
+	// VIDEO element too:
+	//
+	//	VideoCaptureID == AudioCaptureID   ONE decklinkvideosrc (vcapsrc) serves
+	//	                                   the video leg AND the audio clock. The
+	//	                                   card is EXCLUSIVE — two sources in one
+	//	                                   process fail 3/3 and two processes fail
+	//	                                   3/3 — so a second one is impossible,
+	//	                                   not merely wasteful.
+	//	VideoCaptureID == ""               a decklinkvideosrc named vcapclock is
+	//	                                   built beside the slate leg, feeding
+	//	                                   fakesink, purely to clock this. It
+	//	                                   costs 0.6-2.4 % of one core, measured,
+	//	                                   and touches nothing else in the graph.
+	//
+	// THE TWO IDS MUST NAME THE SAME CARD when both are set, and Start refuses
+	// when they do not. config.json carries ONE decklinkPersistentId for both
+	// legs, so the application cannot produce a disagreement; a caller that
+	// hand-built one is describing a two-card rig whose audio clock would have
+	// to be a THIRD decklink element on the other card, which nothing here has
+	// ever run. Refusing by name beats building a shape nobody has measured.
+	//
+	// It is IGNORED BY EVERYTHING BELOW THE MIX MATRIX. audioresample, the
+	// S16LE/48k/2ch capsfilter, alevel, the AAC encoder, aacparse, mpegtsmux and
+	// srtsink see exactly what they see on a microphone seat, which is what lets
+	// internal/sender and the timestamp discipline go on reasoning about one
+	// graph. See ChannelMap for the routing and channelmap.go for why the matrix
+	// is a NEGOTIATION CONSTRAINT rather than a gain.
+	AudioCaptureID string
 
 	// VideoCaptureID, when non-empty, turns the VIDEO LEG INTO A LIVE CAPTURE:
 	// the DeckLink card it names is opened, conformed to ConformTo and encoded,
@@ -953,6 +1040,101 @@ type PipelineOpts struct {
 	// found.
 	ChannelMap ChannelMap
 }
+
+// refuseWrongAudioSource is the WHOLE RULE about which element opens the
+// commentary, applied by both twins before anything is built.
+//
+// It lives here, with no build tag, for the reason the conform resolution does:
+// this is the check that stops a match going out down the wrong microphone, and
+// a check that only exists in the cgo build is a check Gate A cannot run. Both
+// Starts call it, so a combination Gate A accepts is a combination the card
+// accepts and a combination Gate A refuses is one the real build refuses before
+// touching an element.
+//
+// # The two fields are exclusive, and the emptiness is why
+//
+// AudioDeviceID names a platform endpoint; AudioCaptureID names a DeckLink
+// card. They are two answers to one question, and the failure of allowing both
+// is not ambiguity — it is that WHICH ONE WINS becomes a property of
+// pipelineDescription rather than of anything the operator can see.
+//
+// The failure of allowing NEITHER is worse and is the one this application
+// exists to make impossible. An empty device on wasapi2src or osxaudiosrc is not
+// an error, it is THE SYSTEM DEFAULT INPUT — so a DeckLink seat that reached the
+// platform element with an empty id would transmit the laptop's built-in
+// microphone with every lamp green. Requiring exactly one is what makes that
+// state unreachable by construction: the native element is built only when
+// AudioDeviceID is non-empty, and the only way to get no native element and no
+// card is to be refused here.
+//
+// # What each branch checks
+//
+// A DeckLink id is CONVERTED, not pattern-matched, by the same
+// parseDeckLinkPersistentID configureDeckLinkSource will use — a CoreAudio
+// unique-id or a WASAPI GUID reaching decklinkaudiosrc's persistent-id would
+// leave it at its own -1 default, which means "use device-number", which means
+// whichever card the driver enumerated first.
+//
+// A platform id goes through refuseRenderEndpoint, unchanged and for the reason
+// device_id.go gives at length: wasapi2src accepts a PLAYBACK endpoint at
+// construction and fails asynchronously with error 1551, which internal/sender
+// then misreads as a network failure and retries forever.
+func refuseWrongAudioSource(audioDeviceID, audioCaptureID string) error {
+	switch {
+	case audioDeviceID == "" && audioCaptureID == "":
+		return errors.New("gst: the commentary capture has no source: PipelineOpts.AudioDeviceID " +
+			"(a WASAPI or CoreAudio endpoint) and PipelineOpts.AudioCaptureID (a DeckLink card's " +
+			"persistent-id) are both empty, and exactly one is required. An empty device id is not " +
+			"an error on wasapi2src or osxaudiosrc — it is the SYSTEM DEFAULT INPUT — so a pipeline " +
+			"built from this would go on air off whatever microphone the machine happens to prefer")
+
+	case audioDeviceID != "" && audioCaptureID != "":
+		return fmt.Errorf("gst: the commentary capture has two sources: PipelineOpts.AudioDeviceID "+
+			"is %q and PipelineOpts.AudioCaptureID is %q, and exactly one is required. Which one "+
+			"reached the element would be a property of the pipeline builder rather than of "+
+			"anything the operator chose", audioDeviceID, audioCaptureID)
+
+	case audioCaptureID != "":
+		if _, err := parseDeckLinkPersistentID(audioCaptureID); err != nil {
+			return fmt.Errorf("gst: PipelineOpts.AudioCaptureID names the DeckLink card the "+
+				"commentary is captured from, and it must be a DeckLink persistent-id rather than "+
+				"an audio device id: %w", err)
+		}
+		return nil
+	}
+
+	return refuseRenderEndpoint(audioDeviceID)
+}
+
+// deckLinkAudioChannels is the `channels` property decklinkaudiosrc is built
+// with, and 16 is the only value this application can use.
+//
+// MEASURED on the fitted UltraStudio 4K Mini, 2026-08-16, asking the source pad
+// what it will produce with the pipeline still in NULL:
+//
+//	channels=16   channel-mask=0x0, UNPOSITIONED, no stereo pair available
+//	channels=8    channel-mask=0x0, UNPOSITIONED, no stereo pair available
+//	channels=2    a POSITIONED 0x3 pair, negotiates with no matrix at all
+//
+// channels=2 therefore looks like the easy way out of the unpositioned problem
+// and it is the wrong answer, for a reason that has nothing to do with
+// negotiation: it can only ever reach the card's FIRST PAIR. The commentator may
+// be on any of sixteen embedded channels — which is the entire reason the
+// routing model, the mix matrix, the sixteen-bar picker meter and the mapping
+// screen were built — so a source that cannot see channels 3 to 16 makes all of
+// that unreachable. Sixteen has to be the steady state for the further reason
+// that `channels` is NOT live-settable: reaching another pair by changing it
+// would cost a pipeline restart, mid-match.
+//
+// `max` is deliberately not used. It publishes a CHOICE in NULL (2, or 8-or-16)
+// and fixes itself only once the card is open, which is after the moment the mix
+// matrix has to be sized. fixedChannelCount refuses it by name for that reason.
+const deckLinkAudioChannels = 16
+
+// It lives here, with no build tag, rather than beside audioCaptureFactory in
+// gst_cgo.go, because the stub twin models it: a DeckLink commentary seat whose
+// fake pad negotiated a stereo pair is a shape the real build cannot produce,
+// and a Gate A test written against one would be testing a fiction.
 
 // Levels is one audio level report from the send pipeline: what the level
 // element measured over its last 50 ms window, immediately upstream of the AAC

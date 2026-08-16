@@ -81,6 +81,19 @@ func TestCommentaryInputPairIsCoherent(t *testing.T) {
 		// wantPreflightNames is the same for App.preflightCapture, which is
 		// asked only when Validate passed.
 		wantPreflightNames string
+
+		// wantVideoCard and wantAudioCard are the persistent-ids the pre-flight
+		// must hand each leg when it ACCEPTS the seat. Empty means the still
+		// slate for the video leg and the platform's own capture source for the
+		// audio one — which is the answer on every seat shipping today, and the
+		// answer that must survive this feature unchanged.
+		//
+		// They are asserted rather than left implied because the two are the
+		// same type, decided together, and a transposition would produce a seat
+		// whose picture and commentary had swapped sources with nothing
+		// anywhere reporting an error.
+		wantVideoCard string
+		wantAudioCard string
 	}{
 		{
 			name: "a native seat with a device chosen is the ordinary case",
@@ -104,29 +117,66 @@ func TestCommentaryInputPairIsCoherent(t *testing.T) {
 				c.VideoSource = config.VideoSourceDeckLink
 				c.DeckLinkPersistentID = cardID
 			},
+			wantVideoCard: cardID,
 		},
 		{
-			name: "a native microphone with a DeckLink camera and no card named picks the one card",
-			edit: func(c *config.Config) { c.VideoSource = config.VideoSourceDeckLink },
+			name:          "a native microphone with a DeckLink camera and no card named picks the one card",
+			edit:          func(c *config.Config) { c.VideoSource = config.VideoSourceDeckLink },
+			wantVideoCard: cardID,
 		},
 		{
-			name: "a DeckLink commentary seat is refused by name while its capture leg is unbuilt",
+			// THE SEAT THIS WHOLE FEATURE EXISTS FOR, and the row that changed
+			// when the capture leg landed. It used to be a refusal — the audio
+			// leg was not built and reaching osxaudiosrc or wasapi2src with an
+			// empty device is the SYSTEM DEFAULT INPUT, so the gate was what
+			// kept the unbuilt half unreachable. The leg exists now, so the
+			// seat starts: the card is resolved against the enumeration and
+			// handed to gst.PipelineOpts.AudioCaptureID.
+			//
+			// NOTE WHAT IS STILL EMPTY. audioDeviceId is not required and is
+			// not consulted; the pre-flight never asks the device monitor about
+			// a CoreAudio endpoint this seat will never open. See
+			// nativeAudioDeviceID, which clears it on the way to the pipeline.
+			name: "a DeckLink commentary seat with one card in the machine starts",
 			edit: func(c *config.Config) {
 				c.AudioSourceKind = config.AudioSourceDeckLink
 				c.AudioDeviceID = ""
 			},
-			// NOT "audioDeviceId is required": Validate stops requiring it for
-			// this kind, correctly, because no CoreAudio or WASAPI endpoint is
-			// ever opened. The refusal comes from the pre-flight and names the
-			// field that actually decides it.
-			wantPreflightNames: "audioSourceKind",
+			wantAudioCard: cardID,
 		},
 		{
-			name: "a DeckLink commentary seat naming its card is refused the same way",
+			name: "a DeckLink commentary seat naming its card starts on that card",
 			edit: func(c *config.Config) {
 				c.AudioSourceKind = config.AudioSourceDeckLink
 				c.AudioDeviceID = ""
 				c.DeckLinkPersistentID = cardID
+			},
+			wantAudioCard: cardID,
+		},
+		{
+			// BOTH LEGS ON THE CARD: one decklinkvideosrc serves the picture and
+			// clocks the commentary. There is one decklinkPersistentId, so the
+			// two ids are the same by construction — which is what internal/gst
+			// requires, because a DeckLink clocks its audio off its OWN video.
+			name: "the card carrying both the picture and the commentary starts on one card",
+			edit: func(c *config.Config) {
+				c.VideoSource = config.VideoSourceDeckLink
+				c.AudioSourceKind = config.AudioSourceDeckLink
+				c.AudioDeviceID = ""
+				c.DeckLinkPersistentID = cardID
+			},
+			wantVideoCard: cardID,
+			wantAudioCard: cardID,
+		},
+		{
+			// A DECKLINK COMMENTARY SEAT WITH NO CARD IN THE MACHINE is still
+			// refused, and the refusal names the setting that decides it rather
+			// than videoSource, which on this seat is already correct.
+			name: "a DeckLink commentary seat with no card is refused, naming audioSourceKind",
+			edit: func(c *config.Config) {
+				c.AudioSourceKind = config.AudioSourceDeckLink
+				c.AudioDeviceID = ""
+				c.DeckLinkPersistentID = otherID
 			},
 			wantPreflightNames: "audioSourceKind",
 		},
@@ -171,10 +221,19 @@ func TestCommentaryInputPairIsCoherent(t *testing.T) {
 				return
 			}
 
-			_, err = a.preflightCapture(cfg)
+			plan, err := a.preflightCapture(cfg)
 			if tc.wantPreflightNames == "" {
 				if err != nil {
 					t.Fatalf("preflightCapture() refused a startable seat: %v", err)
+				}
+				if plan.VideoCaptureID != tc.wantVideoCard {
+					t.Errorf("the video leg was given card %q, want %q",
+						plan.VideoCaptureID, tc.wantVideoCard)
+				}
+				if plan.AudioCaptureID != tc.wantAudioCard {
+					t.Errorf("the commentary leg was given card %q, want %q; an id here that the "+
+						"seat did not ask for moves the commentary off the operator's microphone "+
+						"and onto the card", plan.AudioCaptureID, tc.wantAudioCard)
 				}
 				return
 			}
