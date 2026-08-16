@@ -283,6 +283,49 @@ const (
 	nameVideoScale = "vscale" // videoscale, so a slate that is not the conform size still starts
 )
 
+// The LIVE CAPTURE video leg's element names.
+//
+// The capture source itself is NOT here: it is nameVideoCaptureSrc, declared in
+// capturefault.go beside the fault classifier that reads it, because that
+// decision has to be testable at Gate A where this file does not compile. These
+// are its conform chain, and every one of them begins with
+// videoCaptureNamePrefix for a reason that is worth more than the tidiness of a
+// shared prefix.
+//
+// classifyBusError decides whether a bus error takes the commentary off air BY
+// ELEMENT NAME. An element left unnamed in the parse string gets a GStreamer
+// name of its own — "videoconvert0", "deinterlace0" — which matches no prefix
+// and therefore rejoins the FATAL default. So a conform chain written without
+// these names does not degrade to a frozen picture when the camera is unplugged
+// mid-match: it takes the commentary off air, silently, for a video fault, on a
+// pipeline whose audio was perfectly healthy. Naming them is what makes
+// capturefault.go's prefix rule true of the whole leg rather than of the source
+// alone.
+//
+// They are separate from the slate leg's names rather than shared with them
+// because the two legs are never both built, and a log line naming vcapscale
+// says which leg the reader is looking at without having to know what was
+// configured.
+const (
+	nameVideoCapConv  = "vcapconv"  // videoconvert: whatever the card gives us into NV12
+	nameVideoCapDeint = "vcapdeint" // deinterlace: the only thing that handles a 1080i camera
+	nameVideoCapScale = "vcapscale" // videoscale: the camera's raster into the conform target's
+	nameVideoCapRate  = "vcaprate"  // videorate: MANDATORY, see pipelineDescription
+	nameVideoCapTee   = "vcaptee"   // tee: the broadcast branch, plus an optional preview
+	nameVideoCapQueue = "vcapq"     // the broadcast branch's head queue
+)
+
+// videoCaptureFactory is the element that opens the card's video input.
+//
+// It is NOT in elements_windows.go / elements_darwin.go, and its absence from
+// that seam is the statement that the two ports agree here: the decklink plugin
+// is one upstream source tree built against Blackmagic's own SDK, and the
+// factory is decklinkvideosrc on both. The seam exists for the elements that
+// genuinely differ — the platform's own capture source and AAC encoder — and
+// putting an identical constant in both halves would be two places to change a
+// name that can only ever change in one.
+const videoCaptureFactory = "decklinkvideosrc"
+
 // propMixMatrix is audioconvert's routing matrix: the property that says which
 // input channel reaches which output, and at what gain. It is the whole of the
 // channel-map mechanism at the GStreamer end; channelmap.go is the model above
@@ -384,6 +427,39 @@ var requiredElements = append([]requiredElement{
 	{"mpegtsmux", "mpegtsmux"},
 	{"srtsink", "srt"},
 }, platformRequiredElements...)
+
+// videoCaptureRequiredElements are the four factories the LIVE CAPTURE video leg
+// needs and no other configuration does.
+//
+// THEY ARE A SEPARATE LIST AND ARE DELIBERATELY NOT IN requiredElements, and the
+// reason is the difference between two failures rather than tidiness. A missing
+// entry in requiredElements makes Init return an error, which makes the
+// application refuse to launch at all. That is exactly right for a resampler
+// every seat needs; it is exactly wrong for a plugin only a seat with a card in
+// it can use, because it would take a commentary position that has never seen a
+// DeckLink off the air over a bundle defect that could not possibly affect it.
+//
+// So the check runs twice, in two different registers. Init reports a missing
+// one as a LOG LINE — the bundle-contract diagnosis, present on every start of
+// every seat, which is what somebody staging a bundle needs — and Start refuses
+// WITH A NAMED ERROR when a capture is actually configured, which is what the
+// operator whose card will not open needs. Neither of those is the twenty
+// minutes before kick-off failure the requiredElements comment is about: on the
+// seat that needs these, the refusal is at Start with the plugin named, and it
+// is the same moment gst_parse_launch would have failed anyway, with a better
+// sentence.
+//
+// tee is in coreelements and cannot be missing from a GStreamer that has queue
+// in it, and it is listed anyway. The list's value is that it is exhaustive: a
+// reader staging a bundle should be able to satisfy the capture leg from this
+// one place, and an entry that is always present costs one registry lookup at
+// Init.
+var videoCaptureRequiredElements = []requiredElement{
+	{videoCaptureFactory, "decklink"},
+	{"deinterlace", "deinterlace"},
+	{"videorate", "videorate"},
+	{"tee", "coreelements"},
+}
 
 // initEnvVar is one environment variable that has to be in place before
 // gst_init, as a name and a value.
@@ -557,6 +633,19 @@ func doInit(appDir string) error {
 			pluginDir, strings.Join(missing, ", "), bundleAllowlistNoun, registryPath)
 	}
 
+	// The live capture leg's plugins, reported and NOT refused. See
+	// videoCaptureRequiredElements for why this is a log line and the block above
+	// is an error: a seat with no card must not be stopped from going on air by
+	// the absence of a plugin it will never load. The line is written on every
+	// start of every seat because that is what makes it useful to the person
+	// staging a bundle, who has no card either.
+	if missing := missingFrom(videoCaptureRequiredElements); len(missing) > 0 {
+		log.Printf("gst: Init: the bundled GStreamer in %q cannot build a live video capture leg: "+
+			"%s. The slate leg is unaffected and this seat will go on air normally; a seat "+
+			"configured for a DeckLink video input will be refused at Start (check the %s allowlist)",
+			pluginDir, strings.Join(missing, ", "), bundleAllowlistNoun)
+	}
+
 	log.Printf("gst: initialised, plugins from %q, registry %q", pluginDir, registryPath)
 	return nil
 }
@@ -600,8 +689,17 @@ func registryFile() (string, error) {
 // missingElements returns a description of every required element factory that
 // the registry does not have, or nil if the bundle is complete.
 func missingElements() []string {
+	return missingFrom(requiredElements)
+}
+
+// missingFrom is the same lookup against any of the contract lists. It is
+// factored out because the video capture leg's list is checked in two places
+// and at two severities — see videoCaptureRequiredElements — and a second copy
+// of this loop would be a second chance to format the plugin name differently
+// in the two messages somebody has to compare.
+func missingFrom(reqs []requiredElement) []string {
 	var missing []string
-	for _, req := range requiredElements {
+	for _, req := range reqs {
 		if gogst.ElementFactoryFind(req.factory) == nil {
 			missing = append(missing, fmt.Sprintf("%s (plugin %s)", req.factory, req.plugin))
 		}
@@ -1159,6 +1257,40 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 			opts.VideoBitrateKbps, opts.AudioBitrateBps)
 	}
 
+	// THE VIDEO LEG'S SOURCE, decided once, here, and refused here if it cannot
+	// be honoured. Both checks are made BEFORE anything is built, because both
+	// failures are configuration failures and the message a configuration
+	// failure deserves is one that names the value, not a parse error naming an
+	// element.
+	//
+	// The id is validated by CONVERTING it, which is the same test
+	// configureDeckLinkSource will make later and is deliberately the same call.
+	// A CoreAudio unique-id or a WASAPI endpoint GUID reaching the element's
+	// persistent-id property would leave it at its own -1 default, which means
+	// "use device-number", which means whichever card the driver enumerated
+	// first — a wrong-card video feed with every lamp green. Refusing early
+	// costs nothing and makes the wrong-kind case a sentence rather than a
+	// picture nobody recognises.
+	if opts.VideoCaptureID != "" {
+		if _, err := parseDeckLinkPersistentID(opts.VideoCaptureID); err != nil {
+			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID names the DeckLink card whose "+
+				"input becomes the video leg, and it must be a DeckLink persistent-id rather "+
+				"than an audio device id: %w", err)
+		}
+		// The bundle contract for this leg alone. Init logged it and did not
+		// refuse, precisely so a seat with no card could still go on air; this
+		// is the seat that does have one, so this is where it becomes an error.
+		// See videoCaptureRequiredElements.
+		if missing := missingFrom(videoCaptureRequiredElements); len(missing) > 0 {
+			return fmt.Errorf("gst: a DeckLink video input is configured but this build's "+
+				"GStreamer cannot build the capture leg: %s. The commentary audio is unaffected; "+
+				"clearing the video input setting will start this seat with the slate",
+				strings.Join(missing, ", "))
+		}
+		log.Printf("gst: Start: the video leg is a LIVE CAPTURE from DeckLink card %s; "+
+			"the slate is not built", opts.VideoCaptureID)
+	}
+
 	// The conform target is resolved HERE and nowhere else, so that the string
 	// handed to gst_parse_launch and the string written to the log are the same
 	// decision. resolve never fails — a format that cannot be used falls back
@@ -1203,7 +1335,85 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	}
 	p.encoderName = encoderName
 
-	desc := pipelineDescription(encoderName, opts.AudioBitrateBps, conform)
+	// THE CONFIDENCE MONITOR, decided here and nowhere else, before anything is
+	// built. preview.go carries the whole argument. Two things about this call
+	// site are load-bearing: the preview is a STRING appended to the parse
+	// description and never an element added to a running graph — set_state(NULL)
+	// on such a branch inside a blocking pad probe took the on-air leg from 50 fps
+	// to 0 PERMANENTLY with the pipeline still reporting PLAYING — and
+	// opts.VideoCaptureID is passed so that a preview can never be rendered
+	// against a tee the slate leg does not build, which would be a
+	// gst_parse_launch failure of this whole pipeline rather than a missing
+	// preview.
+	//
+	// It is resolved ONCE, here, rather than inside the build below, because the
+	// build below may run twice: resolving it there would ask the registry for a
+	// sink a second time and log the branch a second time for a pipeline that is
+	// deliberately not getting one.
+	preview := previewBranchFor(opts.Preview, opts.VideoCaptureID)
+
+	if err := p.startBuiltLocked(opts, conform, encoderName, preview); err != nil {
+		if preview == "" {
+			return err
+		}
+		// THE CONFIDENCE MONITOR IS OPTIONAL AND THE COMMENTARY IS NOT.
+		//
+		// Every OTHER way the preview can fail is spared: a bus error from one of
+		// its elements is classPreview and never reaches the gate or Errors(). A
+		// sink that will not come up at all is the one that is not, because it
+		// fails as a STATE CHANGE and the bus filter is not consulted. Building
+		// once more without the branch can only turn a failure into a success,
+		// and the alternative is a seat that will not go on air because of a
+		// window.
+		//
+		// abort() has already taken the pipeline to NULL and dropped every
+		// element reference, so the second attempt starts where the first did.
+		// p.fatal is the one thing that survives, and that is correct: nothing a
+		// preview element posts can latch it (classPreview never calls markFatal),
+		// so a latched fatal means the first attempt failed for a reason the
+		// second will fail for too — and it will say so, in the same words.
+		//
+		// WHAT IT COSTS when the fault is NOT the preview's: one more NULL to
+		// PLAYING, so a seat that cannot start at all takes up to
+		// pipelineStartTimeout longer to say so. That is paid only by a seat that
+		// has both chosen a camera and ticked the monitor, and only when it is
+		// already failing.
+		log.Printf("gst: Start: the pipeline would not start with the confidence monitor in it "+
+			"(%v); rebuilding WITHOUT it. The commentary is the product and the preview is not", err)
+		return p.startBuiltLocked(opts, conform, encoderName, "")
+	}
+	return nil
+}
+
+// startBuiltLocked builds the pipeline, points every element at what it is to
+// open, and takes it to PLAYING. p.mu must be held; Start is its only caller.
+//
+// # Why it is a function of its own, and why it may be called twice
+//
+// It is the whole of Start below the option checks, extracted for exactly one
+// reason: a preview sink that EXISTS and then will not START — no GL context, no
+// D3D11 device, a display that has gone away — fails inside the NULL to PLAYING
+// transition. That is a state change and not a bus error, so capturefault.go's
+// classifier never sees it and none of the sparing that protects the preview
+// everywhere else applies. The only answer available at that point is to build
+// the pipeline again without it, which needs the build to be callable twice.
+//
+// It is safe to call twice because every path out of it that is not success goes
+// through abort(), which runs teardownLocked: the pipeline reaches NULL, the
+// capture device and the card are released, every element reference is dropped
+// and matrixWidth goes back to zero. The second call therefore starts from the
+// same state the first one did, with two deliberate exceptions — p.fatal, which
+// is latched and must survive so that a real fault fails the retry too, and the
+// process-lifetime base time, which is sampled once and reused forever.
+//
+// THE ORDER OF WHAT IT DOES IS LOAD-BEARING THROUGHOUT and is guarded from Gate
+// A by source-reading tests in gst_stub_test.go, which read this function and
+// Start together as one sequence — see startSequence there. Nothing in here may
+// be reordered on the strength of it reading better.
+func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
+	encoderName, preview string) error {
+	desc := pipelineDescription(encoderName, opts.AudioBitrateBps, conform,
+		opts.VideoCaptureID, preview)
 	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
 	element, err := gogst.ParseLaunch(desc)
@@ -1226,36 +1436,70 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		return err
 	}
 
-	// The slate path and the device GUID are set with g_object_set rather than
+	// THE VIDEO LEG'S SOURCE. Exactly one of the two branches below is built,
+	// decided by the same condition pipelineDescription used, so the element
+	// looked up is always the element the string put there.
+	//
+	// The slate path and the device ids are set with g_object_set rather than
 	// placed in the parse string. gst_parse_launch's quoting rules treat a
 	// backslash as an escape inside double quotes, so a Windows path would be
 	// mangled, and the endpoint GUID's braces and dots are similarly at the
 	// mercy of the parser. Neither value ever reaches the parser.
-	slate := pipeline.GetByName(nameSlateSrc)
-	if slate == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameSlateSrc))
-	}
-	if err := setStringProperty(slate, "location", opts.SlatePath); err != nil {
-		return abort(err)
+	if opts.VideoCaptureID == "" {
+		slate := pipeline.GetByName(nameSlateSrc)
+		if slate == nil {
+			return abort(errors.New("gst: parsed pipeline has no element named " + nameSlateSrc))
+		}
+		if err := setStringProperty(slate, "location", opts.SlatePath); err != nil {
+			return abort(err)
+		}
+	} else {
+		vsrc := pipeline.GetByName(nameVideoCaptureSrc)
+		if vsrc == nil {
+			return abort(errors.New("gst: parsed pipeline has no element named " + nameVideoCaptureSrc))
+		}
+		// The SAME function the audio source goes through, on purpose. One saved
+		// persistent-id serves both entries the card publishes, and routing both
+		// kinds of decklink element through one setter is what stops the two
+		// growing different rules about the identical string. Note what is NOT
+		// called anywhere near here: nothing sets `connection`. See
+		// pipelineDescription.
+		if err := configureDeckLinkSource(vsrc, opts.VideoCaptureID); err != nil {
+			return abort(err)
+		}
 	}
 
 	// add-borders is set here rather than in the parse string because
 	// gst_parse_launch treats an unknown property as a hard error, and a
 	// commentary position that will not start because a scaler property was
-	// renamed is a worse outcome than a slate scaled at the element's default.
-	// The value pins the behaviour for artwork whose aspect ratio is not 16:9:
-	// letterbox it rather than stretch it. videoscale's own default is already
-	// true, so this is a guard against the default changing, not a change.
-	if vscale := pipeline.GetByName(nameVideoScale); vscale != nil {
+	// renamed is a worse outcome than a picture scaled at the element's default.
+	// The value pins the behaviour for a source whose aspect ratio is not the
+	// conform target's: letterbox it rather than stretch it. videoscale's own
+	// default is already true, so this is a guard against the default changing,
+	// not a change.
+	//
+	// It applies to WHICHEVER leg was built, and the name is chosen from the
+	// same condition rather than by trying both: a lookup that misses is logged
+	// as a defect below, and a message saying the slate's scaler is missing on a
+	// pipeline that was never asked to build one is a false alarm in the one
+	// file somebody reads when a feed looks wrong. On the capture leg it matters
+	// for a reason the slate never had — a 16:9 camera into a 4:3 switcher
+	// configuration is a real facility, and stretching faces is the kind of
+	// fault nobody reports as a fault.
+	scaleName := nameVideoScale
+	if opts.VideoCaptureID != "" {
+		scaleName = nameVideoCapScale
+	}
+	if vscale := pipeline.GetByName(scaleName); vscale != nil {
 		if hasProperty(vscale, "add-borders") {
 			vscale.SetObjectProperty("add-borders", true)
 		} else {
-			log.Printf("gst: %s has no add-borders property; a slate that is not 16:9 will be stretched",
-				nameVideoScale)
+			log.Printf("gst: %s has no add-borders property; a picture that is not the conform "+
+				"target's aspect ratio will be stretched", scaleName)
 		}
 	} else {
-		log.Printf("gst: parsed pipeline has no element named %s; a slate that is not exactly "+
-			"%dx%d will fail caps negotiation", nameVideoScale, conform.Width, conform.Height)
+		log.Printf("gst: parsed pipeline has no element named %s; a picture that is not exactly "+
+			"%dx%d will fail caps negotiation", scaleName, conform.Width, conform.Height)
 	}
 
 	asrc := pipeline.GetByName(nameAudioSrc)
@@ -1327,6 +1571,19 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		return abort(errors.New("gst: parsed pipeline has no element named " + nameVideoEncod))
 	}
 	applyEncoderProperties(p.encoder, encoderName, opts.VideoBitrateKbps)
+
+	// The preview sink's surface, and the properties that could not safely go in
+	// the parse string. It MUST happen before the pipeline leaves NULL: a
+	// GstVideoOverlay with no window handle makes its OWN top-level window, with
+	// a title bar and a close button, over the commentator's screen.
+	//
+	// It does nothing at all when there is no preview branch. Every error it can
+	// return means the parsed graph is not the one this package just asked for,
+	// so it aborts — and the rebuild in Start is what stops that costing the
+	// commentary anything.
+	if err := attachPreview(pipeline, opts.Preview, preview); err != nil {
+		return abort(err)
+	}
 
 	p.srtq = pipeline.GetByName(nameSRTQueue)
 	if p.srtq == nil {
@@ -1888,9 +2145,12 @@ func (p *cgoPipeline) drainStartupError() error {
 // encoderName is the H.264 factory resolved at runtime. audioBitrateBps is the
 // AAC encoder's bitrate property, in bits per second — the same unit on
 // mfaacenc and on atenc, which is the one piece of luck in this port. conform
-// is the ALREADY-RESOLVED raster and rate the slate leg is conformed to: Start
+// is the ALREADY-RESOLVED raster and rate the video leg is conformed to: Start
 // resolves it and logs what it resolved, so this function never sees a zero or
-// a nonsense one and does not check.
+// a nonsense one and does not check. videoCapture is non-empty when the video
+// leg is a LIVE CAPTURE rather than the slate; its VALUE is not used here — the
+// persistent-id is set with g_object_set for the same reason the slate path and
+// the device id are — only whether it is empty.
 //
 // # Exactly two element names in it are per-platform
 //
@@ -1933,6 +2193,141 @@ func (p *cgoPipeline) drainStartupError() error {
 // configured for anything but 1080p50. That is not tidier, it is a commentary
 // position that cannot go on air; see FallbackConformTarget.
 //
+// # The second conditional: which SOURCE the video leg has
+//
+// This one varies the elements and it is exactly the thing the paragraph above
+// says needs arguing for on its own terms. Here is the argument.
+//
+// What must not vary is the format everything BELOW the encoder sees. It does
+// not: the two legs meet at one capsfilter carrying the same ConformTarget, and
+// from " ! " + encoderName onwards the string is written ONCE, in one place,
+// for both. h264parse, the byte-stream capsfilter, vq, mpegtsmux, srtq and
+// every reconnect rule in internal/sender are handed an identical graph
+// whichever leg is above them, and that is checked rather than asserted —
+// TestBothVideoLegsMeetAtTheSameEncoder reads this function and fails if the
+// encoder line is ever written twice.
+//
+// What varies above it is a SOURCE, and a source is the one thing in this graph
+// the application has always been allowed to choose: the audio leg has been
+// pointed at a different device on every seat since the first build, and
+// nothing downstream has ever known or cared. A camera instead of a PNG is the
+// same kind of choice made in the other leg, and the conform chain is what
+// makes it the same kind of choice — a 1080i50 camera, a 720p59.94 camera and
+// the card's own start-up placeholder all leave the leg as one raster and rate.
+//
+// The alternative was a second Pipeline implementation, or a slate leg that
+// switches source live. Both were rejected on the same measurement:
+// set_state(NULL) inside a blocking pad probe took the on-air leg from 50 fps
+// to 0 PERMANENTLY, with the pipeline still reporting PLAYING and no error
+// anywhere. The source is therefore decided at Start, from configuration, and
+// never afterwards.
+//
+// # What the capture leg is, element by element, and what breaks without each
+//
+// Every line below was measured on the fitted UltraStudio 4K Mini on
+// 2026-08-16. None of it is defensive habit.
+//
+//	mode=auto             ONLY. A pinned mode that disagrees with the input does
+//	                      not fail — measured, mode=pal against a real 1080p25
+//	                      input produced 50 clean PAL buffers with nothing but a
+//	                      warning. Green lamp, real bitrate, black picture.
+//	connection            IS NEVER SET, not here and not anywhere in this
+//	                      package. It is not a per-pipeline selection: it
+//	                      PERSISTENTLY RECONFIGURES THE CARD and overrides what
+//	                      the operator set in Blackmagic Desktop Video Setup, and
+//	                      it has had to be undone by hand twice. The card's input
+//	                      is chosen in Desktop Video Setup and leaving the
+//	                      property alone is what makes that work. If a capture is
+//	                      black or silent the answer is NEVER another connection
+//	                      value.
+//	drop-no-signal-frames Left at its default of false, and stated so that the
+//	                      default changing is a visible edit rather than a silent
+//	                      one. False means the card keeps emitting black
+//	                      GAP-flagged frames at full rate FOREVER on signal loss
+//	                      — no error, no EOS, the muxer never starves. That is
+//	                      why the feed's continuity is not at risk, and it is
+//	                      also why nothing in this pipeline can tell you the
+//	                      signal has gone: the only thing that can is the card's
+//	                      own signal property, which is what signalwatch.go
+//	                      polls.
+//	videoconvert          The card negotiates UYVY or v210 depending on the
+//	                      input; the encoder wants NV12.
+//	deinterlace           The only thing in this chain that handles a 1080i50
+//	                      camera, which is still what a good deal of outside
+//	                      broadcast kit produces. It passes progressive through
+//	                      at essentially zero cost, so it is not a trade — it is
+//	                      free insurance against the one input format that would
+//	                      otherwise reach the encoder as interlaced frames the
+//	                      switcher will not take.
+//	videoscale            The camera's raster need not be the switcher's.
+//	videorate             MANDATORY, and the least obvious element here.
+//	                      decklinkvideosrc emits a 720x486 NTSC PLACEHOLDER as
+//	                      its FIRST BUFFER on every start, with GAP set and
+//	                      signal=false, and the real caps arrive about 170 ms
+//	                      later. A fixed capsfilter with no videorate in front of
+//	                      it dies 0.088 s after PLAYING with not-negotiated (-4),
+//	                      3 runs out of 3. It also absorbs a camera whose rate is
+//	                      not the switcher's.
+//	tee allow-not-linked  The broadcast branch is linked below; the preview
+//	                      branch is optional and arrives as this function's
+//	                      `preview` argument, rendered by previewBranchFor and
+//	                      empty on every seat that has not asked for one. Without
+//	                      allow-not-linked=true a tee with an unlinked src pad
+//	                      returns NOT_LINKED upstream and stops the leg — which is
+//	                      to say the DEFAULT configuration is the one that needs
+//	                      the property, not the preview. A SECOND
+//	                      decklinkvideosrc IS NOT AN OPTION — the card is
+//	                      exclusive, two sources in one process fail 3/3 and two
+//	                      processes fail 3/3 — so sharing this one through a tee
+//	                      is the only shape a preview can have.
+//	queue vcapq           The branch head queue. Bounded by TIME only, one
+//	                      second, exactly as vq below is: a plain queue's default
+//	                      10 MB bound is about three frames of 1080p NV12, which
+//	                      would make the bound depend on the raster. It is NOT
+//	                      leaky — this is the branch that goes on air, and
+//	                      dropping its frames to protect a preview would be
+//	                      backwards. The PREVIEW branch's head queue is the one
+//	                      that must be leaky=downstream, because tee pushes
+//	                      serially on the upstream thread and a preview that
+//	                      merely renders slowly was measured dragging this
+//	                      branch from 50 fps to 20.8.
+//
+// proxysrc was measured as an alternative to the tee and REJECTED: its internal
+// queue is leaky=0, so a wedged consumer stalls the producer from 50 fps to 0 in
+// under two seconds, and the producer's death is silent across it. A tee INSIDE
+// the contribution pipeline crosses no boundary CONTRACT.md draws.
+//
+// # The capture leg was proven end to end against a live M2L-X, 2026-08-16
+//
+// Not against a loopback and not against a receiver written to be agreeable:
+// against the live instance matchH, through this package's own Pipeline, with
+// the card locked to a real 525i59.94 input — 720x486, interlaced,
+// bottom-field-first, bt601, pixel aspect 10:11, 29.97 fps, which is the worst
+// input the conform chain can be handed.
+//
+// 45 seconds of it were ingested by cam4 "COMMS", and switcher_status reported,
+// on two independent reads twelve seconds apart:
+//
+//	stream_state              "streaming"
+//	video format              h264, width 1920, height 1080, scan_type "P",
+//	                          sample_format "420", bit_depth 8, YCbCr
+//	audio format              aac, 2 channels, 48000
+//	bitrate                   10463.0 then 10454.0 kbit/s (asked for 10000)
+//	error_packet_count        0
+//	discontinuous_packet_count 0
+//
+// A local listener-first srtsink run immediately before it captured the same
+// stream to disk and settles what was actually on the wire rather than what a
+// switcher said about it: 25,301,792 bytes in 19.75 s, PID 0x41 carrying
+// 10,041 kbit/s of video (98.0 % of packets) and PID 0x42 179 kbit/s of audio,
+// decoding as H.264 High profile level 4.2, 1920x1080, NV12, progressive,
+// bt709, pixel aspect 1/1 — which is conform.captureCaps() field for field.
+//
+// The conform chain is what that proves. A 720x486 interlaced 29.97 fps
+// standard-definition input left this leg as 1920x1080p50 square-pixel bt709
+// progressive, continuously, for 45 seconds, with not one discontinuous packet
+// at the far end.
+//
 // The full send path was proven end to end over real SRT on macOS on
 // 2026-08-14, receiver first: 16.2 s of media reached a listener-first
 // srtsrc, the received transport stream carried PID 0x41 video (91.2 %) and
@@ -1940,7 +2335,8 @@ func (p *cgoPipeline) drainStartupError() error {
 // 1920x1080", and the audio decoded to 48 kHz stereo with real room tone on it
 // (peak -36.0 dBFS, RMS -59.2 dBFS) rather than the digital silence a
 // mis-negotiated AAC path produces.
-func pipelineDescription(encoderName string, audioBitrateBps int, conform ConformTarget) string {
+func pipelineDescription(encoderName string, audioBitrateBps int, conform ConformTarget,
+	videoCapture, preview string) string {
 	// alignment=7 gives 7 x 188 = 1316-byte buffers, exactly one SRT payload,
 	// so nothing fragments. pcr-interval=3600 is the specification's value.
 	// leaky=downstream means output produced during an outage is dropped rather
@@ -2015,17 +2411,49 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 	// the CoreAudio device is configured for. audioconvert and audioresample
 	// convert whatever the endpoint gives us; the capsfilter that actually
 	// matters is the one below them, pinning what enters the AAC encoder.
-	return "" +
-		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
-		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
 
+	// THE SLATE LEG, unchanged, and it is what a caller that configures nothing
+	// gets. It ends at a capsfilter carrying the conform target, which is the
+	// point the capture leg below also ends at and the reason the encoder line
+	// is written once for both.
+	videoLeg := "" +
 		"filesrc name=" + nameSlateSrc +
 		" ! pngdec" +
 		" ! videoconvert" +
 		" ! videoscale name=" + nameVideoScale +
 		" ! " + conform.spatialCaps() +
 		" ! imagefreeze is-live=true" +
-		" ! " + conform.temporalCaps() +
+		" ! " + conform.temporalCaps()
+
+	// THE LIVE CAPTURE LEG, which replaces it whole. The long comment above has
+	// the measurement behind every element and every property; the two that are
+	// easiest to lose in a later tidy-up are that videorate is what survives the
+	// card's NTSC placeholder first buffer, and that connection is NEVER set.
+	//
+	// The persistent-id is absent from this string deliberately, exactly as the
+	// slate path and the audio device id are: it is set with g_object_set in
+	// Start, through the same configureDeckLinkSource the audio source uses, so
+	// one saved string reaches both kinds of decklink element by one route.
+	if videoCapture != "" {
+		videoLeg = "" +
+			videoCaptureFactory + " name=" + nameVideoCaptureSrc +
+			" mode=auto drop-no-signal-frames=false" +
+			" ! videoconvert name=" + nameVideoCapConv +
+			" ! deinterlace name=" + nameVideoCapDeint +
+			" ! videoscale name=" + nameVideoCapScale +
+			" ! videorate name=" + nameVideoCapRate +
+			" ! " + conform.captureCaps() +
+			" ! tee name=" + nameVideoCapTee + " allow-not-linked=true\n" +
+
+			nameVideoCapTee + ". ! queue name=" + nameVideoCapQueue +
+			" max-size-time=1000000000 max-size-bytes=0 max-size-buffers=0"
+	}
+
+	return "" +
+		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
+		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
+
+		videoLeg +
 		" ! " + encoderName + " name=" + nameVideoEncod +
 		" ! video/x-h264,profile=high" +
 		" ! h264parse config-interval=-1" +
@@ -2169,7 +2597,14 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 		" ! level name=alevel interval=50000000" +
 		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
-		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "."
+		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "." +
+
+		// THE CONFIDENCE MONITOR, appended whole or not at all. previewBranchFor
+		// has already decided; the empty string is the ordinary answer and leaves
+		// this description character for character the one that ships today. It
+		// carries its own leading newline, so nothing here has to know whether
+		// there is a branch.
+		preview
 }
 
 // applyEncoderProperties sets the platform's encoder settings on whichever
@@ -2416,6 +2851,12 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		// peer and defeat the sparing entirely, so this genuinely cannot be
 		// folded into the switch below — it has to move ahead of the store.
 		//
+		// A CONFIDENCE MONITOR failure must leave the gate open for the same
+		// reason and a stronger one: the gate is between the mux and the sink,
+		// and the preview hangs off a tee far upstream of both. Nothing it can do
+		// reaches the feed, so closing the gate over one would starve the SRT peer
+		// to no purpose whatever.
+		//
 		// WHAT RUNS THERE IS THE PART THAT COSTS NOTHING, and the split is not
 		// cosmetic. classifyBusError with the zero captureLegs is three string
 		// comparisons on a string already in hand: no allocation, no cgo, no
@@ -2435,7 +2876,7 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		// settled. See capturefault.go.
 		class := classifyBusError(source, captureLegs{})
 
-		if class != classVideoCapture {
+		if class != classVideoCapture && class != classPreview {
 			// Close the gate before building the error value. Everything after
 			// this point is allocation, and the buffer that is about to carry
 			// GST_FLOW_ERROR into the queue is racing us.
@@ -2490,6 +2931,20 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 			// that never touched the feed.
 			p.deliverWarning("gst: the video capture failed and the commentary is unaffected: " +
 				err.Error())
+			return gogst.BusDrop
+
+		case classPreview:
+			// The operator's confidence monitor. SPARED, and unlike
+			// classVideoCapture there is no second stage that can upgrade it: the
+			// preview is downstream of a leaky tee branch and feeds a window, so
+			// nothing it does can reach the feed. This is a log line and nothing
+			// more.
+			//
+			// It must NOT reach Errors(): internal/sender treats any error arriving
+			// while CONNECTED as the peer going away and would spend a whole
+			// DRAINING/BACKOFF cycle — seven seconds off air — over a monitor.
+			p.deliverWarning("gst: the confidence monitor failed and the commentary and the feed " +
+				"are unaffected: " + err.Error())
 			return gogst.BusDrop
 
 		case classAudioCapture:

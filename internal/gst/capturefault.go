@@ -35,6 +35,12 @@
 //     keep the audio flowing, keep the sender's socket. The far end sees the
 //     video freeze or go black and hears uninterrupted commentary, which is
 //     the correct degradation: the commentary IS the product.
+//   - THE CONFIDENCE MONITOR, the optional preview branch hanging off the
+//     capture leg's tee. SPARED ABSOLUTELY, and it is a class of its own rather
+//     than part of the video capture leg for the one reason that makes the
+//     feature safe: the video class UPGRADES to fatal when the commentary is
+//     clocked by the card's video, which is the very configuration a preview is
+//     for, so it would upgrade nearly every time. See classPreview.
 //   - THE AUDIO CAPTURE. FATAL, because there is nothing to degrade to — but
 //     NAMED, because at the GStreamer level "device busy", "device missing"
 //     and "no signal" are the same generic stream error, and three problems
@@ -144,6 +150,23 @@ const (
 
 	// classAudioCapture is the commentary capture itself. Fatal, and named.
 	classAudioCapture
+
+	// classPreview is the DeckLink CONFIDENCE MONITOR's own branch: the leaky
+	// queue, the rate cap, the scaler and the sink that draw a small copy of the
+	// capture in a native surface over the page. SPARED, ABSOLUTELY.
+	//
+	// It is its OWN class and not classVideoCapture for one reason, and it is the
+	// reason the whole preview is safe: classVideoCapture is UPGRADED to
+	// classAudioCapture whenever the commentary audio is clocked by the card's
+	// video, which is the DeckLink configuration the preview exists for. It would
+	// upgrade nearly every time, and a monitor nobody was looking at would take
+	// the commentary off air. This class can never upgrade to anything.
+	//
+	// Nothing about the preview can affect the feed: it is downstream of a tee
+	// whose head queue is leaky=downstream, it feeds a window, and it is absent
+	// from the graph entirely on every seat that has not asked for it. See
+	// preview.go.
+	classPreview
 )
 
 // captureLegs is what the classification needs to know about how THIS pipeline
@@ -184,6 +207,11 @@ func classifyBusError(source string, legs captureLegs) busErrorClass {
 	switch {
 	case source == captureSinkQueueName || strings.HasPrefix(source, captureSinkNamePrefix):
 		return classSinkSourced
+	case isPreviewSourced(source):
+		// Second, immediately below the sink, because these are the two classes
+		// that must never depend on anything else being right. isPreviewSourced
+		// is preview.go's, which is where the naming rule and its test live.
+		return classPreview
 	case source == captureAudioSrcName:
 		return classAudioCapture
 	case strings.HasPrefix(source, videoCaptureNamePrefix):

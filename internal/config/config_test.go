@@ -652,6 +652,17 @@ func TestDefaults_VideoLegAndCaptureFields(t *testing.T) {
 	if d.AudioSourceKind != AudioSourceNative {
 		t.Errorf("Defaults().AudioSourceKind = %q, want %q", d.AudioSourceKind, AudioSourceNative)
 	}
+	// The video leg's default is the one it would be worst to move: it decides
+	// what the switcher receives, so a change here puts a camera on air for every
+	// position that upgrades, on its next launch, without anybody asking.
+	if d.VideoSource != VideoSourceSlate {
+		t.Errorf("Defaults().VideoSource = %q, want %q — the still slate is what this application "+
+			"has transmitted for its whole life", d.VideoSource, VideoSourceSlate)
+	}
+	if d.DeckLinkPreviewEnabled {
+		t.Error("Defaults().DeckLinkPreviewEnabled = true; a confidence monitor that appears " +
+			"without anybody asking is a window over whatever the operator was looking at")
+	}
 	// The two whose blank IS the decision. Defaults() states neither, and that
 	// is the point: "derive the format from the switcher" and "the only card in
 	// this machine" are exactly what the zero value already says.
@@ -664,7 +675,7 @@ func TestDefaults_VideoLegAndCaptureFields(t *testing.T) {
 
 	// And nothing Defaults() sets may be a reason Validate refuses.
 	err := d.Validate()
-	for _, field := range []string{"videoBitrateKbps", "videoFormatOverride", "audioSourceKind"} {
+	for _, field := range []string{"videoBitrateKbps", "videoFormatOverride", "audioSourceKind", "videoSource"} {
 		if err != nil && strings.Contains(err.Error(), field) {
 			t.Errorf("Defaults() fails Validate on %s: %v", field, err)
 		}
@@ -728,6 +739,102 @@ func TestEffectiveAudioSourceKindAndUsesDeckLinkAudio(t *testing.T) {
 	}
 }
 
+func TestEffectiveVideoSourceAndUsesDeckLinkVideo(t *testing.T) {
+	tests := []struct {
+		set      string
+		want     string
+		decklink bool
+	}{
+		// Empty is the case that matters most and it appears three ways: a
+		// config.json written before the field existed, a hand-edited file, and a
+		// Settings screen whose collectConfig does not restate the key. All three
+		// must read as the still slate, because turning "nobody said" into a live
+		// camera is the one mistake this field can make that reaches air.
+		{"", VideoSourceSlate, false},
+		{"   ", VideoSourceSlate, false},
+		{VideoSourceSlate, VideoSourceSlate, false},
+		{VideoSourceDeckLink, VideoSourceDeckLink, true},
+		// Unrecognised is returned as it stands rather than corrected, for the
+		// reason EffectiveAudioSourceKind gives: Validate reports it by name, and
+		// silently reading it as one of the two would build a leg the operator
+		// did not ask for while the screen showed something else.
+		{"ndi", "ndi", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.set, func(t *testing.T) {
+			c := &Config{VideoSource: tt.set}
+			if got := c.EffectiveVideoSource(); got != tt.want {
+				t.Errorf("EffectiveVideoSource() = %q, want %q", got, tt.want)
+			}
+			if got := c.UsesDeckLinkVideo(); got != tt.decklink {
+				t.Errorf("UsesDeckLinkVideo() = %v, want %v", got, tt.decklink)
+			}
+		})
+	}
+}
+
+// TestUsesDeckLinkCardCoversAllFourCombinations is the expressiveness test for
+// the whole tier: the video leg and the audio leg are independent, all four
+// pairings are legal configurations, and the card is required by any pairing
+// that names it on either leg.
+//
+// The combination worth naming is decklink video with NATIVE audio. It is the
+// safest live configuration there is and the one to bring up first, because the
+// two failure domains are genuinely separate: a lost video signal is a black
+// picture and a commentator who is still being heard, since the legs share no
+// element, no device and no failure.
+func TestUsesDeckLinkCardCoversAllFourCombinations(t *testing.T) {
+	tests := []struct {
+		video, audio string
+		wantCard     bool
+	}{
+		{VideoSourceSlate, AudioSourceNative, false},
+		{VideoSourceSlate, AudioSourceDeckLink, true},
+		{VideoSourceDeckLink, AudioSourceNative, true},
+		{VideoSourceDeckLink, AudioSourceDeckLink, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.video+"+"+tt.audio, func(t *testing.T) {
+			c := validConfig()
+			c.VideoSource = tt.video
+			c.AudioSourceKind = tt.audio
+			if tt.audio == AudioSourceDeckLink {
+				// A DeckLink seat is not required to name an audio endpoint; the
+				// point of the pairing is that it never opens one.
+				c.AudioDeviceID = ""
+			}
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate() refused the %s/%s pairing: %v — all four combinations must be "+
+					"expressible, and hardware presence is Start's question, not this one",
+					tt.video, tt.audio, err)
+			}
+			if got := c.UsesDeckLinkCard(); got != tt.wantCard {
+				t.Errorf("UsesDeckLinkCard() = %v, want %v", got, tt.wantCard)
+			}
+		})
+	}
+}
+
+// TestValidateNamesTheVideoSourceField pins that an unbuildable video-leg source
+// is refused BY NAME, for the reason videoFormatOverride is: the alternative is
+// not-negotiated (-4) several seconds after START, naming no field and no value,
+// with a commentator waiting.
+func TestValidateNamesTheVideoSourceField(t *testing.T) {
+	c := validConfig()
+	c.VideoSource = "ndi"
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate() accepted videoSource \"ndi\"; there is no leg behind it")
+	}
+	for _, want := range []string{"videoSource", "ndi", VideoSourceSlate, VideoSourceDeckLink} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate() error %q does not mention %q; it must name the field, the value "+
+				"that was typed and what is accepted", err, want)
+		}
+	}
+}
+
 // TestValidateNamesTheVideoFormatFieldAndTheValue is the acceptance test for
 // the whole videoFormatOverride design. IT MUST NOT BE POSSIBLE for a value to
 // get past this and fail later as a caps error naming no field: what a
@@ -769,6 +876,11 @@ func TestVideoLegAndCaptureFieldsRoundTripThroughTheFile(t *testing.T) {
 	c.VideoFormatOverride = "1280x720p59.94"
 	c.AudioSourceKind = AudioSourceDeckLink
 	c.DeckLinkPersistentID = "0x0000000000AB12CD"
+	// Both non-default, so a key that silently fails to round-trip reads as the
+	// operator's camera reverting to a slate rather than as a value that never
+	// changed.
+	c.VideoSource = VideoSourceDeckLink
+	c.DeckLinkPreviewEnabled = true
 	if err := c.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +892,9 @@ func TestVideoLegAndCaptureFieldsRoundTripThroughTheFile(t *testing.T) {
 	if got.VideoBitrateKbps != 10000 ||
 		got.VideoFormatOverride != "1280x720p59.94" ||
 		got.AudioSourceKind != AudioSourceDeckLink ||
-		got.DeckLinkPersistentID != "0x0000000000AB12CD" {
+		got.DeckLinkPersistentID != "0x0000000000AB12CD" ||
+		got.VideoSource != VideoSourceDeckLink ||
+		!got.DeckLinkPreviewEnabled {
 		t.Fatalf("round trip lost a video-leg or capture field: %+v", got)
 	}
 
@@ -793,7 +907,10 @@ func TestVideoLegAndCaptureFieldsRoundTripThroughTheFile(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, tag := range []string{"videoBitrateKbps", "videoFormatOverride", "audioSourceKind", "decklinkPersistentId"} {
+	for _, tag := range []string{
+		"videoBitrateKbps", "videoFormatOverride", "audioSourceKind", "decklinkPersistentId",
+		"videoSource", "decklinkPreviewEnabled",
+	} {
 		if _, ok := raw[tag]; !ok {
 			t.Errorf("config.json has no %q key; the Settings screen writes that name", tag)
 		}

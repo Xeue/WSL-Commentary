@@ -1037,6 +1037,18 @@ func assertBoundSurface(t *testing.T) {
 
 		"GetChannelMap": true,
 		"SetChannelMap": true,
+
+		// The video leg. SetVideoSource is the one method on this whole surface
+		// that decides what a broadcast switcher receives, and the other three are
+		// the operator's confidence monitor: whether it exists, where it goes and
+		// whether it is on screen. All four are host-only — see
+		// TestRemoteHostOnlySet — and the two that write configuration are backed
+		// by App.refuseRemoteVideoLegChange, because SaveConfig is remotely
+		// reachable and would otherwise be the way round them.
+		"SetVideoSource":            true,
+		"SetDeckLinkPreviewEnabled": true,
+		"SetPreviewRect":            true,
+		"SetPreviewVisible":         true,
 	}
 
 	got := exportedMethodsOfApp()
@@ -1531,6 +1543,298 @@ func TestStartAcceptsThePresentSavedDevice(t *testing.T) {
 	}
 	if err := a.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The VIDEO leg's pre-flight
+// ---------------------------------------------------------------------------
+//
+// The same argument as the audio pre-flight above, on the leg where GStreamer is
+// least helpful. An absent, busy or unresolvable DeckLink card gives
+// "Internal data stream error / not-negotiated (-4)" in about 100 microseconds
+// and names neither the device nor the cause, so every refusal below is checked
+// for the FIELD an operator would go and change. And the two deliberate
+// non-refusals are pinned too: a slate seat must not be made to consult the
+// device monitor at all, and a named card must survive an enumeration hiccup.
+
+// deckLinkStubDevice is a card as the device monitor reports one, in the shape
+// decklinkdevices.go formats: a 16-digit hex persistent-id, and Kind decklink.
+func deckLinkStubDevice(id, name string) gst.Device {
+	return gst.Device{ID: id, Name: name, Kind: gst.KindDeckLink}
+}
+
+// nativeStubDevice is the machine's own audio input, carrying validConfig's
+// saved id so that the audio half of the pre-flight passes and the video half is
+// what each test is actually exercising.
+func nativeStubDevice() gst.Device {
+	return gst.Device{
+		ID:   validConfig().AudioDeviceID,
+		Name: "Microphone (Realtek High Definition Audio)",
+		Kind: gst.KindNative,
+	}
+}
+
+// TestPreflightSlateNeverConsultsTheDeviceMonitorForACard is the compatibility
+// statement for every seat shipping today, expressed as a test: with the video
+// source left alone, a device monitor that is failing outright cannot stop a
+// match going out, and no card is resolved.
+func TestPreflightSlateNeverConsultsTheDeviceMonitorForACard(t *testing.T) {
+	a, _ := newTestApp(t)
+	withStubDeviceError(t, errors.New("the device monitor is unavailable"))
+
+	id, err := a.preflightCapture(a.snapshotConfig())
+	if err != nil {
+		t.Fatalf("preflightCapture() error = %v; a slate seat must be unaffected by the device "+
+			"monitor, which is every seat shipping today", err)
+	}
+	if id != "" {
+		t.Errorf("preflightCapture() resolved %q for a slate seat; an empty id is what tells "+
+			"internal/gst to build the slate leg", id)
+	}
+}
+
+func TestPreflightRefusesACameraWithNoCardOnTheMachine(t *testing.T) {
+	a, _ := newTestApp(t)
+	withStubDevices(t, []gst.Device{nativeStubDevice()})
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+
+	_, err := a.preflightCapture(cfg)
+	if err == nil {
+		t.Fatal("preflightCapture() accepted a camera on a machine with no Blackmagic card; the " +
+			"pipeline would fail with not-negotiated (-4) naming nothing")
+	}
+	if !strings.Contains(err.Error(), "videoSource") {
+		t.Errorf("the refusal does not name videoSource, which is the box to go and change: %v", err)
+	}
+}
+
+func TestPreflightRefusesAPersistentIDThatNoLongerResolves(t *testing.T) {
+	a, _ := newTestApp(t)
+	const fitted = "0x0000000000AB12CD"
+	withStubDevices(t, []gst.Device{
+		nativeStubDevice(),
+		deckLinkStubDevice(fitted, "Blackmagic UltraStudio 4K Mini"),
+	})
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+	cfg.DeckLinkPersistentID = "0x00000000DEADBEEF"
+
+	_, err := a.preflightCapture(cfg)
+	if err == nil {
+		t.Fatal("preflightCapture() accepted an id no card claims")
+	}
+	// The field, the id that was asked for, and the card that IS there — the
+	// operator's next move is to copy the third of those into the first.
+	for _, want := range []string{"decklinkPersistentId", "0x00000000DEADBEEF", fitted} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// TestPreflightResolvesTheOnlyCard pins the translation this whole function
+// exists for: decklinkPersistentId empty means "the card this machine has", and
+// an empty VideoCaptureID means THE SLATE — the opposite instruction — so the
+// emptiness must be resolved here and never forwarded.
+func TestPreflightResolvesTheOnlyCard(t *testing.T) {
+	a, _ := newTestApp(t)
+	const fitted = "0x0000000000AB12CD"
+	withStubDevices(t, []gst.Device{
+		nativeStubDevice(),
+		deckLinkStubDevice(fitted, "Blackmagic UltraStudio 4K Mini"),
+	})
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+
+	id, err := a.preflightCapture(cfg)
+	if err != nil {
+		t.Fatalf("preflightCapture() error = %v; one card and no id named is the ordinary case at "+
+			"a commentary position", err)
+	}
+	if id != fitted {
+		t.Errorf("preflightCapture() = %q, want %q — an empty result would build the slate leg on "+
+			"a seat the operator has pointed at a camera", id, fitted)
+	}
+}
+
+// TestPreflightRefusesTwoCardsWithNothingNamingOne says why guessing is not on
+// offer: the card is EXCLUSIVE, so picking whichever one enumerated first can
+// take a card another application is holding, and the enumeration order is not
+// an identity in the first place.
+func TestPreflightRefusesTwoCardsWithNothingNamingOne(t *testing.T) {
+	a, _ := newTestApp(t)
+	withStubDevices(t, []gst.Device{
+		nativeStubDevice(),
+		deckLinkStubDevice("0x0000000000AB12CD", "Blackmagic UltraStudio 4K Mini"),
+		deckLinkStubDevice("0x00000000001234EF", "Blackmagic DeckLink Duo 2"),
+	})
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+
+	_, err := a.preflightCapture(cfg)
+	if err == nil {
+		t.Fatal("preflightCapture() picked one of two cards; which one it picked would be the " +
+			"driver's enumeration order, which is not an identity")
+	}
+	if !strings.Contains(err.Error(), "decklinkPersistentId") {
+		t.Errorf("the refusal does not name decklinkPersistentId, which is the box that resolves "+
+			"the ambiguity: %v", err)
+	}
+}
+
+// TestPreflightCarriesOnWithANamedCardWhenEnumerationFails is the other half of
+// the rule the audio pre-flight states: a device monitor hiccup must never
+// become a new way to be unable to go on air. A card WAS named, so the
+// enumeration is not the only source of truth and the element gets the
+// operator's id.
+func TestPreflightCarriesOnWithANamedCardWhenEnumerationFails(t *testing.T) {
+	a, _ := newTestApp(t)
+	withStubDeviceError(t, errors.New("the device monitor is unavailable"))
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+	cfg.DeckLinkPersistentID = "0x0000000000AB12CD"
+
+	id, err := a.preflightCapture(cfg)
+	if err != nil {
+		t.Fatalf("preflightCapture() error = %v; the card was named, so a failing enumeration is "+
+			"not the only thing that could have answered", err)
+	}
+	if id != "0x0000000000AB12CD" {
+		t.Errorf("preflightCapture() = %q, want the configured id", id)
+	}
+}
+
+// TestPreflightRefusesACameraWithNothingToNameItAndNoEnumeration is the one
+// place the hiccup rule gives way, and it gives way because the alternative is
+// worse than not starting: an empty result builds the SLATE, so carrying on
+// would send a still picture to a switcher the operator believes is receiving
+// their camera, with every lamp green.
+func TestPreflightRefusesACameraWithNothingToNameItAndNoEnumeration(t *testing.T) {
+	a, _ := newTestApp(t)
+	withStubDeviceError(t, errors.New("the device monitor is unavailable"))
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = config.VideoSourceDeckLink
+
+	_, err := a.preflightCapture(cfg)
+	if err == nil {
+		t.Fatal("preflightCapture() carried on with no card and no way to find one; that would " +
+			"transmit the slate from a seat configured for a camera")
+	}
+	if !strings.Contains(err.Error(), "decklinkPersistentId") {
+		t.Errorf("the refusal does not name decklinkPersistentId: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What a remote seat may not change
+// ---------------------------------------------------------------------------
+
+// TestARemoteSaveCannotChangeWhatGoesOnAir is the test that makes SetVideoSource
+// being host-only mean anything. SaveConfig is remotely reachable and is a
+// WHOLE-DOCUMENT write, so without this check the host-only classification would
+// be a decoration a remote seat could walk straight round.
+func TestARemoteSaveCannotChangeWhatGoesOnAir(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	const remoteSeat = "remote-1"
+
+	// A remote save that restates the video leg exactly as it is passes: the
+	// ordinary case, a port or a status key being fixed from another desk.
+	unchanged := a.snapshotConfig()
+	unchanged.StatusKey = "cam9"
+	if err := a.saveConfigFrom(remoteSeat, unchanged); err != nil {
+		t.Fatalf("a remote save that changes nothing about the video leg was refused: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		field string
+		edit  func(*config.Config)
+	}{
+		{"the camera", "videoSource", func(c *config.Config) { c.VideoSource = config.VideoSourceDeckLink }},
+		{"the preview", "decklinkPreviewEnabled", func(c *config.Config) { c.DeckLinkPreviewEnabled = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := a.snapshotConfig()
+			tc.edit(c)
+			err := a.saveConfigFrom(remoteSeat, c)
+			if err == nil {
+				t.Fatalf("a remote seat changed %s", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("the refusal does not name %s: %v", tc.field, err)
+			}
+			// And nothing was written: a refusal that had already saved would be
+			// the worst of both, an error message beside the change it describes.
+			if live := a.snapshotConfig(); live.UsesDeckLinkVideo() || live.DeckLinkPreviewEnabled {
+				t.Errorf("the refused save reached the live configuration: %+v", live)
+			}
+
+			// The SAME edit from the local seat is accepted, which is what makes
+			// this a restriction on the caller rather than on the value.
+			local := a.snapshotConfig()
+			tc.edit(local)
+			if err := a.saveConfigFrom(localClientID, local); err != nil {
+				t.Fatalf("the local seat was refused: %v", err)
+			}
+			// Put it back for the next subtest.
+			if err := a.saveConfigFrom(localClientID, validConfig()); err != nil {
+				t.Fatalf("restoring the configuration: %v", err)
+			}
+		})
+	}
+}
+
+// TestSetVideoSourceRefusesWhileSending pins the other refusal: the video leg is
+// built at START and cannot be exchanged under a running feed, so accepting the
+// change would be a control that appears to switch a camera on air and silently
+// does nothing until the next restart.
+func TestSetVideoSourceRefusesWhileSending(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer func() { _ = a.Stop() }()
+
+	if err := a.SetVideoSource(config.VideoSourceDeckLink); err == nil {
+		t.Fatal("SetVideoSource was accepted while sending; nothing would have changed until the " +
+			"next START and the operator would not have been told")
+	}
+	if err := a.SetDeckLinkPreviewEnabled(true); err == nil {
+		t.Fatal("SetDeckLinkPreviewEnabled was accepted while sending; the preview is a branch of " +
+			"the running pipeline and cannot be attached to it")
+	}
+	if a.snapshotConfig().UsesDeckLinkVideo() {
+		t.Error("the refused SetVideoSource wrote the configuration anyway")
+	}
+}
+
+// TestSetVideoSourceRefusesAValueWithNoLegBehindIt keeps the method's message
+// and config.Validate's agreeing: an operator may well meet both about the same
+// typed value.
+func TestSetVideoSourceRefusesAValueWithNoLegBehindIt(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	err := a.SetVideoSource("ndi")
+	if err == nil {
+		t.Fatal("SetVideoSource(\"ndi\") was accepted; there is no leg behind it")
+	}
+	for _, want := range []string{"videoSource", "ndi"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
 	}
 }
 

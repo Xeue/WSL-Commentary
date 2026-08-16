@@ -39,6 +39,11 @@ import {
 // validator with its own copy of a bound is how a value becomes savable here and
 // refused by the element it was written for.
 import { MAX_INPUT_CHANNELS, GAIN_LIMIT, OUTPUTS } from './channelmap.js';
+// The two video-leg sources, from the module that owns them. Imported rather
+// than restated for RETURN_CHANNEL_VALUES' reason exactly: a validator with its
+// own copy of an enum is how a value becomes savable here and unbuildable in the
+// pipeline — and on this field that means a position that will not start.
+import { VIDEO_SOURCES, VIDEO_SOURCE_SLATE } from './videosource.js';
 
 const PBKEYLEN_VALUES = [0, 16, 32];
 
@@ -65,6 +70,11 @@ const DEFAULT_VIDEO_BITRATE_KBPS = 2000;
 // produces them; this list is what the form may not save outside of.
 const AUDIO_SOURCE_NATIVE = 'native';
 const AUDIO_SOURCE_KINDS = [AUDIO_SOURCE_NATIVE, 'decklink'];
+
+// The video-leg sources this form may save, DERIVED from the control's own table
+// rather than written out again — so an option added to the screen and forgotten
+// here cannot become a value the operator can select and the form then refuses.
+const VIDEO_SOURCE_VALUES = VIDEO_SOURCES.map((s) => s.value);
 
 // The video-format grammar, mirrored from internal/config/videoformat.go.
 //
@@ -367,6 +377,30 @@ export function validateConfig(config) {
     const message = videoFormatError(config.videoFormatOverride);
     if (message) errors.videoFormatOverride = message;
   }
+
+  // WHAT THE VIDEO LEG CARRIES. Undefined is ACCEPTED and reads as the slate —
+  // that is what every config.json written before this field existed holds, and
+  // refusing it would make the Settings screen unsavable on the first launch
+  // after an upgrade, over a field the operator has never seen. It is also what
+  // config.EffectiveVideoSource does with an empty value, for the same reason
+  // and in the same direction: nobody's silence may turn into a live camera.
+  //
+  // What is NOT checked here is whether the machine has the card the value
+  // names. That is deliberate and it is validate.js's standing rule (see the
+  // file header on audioDeviceId): an engineer must be able to configure a
+  // position before the hardware is patched into it. The absence is a WARNING on
+  // the control instead — videosource.js's describeCardAvailability — and a
+  // refusal at START, from Go, which is the only place that can be sure.
+  if (!VIDEO_SOURCE_VALUES.includes(config.videoSource ?? VIDEO_SOURCE_SLATE)) {
+    errors.videoSource =
+      'Video sent to the switcher must be either the slate or the DeckLink card’s video input.';
+  }
+
+  // decklinkPreviewEnabled is deliberately NOT validated. It is a boolean the
+  // form produces with .checked, and every non-boolean a hand-edited file could
+  // put there is read as OFF by normalisePreviewEnabled — which is the safe
+  // direction and needs no refusal, because there is no value of it that stops
+  // this position going on air.
 
   // --- the commentary input subsystem --------------------------------------
 

@@ -254,9 +254,20 @@ test('the widest fields are named by ids settings.js actually creates', () => {
   // Closes the CSS<->JS coupling introduced by selecting wide fields by id.
   const ids = [...sheet.matchAll(/\.field:has\(> #(f-[A-Za-z0-9]+)\)/g)].map((m) => m[1]);
   assert.ok(ids.length >= 4, 'the full-width field list must still be in main.css');
+  // Every constructor settings.js has. The list grew when the video-source
+  // control arrived: a <select> whose hint names both options and what each
+  // costs, and the one tick box on the form, whose hint is the measured reason
+  // the preview cannot be switched live. Both are full-row for their PROSE,
+  // exactly as the four text and number fields are, so both belong to this
+  // coupling — and leaving the list at two constructors would have meant either
+  // a rule that matches nothing or a hint in an 18rem track.
   for (const id of ids) {
     assert.ok(
-      js.includes(`textInput('${id}'`) || js.includes(`numberInput('${id}'`),
+      js.includes(`textInput('${id}'`) ||
+        js.includes(`numberInput('${id}'`) ||
+        js.includes(`selectInput(\n      '${id}'`) ||
+        js.includes(`selectInput('${id}'`) ||
+        js.includes(`checkboxInput('${id}'`),
       `main.css marks #${id} full-width but settings.js never creates it: the ` +
         'rule matches nothing and the long hints silently return to a 350px track',
     );

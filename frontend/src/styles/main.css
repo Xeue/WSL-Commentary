@@ -1721,3 +1721,153 @@ input[type='range'] {
   font-size: 0.8rem;
   color: var(--text-muted);
 }
+
+/* ==================================================================== */
+/* THE VIDEO SOURCE AND THE CARD PREVIEW                                */
+/* (appended block — see the note on the input-meters block above)      */
+/*                                                                      */
+/* Two screens' worth of one feature: the Settings control that decides */
+/* WHAT THIS POSITION SENDS, and the reserved rectangle on the main     */
+/* screen that the card's confidence preview is painted into. Both draw */
+/* only from the :root token set, so this block depends on nothing      */
+/* above it and can sit at the end of the file — added here on purpose, */
+/* alongside the input-meters and remote-access blocks, so a change     */
+/* editing the middle of this stylesheet does not collide with it.      */
+/* ==================================================================== */
+
+/* Prose that describes the whole group rather than one field, so it takes the
+   whole row — `1 / -1` and never `span N`, for the reason the .settings-group
+   rule records at length. */
+.settings-group > .video-to-air,
+.settings-group > .video-card-note,
+.settings-group > .preview-sending-note {
+  grid-column: 1 / -1;
+}
+
+/* The video source control and the preview tick box are full-row for their
+   HINTS: the source's names both options and states what each costs, and the
+   preview's is the measured reason it cannot be switched live. In a 350px track
+   both would run to a column two words wide.
+
+   Selected by id, like the four full-row fields above, and settingslayout.test.js
+   asserts that settings.js still creates each id named here — which is what stops
+   a rename silently returning a ~500-character hint to an 18rem track. */
+.field:has(> #f-videoSource),
+.field:has(> #f-decklinkPreviewEnabled) {
+  grid-column: 1 / -1;
+}
+
+/* WHAT IS GOING TO AIR, under the control that decides it. Brighter than a
+   .field-hint on purpose: it is not guidance about how to fill a box in, it is
+   the consequence of the box beside it, and it is the only sentence on this
+   screen that answers the question at all. */
+.video-to-air {
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* The configuration that cannot start. Marked as well as worded — the sentence
+   says what will happen, the mark is what makes it findable on a form two
+   screenfuls deep — and marked with a BORDER as well as a colour, so the
+   warning survives a colour-blind reader and a washed-out gallery projector.
+   Same rule as the preview's dashed border and the clipping channel sum. */
+.video-to-air--unstartable {
+  color: var(--red);
+  border-left: 3px solid var(--red);
+  padding-left: 0.6rem;
+}
+
+/* The hardware note. Ordinary weight: on a working seat it says nothing at all
+   (it is hidden), and when it does speak it is usually the mild case — a card
+   fitted and not in use. */
+.video-card-note--missing {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* The one tick box on the Settings form. Laid out as [box] Label, which is what
+   a checkbox is read as everywhere else, with the hint on its own line
+   underneath — the .field default of label-above-control would put a lone tick
+   box under a heading with nothing beside it. */
+.field--check {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 0.5rem;
+}
+
+.field--check > input[type='checkbox'] {
+  order: 1;
+  flex: 0 0 auto;
+  width: 1.05rem;
+  height: 1.05rem;
+  accent-color: var(--green);
+}
+
+.field--check > label {
+  order: 2;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+/* The hint and the error take the whole width below the box and its label. */
+.field--check > .field-hint,
+.field--check > .field-error {
+  order: 3;
+  flex-basis: 100%;
+}
+
+/* ------------------------------------------------------------------ */
+/* The reserved preview rectangle                                      */
+/*                                                                      */
+/* home.js builds it in .pgm-stage as a SIBLING of .pgm-tile and of the */
+/* input meters — never inside the tile. Two opaque native child        */
+/* windows told to occupy overlapping rectangles simply erase one       */
+/* another, and neither the page nor Go would report anything wrong.    */
+/*                                                                      */
+/* It is a CONFIDENCE monitor and it is sized like one. A quarter of    */
+/* the stage's height, capped, because a big one would take width from  */
+/* the picture the commentator is actually watching — and because the   */
+/* preview branch is deliberately capped at 12.5 fps for the same       */
+/* reason: a confidence monitor does not need 50.                       */
+/* ------------------------------------------------------------------ */
+.preview-tile {
+  position: relative;
+  flex: 0 0 auto;
+  align-self: center;
+  margin-left: 8px;
+  /* The fallback first, for a UA without container size queries: the clamp
+     below is dropped whole if cqh is not understood, and a box with an
+     aspect-ratio and no height would collapse to nothing. Chromium has had
+     container queries since 105 and WebView2 is evergreen, so this is a safety
+     net rather than a supported path — the same posture .pgm-tile takes. */
+  height: 120px;
+  height: clamp(90px, 22cqh, 180px);
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+/* The caption inside the box. It is NEVER hidden by the page: the native
+   surface is opaque and on top, so this is visible exactly when there is no
+   picture over it — which is the one thing this side cannot learn from Go,
+   because the preview branch is built at START and there is no event that says
+   whether it was. A box showing a caption is a box explaining itself. */
+.preview-caption {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem;
+  text-align: center;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  pointer-events: none;
+}

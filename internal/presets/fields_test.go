@@ -81,10 +81,19 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 	}
 }
 
-// TestClassificationCounts pins the 14 + 7 + 2 + 1 = 24 split (srtHost was
+// TestClassificationCounts pins the 14 + 8 + 3 + 1 = 26 split (srtHost was
 // removed — the SRT host is always derived from m2lxHost — and eventId moved
 // from the whitelist to DiscoveredFields), so growth in any table is a
 // deliberate, reviewed change.
+//
+// The two added with the DeckLink VIDEO leg went to different tables on purpose
+// and the split is the reviewed decision this count exists to protect.
+// videoSource is the EIGHTH machine field: it is audioSourceKind's twin on the
+// other leg, the authority for it is this PC's cabling, and a preset carrying it
+// would describe a camera that is not there — unstartable, not merely wrong.
+// decklinkPreviewEnabled is the THIRD ui field: it changes nothing that is
+// transmitted and everything about what is on the operator's own screen, which
+// is returnSource's class exactly.
 //
 // The four that moved these numbers, and which way each went:
 // videoBitrateKbps and videoFormatOverride are INSTANCE — one is how much of
@@ -103,11 +112,11 @@ func TestClassificationCounts(t *testing.T) {
 	if got := len(InstanceFields); got != 14 {
 		t.Errorf("len(InstanceFields) = %d, want 14", got)
 	}
-	if got := len(MachineFields); got != 7 {
-		t.Errorf("len(MachineFields) = %d, want 7", got)
+	if got := len(MachineFields); got != 8 {
+		t.Errorf("len(MachineFields) = %d, want 8", got)
 	}
-	if got := len(UIFields); got != 2 {
-		t.Errorf("len(UIFields) = %d, want 2", got)
+	if got := len(UIFields); got != 3 {
+		t.Errorf("len(UIFields) = %d, want 3", got)
 	}
 	if got := len(DiscoveredFields); got != 1 {
 		t.Errorf("len(DiscoveredFields) = %d, want 1", got)
@@ -134,7 +143,7 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 	}
 }
 
-// TestInstanceFieldsExcludeEveryDeviceField names all seven MACHINE tags: the
+// TestInstanceFieldsExcludeEveryDeviceField names all eight MACHINE tags: the
 // guarantee "a preset cannot carry a device id" reduced to a table lookup.
 //
 // audioSourceKind and decklinkPersistentId are on this list for exactly the
@@ -148,10 +157,17 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 // decklinkChannelMap is the seventh and it does NOT fail hard, which is why it
 // belongs here most of all: a routing from another building negotiates, starts,
 // and carries the wrong channel — or nothing — behind a screen full of green.
+//
+// videoSource is the eighth, and it is the one whose classification was actually
+// argued (fields.go records both sides). It is here because the authority for
+// "is there a camera cabled into this position" is this PC, and because a preset
+// carrying it would leave a seat unstartable — not because it is harmless. What
+// keeps it from being changed by a seat that should not is App.SetVideoSource
+// being host-only, which is a different mechanism in a different file.
 func TestInstanceFieldsExcludeEveryDeviceField(t *testing.T) {
 	for _, tag := range []string{
 		"audioDeviceId", "headphoneDeviceId", "headphoneEndpointId", "slatePath",
-		"audioSourceKind", "decklinkPersistentId", "decklinkChannelMap",
+		"audioSourceKind", "decklinkPersistentId", "decklinkChannelMap", "videoSource",
 	} {
 		if slices.Contains(InstanceFields, tag) {
 			t.Errorf("InstanceFields contains %q: a preset carrying it would deliver another "+
@@ -183,8 +199,10 @@ func TestClassify(t *testing.T) {
 		{"audioSourceKind", ClassMachine, true},
 		{"decklinkPersistentId", ClassMachine, true},
 		{"decklinkChannelMap", ClassMachine, true},
+		{"videoSource", ClassMachine, true},
 		{"returnSource", ClassUI, true},
 		{"returnChannel", ClassUI, true},
+		{"decklinkPreviewEnabled", ClassUI, true},
 		{"eventId", ClassDiscovered, true},
 		{"pictureSource", "", false}, // frontend-only key with no Go field: unclassified on purpose
 		{"", "", false},
@@ -212,6 +230,11 @@ func fullConfig() *config.Config {
 		StatusKey:           "cam7",
 		AudioDeviceID:       "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
 		AudioSourceKind:     "decklink",
+		// The two video-leg fields, both set to the NON-default value, so that a
+		// merge test can tell "left alone" from "quietly reset to what this
+		// application used to do".
+		VideoSource:            "decklink",
+		DeckLinkPreviewEnabled: true,
 		// A recognisable persistent-id, NOT a device number. The distinction is
 		// the field's whole point and a fixture holding "0" would quietly make
 		// the wrong shape look normal.
@@ -464,6 +487,46 @@ func TestApplyDropsTheDeckLinkCaptureKeys(t *testing.T) {
 	}
 	if live.SRTPort != 40009 {
 		t.Error("the whitelisted key travelling with the machine ones must still apply")
+	}
+}
+
+// TestApplyDropsTheDeckLinkVideoKeys is the same phantom-hardware test on the
+// leg where the failure is loudest, plus its UI companion.
+//
+// A preset carrying videoSource="decklink" applied at a seat with no card in it
+// describes a camera that is not there, and the result is not a degraded feed
+// but no feed at all: an absent or busy card gives not-negotiated (-4) in about
+// 100 microseconds, naming neither the device nor the cause, with a Settings
+// screen showing nothing wrong. decklinkPreviewEnabled travels with it here
+// because the two arrive together in any hand-edited file and they are refused
+// for two different reasons — one is this PC's cabling, the other is what is on
+// this operator's screen.
+func TestApplyDropsTheDeckLinkVideoKeys(t *testing.T) {
+	live := fullConfig()
+	live.VideoSource = config.VideoSourceSlate
+	live.DeckLinkPreviewEnabled = false
+
+	ignored, err := Apply(live, map[string]json.RawMessage{
+		"srtLatencyMs":           json.RawMessage(`400`),
+		"videoSource":            json.RawMessage(`"decklink"`),
+		"decklinkPreviewEnabled": json.RawMessage(`true`),
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if !slices.Equal(ignored, []string{"decklinkPreviewEnabled", "videoSource"}) {
+		t.Errorf("Apply() ignored = %v, want [decklinkPreviewEnabled videoSource]", ignored)
+	}
+	if live.VideoSource != config.VideoSourceSlate {
+		t.Errorf("videoSource became %q; a preset must never decide what this position puts on "+
+			"air, and this seat may have no camera at all", live.VideoSource)
+	}
+	if live.DeckLinkPreviewEnabled {
+		t.Error("decklinkPreviewEnabled became true; a preset must not open a window on somebody " +
+			"else's screen from a configuration form")
+	}
+	if live.SRTLatencyMs != 400 {
+		t.Error("the whitelisted key travelling with the two refused ones must still apply")
 	}
 }
 

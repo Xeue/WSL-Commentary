@@ -222,9 +222,14 @@ test('home.js draws the meters OUTSIDE the tile, beside it in the stage', () => 
   // up — precisely when it is needed. The meters must be a SIBLING in
   // .pgm-stage.
   const src = ui('home.js');
+  // The list is open-ended: the stage now also carries the card's confidence
+  // preview box, which is a SECOND native surface and is a sibling for the very
+  // same reason the meters are. What this pins is the two things that matter —
+  // metersEl goes into the stage, and it goes in after the tile — not how many
+  // other boxes stand beside it.
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, metersEl\)/,
+    /pgmStage\.append\(pgmTile, metersEl[,)]/,
     'the meters container must be appended to pgmStage beside the tile',
   );
   assert.ok(

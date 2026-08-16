@@ -481,7 +481,13 @@ import (
 // The contract
 // ---------------------------------------------------------------------------
 
-// PictureOverlay is the surface the SRT picture is drawn in.
+// PictureOverlay is one of this application's native video surfaces.
+//
+// THERE ARE TWO OF THEM: the SRT programme picture, and the DeckLink confidence
+// preview. The type keeps the name it was born with because it is what
+// app_picture.go is written against and renaming it would touch every file on
+// that path to say nothing new; NewOverlaySurface is what says which one is
+// being made, and nothing else about a surface differs between the two.
 //
 // It is the same interface overlay_windows.go declares, method for method,
 // because app_picture.go drives both and must not know which it has. Where the
@@ -564,6 +570,12 @@ type overlay struct {
 	// on every call is exactly the pattern go vet's unsafeptr check exists to
 	// stop. It points at an NSView, which is not Go memory, so storing it in a Go
 	// struct is allowed and the collector has nothing to do with it.
+	// purpose is the word this surface is called by in every message it can
+	// produce. It is set once at construction and never written again, so it
+	// needs no lock; it is inside the struct rather than captured in a closure
+	// because the only methods that report anything are the ones below.
+	purpose string
+
 	mu      sync.Mutex
 	view    unsafe.Pointer
 	rect    PictureRect
@@ -577,8 +589,50 @@ type overlay struct {
 
 var _ PictureOverlay = (*overlay)(nil)
 
-// NewPictureOverlay installs the picture view in this process's own application
+// NewPictureOverlay installs the SRT picture's view. It is NewOverlaySurface
+// with this application's first surface named, and it is kept as its own
+// function because app_picture.go has called it since before there was a second
+// one and the picture's own purpose is not a thing that moves.
+func NewPictureOverlay(title string) (PictureOverlay, error) {
+	return NewOverlaySurface(title, "picture")
+}
+
+// NewOverlaySurface installs one overlay view in this process's own application
 // window.
+//
+// # There are TWO of these now, and this is where that became true
+//
+// purpose is a short lower-case word naming which surface this is — "picture"
+// for the SRT programme monitor, gst.PreviewSurfacePurpose for the DeckLink
+// confidence preview. It changes NOTHING about the view's behaviour and appears
+// only in this file's log lines, which is exactly what it is for: two surfaces
+// installed in one contentView, both reported by the same three log lines, is a
+// field log in which the two cannot be told apart at the moment somebody is
+// trying to work out which of them is in the wrong place.
+//
+// Everything that makes two surfaces SAFE rather than merely possible is
+// elsewhere and was landed before this: WSLCommsOverlayView, so that one of
+// these can recognise another; and the raise in wslcomms_overlay_apply, which
+// asks "am I above every sibling that is not one of my own kind" rather than "am
+// I last". Read the header of overlay_zorder.go for why the second question is
+// false for one of two surfaces on every single apply, forever, and what that
+// costs on this platform in particular — the only way AppKit offers to reorder a
+// subview is to take it out of its window and put it back, through a view that is
+// hosting a live GL surface.
+//
+// The two views are otherwise entirely independent, and their order RELATIVE TO
+// EACH OTHER is settled once, at construction, and then never touched again: a
+// new view is added above every sibling, and the raise on every later apply
+// skips its own kind. So the one created SECOND sits above the one created
+// first, permanently, and neither ever moves the other.
+//
+// That is a real property and not an accident, and it costs nothing because the
+// frontend gives them rectangles that do not overlap — they are two panes of one
+// layout. If it ever gives them rectangles that DO overlap, the second surface
+// created wins, quietly and stably. The alternative, an ordering rule between
+// them, is the fight overlay_zorder.go exists to prevent, and it would be paid
+// on every frame of a resize drag on the surface carrying the commentator's
+// programme picture.
 //
 // title is the host window's title, used to identify it; pass main.go's
 // windowTitle, which is the string Wails gives -[NSWindow setTitle:]. An empty
@@ -602,7 +656,10 @@ var _ PictureOverlay = (*overlay)(nil)
 // The view is created HIDDEN, at 1x1. Nothing appears on the operator's screen
 // until the frontend has told the overlay where the picture goes and the monitor
 // has reported that there are pictures to put in it.
-func NewPictureOverlay(title string) (PictureOverlay, error) {
+func NewOverlaySurface(title, purpose string) (PictureOverlay, error) {
+	if purpose == "" {
+		purpose = "overlay"
+	}
 	cTitle := C.CString(title)
 	defer C.free(unsafe.Pointer(cTitle))
 
@@ -619,20 +676,22 @@ func NewPictureOverlay(title string) (PictureOverlay, error) {
 		// reader actually sees is the true one. "The window does not exist yet"
 		// would be a guess here: we never got far enough to look.
 		return nil, fmt.Errorf("gst: overlay: this process has no running NSApplication, "+
-			"so nothing would service the main queue the picture view has to be created on: %w", ErrNoHostWindow)
+			"so nothing would service the main queue the %s view has to be created on: %w",
+			purpose, ErrNoHostWindow)
 	case C.WSLCOMMS_OVERLAY_NO_CONTENT:
-		return nil, errors.New("gst: overlay: the application window has no content view to put the picture in")
+		return nil, errors.New("gst: overlay: the application window has no content view to put the " +
+			purpose + " in")
 	default:
-		return nil, fmt.Errorf("gst: overlay: could not create the picture view (code %d)", int(rc))
+		return nil, fmt.Errorf("gst: overlay: could not create the %s view (code %d)", purpose, int(rc))
 	}
 	if info.view == nil {
-		return nil, errors.New("gst: overlay: the picture view was reported created and is nil")
+		return nil, fmt.Errorf("gst: overlay: the %s view was reported created and is nil", purpose)
 	}
 
 	if int(info.matches) > 1 {
 		log.Printf("gst: overlay: this process has %d visible parentless windows titled %q; "+
-			"using the first. If the picture appears in the wrong one, that is why",
-			int(info.matches), title)
+			"using the first. If the %s appears in the wrong one, that is why",
+			int(info.matches), title, purpose)
 	}
 
 	// The same diagnostic the Windows twin logs its DPI for, and the same
@@ -641,13 +700,16 @@ func NewPictureOverlay(title string) (PictureOverlay, error) {
 	// devicePixelRatio, and the two are different measurements taken at different
 	// moments. Logging both is what lets a picture in the wrong place be told
 	// from a page reporting the wrong ratio.
-	log.Printf("gst: overlay: picture view %p installed in a %.0fx%.0f pt content view, "+
+	//
+	// The purpose is in it because there is now more than one of these views in
+	// the contentView, and %p alone is an address nobody can attribute.
+	log.Printf("gst: overlay: %s view %p installed in a %.0fx%.0f pt content view, "+
 		"backingScaleFactor %.2f. Rectangles arrive in PHYSICAL PIXELS from the page and are "+
 		"divided by that factor on the main thread; the page's own devicePixelRatio is what "+
 		"produced them",
-		info.view, float64(info.contentWidth), float64(info.contentHeight), float64(info.scale))
+		purpose, info.view, float64(info.contentWidth), float64(info.contentHeight), float64(info.scale))
 
-	return &overlay{view: info.view}, nil
+	return &overlay{purpose: purpose, view: info.view}, nil
 }
 
 // Handle returns the NSView*. See PictureOverlay.
@@ -713,7 +775,7 @@ func (o *overlay) apply() error {
 	if closed || view == nil {
 		// Fail closed. A SetRect that quietly succeeded on a closed overlay would
 		// let app_picture.go believe the picture had been placed.
-		return errors.New("gst: overlay: the picture view is closed")
+		return errors.New("gst: overlay: the " + o.purpose + " view is closed")
 	}
 
 	// An empty rectangle is a hide, not a zero-sized view. A zero-sized view

@@ -16,6 +16,11 @@ import {
   normalisePictureState,
 } from './picturesource.js';
 import { createErrorLog, createBackoffEpisode, describeEntry, formatErrorTime } from './errorlog.js';
+// The CAMERA lamp's name. The lamp's DERIVATION is not here and must not be —
+// this file holds no backend knowledge and no state machine — app.js derives it
+// from the "signal" event and the saved video source and pushes it into
+// lamps.CAMERA, exactly as it does for the four lamps beside it.
+import { LAMP_CAMERA } from './videosource.js';
 // The input meters' maths and state: the mixer's own -60..0 scale and
 // -18/-6 zone boundaries (imported there, not copied — two meter scales that
 // disagree is the two-tables bug), plus the peak-hold. This file only builds
@@ -67,7 +72,25 @@ import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../mo
 // the crop is computed from the size that actually arrived. See tile.js for why
 // assuming otherwise put the picture in the wrong place.
 
-const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
+// ======================= WHY THERE IS A CAMERA LAMP =========================
+//
+// It is SECOND, immediately after SENDING, because the row reads outwards from
+// this desk: what this position is sending, then what the switcher makes of it.
+// CAMERA belongs on our side of that line — it is the only lamp on the row that
+// describes what this seat is putting INTO the feed.
+//
+// It exists because nothing else here can tell. MEASURED: a DeckLink that loses
+// its input goes on emitting black frames at full rate for ever, so SENDING
+// stays green, all three switcher lamps stay green — the switcher really is
+// receiving a healthy, correctly-formatted, correctly-bitrated feed — and the
+// audio meters keep moving. Black goes to air with five green lamps above it.
+//
+// On a slate position, which is every position shipping today, it reads grey
+// SLATE. That is not a filler state: it is the at-a-glance answer to "what is
+// this seat contributing", which no other lamp on this row gives, and a lamp
+// that appeared and disappeared with a setting would be a lamp nobody learns to
+// look at. See videosource.js's deriveCameraLamp.
+const LAMP_NAMES = ['SENDING', LAMP_CAMERA, 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
 
 // The Return dropdown offers all seven audio tracks. It used to offer two, CLN
 // and PGM. That was fine as long as the documented routing held. It did not:
@@ -101,6 +124,11 @@ const LAMP_NAMES = ['SENDING', 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'
  *                                       over the tile. The ONLY thing that may
  *                                       suppress the mosaic; see the function.
  *   measurePictureRect()                the reserved box, in CSS pixels
+ *   setPreviewReserved(on)              whether the card's confidence preview
+ *                                       box exists in the layout at all
+ *   setPreviewCaption(text)             the words drawn inside that box, which
+ *                                       the native surface covers when it paints
+ *   measurePreviewRect()                that box, in CSS pixels
  *   setLevels(frame)                    paints the input meters from one
  *                                       "levels" frame {peak:[], rms:[]}; an
  *                                       all-silence frame (or null) dims them
@@ -508,7 +536,44 @@ export function createHomeView(handlers) {
     return { fills, peakMark };
   });
 
-  pgmStage.append(pgmTile, metersEl);
+  // --- the card's confidence preview, at the right edge --------------------
+  //
+  // A SECOND RESERVED RECTANGLE, and the same mechanism as the first: the
+  // preview is decoded and drawn in Go and painted by a NATIVE CHILD WINDOW
+  // over this page, because the frames never leave that process and a <video>
+  // element cannot be handed a GStreamer sink. So this file's whole job is
+  // identical to its job for the SRT picture — reserve a box, expose a way to
+  // measure it — and app.js reports it through a createOverlay of its own.
+  //
+  // ================ IT IS OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING ========
+  //
+  // Two opaque native windows must not be told to occupy overlapping
+  // rectangles: whichever is on top simply erases the other, and neither the
+  // page nor Go would report anything wrong. .pgm-tile is measured exactly by
+  // measurePictureRect, so this sits BESIDE it in .pgm-stage — the same
+  // reasoning, and the same place, as the input meters above.
+  //
+  // ================ THE CAPTION NEEDS NO VISIBILITY FLAG =====================
+  //
+  // It is drawn INSIDE the reserved box and is never hidden by this file. The
+  // native surface is opaque and on top, so the caption is visible exactly when
+  // there is no picture over it — which is the one thing this page genuinely
+  // cannot learn from Go, since the preview branch is built at START from the
+  // saved configuration and there is no event that says whether it was. A box
+  // showing a caption is a box explaining itself; a box showing a picture needs
+  // no caption. app.js supplies the words (videosource.js's describePreviewBox).
+  const previewTile = document.createElement('div');
+  previewTile.className = 'preview-tile';
+  // HIDDEN UNTIL SOMETHING SAYS OTHERWISE, so that a seat which has never
+  // turned the preview on — which is every seat today — has the main screen it
+  // has always had, to the pixel. An empty reserved box would also move
+  // .pgm-tile, which is the commentator's picture.
+  previewTile.hidden = true;
+  const previewCaption = document.createElement('p');
+  previewCaption.className = 'preview-caption';
+  previewTile.appendChild(previewCaption);
+
+  pgmStage.append(pgmTile, metersEl, previewTile);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -1024,6 +1089,47 @@ export function createHomeView(handlers) {
     return { x: r.left, y: r.top, width: r.width, height: r.height };
   }
 
+  /**
+   * setPreviewReserved decides whether the preview box exists in the layout at
+   * all. app.js is the only caller and the only thing that knows the answer: it
+   * takes the saved video source, the saved preview flag and whether this build
+   * can position the surface.
+   *
+   * Reserving is a LAYOUT change — .pgm-tile is sized against what is left in
+   * .pgm-stage — so app.js re-syncs both overlays after calling it. That is not
+   * this file's business; it neither knows nor may know that either window
+   * exists.
+   */
+  function setPreviewReserved(reserved) {
+    previewTile.hidden = reserved !== true;
+  }
+
+  /** setPreviewCaption writes the words drawn inside the reserved box. */
+  function setPreviewCaption(text) {
+    previewCaption.textContent = typeof text === 'string' ? text : '';
+  }
+
+  /**
+   * measurePreviewRect reports the preview box in CSS pixels, relative to the
+   * viewport — the WebView client area — exactly as measurePictureRect does.
+   *
+   * Deliberately raw: no rounding, no scaling, no opinion. ./overlay.js is the
+   * only module on this side allowed one, and there is one conversion rule in
+   * this application rather than two. Null when there is no box to measure,
+   * which is what a hidden preview and a hidden view both look like — and null
+   * means "do not report", which leaves the surface where it was rather than
+   * moving it to a corner and shrinking it to nothing.
+   *
+   * @returns {{x: number, y: number, width: number, height: number}|null}
+   */
+  function measurePreviewRect() {
+    if (previewTile.hidden) return null;
+    if (typeof previewTile.getBoundingClientRect !== 'function') return null;
+    const r = previewTile.getBoundingClientRect();
+    if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+    return { x: r.left, y: r.top, width: r.width, height: r.height };
+  }
+
   // Draw the note and the badge once at construction so neither is blank before
   // any config has loaded.
   renderPicture();
@@ -1110,6 +1216,11 @@ export function createHomeView(handlers) {
     // The element whose box the native overlay is told to occupy. app.js
     // observes it; nothing here knows what it is for.
     pictureEl: pgmTile,
+    // The SECOND such element, for the card's confidence preview. Two boxes,
+    // two native windows, one mechanism — and they are separate elements
+    // precisely so the two rectangles can never overlap, which would erase one
+    // window with the other and report nothing.
+    previewEl: previewTile,
     lamps,
     setDevBadge,
     setRemoteClients,
@@ -1123,6 +1234,9 @@ export function createHomeView(handlers) {
     setPictureState,
     setPictureOverlaid,
     measurePictureRect,
+    setPreviewReserved,
+    setPreviewCaption,
+    measurePreviewRect,
     setLevels,
     setLevel,
     setPresets,

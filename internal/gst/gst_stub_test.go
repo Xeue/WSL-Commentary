@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"math"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -582,6 +583,42 @@ func funcBody(t *testing.T, fset *token.FileSet, file *ast.File, receiver, name 
 	return ""
 }
 
+// startSequence is Start's body followed by startBuiltLocked's, as one text.
+//
+// EVERY GUARD BELOW THAT USED TO READ Start ALONE READS THIS INSTEAD, and the
+// reason is a refactor rather than a preference. Start used to be one function:
+// the option checks, then the build, then NULL to PLAYING. It is now two,
+// because a preview sink that exists and then will not START fails inside the
+// state change — which is not a bus error, so none of the sparing that protects
+// the confidence monitor everywhere else applies — and the only answer is to
+// build again without it. That needs the build callable twice, so it moved into
+// cgoPipeline.startBuiltLocked and Start kept the option checks and the retry.
+//
+// READING THE TWO AS ONE TEXT IS EXACT, not a convenience. Start runs its
+// prologue and then calls startBuiltLocked, so concatenating them in that order
+// is the order the statements execute in, which is the only property the
+// ordering guards below assert. Every one of them compares positions across the
+// seam — the OnLevels store in the first half against gst_parse_launch in the
+// second, the render-endpoint refusal against the same — and gets the same
+// answer it got when both halves were in one body.
+//
+// READING BOTH HALVES IS ALSO MANDATORY RATHER THAN TIDY. Two of the guards
+// below — the DeckLink `connection` prohibition and the "Start must not
+// enumerate devices" rule — would still have PASSED against Start alone after
+// the extraction, because the code they forbid had moved into the half they
+// stopped reading. A guard that passes because it can no longer see the code is
+// worse than one that fails, and the connection rule is the one hardware rule in
+// this package that cannot be undone by restarting anything.
+//
+// The retry block itself sits in the first half, after the call. Nothing in it
+// matches any guard below; if a future edit puts something there that does, read
+// this comment before assuming the position it reports is wrong.
+func startSequence(t *testing.T, fset *token.FileSet, file *ast.File) string {
+	t.Helper()
+	return funcBody(t, fset, file, "cgoPipeline", "Start") + "\n" +
+		funcBody(t, fset, file, "cgoPipeline", "startBuiltLocked")
+}
+
 // receiverName returns the type name of a method's receiver, without the
 // pointer star, or "" for a package-level function.
 func receiverName(fn *ast.FuncDecl) string {
@@ -882,20 +919,26 @@ func TestPipelineDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
 // by reading source — that the default renders the exact string that used to
 // be written here.
 func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+	slate := slateLegSource(t)
 
-	if !strings.Contains(body, "videoscale") {
+	if !strings.Contains(slate, "videoscale") {
 		t.Fatal("the slate branch has no videoscale; artwork that is not exactly the conform " +
 			"target's size fails caps negotiation at Start with no diagnostic naming the size")
 	}
 	for _, want := range []string{"conform.spatialCaps()", "conform.temporalCaps()"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the video leg no longer renders %s. If the caps have gone back to being "+
+		if !strings.Contains(slate, want) {
+			t.Errorf("the slate leg no longer renders %s. If the caps have gone back to being "+
 				"written out, they are written out for ONE switcher configuration, and M2L-X "+
 				"refuses any source that is not in the format it is configured for", want)
 		}
 	}
+	// The hardcoding check is made against the WHOLE function rather than the
+	// slate leg alone, deliberately: the live capture leg conforms to the same
+	// target and would be the easier of the two to write a literal into, because
+	// a reader who has just learned what a card produces is thinking about 1080
+	// rather than about the switcher's configuration.
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "", "pipelineDescription")
 	for _, literal := range []string{"width=1920", "height=1080", "framerate=50"} {
 		if strings.Contains(body, literal) {
 			t.Errorf("pipelineDescription contains the literal %q again; the conform target is "+
@@ -923,8 +966,7 @@ func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
 // every behavioural test in this package and costs only CPU, which is the one
 // resource a commentary machine has spare right up until it does not.
 func TestPipelineDescriptionScalesBeforeFreezing(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+	body := slateLegSource(t)
 
 	convert := strings.Index(body, "videoconvert")
 	scale := strings.Index(body, "videoscale name=")
@@ -953,10 +995,404 @@ func TestPipelineDescriptionScalesBeforeFreezing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The LIVE CAPTURE video leg.
+//
+// pipelineDescription now renders one of two video legs, chosen by whether a
+// DeckLink card was configured, and the guards above had to learn which half
+// they were reading. slateLegSource and captureLegSource are that split, and it
+// is made by TEXT POSITION rather than by re-rendering the function, for the
+// same reason every other guard in this file reads source: gst_cgo.go cannot be
+// compiled at Gate A, so there is nothing to call.
+//
+// The split is deliberately FRAGILE IN THE SAFE DIRECTION. If the function is
+// restructured so the marker is not there, these fail loudly and immediately
+// rather than silently returning the whole body and letting a slate assertion
+// be satisfied by a line in the capture leg — which is exactly the failure a
+// position-based split invites and the one thing it must not do.
+// ---------------------------------------------------------------------------
+
+// captureLegMarker is the first token of the capture leg's construction. It is
+// the factory constant rather than a literal element name so that renaming the
+// element does not silently unsplit the two halves.
+const captureLegMarker = "videoCaptureFactory"
+
+// slateLegSource is pipelineDescription's source ABOVE the capture leg: the
+// slate branch, the mux and the sink queue.
+func slateLegSource(t *testing.T) string {
+	t.Helper()
+	body := pipelineDescriptionSource(t)
+	i := strings.Index(body, captureLegMarker)
+	if i < 0 {
+		t.Fatalf("pipelineDescription no longer mentions %s, so the slate leg and the live "+
+			"capture leg cannot be told apart in its source. Re-derive this split from the new "+
+			"shape rather than deleting it: without it a guard written for the slate can be "+
+			"satisfied by a line in the capture leg and go green while checking nothing",
+			captureLegMarker)
+	}
+	return body[:i]
+}
+
+// captureLegSource is pipelineDescription's source FROM the capture leg
+// onwards, which is the capture branch plus the shared encoder-and-mux tail.
+func captureLegSource(t *testing.T) string {
+	t.Helper()
+	body := pipelineDescriptionSource(t)
+	i := strings.Index(body, captureLegMarker)
+	if i < 0 {
+		t.Fatalf("pipelineDescription no longer mentions %s; see slateLegSource", captureLegMarker)
+	}
+	return body[i:]
+}
+
+// pipelineDescriptionSource is the comment-free source of the one function both
+// halves come out of.
+func pipelineDescriptionSource(t *testing.T) string {
+	t.Helper()
+	fset, file := parseSource(t, cgoSourceFile)
+	return funcBody(t, fset, file, "", "pipelineDescription")
+}
+
+// TestCaptureLegNeverSetsTheConnectionProperty is the guard on the one
+// hardware rule in this package that cannot be undone by restarting anything.
+//
+// decklinkvideosrc's `connection` property is NOT a per-pipeline input
+// selection. Setting it PERSISTENTLY RECONFIGURES THE CARD and overrides what
+// the operator chose in Blackmagic Desktop Video Setup, and it has had to be
+// undone by hand twice on this rig. The card's input is chosen in Desktop Video
+// Setup; leaving the property unset is what makes the microphone on the card's
+// MIC input work at all. When a capture is black or silent the answer is never
+// another connection value — which is precisely the intuition a person
+// debugging at midnight will have, which is why this is a test and not a
+// comment.
+//
+// It reads pipelineDescription AND THE WHOLE OF THE START SEQUENCE, because
+// those are the two places a property can reach an element: the parse string and
+// g_object_set. The start sequence is BOTH halves — see startSequence — and that
+// is not tidiness here, it is the whole guard: the g_object_set half moved into
+// startBuiltLocked, so a version of this test that went on reading Start alone
+// would have passed for ever by no longer being able to see the code it forbids.
+// capturefault_cgo.go is deliberately not covered — it READS the property to
+// name it in a no-signal message, which is the opposite operation and is
+// somebody else's file.
+func TestCaptureLegNeverSetsTheConnectionProperty(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	for _, fn := range []struct{ name, body string }{
+		{"pipelineDescription", funcBody(t, fset, file, "", "pipelineDescription")},
+		{"the Start sequence", startSequence(t, fset, file)},
+	} {
+		if strings.Contains(fn.body, "connection") {
+			t.Errorf("%s mentions the DeckLink `connection` property. It is not a per-pipeline "+
+				"selection: it persistently reconfigures the CARD and overrides Blackmagic "+
+				"Desktop Video Setup, and the owner has had to undo that twice. Delete it",
+				fn.name)
+		}
+	}
+}
+
+// TestCaptureLegNamesEveryElementWithTheCapturePrefix is the guard that keeps a
+// video fault from taking the commentary off air.
+//
+// classifyBusError decides fatal-or-recoverable BY ELEMENT NAME, and an element
+// left unnamed in the parse string is named by GStreamer — "videoconvert0" —
+// which matches no prefix and rejoins the FATAL default. So an unnamed element
+// in this leg does not degrade to a frozen picture when a camera is unplugged
+// mid-match: it takes the commentary off air, for a video fault, on a pipeline
+// whose audio was perfectly healthy. capturefault.go's own guard covers the two
+// constants it declares; this covers the conform chain, which is where the
+// elements a later change would add actually go.
+func TestCaptureLegNamesEveryElementWithTheCapturePrefix(t *testing.T) {
+	// The constants are read out of gst_cgo.go AS TEXT rather than referenced,
+	// for the reason capturefault.go's own duplication exists: that file is
+	// `cgo && !gststub` and its identifiers do not exist in this test binary.
+	// Reading the declarations is stronger than mirroring them anyway — it
+	// checks the source of truth instead of a copy of it.
+	src, err := os.ReadFile(cgoSourceFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v", cgoSourceFile, err)
+	}
+	for _, decl := range []string{
+		"nameVideoCapConv", "nameVideoCapDeint", "nameVideoCapScale",
+		"nameVideoCapRate", "nameVideoCapTee", "nameVideoCapQueue",
+	} {
+		m := regexp.MustCompile(decl + `\s*=\s*"([^"]*)"`).FindSubmatch(src)
+		if m == nil {
+			t.Errorf("%s no longer declares %s as a string constant; the capture leg's elements "+
+				"must be named from constants so this guard can check them", cgoSourceFile, decl)
+			continue
+		}
+		if name := string(m[1]); !strings.HasPrefix(name, videoCaptureNamePrefix) {
+			t.Errorf("capture leg element %s = %q does not begin with %q, so a bus error from "+
+				"it would be classified pipeline-fatal and take the commentary off air over a "+
+				"video fault", decl, name, videoCaptureNamePrefix)
+		}
+	}
+
+	// And every element in the leg must actually be given one of those names,
+	// which is the half a constant cannot check on its own.
+	body := captureLegSource(t)
+	for _, want := range []string{
+		"videoconvert name=", "deinterlace name=", "videoscale name=",
+		"videorate name=", "tee name=", "queue name=",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the capture leg has an element built without %q. An unnamed element is "+
+				"named by GStreamer, matches no prefix, and its failures become fatal", want)
+		}
+	}
+}
+
+// TestCaptureLegConformsBeforeTheTee pins the ORDER of the conform chain, and
+// each position in it was paid for.
+//
+// videoconvert first because the card negotiates UYVY or v210 and the rest of
+// the chain wants neither. deinterlace above videoscale because scaling
+// interleaved fields mixes two moments in time into one line pair. videorate
+// LAST and MANDATORY: decklinkvideosrc emits a 720x486 NTSC placeholder as its
+// first buffer on every start, and a fixed capsfilter with no videorate in
+// front of it dies 0.088 s after PLAYING with not-negotiated (-4), 3 runs of 3.
+// The caps then sit above the tee so that BOTH branches — the broadcast one and
+// any preview — see the conformed format rather than whatever the camera is.
+func TestCaptureLegConformsBeforeTheTee(t *testing.T) {
+	body := captureLegSource(t)
+
+	positions := []struct {
+		what  string
+		token string
+	}{
+		{"the capture source", captureLegMarker},
+		{"videoconvert", "videoconvert name="},
+		{"deinterlace", "deinterlace name="},
+		{"videoscale", "videoscale name="},
+		{"videorate", "videorate name="},
+		{"the conform capsfilter", "conform.captureCaps()"},
+		{"the tee", "tee name="},
+	}
+	last := -1
+	for _, p := range positions {
+		i := strings.Index(body, p.token)
+		if i < 0 {
+			t.Fatalf("the capture leg has no %s (%q). Re-derive this guard from the new shape "+
+				"rather than deleting it, and read the comment above first — every element in "+
+				"that list is there because something measurable broke without it", p.what, p.token)
+		}
+		if i < last {
+			t.Errorf("%s is out of order in the capture leg; the required order is "+
+				"source, videoconvert, deinterlace, videoscale, videorate, caps, tee", p.what)
+		}
+		last = i
+	}
+
+	if !strings.Contains(body, "mode=auto") {
+		t.Error("the capture source no longer asks for mode=auto. A PINNED mode that disagrees " +
+			"with the input does not fail: measured, mode=pal against a real 1080p25 input " +
+			"produced 50 clean PAL buffers with only a warning — green lamp, real bitrate, " +
+			"black picture")
+	}
+	if !strings.Contains(body, "allow-not-linked=true") {
+		t.Error("the tee no longer allows an unlinked branch, so a build without the optional " +
+			"preview returns NOT_LINKED upstream and stops the broadcast leg. A second " +
+			"decklinkvideosrc is not an alternative: the card is exclusive and two sources " +
+			"fail 3/3 in one process and 3/3 across two")
+	}
+}
+
+// TestBothVideoLegsMeetAtTheSameEncoder is the guard the whole two-leg design
+// rests on, and the one to read first if anything downstream ever behaves
+// differently depending on what the video leg is.
+//
+// Everything from the H.264 encoder down — h264parse, the byte-stream
+// capsfilter, vq, mpegtsmux, srtq, ReplaceSink and every reconnect rule in
+// internal/sender — must be one graph, written once, for both sources. Written
+// twice it would be two graphs that are equal today, and the day they stopped
+// being equal the symptom would not be a build failure: it would be a feed that
+// behaves differently on the seat with a card in it.
+func TestBothVideoLegsMeetAtTheSameEncoder(t *testing.T) {
+	body := pipelineDescriptionSource(t)
+
+	// The encoder's INSERTION, not the parameter — funcBody renders the
+	// signature too, so `encoderName` alone would always be found twice.
+	if n := strings.Count(body, `encoderName + " name="`); n != 1 {
+		t.Errorf("pipelineDescription inserts the H.264 encoder %d times, want exactly 1. The two "+
+			"video legs must MEET at one capsfilter and share every element below it; a second "+
+			"encoder line is a second graph that only has to stay equal by hand", n)
+	}
+	for _, tail := range []string{
+		"h264parse config-interval=-1",
+		"video/x-h264,stream-format=byte-stream,alignment=au",
+		"queue name=vq max-size-time=1000000000",
+	} {
+		if n := strings.Count(body, tail); n != 1 {
+			t.Errorf("%q appears %d times in pipelineDescription, want exactly 1: the mux tail "+
+				"is shared by both video legs and is what lets internal/sender reason about one "+
+				"graph", tail, n)
+		}
+	}
+}
+
+// TestTheVideoLegIsChosenOnlyByTheConfiguredCard pins the compatibility
+// statement for the whole feature: a seat that configures nothing builds the
+// slate leg, and nothing else can change that.
+//
+// It matters because the tempting "improvement" is to detect a card and use it
+// — which would turn a DeckLink somebody fitted for an unrelated purpose into
+// the picture a commentary position transmits, with no setting anywhere saying
+// so. The condition must be the option field and only the option field.
+func TestTheVideoLegIsChosenOnlyByTheConfiguredCard(t *testing.T) {
+	body := pipelineDescriptionSource(t)
+	if !strings.Contains(body, `videoCapture != ""`) {
+		t.Error("pipelineDescription no longer chooses the video leg on whether a card id was " +
+			"supplied. An empty PipelineOpts.VideoCaptureID must mean THE SLATE, byte for byte, " +
+			"on every seat that has configured nothing")
+	}
+
+	// Start must decide the same way, and must not consult an enumeration.
+	fset, file := parseSource(t, cgoSourceFile)
+	start := startSequence(t, fset, file)
+	if !strings.Contains(start, `opts.VideoCaptureID == ""`) &&
+		!strings.Contains(start, `opts.VideoCaptureID != ""`) {
+		t.Error("Start no longer branches on opts.VideoCaptureID, so the element it configures " +
+			"and the element pipelineDescription built can disagree")
+	}
+	if strings.Contains(start, "ListInputDevices") {
+		t.Error("Start enumerates devices to decide the video leg. The leg is chosen by " +
+			"CONFIGURATION alone: a card that happens to be fitted must never become the " +
+			"picture a commentary position transmits")
+	}
+}
+
+// TestCaptureLegSetsThePersistentIDOutsideTheParseString mirrors the rule the
+// slate path and the audio device id already follow, for the reason
+// pipelineDescription gives: user-supplied strings do not go through
+// gst_parse_launch's quoting rules. It also pins the reuse — the id goes to the
+// video source through the SAME configureDeckLinkSource the audio source uses,
+// because one saved persistent-id serves both entries the card publishes and
+// two setters would be two chances to disagree about the same string.
+func TestCaptureLegSetsThePersistentIDOutsideTheParseString(t *testing.T) {
+	body := pipelineDescriptionSource(t)
+	if strings.Contains(body, "persistent-id") || strings.Contains(body, "propPersistentID") {
+		t.Error("the capture leg puts the persistent-id in the parse string. User-supplied " +
+			"strings are set with g_object_set; the parser's quoting rules are not something to " +
+			"trust a persisted id to")
+	}
+
+	fset, file := parseSource(t, cgoSourceFile)
+	start := startSequence(t, fset, file)
+	if !strings.Contains(start, "configureDeckLinkSource") {
+		t.Error("Start no longer points the video capture source at the card through " +
+			"configureDeckLinkSource. That function is shared with the audio source on purpose: " +
+			"the card publishes ONE persistent-id for both, and a second setter is a second set " +
+			"of rules about the identical saved string")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The conform target. Unlike the guards above these are ORDINARY TESTS: the
 // type and every rule about it live in gst.go, which carries no build tag, so
 // Gate A links and runs the real code rather than reading it as text.
 // ---------------------------------------------------------------------------
+
+// TestCaptureCapsAreTheSpatialCapsPlusTheRate pins the caps the live capture
+// leg conforms to, and it is a behavioural test rather than a source guard
+// because ConformTarget lives in gst.go where Gate A can run it.
+//
+// The exact string below is the one that was on the wire during the end-to-end
+// proof on 2026-08-16: a real DeckLink capture through this leg was ingested by
+// the live M2L-X instance matchH, which reported cam4 "COMMS" streaming at
+// h264 1920x1080, scan type P, 4:2:0, 8-bit, with 0 error packets. Changing it
+// is changing what a switcher was measured accepting.
+//
+// The two legs must agree on everything except WHERE the rate is pinned, which
+// is why this is asserted against spatialCaps rather than written out twice: a
+// capture leg sending bt601 where the slate sent bt709 would be a colorimetry
+// change at every source swap and would be invisible in the source.
+func TestCaptureCapsAreTheSpatialCapsPlusTheRate(t *testing.T) {
+	f := FallbackConformTarget()
+
+	const want = "video/x-raw,format=NV12,width=1920,height=1080," +
+		"pixel-aspect-ratio=1/1,colorimetry=bt709,interlace-mode=progressive,framerate=50/1"
+	if got := f.captureCaps(); got != want {
+		t.Errorf("captureCaps() = %q\nwant %q", got, want)
+	}
+
+	// The relationship, not just the value: whatever spatialCaps says about one
+	// picture, the capture leg says too.
+	if !strings.HasPrefix(f.captureCaps(), f.spatialCaps()+",") {
+		t.Errorf("captureCaps() = %q no longer begins with spatialCaps() = %q. The two legs "+
+			"have started describing a picture differently, which is a format change the "+
+			"switcher sees and this file does not", f.captureCaps(), f.spatialCaps())
+	}
+
+	// And a non-default target, because the whole point of the type is that
+	// 1080p50 is not the only answer. 720p50 is the configuration that was
+	// measured being ingested by M2L-X as width=1280 height=720.
+	small := ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
+	if got := small.captureCaps(); !strings.Contains(got, "width=1280,height=720") ||
+		!strings.HasSuffix(got, ",framerate=50/1") {
+		t.Errorf("captureCaps() for 720p50 = %q, which does not carry the target it was given", got)
+	}
+
+	// 29.97 must stay the exact fraction. A capture leg paced at 2997/100
+	// against a 30000/1001 source gains a frame every 33 seconds — well inside
+	// a match and invisible in a twenty-second test.
+	ntsc := ConformTarget{Width: 1920, Height: 1080, FrameRateNum: 30000, FrameRateDen: 1001}
+	if !strings.HasSuffix(ntsc.captureCaps(), ",framerate=30000/1001") {
+		t.Errorf("captureCaps() for 1080p29.97 = %q; the rate must be the exact fraction",
+			ntsc.captureCaps())
+	}
+}
+
+// TestStubRefusesAVideoCaptureIDThatIsNotACard is the Gate A half of the
+// refusal the real build makes before it builds anything.
+//
+// The failure it prevents is silent by construction: the decklink elements'
+// persistent-id default is -1, meaning "use device-number instead", meaning
+// whichever card the driver enumerated first. A CoreAudio unique-id or a WASAPI
+// endpoint GUID wired into the video option by a caller reaching for the wrong
+// field would therefore not fail — it would transmit a picture from a card
+// nobody chose, with every lamp green.
+func TestStubRefusesAVideoCaptureIDThatIsNotACard(t *testing.T) {
+	for _, id := range []string{
+		"BuiltInMicrophoneDevice",
+		"{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
+		"90:a3c204a4:00000000:Audio",
+		"-1",
+	} {
+		p := NewStubPipeline()
+		err := p.Start(PipelineOpts{
+			SlatePath:      "slate.png",
+			AudioDeviceID:  "BuiltInMicrophoneDevice",
+			VideoCaptureID: id,
+		})
+		if err == nil {
+			t.Errorf("Start accepted VideoCaptureID %q. It is not a DeckLink persistent-id, and "+
+				"the element would silently fall back to device-number 0", id)
+			_ = p.Stop()
+			continue
+		}
+		if !strings.Contains(err.Error(), "VideoCaptureID") {
+			t.Errorf("Start refused %q with %v, which does not name the field the operator or "+
+				"the caller has to fix", id, err)
+		}
+		_ = p.Stop()
+	}
+
+	// The real id from the fitted card must be accepted, and so must an empty
+	// one — which is the slate and is every seat shipping today.
+	for _, id := range []string{"", "2747401380"} {
+		p := NewStubPipeline()
+		if err := p.Start(PipelineOpts{
+			SlatePath:      "slate.png",
+			AudioDeviceID:  "BuiltInMicrophoneDevice",
+			VideoCaptureID: id,
+		}); err != nil {
+			t.Errorf("Start refused VideoCaptureID %q: %v", id, err)
+		}
+		if got := p.StartedWith().VideoCaptureID; got != id {
+			t.Errorf("StartedWith().VideoCaptureID = %q, want %q", got, id)
+		}
+		_ = p.Stop()
+	}
+}
 
 // TestFallbackConformTargetReproducesTheShippedCaps is the compatibility
 // statement for the whole change, and it is the test to read first if this
@@ -1534,7 +1970,7 @@ func calleeName(call *ast.CallExpr) string {
 // running pipeline whose capture chain is already dead.
 func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 
 	refuse := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "refuseRenderEndpoint(opts.AudioDeviceID)")
@@ -1581,7 +2017,7 @@ func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 // request instead of leaving the id to be argued about.
 func TestStartLogsTheEndpointID(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "Start")
+	body := startSequence(t, fset, file)
 
 	logged := false
 	for idx := strings.Index(body, "log.Printf("); idx >= 0; {
@@ -2173,7 +2609,7 @@ func TestBusHandlerForwardsLevelMessages(t *testing.T) {
 // first frames of every session race the store.
 func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 
 	store := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "p.onLevels.Store(")
@@ -2202,7 +2638,7 @@ func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
 // meter and send them looking for the fault somewhere else entirely.
 func TestStartPublishesOnChannelLevelsBeforeBuildingThePipeline(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 
 	store := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "p.onChannelLevels.Store(")
@@ -2273,7 +2709,7 @@ func TestPerChannelMeterIsArmedFromTheMatrixDecision(t *testing.T) {
 			"every native capture would start posting sixteen-channel frames nobody asked for")
 	}
 
-	start := funcBody(t, fset, file, "cgoPipeline", "Start")
+	start := startSequence(t, fset, file)
 	arm := strings.Index(start, "p.armChannelMeterLocked(")
 	if arm < 0 {
 		t.Fatal("Start never arms the per-channel meter; it is built silent, so the routing " +
@@ -2327,7 +2763,7 @@ func TestStopStopsTheSignalWatchdogBeforeTheTeardown(t *testing.T) {
 // that no abort() path can leak the goroutine.
 func TestStartStartsTheWatchdogOnlyAfterPlaying(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 
 	watch := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "startSignalWatch(")
@@ -2544,7 +2980,7 @@ func TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad(t *testing.T) {
 	// negotiation constraint, not a gain on a running stream. Measured —
 	// sixteen unpositioned channels into this chain with no matrix die 0.069 s
 	// after PLAYING with not-negotiated (-4).
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 	apply := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "p.applyStartChannelMapLocked(")
 	})

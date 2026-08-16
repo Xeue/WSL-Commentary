@@ -242,6 +242,62 @@ type Config struct {
 	// See the switch in Validate.
 	AudioDeviceID string `json:"audioDeviceId"`
 
+	// VideoSource selects WHAT THE VIDEO LEG CARRIES: VideoSourceSlate
+	// ("slate", the default — the still PNG at SlatePath, re-encoded fifty times
+	// a second, which is what this application has transmitted for its whole
+	// life) or VideoSourceDeckLink ("decklink" — live video captured from the
+	// Blackmagic card named by DeckLinkPersistentID).
+	//
+	// It is INDEPENDENT of AudioSourceKind, and the independence is the point.
+	// The two legs have genuinely separate failure domains, so all four
+	// combinations are expressible and each means something:
+	//
+	//	slate    + native    what ships today, on air, on Windows.
+	//	slate    + decklink  commentary off the card's embedded audio with no
+	//	                     camera: the position that has an XLR into an
+	//	                     embedder and nothing to show.
+	//	decklink + native    THE SAFEST LIVE CONFIGURATION, and the one to bring
+	//	                     up first. The camera cannot touch the commentary at
+	//	                     all: a lost video signal is a black picture and a
+	//	                     commentator still being heard, because the two legs
+	//	                     share no element, no device and no failure.
+	//	decklink + decklink  one card, both legs, one pipeline.
+	//
+	// # The clock, and the one property that must never be set
+	//
+	// PUT HERE BECAUSE THIS IS THE FIELD SOMEBODY TUNING LATENCY TURNS ON.
+	// decklinkvideosrc PROVIDES NO CLOCK. In a mixed pipeline the audio source
+	// owns it and the DeckLink capture slaves to it, re-fitting a 64-sample
+	// regression clamped to 5% of a frame per update: MEASURED residual +17.6 ms
+	// over 22 s, below frame quantisation, with zero imperfect-timestamp
+	// warnings. That is why there is no livesync element in the video leg and why
+	// none is needed.
+	//
+	// NEVER SET provide-clock=false ON THE CAPTURE SOURCE to "fix" a timing
+	// question. MEASURED: it collapses every audio PTS to zero — 2200 of 2200
+	// buffers in duplicate pairs — WHILE STILL DELIVERING REAL AUDIO. The feed
+	// would be sent, every lamp would be green, the bitrate would be right, and
+	// it would be unusable at M2L-X. There is no diagnostic anywhere in this
+	// application that would catch it, which is the whole reason the warning is
+	// written down rather than left to whoever next opens the pipeline string.
+	//
+	// # Empty means slate
+	//
+	// EffectiveVideoSource substitutes "slate" for an empty value, so every
+	// config.json written before this field existed keeps sending exactly the
+	// picture it sent before — which for a field that decides WHAT GOES ON AIR is
+	// the only acceptable reading of "nobody has said".
+	//
+	// # It is MACHINE state, and the argument is not a one-liner
+	//
+	// It names hardware in THIS PC, and hardware presence is the binding
+	// constraint: a preset switching a position to a camera that position does
+	// not have is not merely wrong, it is unstartable. The full argument —
+	// including the real case AGAINST, which is that this changes what goes on
+	// air and that is what the UI class exists to protect — is recorded beside
+	// the tag in internal/presets/fields.go rather than summarised here.
+	VideoSource string `json:"videoSource"`
+
 	// AudioSourceKind selects WHERE the commentary audio is captured from:
 	// AudioSourceNative ("native", the default — the platform's own audio API,
 	// wasapi2src or osxaudiosrc, reading AudioDeviceID) or AudioSourceDeckLink
@@ -347,6 +403,37 @@ type Config struct {
 	// their reason: a preset carrying a routing would silently move somebody's
 	// microphone from a configuration screen, in a different building, mid-match.
 	DeckLinkChannelMap []ChannelContribution `json:"decklinkChannelMap,omitempty"`
+
+	// DeckLinkPreviewEnabled turns on the OPERATOR'S OWN CONFIDENCE MONITOR: a
+	// small live picture of what the card is capturing, rendered on this screen,
+	// beside the controls. It is read only when VideoSource is "decklink" — there
+	// is nothing to preview on a still slate — and it changes NOTHING about what
+	// is transmitted.
+	//
+	// # Why it is UI state and not machine state
+	//
+	// It is the same class of choice as ReturnSource: live monitoring on the
+	// screen of the person at the desk right now. It answers "do I want to look
+	// at this", not "what is plugged into this PC" and not "what does this
+	// deployment need", so a preset applied from a configuration screen must
+	// never be able to turn it on or off. See internal/presets/fields.go.
+	//
+	// # It costs something, and the number is why the default is off
+	//
+	// The preview shares the ONE capture through a tee inside the contribution
+	// pipeline — a second decklinkvideosrc is impossible, the card admits exactly
+	// one user — so it is not free of the feed the way the SRT picture monitor
+	// is. What makes it affordable is measured and is in internal/gst: the branch
+	// scales BEFORE it converts (1.8-2.4% of a core written that way against 18.0%
+	// written naively), it is capped at 12.5 fps because a confidence monitor does
+	// not need 50, and its head queue is leaky=downstream because tee pushes
+	// serially on the upstream thread and a preview that merely renders slowly
+	// otherwise drags the broadcast feed from 50 fps to 20.8.
+	//
+	// Defaults to OFF. A window that appears on the operator's screen without
+	// anybody asking for it is a window over whatever they were looking at, and
+	// the cost above is a cost on the leg that is going to air.
+	DeckLinkPreviewEnabled bool `json:"decklinkPreviewEnabled"`
 
 	// HeadphoneDeviceID is the browser mediaDeviceId of the commentator's
 	// headphone output, written by the output dropdown and consumed only by the
@@ -648,6 +735,31 @@ const (
 	// to the return path.
 	DefaultAudioSourceKind = AudioSourceNative
 
+	// The two video-leg sources. They are the strings stored in videoSource and
+	// the values of the Settings screen's control.
+	//
+	// VideoSourceSlate is the still PNG at slatePath, decoded once and repeated
+	// by imagefreeze at the conform target's rate. It is what this application
+	// has transmitted since it was written, and it is the default.
+	VideoSourceSlate = "slate"
+	// VideoSourceDeckLink is live video from the Blackmagic card named by
+	// decklinkPersistentId, captured by decklinkvideosrc.
+	//
+	// videorate is MANDATORY behind it and is not a nicety: MEASURED, on every
+	// start, 3 of 3 runs, the element emits a 720x486 NTSC PLACEHOLDER as its
+	// first buffer with GAP set and signal=false, and the real caps arrive about
+	// 170 ms later. A fixed capsfilter with no videorate in front of it dies in
+	// 0.088 s with not-negotiated (-4). mode=auto ONLY, likewise measured:
+	// mode=pal against a real 1080p25 input produced 50 clean PAL buffers with
+	// nothing but a warning — a green lamp, a real bitrate and a black picture.
+	VideoSourceDeckLink = "decklink"
+
+	// DefaultVideoSource is VideoSourceSlate, and this is the one default in this
+	// table it would be worst to change. It decides WHAT GOES ON AIR, so moving
+	// it would put a camera on the switcher for every position that upgraded,
+	// without anybody having asked, on the next launch.
+	DefaultVideoSource = VideoSourceSlate
+
 	// DefaultReturnMid is the transceiver mid routed to the headphones: mid 4,
 	// MIC1 — the mix-minus feed the operator labels "Monitor 1" and chose as the
 	// default return.
@@ -764,6 +876,14 @@ func Defaults() *Config {
 		// written here or a fresh config.json would carry an empty kind that only
 		// EffectiveAudioSourceKind makes sense of.
 		AudioSourceKind: DefaultAudioSourceKind,
+		// And the same for the video leg: "slate" is a real value, and it is the
+		// one this application has always transmitted.
+		VideoSource: DefaultVideoSource,
+		// Explicit even though it is the zero value, for the reason
+		// srtReturnPBKeyLen above is: this table says what every documented
+		// default IS, and "the operator's confidence monitor starts off" is a
+		// decision about what appears on somebody's screen, not an absence of one.
+		DeckLinkPreviewEnabled: false,
 		// videoFormatOverride and decklinkPersistentId are deliberately absent.
 		// Both are documented as MEANINGFUL when empty — "derive the format from
 		// the switcher" and "the only card in this machine" — so unlike
@@ -999,6 +1119,48 @@ func (c *Config) UsesDeckLinkAudio() bool {
 	return c.EffectiveAudioSourceKind() == AudioSourceDeckLink
 }
 
+// EffectiveVideoSource returns the configured video-leg source, substituting
+// DefaultVideoSource for an empty value.
+//
+// The substitution matters more here than it does for the audio kind, because
+// this field decides what a switcher receives. Load already fills in defaults
+// for keys ABSENT from config.json, but an explicitly empty string survives —
+// a hand-edited file, a preset applied over a config from a build with no such
+// field, or (the one that will actually happen) a Settings screen whose
+// collectConfig does not yet restate the key. "slate" is the right answer in
+// every one of those cases: it is what the machine was transmitting before
+// anybody touched the file, and no path anywhere may turn "nobody said" into a
+// live camera.
+func (c *Config) EffectiveVideoSource() string {
+	if s := strings.TrimSpace(c.VideoSource); s != "" {
+		return s
+	}
+	return DefaultVideoSource
+}
+
+// UsesDeckLinkVideo reports whether the video leg carries live capture from a
+// Blackmagic card rather than the still slate.
+//
+// It is the one question the rest of the application asks about videoSource —
+// which video leg to build, and whether decklinkPersistentId means anything —
+// so it is answered once, here, rather than by string comparison at each call
+// site. Mirrors UsesDeckLinkAudio above.
+func (c *Config) UsesDeckLinkVideo() bool {
+	return c.EffectiveVideoSource() == VideoSourceDeckLink
+}
+
+// UsesDeckLinkCard reports whether EITHER leg needs the Blackmagic card open.
+//
+// It exists because the card is the thing that has to be present, and it is
+// EXCLUSIVE: two decklinkvideosrc in one process fail 3 of 3, and in two
+// processes fail 3 of 3, with a busy card giving not-negotiated (-4) in about
+// 100 microseconds and naming nothing. So the question "is a card required for
+// this configuration" has one answer for both legs, and the pre-flight that
+// asks it before Start builds anything asks it once.
+func (c *Config) UsesDeckLinkCard() bool {
+	return c.UsesDeckLinkVideo() || c.UsesDeckLinkAudio()
+}
+
 // VideoFormatOverrideSpec parses videoFormatOverride.
 //
 // The three answers are distinct and every caller has to tell them apart:
@@ -1144,9 +1306,10 @@ func hostOnly(host string) string {
 // TCP/UDP port, 1..65535. pbkeylen must be 0 (no passphrase negotiated), 16 or
 // 32 — the only key lengths SRT's AES-CTR supports. returnMid must be 1..7, the
 // range of transceiver mids the KVS signalling channel can address.
-// audioSourceKind must be one of the two capture kinds. videoBitrateKbps must be
-// 0 (meaning the default) or within MaxVideoBitrateKbps. videoFormatOverride, if
-// it is set at all, must be a format ParseVideoFormat can read.
+// audioSourceKind must be one of the two capture kinds and videoSource one of
+// the two video-leg sources. videoBitrateKbps must be 0 (meaning the default) or
+// within MaxVideoBitrateKbps. videoFormatOverride, if it is set at all, must be
+// a format ParseVideoFormat can read.
 //
 // Deliberately NOT required: statusKey, which only names the node the three
 // WebSocket-derived lamps read (see the field comment). It is not needed to put
@@ -1180,6 +1343,26 @@ func (c *Config) Validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("audioSourceKind must be %q or %q, got %q",
 			AudioSourceNative, AudioSourceDeckLink, c.AudioSourceKind))
+	}
+
+	// videoSource decides which video leg Start builds, so an unrecognised one
+	// has no pipeline behind it either — and unlike the audio kind, the failure
+	// of guessing would be a leg that negotiates nothing at all.
+	//
+	// It is checked here rather than only at Start for the reason
+	// videoFormatOverride is: a value this application cannot build means the
+	// contribution feed cannot be built either way, so the match does not go out
+	// regardless, and the only question is whether the operator is told which
+	// box to fix while they can still fix it. Note what is NOT checked: whether
+	// the card is actually fitted. That is hardware presence, it is knowable only
+	// by enumerating, and it belongs in App.preflightCapture where the enumerated
+	// list can be quoted back — not in a function whose whole job is to decide
+	// whether a document is well formed.
+	switch c.EffectiveVideoSource() {
+	case VideoSourceSlate, VideoSourceDeckLink:
+	default:
+		errs = append(errs, fmt.Errorf("videoSource must be %q or %q, got %q",
+			VideoSourceSlate, VideoSourceDeckLink, c.VideoSource))
 	}
 
 	// audioDeviceId is required for a NATIVE capture and meaningless for a

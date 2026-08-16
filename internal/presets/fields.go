@@ -144,6 +144,42 @@ var MachineFields = []string{
 	// as "Internal data stream error / not-negotiated (-4)" in about 100
 	// microseconds, naming neither the device nor the cause.
 	"audioSourceKind",
+	// WHAT THIS PC PUTS ON THE VIDEO LEG: "slate" or "decklink". It is the video
+	// twin of audioSourceKind above, and it is the hardest classification in this
+	// file. The argument is written out rather than asserted, because the case
+	// against is real and the next person to read this table will find it for
+	// themselves if it is not here.
+	//
+	// THE CASE FOR UI, which is not weak. This field decides WHAT GOES ON AIR.
+	// UIFields exists precisely to stop a preset, applied from a configuration
+	// screen, changing something live as a side effect — and there is no more
+	// live thing in this application than the picture the switcher is receiving.
+	// A preset that could switch a position from a slate to a camera would be the
+	// returnSource fault with the stakes raised: not "the wrong thing in one
+	// person's ears" but "the wrong thing on the broadcast".
+	//
+	// THE CASE FOR MACHINE, which wins. The four classes are separated by WHO THE
+	// AUTHORITY FOR THE VALUE IS, not by how much it would hurt to be wrong —
+	// that rule is stated at the top of this file and it decides this. The
+	// authority for "is there a camera cabled into this position" is this PC and
+	// nothing else. A venue preset cannot know it, because two seats at the same
+	// facility, sharing every instance coordinate, routinely differ on it. And
+	// hardware presence is a BINDING constraint rather than a preference: a
+	// preset switching a position to a camera it does not have is not merely
+	// wrong, it is UNSTARTABLE — an absent or busy card surfaces from GStreamer as
+	// not-negotiated (-4) in about 100 microseconds, naming neither the device nor
+	// the cause. It is audioSourceKind's fault exactly, on the leg where the
+	// failure is louder, and putting the two halves of one question in two
+	// different tables would be two answers to it.
+	//
+	// AND THE THING THAT MAKES THE CHOICE SAFE RATHER THAN MERELY DEFENSIBLE:
+	// both classes forbid travel absolutely, so nothing about the on-air risk
+	// turns on which of the two this row is in. The risk is closed where it
+	// arises instead — App.SetVideoSource is HOST-ONLY, so no remote seat can
+	// change what goes to air, and App.preflightCapture refuses at Start, naming
+	// this field and the card, rather than twenty seconds later naming nothing.
+	// A classification is not a place to fix an authorisation problem.
+	"videoSource",
 	// The persistent-id of a Blackmagic card in THIS PC — hardware, by
 	// definition. One field serves audio and video because the id names the
 	// CARD: both elements publish the same one. It is stored as the
@@ -175,6 +211,19 @@ var UIFields = []string{
 	"returnSource",
 	// Reaches the live Web Audio graph via onConfigSaved's setChannelMode.
 	"returnChannel",
+	// Whether the operator's own confidence monitor is on their screen. It is
+	// returnSource's class exactly — live monitoring, chosen by the person at the
+	// desk, for the desk they are at — and it is here rather than beside
+	// videoSource in MachineFields because it changes NOTHING about what is
+	// transmitted: the preview is a tee off the capture that is already running,
+	// and turning it off does not alter one byte the switcher receives.
+	//
+	// What a preset carrying it would do is open or close a window on somebody
+	// else's screen, in another building, from a configuration form — over
+	// whatever they were looking at, which on this application's home screen is
+	// the picture the commentator is watching. That is the same defect
+	// returnSource is on this list for, in the other sense.
+	"decklinkPreviewEnabled",
 }
 
 // DiscoveredFields are the json tags of values the application LEARNS from the

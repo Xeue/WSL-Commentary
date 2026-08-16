@@ -1065,7 +1065,12 @@ test('Apply and Delete are gated on the sending state, with the reason on the co
 
   // And the view object hands setSending out for app.js to drive from the
   // same place as the SENDING lamp.
-  assert.match(js, /return \{ el, open, setSending \};/);
+  // The handle list is open-ended; what this pins is that setSending is still on
+  // it, because app.js drives the gate through it from the same derivation the
+  // SENDING lamp uses. adoptVideoLeg joined it for the two video-leg controls,
+  // which a remote seat's stale cache can otherwise use to refuse a save they
+  // are not part of — see settings.js's own comment on it.
+  assert.match(js, /return \{ el, open, setSending, adoptVideoLeg \};/);
   assert.match(
     ui('app.js'),
     /settings\.setSending\(!!currentSenderState && currentSenderState !== backend\.SENDER_STATE\.STOPPED\)/,
@@ -1811,8 +1816,15 @@ test('the four new fields are classified in the Go whitelist, two each way', () 
   // the two INSTANCE ones are the ones that show up in the preset preview on
   // this form, and the two MACHINE ones must never appear there at all.
   const fields = read(repoRoot, 'internal', 'presets', 'fields.go');
-  const instance = fields.slice(fields.indexOf('var InstanceFields'), fields.indexOf('// MachineFields'));
-  const machine = fields.slice(fields.indexOf('var MachineFields'), fields.indexOf('// UIFields'));
+  // SLICED ON THE DECLARATIONS, not on the doc comments that precede them.
+  // `// UIFields` was the end marker for the machine table and it stopped
+  // working the moment a field's own comment argued the case for the UI class in
+  // a line beginning "// UIFields exists precisely to…" — which is exactly the
+  // kind of comment this repository wants, and which silently truncated the
+  // slice so that decklinkPersistentId read as unclassified. Prose about a table
+  // is not the table; the `var` line is unambiguous.
+  const instance = fields.slice(fields.indexOf('var InstanceFields'), fields.indexOf('var MachineFields'));
+  const machine = fields.slice(fields.indexOf('var MachineFields'), fields.indexOf('var UIFields'));
   for (const tag of ['videoBitrateKbps', 'videoFormatOverride']) {
     assert.ok(instance.includes(`"${tag}"`), `${tag} must travel in a preset: it describes the venue, not the PC`);
     assert.equal(machine.includes(`"${tag}"`), false);

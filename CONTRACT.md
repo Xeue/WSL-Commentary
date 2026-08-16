@@ -283,6 +283,27 @@ about it are load-bearing:
   coefficient **silently**, leaving the previous matrix in force with nothing readable afterwards
   to say which of the two is running.
 
+**Two fields added 2026-08-16 with the DeckLink VIDEO LEG, rule 3** — `videoSource`
+(**MACHINE**, `"slate"` | `"decklink"`, default `"slate"`) and `decklinkPreviewEnabled` (**UI**,
+default off). They went to different tables on purpose:
+
+- **`videoSource` is MACHINE, and the case FOR calling it UI was real.** It decides what goes on
+  air, which is exactly what `UIFields` does not do. But the classes are separated by **who the
+  authority is**, and the authority for "is there a camera cabled into this position" is this PC —
+  a preset carrying it would leave a seat **unstartable**, not merely wrong, because the card it
+  names is in another building. It is `audioSourceKind`'s twin on the other leg and belongs in the
+  same table. Both classes forbid travel equally, so the on-air risk is closed by the host-only
+  setter and the `Start` pre-flight rather than by the table.
+- **`decklinkPreviewEnabled` is UI**, beside `returnSource`: it changes nothing that is transmitted
+  and everything about what is on the operator's own screen.
+- **`Validate` refuses an unknown `videoSource` by name**, for the reason `videoFormatOverride` is
+  refused by name: the alternative is `not-negotiated (-4)` several seconds after START, naming no
+  field and no value, with a commentator waiting. **All four video/audio pairings are legal
+  configuration documents** — `slate+native`, `slate+decklink`, `decklink+native`,
+  `decklink+decklink`, pinned by `TestUsesDeckLinkCardCoversAllFourCombinations`. What this build
+  cannot make is refused at `Start`, not by `Validate`: hardware presence is a different question
+  with a different answer on a different day.
+
 ### `internal/secrets` — WP-1
 `Store` with `Get(key)`/`Set(key, value)`. **Three** keys, not two: `KeyM2LX` (`"m2lx"`), `KeySRT`
 (`"srt"`) and `KeySRTReturn` (`"srtreturn"`), mapping to Credential Manager targets
@@ -314,8 +335,11 @@ onto the live config as a **merge**. The load-bearing mechanism is a **whitelist
 (`InstanceFields`, 14 tags) plus apply-by-`json.Unmarshal`-onto-the-live-struct — the same
 primitive `config.Load` uses — so a preset is *physically incapable* of writing a field it does not
 carry, and `Extract`/`Filter` make sure it never carries a MACHINE field (`audioDeviceId`,
-`headphoneDeviceId`, `headphoneEndpointId`, `slatePath`) or a UI field (`returnSource`,
-`returnChannel`). A reflection test fails by name on any unclassified `config.Config` field.
+`headphoneDeviceId`, `headphoneEndpointId`, `slatePath`, `audioSourceKind`,
+`decklinkPersistentId`, `decklinkChannelMap`, `videoSource`) or a UI field (`returnSource`,
+`returnChannel`, `decklinkPreviewEnabled`). The split is **14 + 8 + 3 + 1 = 26**, pinned by
+`TestClassificationCounts` so growth in any table is a deliberate, reviewed change. A reflection
+test fails by name on any unclassified `config.Config` field.
 `DeriveID` is the security-sensitive function — the id is both a filename and a Credential Manager
 scope segment — and its rejection table (traversal, separators, colons, Windows reserved device
 names, length) is not optional. `active.json` (which preset this PC points at, and its credential
@@ -448,6 +472,47 @@ defeating the sparing.
 is `asrc` whatever factory is behind it; every element of a video capture leg carries the `vcap`
 prefix. An element that does not rejoins the fatal default **silently** — the failure direction is
 safe and therefore invisible — which is why the names are constants in `capturefault.go`.
+
+**The video leg becomes a live DeckLink capture when `PipelineOpts.VideoCaptureID` names a card,
+2026-08-16, rule 3.** The **zero value is the slate**, byte for byte the graph that ships today, and
+the leg is chosen by that field and **nothing else** — there is no card detection, so a DeckLink
+fitted for an unrelated purpose can never become the picture a commentary position transmits. The
+capture leg is `decklinkvideosrc` (`mode=auto`, `drop-no-signal-frames=false`, **`connection` NEVER
+set** — it persistently reconfigures the CARD and overrides Blackmagic Desktop Video Setup) into
+`videoconvert`, `deinterlace`, `videoscale`, `videorate`, the `ConformTo` capsfilter and a `tee`
+with `allow-not-linked=true`. `videorate` is **mandatory**: the card emits a 720x486 NTSC
+placeholder as its first buffer on every start and a fixed capsfilter without it dies in 0.088 s
+with `not-negotiated (-4)`, 3/3. Everything from the H.264 encoder down is written **once** and
+shared by both legs, so `h264parse`, the queues, `mpegtsmux`, `ReplaceSink` and `internal/sender`
+see one fixed format forever. Proven end to end against the live M2L-X instance matchH: a
+525i59.94 input (720x486, interlaced, bt601, PAR 10:11) left the leg as 1920x1080p50 square-pixel
+bt709 progressive for 45 s with `error_packet_count` and `discontinuous_packet_count` both **0**.
+
+**The confidence monitor is a branch of that tee** (`preview.go`, `preview_cgo.go`,
+`preview_stub.go`), and a tee **inside** the contribution pipeline crosses no boundary this
+document draws — `proxysrc` was measured and **rejected** (its queue is `leaky=0`, so a wedged
+consumer stalls the producer 50→0 fps in under two seconds and the producer's death is silent
+across it), and a **second `decklinkvideosrc` is impossible** because the card is exclusive. Four
+properties of it are contract:
+
+- **The head queue is `leaky=downstream`.** A `tee` pushes to its src pads serially on the upstream
+  streaming thread, so a preview that merely renders slowly drags the **broadcast** leg from 50 fps
+  to 20.8. It scales **before** it converts and caps at 12.5 fps first, which is worth about four
+  times the branch's whole cost.
+- **It is built at `Start` from configuration and is never toggled live.** `set_state(NULL)` on such
+  a branch inside a blocking pad probe took the on-air leg from 50 fps to **0 permanently**, with
+  the pipeline still reporting PLAYING.
+- **Every property in the parse string must be one that cannot fail to parse.** An unknown property
+  is a hard `gst_parse_launch` error and the string is the *contribution* pipeline's, so an optional
+  monitor could otherwise stop the commentary going on air. Only `GstQueue`'s and `GstBaseSink`'s
+  own properties appear there; everything else is set behind `hasProperty` in `attachPreview`.
+- **Preview failures are spared absolutely, as `classPreview`** — a fifth bus class, **not**
+  `classVideoCapture`, because that one is UPGRADED to fatal whenever the commentary audio is
+  clocked by the card's video, which is the very configuration a preview is for. It would upgrade
+  nearly every time. The one failure the bus filter cannot see is a sink that will not **start** (no
+  GL context, no D3D11 device): that is a state-change failure, so `Start` builds the pipeline
+  **once more without the branch** before reporting failure. The commentary is the product and the
+  monitor is not.
 
 **The video leg's two capsfilters are rendered from `PipelineOpts.ConformTo`, not constants.**
 `ConformTarget{Width, Height, FrameRateNum, FrameRateDen}`, whose **zero value means "nothing is
@@ -708,9 +773,32 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
 | `GetChannelMap()` | `channelMapPayload {inputChannels, map, isDefault}` | WP-3a | open |
 | `SetChannelMap(map)` | `error` | WP-3a | open |
+| `SetVideoSource(source)` | `error` | none — see below | **host-only** |
+| `SetDeckLinkPreviewEnabled(enabled)` | `error` | none — see below | **host-only** |
+| `SetPreviewRect(x,y,w,h,ratio)` | `error` | WP-5b | **host-only** |
+| `SetPreviewVisible(visible)` | `error` | WP-5b | **host-only** |
 
 `GetChannelMap` and `SetChannelMap` are added 2026-08-16 with the DeckLink routing screen. They
 are the two halves of one control and neither is useful alone.
+
+The last four are added 2026-08-16 with the DeckLink VIDEO LEG and its confidence monitor, and all
+four are host-only. `SetVideoSource` is the only method on this whole surface that decides WHAT A
+BROADCAST SWITCHER RECEIVES; the preview trio concern an opaque native window on the screen of
+whoever is sitting at this machine, and are host-only for the reason `SetPictureRect` and
+`SetPictureVisible` are.
+
+**HOST-ONLY IS NOT SELF-ENFORCING FOR THE FIRST TWO, and the gap is closed in code rather than
+noted here.** `videoSource` and `decklinkPreviewEnabled` are ordinary configuration fields, and
+`SaveConfig` is **open** and is a whole-document write from a page's cache — so a remote seat could
+change either of them without ever naming the host-only method, and the classification above would
+be a decoration. `App.refuseRemoteVideoLegChange` is what enforces it: a REMOTE `SaveConfig` whose
+document would CHANGE either field is refused, naming the field, while an identical restatement
+passes through untouched so ordinary remote saves of unrelated fields are unaffected.
+
+`SetVideoSource` and `SetDeckLinkPreviewEnabled` have **no caller**, deliberately, and the table
+says so rather than naming one that does not exist. The Settings screen writes both fields through
+its single Save, with both controls disabled while sending. They are kept because they are the
+DECLARATION that `remoteAllowlist` enforces and that `TestRemoteHostOnlySet` pins.
 
 `inputChannels` is what the capture pad **actually negotiated**, read from that pad's current caps
 at the moment of the call, and it is the **only** number a channel map may be sized against. It is
@@ -772,7 +860,10 @@ either answer alone.
   `internal/gst` can currently **build**, not about whether the configuration is well formed, and
   the same value becomes valid the day the element exists with no change to `config` at all.
 
-  **Still true as of 2026-08-16, and now it is the ONLY thing missing.** The routing engine, the
+  **Still true as of 2026-08-16, and it is now the only thing missing — of the AUDIO half alone.**
+  The DeckLink **video** leg landed the same day and is proven on air (see the `internal/gst`
+  section above), so `videoSource: "decklink"` starts and transmits; it is `audioSourceKind:
+  "decklink"` that `Start` still refuses. The routing engine, the
   mix-matrix write, the per-channel meters, the signal watchdog, the persisted field and the whole
   operator-facing screen are built, wired end to end and tested; `pipelineDescription` still builds
   `captureSourceFactory` (the platform's own source) unconditionally. Everything downstream of that

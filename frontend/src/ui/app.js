@@ -26,8 +26,22 @@ import {
   normalisePictureSource,
   derivePictureSourceEffects,
 } from './picturesource.js';
-// The native overlay's geometry and its visibility rules.
+// The native overlay's geometry and its visibility rules. It is used TWICE —
+// once for the SRT return picture and once for the card's confidence preview —
+// because both are native child windows over this page and one mechanism for
+// both is the point. See the preview section below.
 import { createOverlay, BLOCK_SETTINGS, BLOCK_MIXER, BLOCK_HIDDEN } from './overlay.js';
+// WHAT THIS POSITION SENDS: the camera lamp's derivation, the preview's caption,
+// and the rule for whether a preview box exists at all. Pure and DOM-free; this
+// file is the wiring and videosource.js is what is being wired.
+import {
+  LAMP_CAMERA,
+  normaliseVideoSource,
+  normalisePreviewEnabled,
+  deriveVideoSourceEffects,
+  deriveCameraLamp,
+  describePreviewBox,
+} from './videosource.js';
 // The return path state machine. Every stop, start, mute and un-mute of either
 // return path goes through it — this file no longer calls startReturn,
 // stopReturn or setAudioEnabled itself, and must not start again. See the header
@@ -258,6 +272,132 @@ export function mountApp(root) {
     log: (message) => console.info(message),
   });
 
+  // --- the card's confidence preview ---------------------------------------
+  //
+  // ===================== THE SAME MECHANISM, A SECOND TIME ===================
+  //
+  // A native child window painted over this page, positioned from a rectangle
+  // this page reserves — which is exactly what the SRT picture above already is,
+  // so this is a second createOverlay and not a second design. Everything the
+  // overlay controller owns is owned here too: the CSS-pixels-plus-ratio call,
+  // the change detection that keeps a DPI change from being missed, and above
+  // all the SET OF BLOCKING REASONS, so that Settings and the mixer drawer are
+  // never drawn underneath an opaque window.
+  //
+  // TWO BOXES, NEVER ONE. home.js reserves .preview-tile beside .pgm-tile rather
+  // than inside it, because two native windows told to occupy overlapping
+  // rectangles simply erase one another and neither side reports anything wrong.
+  //
+  // ===================== AND IT HAS NO START AND NO STOP =====================
+  //
+  // The preview is a BRANCH of the contribution pipeline — a tee off the one
+  // capture, because the card is exclusive — so it exists exactly when a session
+  // started with it exists. There is nothing to start here and, more to the
+  // point, nothing may stop it: tearing the branch down on a running pipeline is
+  // the set_state(NULL) inside a blocking pad probe that was measured to take the
+  // ON-AIR leg to 0 fps permanently, with the pipeline still reporting PLAYING.
+  //
+  /** Whether the saved configuration puts live capture on the video leg. */
+  let currentVideoSource = normaliseVideoSource(undefined);
+  /** Whether the saved configuration asks for the operator's preview. */
+  let currentPreviewEnabled = false;
+  /** The last "signal" event from the video watchdog, or null before one. */
+  let currentSignal = null;
+  /** Whether this build can position the preview surface at all. */
+  let previewBindingsPresent = false;
+
+  const previewOverlay = createOverlay({
+    measure: () => home.measurePreviewRect(),
+    dpr: () => (typeof window !== 'undefined' && window.devicePixelRatio) || 1,
+    setRect: (css, dpr) => {
+      Promise.resolve()
+        .then(() => backend.setPreviewRect(css, dpr))
+        .catch(previewFault);
+    },
+    setVisible: (on) => {
+      Promise.resolve()
+        .then(() => backend.setPreviewVisible(on))
+        .catch(previewFault);
+    },
+    // NO onVisible, and that asymmetry with the picture is deliberate. The
+    // picture's callback exists to un-suppress the mosaic underneath it — there
+    // are two pictures sharing one box and exactly one may show. There is
+    // nothing underneath this one but a caption, and a caption under an opaque
+    // window is already invisible, so there is no second state to keep in step.
+    log: (message) => console.info(message),
+  });
+
+  /**
+   * previewFault reports a failure of the preview surface ONCE, to the console.
+   *
+   * Never a banner, and for a stronger version of pictureFault's reason: this is
+   * the operator's own confidence monitor. Nothing about the feed, the audio or
+   * the commentator's picture depends on it, so a red banner for every failed
+   * SetPreviewRect against a build without the binding would be teaching people
+   * to ignore the banner that matters.
+   */
+  let lastPreviewFault = '';
+  function previewFault(err) {
+    const message = String(err?.message || err);
+    if (message === lastPreviewFault) return;
+    lastPreviewFault = message;
+    console.info('wslcomms: the card preview surface is not answering:', message);
+  }
+
+  /**
+   * renderPreview decides whether the preview box exists, what its caption says,
+   * and whether the native surface should be on screen.
+   *
+   * The box is reserved from the SAVED CONFIGURATION and not from anything about
+   * the running session, because the page cannot know whether Go built a preview
+   * branch this time — the branch is decided at Start and there is no event that
+   * reports it. The caption closes that gap honestly: an opaque native window
+   * covers it when there is a picture, so what the operator sees is either their
+   * camera or a sentence explaining why it is not there.
+   */
+  function renderPreview() {
+    const effects = deriveVideoSourceEffects(currentVideoSource, currentInputDevices);
+    const reserved = previewBindingsPresent && effects.wantCard && currentPreviewEnabled;
+    const running = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
+
+    home.setPreviewCaption(describePreviewBox(running));
+    home.setPreviewReserved(reserved);
+    previewOverlay.setWanted(reserved && running);
+
+    // RESERVING IS A LAYOUT CHANGE, and .pgm-tile is sized against what is left
+    // in the stage — so the commentator's picture has just moved. Both surfaces
+    // are re-measured, the picture's first: an overlay left at yesterday's
+    // rectangle is a native window sitting over the controls beside it.
+    overlay.sync();
+    previewOverlay.sync();
+  }
+
+  /**
+   * renderCameraLamp paints the one lamp that can tell a live picture from black.
+   *
+   * Driven from the saved video source AND the watchdog's last report, because
+   * neither alone is an answer: a LOST signal on a slate position is not a fault
+   * (there is no camera), and a slate position with no lamp at all would say
+   * nothing about what it is contributing. videosource.js owns both halves.
+   */
+  function renderCameraLamp() {
+    home.lamps[LAMP_CAMERA].update(deriveCameraLamp(currentVideoSource, currentSignal));
+  }
+
+  /**
+   * adoptVideoConfig takes the video-leg half of a configuration and pushes it
+   * everywhere it is shown. One function, called from every path that adopts a
+   * config — the startup load, a Settings save, an applied preset and another
+   * seat's save — so the lamp and the preview box cannot end up describing
+   * different configurations.
+   */
+  function adoptVideoConfig(config) {
+    currentVideoSource = normaliseVideoSource(config?.videoSource);
+    currentPreviewEnabled = normalisePreviewEnabled(config?.decklinkPreviewEnabled);
+    renderCameraLamp();
+    renderPreview();
+  }
+
   const mixerHost = createMixerHost({
     mount: mixerMount,
     // THE DRAWER MUST NEVER BE UNDER THE PICTURE OVERLAY. The overlay is a
@@ -271,6 +411,10 @@ export function mountApp(root) {
     onOpenChange: (open) => {
       if (open) overlay.block(BLOCK_MIXER);
       else overlay.unblock(BLOCK_MIXER);
+      // The preview surface is the same hazard with a smaller rectangle: a
+      // routing matrix somebody can read most of and click all of.
+      if (open) previewOverlay.block(BLOCK_MIXER);
+      else previewOverlay.unblock(BLOCK_MIXER);
     },
     onStatus: (message, isError) => {
       if (!message) return;
@@ -349,6 +493,13 @@ export function mountApp(root) {
     // is precisely the bug the reason SET exists to make unwritable.
     overlay.block(BLOCK_SETTINGS);
     overlay.block(BLOCK_HIDDEN);
+    // AND THE PREVIEW SURFACE, on both reasons, for the identical argument. It
+    // is a second opaque native window outside the page's stacking context, and
+    // a Settings form with a live camera painted over the corner of it is a form
+    // the operator can read most of. Blocked separately rather than by one flag,
+    // so a future window can be added without anything having to be un-shared.
+    previewOverlay.block(BLOCK_SETTINGS);
+    previewOverlay.block(BLOCK_HIDDEN);
     home.el.hidden = true;
     settings.el.hidden = false;
     settings.open();
@@ -359,10 +510,13 @@ export function mountApp(root) {
     home.el.hidden = false;
     overlay.unblock(BLOCK_SETTINGS);
     overlay.unblock(BLOCK_HIDDEN);
+    previewOverlay.unblock(BLOCK_SETTINGS);
+    previewOverlay.unblock(BLOCK_HIDDEN);
     // Re-measure before painting: the window may have been resized while
     // Settings was up, and an overlay restored at yesterday's rectangle is a
     // picture in the wrong place for as long as nothing else moves.
     overlay.sync();
+    previewOverlay.sync();
   }
 
   /**
@@ -425,6 +579,11 @@ export function mountApp(root) {
 
   renderSenderLamp();
   renderStatusLamps();
+  // Grey SLATE before any configuration has loaded, which is the truth on every
+  // position shipping today and the safe direction on the rest: a CAMERA lamp
+  // that read green before anything had been measured would be the one failure a
+  // status lamp may not have.
+  renderCameraLamp();
   home.lamps.MONITOR.update(deriveMonitorLamp(undefined));
   // Not awaited: the lamp row is drawn immediately from the fallback and
   // refines itself when Go answers. Blocking the mount on it would let a slow
@@ -441,6 +600,23 @@ export function mountApp(root) {
     // would be one Wails round trip per rung for an answer known not to differ.
     const isRunning = !!state && state !== backend.SENDER_STATE.STOPPED;
     if (isRunning !== wasRunning) refreshConformTarget();
+    // The preview's caption and the surface's visibility both turn on whether a
+    // session is up — "press START" against "STOP and START to see it" — so they
+    // follow the same edge. Only on the edge, for the reason above it: the
+    // sender cycles through CONNECTING and BACKOFF during a retry ladder and
+    // none of those change either answer.
+    if (isRunning !== wasRunning) renderPreview();
+  });
+
+  // THE CARD'S VIDEO SIGNAL, debounced in Go. This is the wire that makes black
+  // going to air visible at all — see videosource.js's deriveCameraLamp for the
+  // measurement, and note that this side adds NO second hysteresis: the
+  // watchdog's hold-offs are asymmetric and measured against the real card, and
+  // two filters in series would lag a real loss by however long both took to
+  // agree.
+  backend.onSignal((payload) => {
+    currentSignal = payload;
+    renderCameraLamp();
   });
 
   backend.onStatus((status) => {
@@ -502,6 +678,13 @@ export function mountApp(root) {
     // and above all do not showHome() on a page that may be mid-edit.
     if (payload.origin === ownClientId()) return;
     applyRemoteConfig(payload.config);
+    // AND THE SETTINGS FORM'S TWO VIDEO-LEG BOXES, which are the only controls
+    // on that screen whose staleness can refuse a save they are not part of:
+    // App.SaveConfig refuses a REMOTE save whose videoSource or
+    // decklinkPreviewEnabled differ from the live ones, and that form is a page
+    // cache refreshed only by open(). Narrow on purpose — it is not populate(),
+    // which would redraw the whole form under somebody mid-edit.
+    settings.adoptVideoLeg(payload.config);
     // Another seat's save may have applied a different instance — the Settings
     // screen or a remote client can change the active preset — so refresh the
     // header indicator from the authority rather than trusting the config event
@@ -542,6 +725,18 @@ export function mountApp(root) {
       const sink = selectedHeadphoneId();
       if (sink && currentReturnSource !== RETURN_SOURCE_SRT) m.setSinkId(sink);
     });
+
+    // AND THE VIDEO LEG'S READOUTS, which is a display change and nothing else:
+    // the leg itself is built at Start, so adopting another seat's save here can
+    // only correct what this page SAYS about it. Not adopting would be the worse
+    // half of the same coin — a CAMERA lamp on this desk still reading SLATE
+    // after somebody else moved this position onto the card.
+    //
+    // Whether another seat should be able to make that change at all is a
+    // question for the Go side and not for this line: App.SaveConfig is
+    // remote-mutating and carries the whole document, so the refusal, if there is
+    // to be one, belongs there. See the note in the tier-3 handover.
+    adoptVideoConfig(config);
 
     // The conform target IS re-read for a remote save, unlike the return path
     // above, and the asymmetry is deliberate. Rebuilding the return risks a
@@ -884,7 +1079,16 @@ export function mountApp(root) {
    */
   function watchPictureRect() {
     if (typeof window === 'undefined') return;
-    const sync = () => overlay.sync();
+    // BOTH SURFACES, from one set of watchers. The preview box is sized from the
+    // same stage the picture box is sized from, so every event that moves one
+    // moves the other; a second ResizeObserver on the preview element would fire
+    // on exactly the occasions this one already does. The one case that is NOT
+    // covered by a resize — the box appearing or disappearing when the setting
+    // changes — is synced explicitly by renderPreview, which is where it happens.
+    const sync = () => {
+      overlay.sync();
+      previewOverlay.sync();
+    };
 
     window.addEventListener('resize', sync);
 
@@ -1008,6 +1212,13 @@ export function mountApp(root) {
     // rebuilding on every Save would take the return away for a second or two
     // because somebody corrected a typo in the event id.
     applyReturnOptionsFromConfig();
+
+    // WHAT THIS SEAT SENDS. Re-applied from a Settings save because that is the
+    // screen the field lives on, and safe to re-apply because it changes NOTHING
+    // that is running: the video leg is read once, at Start, so this moves a lamp
+    // and a reserved rectangle and not one byte the switcher receives. The
+    // Settings hint and the preview's own caption are what say the rest.
+    adoptVideoConfig(config);
 
     // The conform target last, because both things that can change it are in
     // the config that just arrived: videoFormatOverride directly, and m2lxHost
@@ -1344,6 +1555,26 @@ export function mountApp(root) {
         headphoneEndpointId: '',
       };
     }
+
+    // Whether the preview SURFACE can be positioned at all.
+    //
+    // Same all-or-nothing rule, and the same three-way answer, as the SRT
+    // picture below: offered against the fake backend because the point of the
+    // fake is that this UI runs without Go, and against a real Wails build only
+    // when both bindings are there. A build without them must reserve NO box —
+    // an empty black rectangle beside the commentator's picture, for a feature
+    // that cannot paint into it, is worse than no preview at all.
+    //
+    // It is false on a remote client by construction: the bindings are host-only
+    // and are pruned from a remote page, and the surface is drawn by the
+    // commentary PC's own graphics hardware, so a rectangle measured in a browser
+    // on the LAN describes nothing that exists.
+    previewBindingsPresent = backend.usingFakeBackend || backend.previewAvailable();
+
+    // WHAT THIS SEAT SENDS, drawn before anything is started: the CAMERA lamp
+    // and, if it was asked for, the preview box. It costs no IPC and it is the
+    // one lamp on the row that is about this desk rather than about the far end.
+    adoptVideoConfig(currentConfig);
 
     home.setTile(currentConfig.monitorTile || { x: 0, y: 360, w: 640, h: 360 });
     home.setReturnMid(currentConfig.returnMid || 2);

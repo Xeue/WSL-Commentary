@@ -32,9 +32,10 @@ import (
 	"runtime"
 )
 
-// PictureOverlay is the surface the SRT picture is drawn in. See
-// overlay_windows.go and overlay_darwin.go for the real ones and for what every
-// method has to promise.
+// PictureOverlay is one of this application's native video surfaces — the SRT
+// programme picture, or the DeckLink confidence preview. See overlay_windows.go
+// and overlay_darwin.go for the real ones and for what every method has to
+// promise.
 type PictureOverlay interface {
 	Handle() uintptr
 	SetRect(r PictureRect) error
@@ -46,19 +47,39 @@ type PictureOverlay interface {
 // is declared here so callers can test for it on any platform.
 var ErrNoHostWindow = errors.New("gst: the application window does not exist yet")
 
-// NewPictureOverlay always fails in this build. There is a native surface for
+// NewPictureOverlay always fails in this build. It is NewOverlaySurface with
+// this application's first surface named, exactly as in the two real files, so
+// that the Gate A build has the same two entry points the others do and app code
+// written against either compiles here.
+func NewPictureOverlay(title string) (PictureOverlay, error) {
+	return NewOverlaySurface(title, "picture")
+}
+
+// NewOverlaySurface always fails in this build. There is a native surface for
 // Windows and one for macOS, and neither can be reached from here: on an
 // unsupported GOOS there is no window server this package knows how to talk to,
 // and on macOS without cgo there is no way to call AppKit at all.
 //
 // The message names the reason rather than the platform, because the macOS case
-// is a build option the reader can change and the other case is not.
-func NewPictureOverlay(string) (PictureOverlay, error) {
-	if runtime.GOOS == "darwin" {
-		return nil, errors.New("gst: the picture overlay on macOS is an NSView rendered into by " +
-			"glimagesink, which needs cgo; this binary was built with CGO_ENABLED=0")
+// is a build option the reader can change and the other case is not. It names
+// the PURPOSE too, now that there is more than one surface: an operator's log
+// showing two of these refusals should say which two things did not appear.
+//
+// The failure is a normal state that app_picture.go already handles —
+// SetPictureRect treats a failure to create an overlay as "not yet" and carries
+// on — and the preview's wiring must handle it the same way, for the same
+// reason. It is deliberately NOT ErrNoHostWindow: there is no window to wait
+// for here and there never will be in this build, so a caller that retried on
+// every layout call would retry for ever.
+func NewOverlaySurface(_ string, purpose string) (PictureOverlay, error) {
+	if purpose == "" {
+		purpose = "overlay"
 	}
-	return nil, errors.New("gst: the picture overlay needs Windows (a child HWND rendered into by " +
-		"d3d11videosink) or macOS (an NSView rendered into by glimagesink), and this is " +
+	if runtime.GOOS == "darwin" {
+		return nil, errors.New("gst: the " + purpose + " overlay on macOS is an NSView rendered into " +
+			"by glimagesink, which needs cgo; this binary was built with CGO_ENABLED=0")
+	}
+	return nil, errors.New("gst: the " + purpose + " overlay needs Windows (a child HWND rendered " +
+		"into by d3d11videosink) or macOS (an NSView rendered into by glimagesink), and this is " +
 		runtime.GOOS)
 }

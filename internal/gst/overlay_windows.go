@@ -1,10 +1,19 @@
 //go:build windows
 
-// overlay_windows.go is the NATIVE SURFACE the picture is drawn on: a child
-// window of the application's own window, which d3d11videosink renders into
-// through GstVideoOverlay.
+// overlay_windows.go is the NATIVE SURFACE video is drawn on: a child window of
+// the application's own window, which d3d11videosink renders into through
+// GstVideoOverlay.
 //
 // Owner: WP-P, with picture_cgo.go.
+//
+// THERE ARE NOW TWO OF THEM IN ONE PARENT — the SRT programme picture and the
+// DeckLink confidence preview — created by NewOverlaySurface, which is the only
+// thing that differs between them. What that does and does not change is at
+// NewOverlaySurface, and the z-order half of it is at the SetWindowPos call in
+// apply, which stays unconditional here and is a test on the Mac. That
+// asymmetry is the one place the two platforms genuinely disagree, and it is
+// written down in three places for that reason: here, there, and in
+// overlay_zorder.go, which holds the rule itself.
 //
 // # Why this exists at all
 //
@@ -88,7 +97,13 @@ import (
 // The contract
 // ---------------------------------------------------------------------------
 
-// PictureOverlay is the window the SRT picture is drawn in.
+// PictureOverlay is one of this application's native video surfaces.
+//
+// THERE ARE TWO OF THEM: the SRT programme picture, and the DeckLink confidence
+// preview. The type keeps the name it was born with because it is what
+// app_picture.go is written against and renaming it would touch every file on
+// that path to say nothing new; NewOverlaySurface is what says which one is
+// being made, and nothing else about a surface differs between the two.
 //
 // It is created once and outlives every pipeline. The picture monitor is stopped
 // and rebuilt whenever the endpoint or the configuration changes, and destroying
@@ -481,6 +496,16 @@ func findHostWindow(title string) (syscall.Handle, error) {
 
 // overlay is the concrete PictureOverlay.
 type overlay struct {
+	// purpose is the word this surface is called by in its window name and in
+	// every message it can produce — "picture" or "preview". It is set once at
+	// construction and never written again, so it is outside the mutex.
+	//
+	// It exists because there are now two of these windows in one parent, and a
+	// log line or a window enumeration that cannot tell them apart is a log line
+	// nobody can act on. It changes nothing else: both windows are the same
+	// class, the same styles and the same pump.
+	purpose string
+
 	// created carries the handle (or the failure) from the pump thread back to
 	// NewPictureOverlay, which is synchronous.
 	//
@@ -508,8 +533,42 @@ type overlay struct {
 
 var _ PictureOverlay = (*overlay)(nil)
 
-// NewPictureOverlay creates the picture window as a child of this process's own
+// NewPictureOverlay creates the SRT picture's window. It is NewOverlaySurface
+// with this application's first surface named, and it is kept as its own
+// function because app_picture.go has called it since before there was a second
+// one and the picture's own purpose is not a thing that moves.
+func NewPictureOverlay(title string) (PictureOverlay, error) {
+	return NewOverlaySurface(title, "picture")
+}
+
+// NewOverlaySurface creates one overlay window as a child of this process's own
 // application window, and starts the thread that pumps it.
+//
+// # There are TWO of these now, and what that does and does not change here
+//
+// purpose is a short lower-case word naming which surface this is — "picture"
+// for the SRT programme monitor, gst.PreviewSurfacePurpose for the DeckLink
+// confidence preview. It reaches the window's NAME and this file's log lines,
+// and nothing else: both surfaces are the same window class, the same style
+// words, the same disabled non-interactive child, each on its own pump thread.
+//
+// WHAT DOES NOT CHANGE IS THE Z-ORDER RULE, and that asymmetry against
+// overlay_darwin.go is deliberate and is argued in full at the SetWindowPos call
+// in apply. The short version: on this platform re-raising an already-correct
+// window is a syscall that moves an entry in a sibling list, and on macOS it is
+// -[NSView addSubview:], which takes a view hosting a live GL surface out of its
+// window and puts it back. Two WS_CLIPSIBLINGS children that do not overlap have
+// the same visible region whichever way round they are, so the two windows
+// exchanging places costs nothing at all — while the unconditional raise remains
+// the only defence there is against a WebView2 reorder, which arrives with no
+// notification whatever.
+//
+// The two windows are otherwise entirely independent: separate HWNDs, separate
+// pump threads, separate mutexes, and no ordering requirement between them. They
+// do exchange places — whichever applied most recently is topmost — and on this
+// platform that exchange is invisible and free. It is NOT free on the Mac, which
+// is why the twin asks first; the difference between the two files is a
+// difference in what the platform charges, not in what either of them wants.
 //
 // title is the host window's title, used to identify it; pass main.go's
 // windowTitle. An empty title falls back to "the only visible unowned top-level
@@ -523,16 +582,26 @@ var _ PictureOverlay = (*overlay)(nil)
 // The window is created HIDDEN. It is opaque, and a black rectangle over the
 // page before there is anything to show in it would cover the fallback picture
 // the commentator is meant to be watching in the meantime.
-func NewPictureOverlay(title string) (PictureOverlay, error) {
+func NewOverlaySurface(title, purpose string) (PictureOverlay, error) {
+	if purpose == "" {
+		purpose = "overlay"
+	}
 	parent, err := findHostWindow(title)
 	if err != nil {
 		return nil, err
 	}
+	// One class for both surfaces, registered exactly once per process. The
+	// sync.Once was already required — this window is created and destroyed
+	// several times in one run — and it is what makes a second surface cost
+	// nothing here: RegisterClassEx would otherwise fail the second call with
+	// ERROR_CLASS_ALREADY_EXISTS and the failure would be indistinguishable from
+	// a genuine one.
 	if _, err := registerOverlayClass(); err != nil {
 		return nil, err
 	}
 
 	o := &overlay{
+		purpose: purpose,
 		created: make(chan error, 1),
 		done:    make(chan struct{}),
 	}
@@ -544,10 +613,10 @@ func NewPictureOverlay(title string) (PictureOverlay, error) {
 
 	if procGetDpiForWindow.Find() == nil {
 		dpi, _, _ := procGetDpiForWindow.Call(uintptr(parent))
-		log.Printf("gst: overlay: created as a child of window 0x%x, whose DPI is %d "+
+		log.Printf("gst: overlay: the %s window was created as a child of window 0x%x, whose DPI is %d "+
 			"(%.2fx). The rectangle arithmetic does NOT use this number — the page's own "+
 			"devicePixelRatio does; it is logged so that a picture in the wrong place can be "+
-			"told from a page reporting the wrong ratio", parent, dpi, float64(dpi)/96.0)
+			"told from a page reporting the wrong ratio", purpose, parent, dpi, float64(dpi)/96.0)
 	}
 	return o, nil
 }
@@ -571,7 +640,12 @@ func (o *overlay) pump(parent syscall.Handle) {
 
 	hinst, _, _ := procGetModuleHandleW.Call(0)
 	className, _ := syscall.UTF16PtrFromString(overlayClassName)
-	windowName, _ := syscall.UTF16PtrFromString("WSL Commentary picture")
+	// The window NAME, which is not a title — this is a child window with no
+	// caption and the operator never sees it. It is what an external tool shows:
+	// Spy++, an accessibility inspector, a support engineer's window enumerator.
+	// With two of these in one parent, a name that did not say which is which
+	// would make the one diagnostic they offer useless.
+	windowName, _ := syscall.UTF16PtrFromString("WSL Commentary " + o.purpose)
 
 	// Created hidden (no WS_VISIBLE), disabled, clipping siblings, at 0x0.
 	// Nothing is shown until SetVisible(true), and nothing is positioned until
@@ -728,10 +802,10 @@ func (o *overlay) wake() error {
 	o.mu.Unlock()
 
 	if closed || hwnd == 0 {
-		return errors.New("gst: overlay: the picture window is closed")
+		return errors.New("gst: overlay: the " + o.purpose + " window is closed")
 	}
 	if ok, _, callErr := procPostMessageW.Call(uintptr(hwnd), wmAppWake, 0, 0); ok == 0 {
-		return fmt.Errorf("gst: overlay: could not post to the picture window: %w", callErr)
+		return fmt.Errorf("gst: overlay: could not post to the %s window: %w", o.purpose, callErr)
 	}
 	return nil
 }
@@ -788,7 +862,7 @@ func (o *overlay) Close() error {
 			if ok, _, callErr := procPostMessageW.Call(uintptr(hwnd), wmAppQuit, 0, 0); ok == 0 {
 				// The queue is gone, which usually means the thread already is.
 				// Fall through to the wait, which will find done closed.
-				log.Printf("gst: overlay: could not post the quit to the picture window: %v", callErr)
+				log.Printf("gst: overlay: could not post the quit to the %s window: %v", o.purpose, callErr)
 			}
 		}
 
@@ -804,9 +878,9 @@ func (o *overlay) Close() error {
 			// into ExitProcess with this thread still inside DestroyWindow or
 			// gstd3d11's subclass procedure. See gst.ErrAbandonedThread.
 			o.closeErr = fmt.Errorf(
-				"gst: overlay: the picture window's message thread did not stop within %s and has been "+
+				"gst: overlay: the %s window's message thread did not stop within %s and has been "+
 					"ABANDONED; the window may remain on screen until the process exits: %w",
-				overlayCloseBudget, ErrAbandonedThread)
+				o.purpose, overlayCloseBudget, ErrAbandonedThread)
 			log.Print(o.closeErr)
 		}
 	})

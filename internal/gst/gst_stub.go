@@ -379,6 +379,22 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	if err := refuseRenderEndpoint(opts.AudioDeviceID); err != nil {
 		return err
 	}
+	// The identical refusal the real twin makes of a video capture id that is
+	// not a DeckLink persistent-id, through the identical conversion, so that a
+	// value Gate A accepts is a value the card accepts. It is the whole of what
+	// a stub can check here: there is no element to open, and "would this card
+	// be there" is not a question a build with no GStreamer in it can answer.
+	// What it does close is the case that matters — a CoreAudio unique-id or a
+	// WASAPI endpoint GUID wired into the video option by a caller that reached
+	// for the wrong field, which on the real element is not an error at all but
+	// a silent fall back to whichever card enumerated first.
+	if opts.VideoCaptureID != "" {
+		if _, err := parseDeckLinkPersistentID(opts.VideoCaptureID); err != nil {
+			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID names the DeckLink card whose "+
+				"input becomes the video leg, and it must be a DeckLink persistent-id rather "+
+				"than an audio device id: %w", err)
+		}
+	}
 
 	if opts.VideoBitrateKbps == 0 {
 		opts.VideoBitrateKbps = DefaultVideoBitrateKbps

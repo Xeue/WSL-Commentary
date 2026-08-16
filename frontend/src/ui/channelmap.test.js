@@ -730,7 +730,16 @@ test('every class the routing screen adds is styled, and no threshold lives in t
   assert.ok(sheet.includes('.settings-group--channelmap'), 'the group needs its full-row rule');
   // The zone widths are set inline from meters.js. A percentage in the sheet
   // would be a second copy of the dB boundaries.
-  const block = sheet.slice(sheet.indexOf('DECKLINK CHANNEL ROUTING'));
+  // BOUNDED AT THE NEXT APPENDED BLOCK, not run to the end of the file. This
+  // used to slice to EOF, which was right only for as long as the routing block
+  // was the last one in the stylesheet — and the first block appended after it
+  // (the video source and the card preview) failed this assertion with a
+  // flex-basis that has nothing to do with a dB scale. main.css's convention is
+  // that each late block opens with its own banner, so that is the boundary.
+  const from = sheet.indexOf('DECKLINK CHANNEL ROUTING');
+  const rest = sheet.slice(from);
+  const next = rest.indexOf('/* ====', 1);
+  const block = next > 0 ? rest.slice(0, next) : rest;
   assert.equal(
     /flex-basis:\s*\d/.test(block),
     false,

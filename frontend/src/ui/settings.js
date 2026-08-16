@@ -33,6 +33,22 @@ import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
 // below for why it is a settings group and not a view of its own, and
 // channelmap.js's header for why the grid is sized the way it is.
 import { createChannelMapView } from './channelmap.js';
+// WHAT THIS POSITION SENDS, and the operator's confidence picture of it. Pure
+// and DOM-free — the wording, the card-present rule and the "which one is going
+// to air" sentence all live there and are driven for real in
+// videosource.test.js; this file is only the controls they are drawn into.
+import {
+  VIDEO_SOURCES,
+  VIDEO_SOURCE_DECKLINK,
+  normaliseVideoSource,
+  normalisePreviewEnabled,
+  deriveVideoSourceEffects,
+  describeToAir,
+  describeCardAvailability,
+  PREVIEW_AT_START_CAVEAT,
+  VIDEO_SOURCE_AT_START_CAVEAT,
+  VIDEO_LEG_WHILE_SENDING,
+} from './videosource.js';
 
 // THE MIXER DRAWER IS NOT HERE ANY MORE. It moved to a button beside Settings
 // on the main screen, at the operator's request — reaching the clean-feed
@@ -175,6 +191,23 @@ function selectInput(id, options) {
     o.textContent = opt.label;
     input.appendChild(o);
   }
+  return input;
+}
+
+/**
+ * checkboxInput is the ONE tick box on this form.
+ *
+ * It exists rather than a two-option <select> because the value it carries is
+ * genuinely a yes/no about the operator's own screen, and because collectConfig
+ * has to send a real boolean: config.DeckLinkPreviewEnabled is a Go `bool`, and
+ * a <select> would hand it the string "false" — which is truthy in JavaScript
+ * and would not survive the round trip as anything an operator could then turn
+ * off. Read with .checked, never .value.
+ */
+function checkboxInput(id) {
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = id;
   return input;
 }
 
@@ -597,6 +630,10 @@ export function createSettingsView(handlers) {
   function setSending(sending) {
     sendingNow = sending === true;
     renderPresetButtons();
+    // And the preview's "this change is not in the running feed" line, which is
+    // true of exactly the same state and must not be able to disagree with the
+    // buttons above about whether a session is up.
+    renderVideoSource();
   }
 
   // --- the preset preview -------------------------------------------------
@@ -1193,6 +1230,270 @@ export function createSettingsView(handlers) {
   const videoHeading = document.createElement('h2');
   videoHeading.textContent = 'Contribution video';
   openGroup(videoHeading);
+
+  // --- WHAT THIS POSITION ACTUALLY SENDS ----------------------------------
+  //
+  // FIRST IN THE GROUP, above the bitrate and the format, because those two
+  // describe whatever this one chooses. A bitrate box read before the operator
+  // knows whether a camera or a still image is being encoded is a number with
+  // nothing to be a number about.
+  //
+  // IT IS A SETTINGS CONTROL AND NOT A MAIN-SCREEN ONE, and that is a decision
+  // rather than a place it happened to land. The video leg is built at START
+  // from the saved configuration; a control on the main screen would appear to
+  // switch what is on air and would in fact do nothing until the next STOP and
+  // START — and the honest alternative, switching it live, is the set_state on a
+  // running pipeline that was measured to take the on-air leg to 0 fps
+  // permanently. So it sits with the other things that are read once, at Start,
+  // and the main screen carries the CAMERA lamp that says what came of it.
+  //
+  // The values are internal/config's own (VideoSourceSlate / VideoSourceDeckLink)
+  // through ./videosource.js, which is also where the wording below comes from.
+  addField(
+    'videoSource',
+    'Video sent to the switcher',
+    selectInput(
+      'f-videoSource',
+      VIDEO_SOURCES.map((s) => ({ value: s.value, label: s.label })),
+    ),
+    `${VIDEO_SOURCES.map((s) => `${s.label}: ${s.summary} ${s.cost}`).join(' ')} ` +
+      VIDEO_SOURCE_AT_START_CAVEAT,
+  );
+
+  // WHICH ONE IS GOING TO AIR, in a sentence, under the control that decides it.
+  //
+  // The <select> alone does not answer that question. Its two options are two
+  // similar phrases, and everything else in this application reads green either
+  // way — the sender's socket is fine, the switcher really is receiving a
+  // healthy correctly-formatted feed, and the picture on the main screen is the
+  // RETURN, which says nothing about what this seat contributes. This line and
+  // the CAMERA lamp are the whole answer; see videosource.js's header.
+  const videoToAirLine = document.createElement('p');
+  videoToAirLine.className = 'field-hint video-to-air';
+  currentGroup.appendChild(videoToAirLine);
+
+  // AND WHETHER THE HARDWARE FOR IT IS THERE. Hidden when there is nothing worth
+  // saying, which is the ordinary case on a working seat of either kind — never
+  // an empty flourish under a control that is already correct.
+  const videoCardNote = document.createElement('p');
+  videoCardNote.className = 'field-hint video-card-note';
+  videoCardNote.hidden = true;
+  currentGroup.appendChild(videoCardNote);
+
+  // --- the operator's confidence picture ----------------------------------
+  //
+  // Off by default, and the caveat is the field's hint rather than a tooltip:
+  // "it only takes effect at START" reads as an unfinished feature unless the
+  // measurement is beside it, and a tooltip is found only by somebody who
+  // already suspected there was something to find. PREVIEW_AT_START_CAVEAT
+  // carries both halves.
+  const previewSupported = backend.usingFakeBackend || backend.previewAvailable();
+
+  addField(
+    'decklinkPreviewEnabled',
+    'Show me what the card is capturing',
+    checkboxInput('f-decklinkPreviewEnabled'),
+    PREVIEW_AT_START_CAVEAT,
+  );
+  // The class is added AFTER the call rather than inside it, so that the
+  // addField text keeps the shape settings.test.js and settingslayout.test.js
+  // read this file by — four spaces, one argument a line. See the note beside
+  // `let currentGroup` for why that matters more than it looks.
+  fields.decklinkPreviewEnabled.wrap.classList.add('field--check');
+
+  // WHY BOTH CONTROLS ABOVE ARE DEAD WHILE A FEED IS UP, said once for the pair.
+  //
+  // The gate is GO'S — App.SetVideoSource and App.SetDeckLinkPreviewEnabled both
+  // refuse while a session runs, in those words — and this is the honest
+  // rendering of it, exactly as renderPresetButtons is the honest rendering of
+  // ApplyPreset's refusal. Disabling rather than offering matters here more than
+  // it does there: the video leg is built at START, so a control that accepted
+  // the change would appear to put a camera on air and would in fact do nothing
+  // at all until the next restart.
+  const previewSendingNote = document.createElement('p');
+  previewSendingNote.className = 'field-hint preview-sending-note';
+  previewSendingNote.textContent = VIDEO_LEG_WHILE_SENDING;
+  previewSendingNote.hidden = true;
+  currentGroup.appendChild(previewSendingNote);
+
+  /**
+   * What ListInputDevices last answered, or null for NOT ASKED / NOT ANSWERED.
+   *
+   * Null and [] are two different states and the difference is the whole reason
+   * this is not initialised to an empty array: an empty list means "this machine
+   * has no capture devices at all", and saying "no DeckLink card is fitted" on
+   * the strength of a listing that FAILED would send an engineer to look for
+   * hardware that is sitting in the slot. deriveVideoSourceEffects reads the
+   * difference; nothing here decides it.
+   */
+  let videoDevices = null;
+
+  /**
+   * renderVideoSource redraws everything that depends on the selected source and
+   * on whether a card was found: the two lines above, the DeckLink option's own
+   * availability, and whether the preview control is offered at all.
+   *
+   * Called from populate() as well as from the control's own event, because
+   * assigning a <select>'s value from script fires neither 'input' nor 'change'
+   * — the same trap renderChannelMapGroup documents further down.
+   */
+  function renderVideoSource() {
+    const effects = deriveVideoSourceEffects(fields.videoSource.input.value, videoDevices);
+
+    videoToAirLine.textContent = describeToAir(effects);
+    // Marked as well as worded when the configuration cannot start: the sentence
+    // says what will happen, the mark is what makes it findable on a form two
+    // screenfuls deep.
+    videoToAirLine.classList.toggle('video-to-air--unstartable', !effects.startable);
+
+    const availability = describeCardAvailability(effects);
+    videoCardNote.textContent = availability;
+    videoCardNote.hidden = availability === '';
+    videoCardNote.classList.toggle('video-card-note--missing', effects.wantCard && !effects.startable);
+
+    // THE CARD OPTION IS WITHDRAWN WHEN THERE IS NO CARD, rather than left there
+    // to be chosen and refused at START. It is disabled and NOT removed, and the
+    // difference matters in the one case that matters: a configuration that
+    // ALREADY names the card on a machine that has none must still show what it
+    // is set to. A removed option would leave the <select> showing the slate
+    // while config.json said otherwise — the screen and the file disagreeing,
+    // which is the fault describeDeviceSelection exists to prevent on the other
+    // dropdown.
+    //
+    // A disabled <option> that is nonetheless SELECTED still renders, so the
+    // operator sees "the card" with the note above explaining why it cannot
+    // start, and the only move available to them is the one that fixes it.
+    const cardOption = [...fields.videoSource.input.options].find(
+      (o) => o.value === VIDEO_SOURCE_DECKLINK,
+    );
+    if (cardOption) {
+      const unavailable = effects.cardKnown && !effects.cardPresent;
+      cardOption.disabled = unavailable && !effects.wantCard;
+      cardOption.title = unavailable ? 'No DeckLink card was found in this machine.' : '';
+    }
+
+    // The preview only means something when there is live video to preview: a
+    // confidence monitor of a still PNG is the still PNG. Hidden rather than
+    // disabled, for the reason the DeckLink routing group is hidden — a seat
+    // that has never had a card must see this screen as it was before any of
+    // this existed — and collected either way, for the reason it is collected
+    // either way there too.
+    fields.decklinkPreviewEnabled.wrap.hidden = !effects.wantCard;
+    previewSendingNote.hidden = !sendingNow;
+
+    // --- who may touch these two, and when -------------------------------
+    //
+    // THREE GATES, IN ORDER OF HOW ABSOLUTE THEY ARE. They are applied to both
+    // controls through one expression each, so the pair can never end up in a
+    // state where one is offered and the other is not for the same reason.
+    //
+    // 1. A REMOTE SEAT MAY NOT TOUCH EITHER. What goes ON AIR is not a remote
+    //    seat's to decide, and the preview is an opaque window on somebody
+    //    else's screen. Both are enforced on the Go side twice over — the
+    //    dedicated setters are host-only, and SaveConfig REFUSES a remote save
+    //    that changes either field — so this is the visible half rather than
+    //    the gate, and its job is to stop a remote operator making an edit that
+    //    would then have their whole Save refused.
+    //
+    // 2. NEITHER MAY CHANGE WHILE SENDING. The video leg is built at START and
+    //    cannot be exchanged under a running feed, so a control that accepted
+    //    the change would appear to put a camera on air and do nothing until the
+    //    next restart. Go refuses both; this is the reason on the control.
+    //
+    // 3. THE PREVIEW ALSO NEEDS A BUILD THAT CAN DRAW IT. All-or-nothing
+    //    availability, the same rule the presets, picture and channel-map groups
+    //    follow — offering a tick box that reserves a rectangle nothing will
+    //    ever paint is worse than saying the build has not got one.
+    //
+    // The values are COLLECTED regardless of every one of these. A disabled
+    // control keeps its value, and this form replaces the whole document, so a
+    // field it fails to restate is a field a Save deletes — which for videoSource
+    // means putting a live position back on the slate.
+    const remote = backend.isRemoteClient();
+    const remoteReason =
+      'Set at the commentary position itself, never from a remote seat: this decides what the ' +
+      'switcher receives, and the preview is a window on somebody else’s screen.';
+
+    fields.videoSource.input.disabled = remote || sendingNow;
+    fields.videoSource.input.title = remote
+      ? remoteReason
+      : sendingNow
+        ? VIDEO_LEG_WHILE_SENDING
+        : '';
+
+    fields.decklinkPreviewEnabled.input.disabled = remote || sendingNow || !previewSupported;
+    fields.decklinkPreviewEnabled.input.title = remote
+      ? remoteReason
+      : sendingNow
+        ? VIDEO_LEG_WHILE_SENDING
+        : previewSupported
+          ? ''
+          : 'This build cannot draw the preview — it has no preview bindings.';
+  }
+
+  /**
+   * adoptVideoLeg refreshes the two video-leg controls from a configuration
+   * ANOTHER seat saved, and touches nothing else on the form.
+   *
+   * ===================== WHY A REMOTE SETTINGS SCREEN NEEDS THIS =============
+   *
+   * App.SaveConfig REFUSES a remote save whose videoSource or
+   * decklinkPreviewEnabled differ from the live ones — the enforcement that
+   * makes the two host-only setters mean anything. This form is a page cache
+   * refreshed only by open(), so a remote seat that had Settings open when the
+   * operator at the desk switched to the camera would carry the OLD value in a
+   * disabled box, and its next save of anything at all — a port, a status key —
+   * would be refused, naming a field that seat is not allowed to change and
+   * cannot see a way to correct.
+   *
+   * It is deliberately NOT populate(). Re-drawing the whole form under somebody
+   * mid-edit is the thing app.js's onConfig handler exists to avoid, and these
+   * two controls are the only ones on the screen that can refuse a save they are
+   * not part of. Both are disabled on a remote seat, so there is no operator
+   * edit here to stomp on.
+   *
+   * On the LOCAL seat it is a no-op in practice: the only saves that reach it are
+   * other seats', and no other seat can change either field.
+   */
+  function adoptVideoLeg(config) {
+    if (!config) return;
+    fields.videoSource.input.value = normaliseVideoSource(config.videoSource);
+    fields.decklinkPreviewEnabled.input.checked = normalisePreviewEnabled(
+      config.decklinkPreviewEnabled,
+    );
+    // lastLoadedConfig is the preset diff's BASELINE and is deliberately left
+    // alone: it is what was POPULATED, and moving two keys under it would make
+    // the preview describe a comparison that was never made.
+    renderVideoSource();
+  }
+
+  fields.videoSource.input.addEventListener('change', renderVideoSource);
+  fields.decklinkPreviewEnabled.input.addEventListener('change', renderVideoSource);
+
+  /**
+   * refreshVideoDevices asks what capture hardware this machine has, so the
+   * control above can refuse a configuration that cannot start.
+   *
+   * It swallows every failure to `null` — not to an empty list — because those
+   * are different claims and only one of them is true after a failed call. The
+   * KINDS are what is read and nothing else: an id is opaque per
+   * internal/gst/gst.go, and one persistent-id names the CARD and serves its
+   * audio and video entries alike, which is why an input listing answers a
+   * question about the video leg at all.
+   */
+  async function refreshVideoDevices() {
+    try {
+      const devices = await backend.listInputDevices();
+      videoDevices = Array.isArray(devices) ? devices : null;
+    } catch (err) {
+      videoDevices = null;
+      console.info(
+        'wslcomms: could not list capture devices for the video source control',
+        err?.message || err,
+      );
+    }
+    renderVideoSource();
+  }
 
   // WHY THIS IS A CONTROL AND NOT A CONSTANT. It was 2000, and 2000 was chosen
   // for what the video leg used to be — one still PNG through imagefreeze, where
@@ -1847,6 +2148,21 @@ export function createSettingsView(handlers) {
     // opened Settings once.
     fields.videoFormatOverride.input.value = config.videoFormatOverride || '';
     fields.statusKey.input.value = config.statusKey || '';
+    // WHAT GOES TO AIR, normalised on the way IN as well as out. An unrecognised
+    // value assigned to a <select> selects nothing at all, and the next Save
+    // would write that nothing back — which for this field means an empty
+    // videoSource, which config.EffectiveVideoSource then reads as the slate. A
+    // camera taken off air by a form that could not read its own file.
+    fields.videoSource.input.value = normaliseVideoSource(config.videoSource);
+    // Read with .checked, and normalised, because anything that is not exactly
+    // `true` is off: this is a branch added to a pipeline that is going to air,
+    // and "the file held a shape we did not recognise" is not a reason to add
+    // one. renderVideoSource follows both, because assigning either control from
+    // script fires no event.
+    fields.decklinkPreviewEnabled.input.checked = normalisePreviewEnabled(
+      config.decklinkPreviewEnabled,
+    );
+    renderVideoSource();
     fields.audioDeviceId.input.value = config.audioDeviceId || '';
     // Normalised on the way in: an unrecognised kind assigned to a <select>
     // shows nothing at all, and a save would then write that nothing back.
@@ -1943,6 +2259,16 @@ export function createSettingsView(handlers) {
       // that mattered.
       videoFormatOverride: fields.videoFormatOverride.input.value.trim(),
       statusKey: fields.statusKey.input.value.trim(),
+      // THE FIELD THAT DECIDES WHAT THE SWITCHER RECEIVES, and therefore the one
+      // on this form whose omission would cost the most: saveConfig REPLACES the
+      // stored document, so a collectConfig that failed to restate videoSource
+      // would put a live position's camera back on the slate because somebody
+      // corrected a typo in the event id — silently, with every lamp green.
+      // Normalised, for the reason populate normalises it.
+      videoSource: normaliseVideoSource(fields.videoSource.input.value),
+      // A REAL BOOLEAN. .checked, never .value — a checkbox's .value is the
+      // string "on" whether or not it is ticked, and Go's field is a bool.
+      decklinkPreviewEnabled: fields.decklinkPreviewEnabled.input.checked === true,
       audioDeviceId: fields.audioDeviceId.input.value.trim(),
       audioSourceKind: normaliseAudioSourceKind(fields.audioSourceKind.input.value),
       decklinkPersistentId: fields.decklinkPersistentId.input.value.trim(),
@@ -2155,6 +2481,14 @@ export function createSettingsView(handlers) {
       saveBtn.disabled = false;
     }
 
+    // WHAT CAPTURE HARDWARE THIS MACHINE HAS, so the video-source control can
+    // refuse a configuration that cannot start. After the config load, because
+    // it renders against the source that load put in the box; separately from
+    // it, and swallowing its own failure, because a device listing that cannot
+    // be made must leave the rest of the screen intact — it decides a WARNING,
+    // and a warning is not worth a blank form.
+    await refreshVideoDevices();
+
     // The capture pad's width, after the config load so the saved map is in
     // place to be conformed against it, and before everything else because the
     // routing grid is the one thing on this screen that draws nothing at all
@@ -2187,5 +2521,5 @@ export function createSettingsView(handlers) {
     await refreshRemote();
   }
 
-  return { el, open, setSending };
+  return { el, open, setSending, adoptVideoLeg };
 }

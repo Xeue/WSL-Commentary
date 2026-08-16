@@ -69,6 +69,19 @@ func TestClassifyBusError(t *testing.T) {
 			source: "vcapclock", legs: captureLegs{AudioClockedByVideo: true}, want: classAudioCapture,
 		},
 		{
+			// The confidence monitor. Spared outright, and the next case is why it
+			// cannot be classVideoCapture.
+			name: "the preview sink", source: "vprevsink", want: classPreview,
+		},
+		{
+			// THE CASE THE SEPARATE CLASS EXISTS FOR. With the commentary clocked by
+			// the card's video a classVideoCapture error becomes classAudioCapture and
+			// takes the feed off air. A preview must be spared here too — this is the
+			// configuration it was built for.
+			name:   "the preview sink, with the commentary clocked by the card's video",
+			source: "vprevscale", legs: captureLegs{AudioClockedByVideo: true}, want: classPreview,
+		},
+		{
 			// The slate leg is NOT video capture. filesrc/pngdec/imagefreeze
 			// cannot fail after Start, so an error from one is a surprise and
 			// stays fatal, which is what it is today.

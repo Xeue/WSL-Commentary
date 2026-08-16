@@ -61,6 +61,26 @@
 // argument for that one conditional — and why it does not move the
 // Windows/macOS seam — is in pipelineDescription's own comment.
 //
+// # The video leg has a second form, and only a second form
+//
+// When PipelineOpts.VideoCaptureID names a DeckLink card, the four lines above
+// between mpegtsmux and the encoder are replaced by a live capture conformed to
+// the same target:
+//
+//	decklinkvideosrc name=vcapsrc mode=auto drop-no-signal-frames=false
+//	  ! videoconvert name=vcapconv ! deinterlace name=vcapdeint
+//	  ! videoscale name=vcapscale ! videorate name=vcaprate
+//	  ! video/x-raw,format=NV12,...                          <- ConformTo
+//	  ! tee name=vcaptee allow-not-linked=true
+//	vcaptee. ! queue name=vcapq max-size-time=1000000000
+//	  ! mfh264enc name=venc ...                              <- unchanged
+//
+// NOTHING FROM THE ENCODER DOWN CHANGES, on either platform, in either form.
+// That is the property the whole shape is built around: h264parse, both
+// queues, mpegtsmux, the leaky srtq, ReplaceSink and internal/sender see one
+// fixed format forever, and the conform chain is what guarantees it whatever
+// the camera is doing. See PipelineOpts.VideoCaptureID and pipelineDescription.
+//
 //	wasapi2src name=asrc device=<endpoint id> low-latency=true
 //	  ! audioconvert ! audioresample ! level name=alevel interval=50000000
 //	  ! mfaacenc bitrate=128000
@@ -612,7 +632,38 @@ func (t ConformTarget) spatialCaps() string {
 // field imagefreeze itself decides, which is the rate at which it repeats the
 // single frame it was handed.
 func (t ConformTarget) temporalCaps() string {
-	return "video/x-raw,framerate=" +
+	return "video/x-raw," + t.rateCapsField()
+}
+
+// captureCaps renders the SINGLE capsfilter the LIVE CAPTURE video leg is
+// conformed to: everything spatialCaps pins about one picture plus the frame
+// rate, in one filter at the bottom of the conform chain.
+//
+// The two legs pin the same fields in different PLACES, and the difference is a
+// property of the elements above them rather than of the target. The slate leg
+// has to split because imagefreeze sits between the two halves and is the thing
+// that decides the rate — see pipelineDescription. The capture leg has nothing
+// between videorate and the tee, and one filter is both correct and the only
+// shape that works: videorate needs the rate on its SRC pad to know what to
+// retime to, and videoscale needs the raster below it for the same reason, so
+// splitting them would leave one of the two elements with nothing to negotiate
+// against.
+//
+// It is spatialCaps plus the rate rather than a second full string, so that the
+// two legs cannot drift on format, pixel aspect ratio, colorimetry or scan. A
+// capture leg that sent bt601 where the slate sent bt709 would be a colorimetry
+// change the switcher sees every time the operator reconfigured the source, and
+// it would be invisible in this file.
+func (t ConformTarget) captureCaps() string {
+	return t.spatialCaps() + "," + t.rateCapsField()
+}
+
+// rateCapsField is the framerate field alone, as GStreamer's exact fraction. It
+// exists so that the two legs' capsfilters render the rate through one function
+// rather than two, which is the only way a change to how a rate is written can
+// reach both.
+func (t ConformTarget) rateCapsField() string {
+	return "framerate=" +
 		strconv.Itoa(t.FrameRateNum) + "/" + strconv.Itoa(t.FrameRateDen)
 }
 
@@ -621,6 +672,15 @@ func (t ConformTarget) temporalCaps() string {
 // rebuilding the pipeline, which is why the SRT endpoint is not among them.
 type PipelineOpts struct {
 	// SlatePath is the PNG fed to filesrc ! pngdec ! imagefreeze. Required.
+	//
+	// It stays REQUIRED even when VideoCaptureID names a card and the slate leg
+	// is therefore not built, and that is deliberate rather than an oversight.
+	// The slate is what the video leg reverts to the moment a seat is configured
+	// without a card — which is every seat shipping today — so a caller that
+	// stopped supplying it would go on working on the one machine it was tested
+	// on and fail on all the others. Validating it unconditionally is what makes
+	// that a Start error on the developer's machine instead of at a commentary
+	// position.
 	SlatePath string
 
 	// AudioDeviceID is the capture endpoint to open. Required; it is Device.ID,
@@ -628,6 +688,111 @@ type PipelineOpts struct {
 	// that macOS has to resolve it before the element will take it — is
 	// documented on Device.ID.
 	AudioDeviceID string
+
+	// VideoCaptureID, when non-empty, turns the VIDEO LEG INTO A LIVE CAPTURE:
+	// the DeckLink card it names is opened, conformed to ConformTo and encoded,
+	// in place of the frozen slate. It is the persistent-id of a Device whose
+	// Kind is KindDeckLink — the same string, from the same dropdown, that
+	// AudioDeviceID takes for a card, because ONE persistent-id names the card
+	// and serves its audio and video entries alike (measured: the Audio/Source
+	// and Video/Source devices for the fitted UltraStudio 4K Mini both publish
+	// 2747401380).
+	//
+	// THE ZERO VALUE IS THE SLATE, and that is the whole compatibility statement
+	// for this feature. A seat that configures nothing builds byte-for-byte the
+	// graph the on-air Windows build has always run — filesrc, pngdec,
+	// imagefreeze — because the leg is chosen by whether this field is empty and
+	// by nothing else. There is no card to detect, no enumeration at Start and
+	// no way for a machine that happens to have a DeckLink fitted to start
+	// transmitting its input because somebody plugged it in.
+	//
+	// It is a SECOND SOURCE MODE rather than a rewrite of the first. Everything
+	// downstream of the H.264 encoder — h264parse, both queues, mpegtsmux,
+	// ReplaceSink and the whole of internal/sender — sees one fixed format
+	// forever, whichever leg is above it, which is what lets the timestamp
+	// discipline and the reconnect ladder go on reasoning about the same graph.
+	// The conform chain is what buys that: videoconvert, deinterlace, videoscale
+	// and videorate between the card and the capsfilter, so a 1080i50 camera, a
+	// 720p59.94 camera and the card's own 720x486 NTSC start-up placeholder all
+	// leave the leg as the one raster and rate ConformTo names.
+	//
+	// It is an ID and not a bool for the reason Device.ID is persisted rather
+	// than Device.Name: the machine may have two cards in it, and "the DeckLink"
+	// is not a thing that can be resolved on a rig where a second one is fitted
+	// for a different purpose. A value that is not a DeckLink persistent-id is
+	// refused at Start, before anything is built — a CoreAudio unique-id or a
+	// WASAPI endpoint GUID handed to the decklink element's persistent-id
+	// property would leave it at its own -1 default, which means "use
+	// device-number", which means whichever card the driver enumerated first.
+	//
+	// # What it costs, measured rather than reasoned about
+	//
+	// On the port machine (macOS arm64, GStreamer 1.26.10, the fitted
+	// UltraStudio 4K Mini), 2026-08-16, 500 frames per run, as a percentage of
+	// ONE core:
+	//
+	//	the card alone, straight to fakesink                     2.4 %
+	//	the card through the whole conform chain                18.5 %
+	//	the same, plus the tee, the queue and vtenc_h264 @10M   25.8 %
+	//	the SHIPPING SLATE LEG plus the same encoder @10M        4.8 %
+	//	the SHIPPING SLATE LEG plus the same encoder @2M         4.0 %
+	//	the whole application pipeline, through this package,
+	//	  capture and audio and mux and SRT to a cloud host,
+	//	  45.6 s including Init and the plugin registry scan     26.8 %
+	//
+	// READ THE CONFORM COST WITH ITS INPUT, because it is the entire story. The
+	// card was locked to 525i59.94 — 720x486, INTERLACED, bt601, pixel aspect
+	// 10:11, 29.97 fps — and the target was 1920x1080p50 bt709 progressive
+	// square-pixel NV12. That is the most expensive conversion this chain can
+	// ever be asked for: deinterlace, a four-and-a-half-times area upscale, a
+	// colorimetry conversion and a rate conversion, all at once. It is not the
+	// case a facility will run.
+	//
+	// The case a facility WILL run was measured beside it: a conforming
+	// 1920x1080p50 source through the identical chain and encoder cost 3.00 s
+	// of CPU per 500 frames against 3.00 s for the source on its own — the
+	// conform chain and the H.264 encode together were indistinguishable from
+	// nothing, because vtenc_h264 runs on the media engine and every element in
+	// the chain passes through when there is nothing to convert. That is what
+	// deinterlace and videoscale being "free on progressive input" means in
+	// numbers.
+	//
+	// So the honest summary is: there is no CPU argument against this feature,
+	// and the one number that could look alarming is the price of a standard
+	// definition interlaced input nobody is going to commentate over.
+	VideoCaptureID string
+
+	// Preview is the operator's choice about the CONFIDENCE MONITOR: a small,
+	// slow, cheap second rendering of the pictures the encoder is getting, taken
+	// off the capture leg's tee and drawn in a native surface. preview.go owns
+	// the whole of it — the branch, the measurements, and every reason it might
+	// decline to build.
+	//
+	// The ZERO VALUE IS OFF and off is the default everywhere. It is meaningful
+	// only on a pipeline whose video leg is a live capture: the tee it hangs off
+	// exists only there, and previewBranchFor refuses a preview on a slate
+	// pipeline rather than naming an element gst_parse_launch would not find —
+	// which would not be a missing preview, it would be a parse failure of the
+	// whole contribution pipeline.
+	//
+	// It is WIRED: Start renders the branch with previewBranchFor, appends it to
+	// the parse description, and hands the sink its surface with attachPreview
+	// before the pipeline leaves NULL. Two things had to be true first, and both
+	// are, so do not take either of them back out:
+	//
+	//   - capturefault.go classifies preview elements as classPreview and
+	//     onBusMessage spares them. Without it a preview sink erroring — a GPU
+	//     driver update mid-match, a display going away — falls through to the
+	//     FATAL default and takes the COMMENTARY off air over a monitor nobody
+	//     was looking at. preview_test.go's
+	//     TestAPreviewInThePipelineIsSparedByTheBusFilter fails by name if the
+	//     wiring is ever present without the classification.
+	//   - Start rebuilds ONCE WITHOUT the branch if the pipeline will not go to
+	//     PLAYING with it. A sink that exists and then will not start is a state
+	//     change failure, which the bus filter never sees, so it is the one way
+	//     an optional monitor could otherwise stop a seat going on air. See
+	//     cgoPipeline.startBuiltLocked.
+	Preview PreviewOpts
 
 	// ConformTo is the raster and rate the VIDEO LEG is conformed to: what the
 	// slate is scaled and paced into before it reaches the H.264 encoder. It is

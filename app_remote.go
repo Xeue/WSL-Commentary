@@ -242,6 +242,26 @@ var remoteAllowlist = map[string]methodPolicy{
 	"StopPicture":       {hostOnly: true},
 	"StartReturn":       {hostOnly: true},
 	"StopReturn":        {hostOnly: true},
+	// The DeckLink preview's surface, host-only for exactly the reason the
+	// picture's two are: they move, resize and show an OPAQUE native window on
+	// the screen of whoever is sitting at this machine, over whatever they were
+	// looking at. A seat in another building has no business doing that.
+	"SetPreviewRect":    {hostOnly: true},
+	"SetPreviewVisible": {hostOnly: true},
+
+	// ---- host-only: what this position puts ON AIR ----
+	// SetVideoSource is the only method on this whole surface that decides what a
+	// broadcast switcher receives, and it is refused for every remote connection.
+	// SetDeckLinkPreviewEnabled is here for the surface reason above rather than
+	// for that one — it reaches nothing that is transmitted.
+	//
+	// NEITHER IS SELF-ENFORCING, and the reason is worth reading before touching
+	// this block: SaveConfig is remotely reachable and is a WHOLE-DOCUMENT write,
+	// so a remote seat could otherwise change either field through a method it is
+	// entitled to call. App.refuseRemoteVideoLegChange is what closes that, and
+	// these two rows are the declaration it enforces.
+	"SetVideoSource":            {hostOnly: true},
+	"SetDeckLinkPreviewEnabled": {hostOnly: true},
 
 	// ---- host-only: remote administration (local Settings screen only) ----
 	"GetRemoteState":    {hostOnly: true},

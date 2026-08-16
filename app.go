@@ -97,6 +97,40 @@
 //	GetActivePreset()                   presets.ActiveRecord    caller: WP-5b
 //	GetPresetCredentialStatus()         PresetCredentialStatus  caller: WP-5b
 //
+// and the four added for the VIDEO LEG — the DeckLink camera and the operator's
+// confidence monitor. All four are HOST-ONLY, which is unusual enough on this
+// surface to be worth saying here rather than only in remoteAllowlist:
+//
+//	SetVideoSource(source)              error                   caller: NONE — see below
+//	SetDeckLinkPreviewEnabled(enabled)  error                   caller: NONE — see below
+//	SetPreviewRect(x,y,w,h,ratio)       error                   caller: WP-5b
+//	SetPreviewVisible(visible)          error                   caller: WP-5b
+//
+// SetVideoSource is the only method anywhere on this surface that decides WHAT A
+// BROADCAST SWITCHER RECEIVES, which is why it is a method of its own rather
+// than one more field somebody has to remember to guard inside SaveConfig. The
+// other two rectangle methods concern a native window on the screen of whoever
+// is at this machine, and are host-only for the reason SetPictureRect and
+// SetPictureVisible are.
+//
+// THE FIRST TWO HAVE NO CALLER, DELIBERATELY, and the annotation says so rather
+// than naming one that does not exist. The Settings screen writes both fields
+// through its single Save, with the two controls DISABLED while sending, so the
+// refusal these methods make is unreachable by construction from the only page
+// that could reach it. They are kept because they are the DECLARATION that
+// remoteAllowlist enforces: a host-only classification on a method is what
+// TestRemoteHostOnlySet pins, and deleting them would leave the two most
+// dangerous fields on this surface reachable only through SaveConfig, whose
+// host-only-ness is a runtime argument in refuseRemoteVideoLegChange rather than
+// a table entry. If a future page wants to write either field on change instead
+// of on Save, these are what it calls and nothing else has to move.
+//
+// HOST-ONLY IS NOT SELF-ENFORCING HERE, and the gap is closed rather than
+// noted: SaveConfig is remotely reachable and is a whole-document write, so
+// refuseRemoteVideoLegChange refuses a remote save that would change either of
+// the two configuration fields. Without it the classification would be a
+// decoration.
+//
 // Wails binds every EXPORTED method of *App, so this list and the set of
 // exported methods are the same thing: adding one silently widens the contract
 // with WP-5a and WP-5b. Everything internal below is lower-case for that reason
@@ -1027,11 +1061,63 @@ type App struct {
 	// otherwise draw the fallback mosaic over a working high-resolution picture.
 	lastPicture gst.PictureState
 
+	// THE DECKLINK PREVIEW — the operator's own confidence monitor — has its own
+	// trio of these, and the duplication is deliberate rather than a missed
+	// factoring. App holds exactly ONE picOverlay under picViewMu, because the
+	// SRT picture is one surface; the preview is a SECOND, SIMULTANEOUS surface
+	// showing something else. They are on screen at the same time — the
+	// commentator's programme return above, what this position is sending below —
+	// so one handle and one rectangle cannot serve both, and sharing picViewMu
+	// would put the preview's layout calls behind whatever the picture path is
+	// doing.
+	//
+	// prevViewMu is picViewMu's twin and obeys the same rule: nothing held under
+	// it may block, and every gst.PictureOverlay method records and posts. The
+	// one ordering it does have is sessMu → prevViewMu, because startSession
+	// builds and releases the surface while holding sessMu; nothing may take them
+	// the other way round, which is why the two bound setters below take
+	// prevViewMu alone and never ask the session anything. It is NOT ordered
+	// against picViewMu, because nothing anywhere takes both — the two surfaces
+	// share no code path, which is what makes a deadlock between them impossible
+	// rather than merely unlikely.
+	prevViewMu sync.Mutex
+
+	// prevOverlay is the native child window the DeckLink preview renders into,
+	// or nil when there is none. Unlike picOverlay it is created and destroyed
+	// WITH THE SESSION, because the preview is a branch of the contribution
+	// pipeline rather than a monitor of its own: the tee it hangs off exists only
+	// while that pipeline does, and set_state(NULL) inside a blocking pad probe
+	// was MEASURED to take the on-air leg from 50 fps to 0 permanently with the
+	// pipeline still reporting PLAYING. So it is built at Start, from the
+	// configuration, and never attached or detached live.
+	prevOverlay gst.PictureOverlay
+
+	// prevRect and prevWantVisible are the preview's half of what picRect and
+	// picWantVisible are for the picture: the last rectangle the page gave, in
+	// PHYSICAL pixels, and the last visibility it asked for. Both are kept
+	// across sessions so that the overlay built by the next Start is positioned
+	// before it is ever shown.
+	prevRect        gst.PictureRect
+	prevWantVisible bool
+
+	// prevRunning records whether THIS session's pipeline actually has a preview
+	// branch in it — the configuration asked for one AND an overlay was created
+	// for it. It is the preview's equivalent of "the monitor is SHOWING" in
+	// applyPictureVisibilityViewLocked: without it, a page that asked to see the
+	// preview would be shown an empty opaque rectangle over its own controls on
+	// every seat that is sending a slate.
+	prevRunning bool
+
 	// pictureDial builds the picture monitor, and overlayDial builds the native
 	// overlay window. Both are gst's real constructors in the application and
 	// fakes in the tests, which is the only way to exercise the wire-up without a
 	// GPU and without a window. Nil means the real one; see
 	// App.newPictureMonitor and App.newPictureOverlay.
+	//
+	// overlayDial builds the PREVIEW's surface too. One seam serves both because
+	// they are the same type of object created the same way — a native child of
+	// the same host window — and a second dial would be a second thing for a test
+	// to forget to install.
 	pictureDial func() gst.PictureMonitor
 	overlayDial func() (gst.PictureOverlay, error)
 
@@ -1617,6 +1703,11 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 	if c == nil {
 		return errors.New("wslcomms: SaveConfig: no configuration supplied")
 	}
+	if originClientID != localClientID {
+		if err := a.refuseRemoteVideoLegChange(c); err != nil {
+			return err
+		}
+	}
 	if err := c.Save(); err != nil {
 		return err
 	}
@@ -1641,6 +1732,164 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 type configEvent struct {
 	Config *config.Config `json:"config"`
 	Origin string         `json:"origin"`
+}
+
+// refuseRemoteVideoLegChange is what makes SetVideoSource and
+// SetDeckLinkPreviewEnabled being HOST-ONLY mean something.
+//
+// # Why a host-only method is not by itself a guarantee
+//
+// SaveConfig is remotely reachable — deliberately, so a producer's laptop can
+// fix a port or a status key — and it is a WHOLE-DOCUMENT write from a page
+// cache. So without this check, marking the two dedicated setters host-only
+// would protect nothing at all: a remote seat could put a camera on air by
+// saving a configuration with videoSource changed, through a method it is
+// entitled to call, and the host-only classification would be a decoration.
+// This is the enforcement; the classification is the declaration.
+//
+// # It refuses the whole save rather than dropping the two fields
+//
+// Silently keeping the live values and writing everything else would be the
+// gentler behaviour and it is the wrong one: the remote page would show the
+// change it thought it had made, its next cache refresh would put it back, and
+// nobody would ever be told which of the two seats was right. A refusal naming
+// the field is one operator asking another to make the change, which is what
+// should happen.
+//
+// The comparison is against the LIVE configuration and only a real difference
+// refuses, so an ordinary remote save — a port, a key length, a status key,
+// with the video leg restated exactly as the page was told it — passes through
+// untouched. A remote seat's cache is refreshed by the "config" event on every
+// save, so a difference is an intention rather than staleness.
+func (a *App) refuseRemoteVideoLegChange(c *config.Config) error {
+	live := a.snapshotConfig()
+
+	if c.EffectiveVideoSource() != live.EffectiveVideoSource() {
+		return fmt.Errorf(
+			"wslcomms: refused: videoSource is %q here and this save would make it %q, and what "+
+				"this position puts ON AIR cannot be changed from a remote seat. Ask the operator at "+
+				"the desk to change it there",
+			live.EffectiveVideoSource(), c.EffectiveVideoSource())
+	}
+	if c.DeckLinkPreviewEnabled != live.DeckLinkPreviewEnabled {
+		return fmt.Errorf(
+			"wslcomms: refused: decklinkPreviewEnabled is %v here and this save would make it %v, "+
+				"and the preview is a window on the operator's own screen rather than anything that "+
+				"is transmitted. Ask the operator at the desk to change it there",
+			live.DeckLinkPreviewEnabled, c.DeckLinkPreviewEnabled)
+	}
+	return nil
+}
+
+// The two refusals the video-leg setters make while a session is running. They
+// are separate errors rather than one shared sentinel because they send the
+// operator to two different places, and a message that had to be right about
+// both would say neither.
+var (
+	errVideoSourceWhileSending = errors.New(
+		"wslcomms: cannot change the video source while sending: the video leg is built at START " +
+			"and there is no way to swap it under a running feed — set_state(NULL) inside a blocking " +
+			"pad probe was measured to take the leg from 50 fps to 0 permanently with the pipeline " +
+			"still reporting PLAYING. Press STOP, change it, then START")
+
+	errPreviewChangeWhileSending = errors.New(
+		"wslcomms: cannot turn the preview on or off while sending: it is a branch of the " +
+			"contribution pipeline and is built with it at START, so it can be neither attached nor " +
+			"detached live. Press STOP, change it, then START")
+)
+
+// SetVideoSource chooses WHAT THE VIDEO LEG CARRIES: config.VideoSourceSlate,
+// the still picture this application has always transmitted, or
+// config.VideoSourceDeckLink, live video from the Blackmagic card.
+//
+// # Why this exists at all when SaveConfig could write the same field
+//
+// Because of who is allowed to call it. This is the one setting on the whole
+// bound surface that decides WHAT A BROADCAST SWITCHER RECEIVES, and it is
+// HOST-ONLY: refused for every remote connection and omitted from the hello
+// frame, so the shim never installs it. A producer's laptop on the facility
+// network can watch the meters, fix a routing and stop the feed; it cannot
+// decide that this position is now showing its camera.
+//
+// The classification alone does not achieve that, because SaveConfig writes the
+// same field and is reachable — refuseRemoteVideoLegChange is what closes it.
+// Having a method of its own is still the right shape: it is where the value is
+// checked before anything is written, and it is the row in remoteAllowlist that
+// STATES the rule the other check enforces.
+//
+// NOTHING CALLS IT TODAY, and that is settled rather than pending. The Settings
+// screen writes videoSource through its single Save, with the control disabled
+// while sending, so this method's refusals are unreachable from the only page
+// that could reach them. It is kept for the classification — see the
+// bound-surface list at the top of this file — and is the thing to call if a
+// later page wants to write the field on change instead of on Save.
+//
+// # It refuses while sending, and that is not caution
+//
+// The video leg is built at Start and cannot be exchanged under a running feed;
+// the alternative to refusing is a control that appears to switch a camera on
+// air and silently does nothing until the next restart, which is the worst
+// outcome available here. See errVideoSourceWhileSending for the measurement.
+//
+// It persists through the same path SaveConfig uses, so the "config" event goes
+// out and every OTHER seat's cached configuration refreshes rather than sitting
+// on a stale answer until somebody reloads it.
+func (a *App) SetVideoSource(source string) error {
+	s := strings.TrimSpace(source)
+	switch s {
+	case config.VideoSourceSlate, config.VideoSourceDeckLink:
+	default:
+		// Named the way config.Validate names it, because the operator may well
+		// meet both messages about the same value and they must agree.
+		return fmt.Errorf("wslcomms: videoSource must be %q or %q, got %q",
+			config.VideoSourceSlate, config.VideoSourceDeckLink, source)
+	}
+
+	a.sessMu.Lock()
+	if a.closing.Load() {
+		a.sessMu.Unlock()
+		return errShuttingDown
+	}
+	running := a.session != nil
+	a.sessMu.Unlock()
+	if running {
+		return errVideoSourceWhileSending
+	}
+
+	cfg := a.snapshotConfig()
+	cfg.VideoSource = s
+	return a.saveConfigFrom(localClientID, cfg)
+}
+
+// SetDeckLinkPreviewEnabled turns the operator's own confidence monitor on or
+// off. It changes nothing about what is transmitted; see the field comment on
+// config.Config.DeckLinkPreviewEnabled for what it costs and why it defaults to
+// off.
+//
+// It is HOST-ONLY for a different reason from SetVideoSource's, and the
+// difference is worth keeping straight: this one cannot reach air at all. What
+// it can do is open or close an opaque native window on the screen of whoever is
+// sitting at this machine — over whatever they were looking at — and a seat in
+// another building has no business doing that. It is the same argument that puts
+// SetPictureVisible on the host-only list.
+//
+// It refuses while sending for the reason SetVideoSource does: the preview is a
+// tee branch of the contribution pipeline, built with it.
+func (a *App) SetDeckLinkPreviewEnabled(enabled bool) error {
+	a.sessMu.Lock()
+	if a.closing.Load() {
+		a.sessMu.Unlock()
+		return errShuttingDown
+	}
+	running := a.session != nil
+	a.sessMu.Unlock()
+	if running {
+		return errPreviewChangeWhileSending
+	}
+
+	cfg := a.snapshotConfig()
+	cfg.DeckLinkPreviewEnabled = enabled
+	return a.saveConfigFrom(localClientID, cfg)
 }
 
 // SetSecret writes one of the three OS credential-store secrets from the
@@ -1743,38 +1992,12 @@ func (a *App) startSession() error {
 		return fmt.Errorf("wslcomms: cannot start, the configuration is incomplete: %w", err)
 	}
 
-	// ============ THE DECKLINK CAPTURE PATH IS NOT BUILT IN THIS REVISION ====
-	//
-	// config, the Settings screen and internal/gst's device enumeration all
-	// understand audioSourceKind="decklink" — the field is stored, classified,
-	// validated and offered in a dropdown — but gst.PipelineOpts still carries
-	// AudioDeviceID alone and pipelineDescription still builds the platform's
-	// own source unconditionally. There is no decklinkaudiosrc leg yet.
-	//
-	// WITHOUT THIS REFUSAL THAT COMBINATION IS A SILENT WRONG-DEVICE FAILURE,
-	// which is the one class of defect this application is built end to end to
-	// prevent. config.Validate stopped requiring audioDeviceId for a DeckLink
-	// seat — correctly, since its commentary never touches CoreAudio or WASAPI —
-	// so a seat set to "decklink" passes validation with that field EMPTY, and
-	// an empty device on osxaudiosrc or wasapi2src is not an error: it is the
-	// system default input. The match would go out from the laptop's built-in
-	// microphone with every lamp green.
-	//
-	// So it is refused here, at the gate, naming the setting and the way back.
-	// This is the ONE line to delete when the capture leg lands; it is
-	// deliberately in Start rather than in config.Validate because it is a
-	// statement about what internal/gst can currently BUILD, not about whether
-	// the configuration is well formed — the same value becomes perfectly valid
-	// the day the element exists, with no change to config at all.
-	if cfg.UsesDeckLinkAudio() {
-		return fmt.Errorf("wslcomms: cannot start: the commentary input is set to a Blackmagic " +
-			"DeckLink card, and this version cannot capture from one yet — the card is offered in " +
-			"the device list but the capture pipeline for it is not built. Set the commentary " +
-			"input back to the computer sound input on the Settings screen and choose the device " +
-			"there")
-	}
-
-	if err := a.preflightAudioDevice(cfg.AudioDeviceID); err != nil {
+	// Every hardware question this session's two legs raise, answered before a
+	// single element is built: which video source, which audio subsystem, which
+	// card, and whether the machine actually has it. It returns the DeckLink
+	// persistent-id the video leg is to open, empty for the slate.
+	videoCaptureID, err := a.preflightCapture(cfg)
+	if err != nil {
 		return err
 	}
 
@@ -1783,13 +2006,47 @@ func (a *App) startSession() error {
 		return err
 	}
 
+	// The operator's confidence monitor, if they have asked for one and the video
+	// leg is a camera. It is built HERE, before the pipeline, because the preview
+	// is a branch of that pipeline and its handle is a build-time option: there is
+	// no attaching one to a running graph. Its failures are SPARED — a preview
+	// that cannot get a window leaves videoCaptureID untouched and the feed goes
+	// out without it — which is the whole rule for this path.
+	previewHandle := a.startSessionPreview(cfg, videoCaptureID != "")
+
 	pipe, err := gst.New()
 	if err != nil {
+		// The preview surface exists by now and nothing will ever render into it,
+		// so it goes back. Ordinarily it is released by the sender-state
+		// forwarder's exit, and this Start never reaches the point where that
+		// forwarder is launched — so without this, a Start that failed here would
+		// leave an opaque native window over the page with no session behind it
+		// and nothing that would ever take it away. The same applies at the
+		// snd.Start failure below. Both are idempotent.
+		a.stopSessionPreview()
 		return fmt.Errorf("wslcomms: creating the media pipeline: %w", err)
 	}
 
 	snd := a.newSender(pipe)
 	opts := a.senderOpts(cfg, passphrase)
+
+	// The two options the PRE-FLIGHT decided rather than the configuration, and
+	// the reason they are set here instead of inside senderOpts: one is a card id
+	// resolved against what this machine is actually offering, the other a native
+	// window handle. Neither is a function of the configuration alone, and
+	// senderOpts is deliberately a pure reading of it — see its comment.
+	opts.Pipeline.VideoCaptureID = videoCaptureID
+	opts.Pipeline.Preview = gst.PreviewOpts{
+		// Enabled is the operator's request AND the pre-flight's verdict, ANDed
+		// here rather than left to internal/gst, so that a seat which asked for a
+		// preview while sending the slate is simply not asking for one. Passing
+		// the request through with no handle would have the pipeline log that the
+		// monitor is switched on and has no surface, which is a true sentence
+		// about a machine that has nothing to preview and would send the operator
+		// looking for a window fault that is not there.
+		Enabled:      cfg.DeckLinkPreviewEnabled && videoCaptureID != "",
+		WindowHandle: previewHandle,
+	}
 
 	if err := snd.Start(opts); err != nil {
 		// sender.Start leaves the pipeline it was given untouched on failure,
@@ -1799,6 +2056,9 @@ func (a *App) startSession() error {
 		if stopErr := pipe.Stop(); stopErr != nil {
 			log.Printf("wslcomms: stopping the pipeline after a failed start: %v", stopErr)
 		}
+		// After the pipeline, never before it: the branch that was rendering into
+		// the surface has to be at NULL first. See stopSessionPreview.
+		a.stopSessionPreview()
 		return err
 	}
 
@@ -1860,6 +2120,15 @@ func (a *App) startSession() error {
 		// to poll. It clears the replay cache too, so a page loaded after the
 		// session ends does not resurrect it.
 		a.forgetSignal()
+		// And the preview surface goes, because the pipeline that was rendering
+		// into it has gone. This runs HERE rather than in App.Stop so that it
+		// covers the self-stop path too — a capture chain that died takes its
+		// preview with it — and it runs AFTER the sender closed its states
+		// channel, which it does as the last act of stopping the pipeline. That
+		// ordering is the same one stopPictureForTeardown insists on and it is
+		// insisted on for the same reason: take the surface away first and the
+		// video sink is presenting into a handle that no longer names anything.
+		a.stopSessionPreview()
 	}()
 	a.session = sess
 
@@ -2189,6 +2458,200 @@ func (a *App) preflightAudioDevice(id string) error {
 			"typed into the Settings screen's Commentary input device ID box, it belongs to another "+
 			"machine.)",
 		id, len(devices))
+}
+
+// preflightCapture answers every hardware question this session's two legs
+// raise, BEFORE a single element is built, and returns the DeckLink
+// persistent-id the VIDEO leg is to open — empty for the still slate.
+//
+// # Why any of this is here rather than left to GStreamer
+//
+// Because of what GStreamer says when the answer is no. A DeckLink card that is
+// absent, or busy, or named by an id that no longer resolves, produces
+// "Internal data stream error / not-negotiated (-4)" in about 100 microseconds
+// — MEASURED, and it names neither the device nor the cause. The operator gets
+// a red lamp and a message about a data stream, several seconds after START,
+// with a commentator waiting. Every refusal below names the FIELD to go and fix
+// and the DEVICE it could not find, which is the entire point of the function.
+//
+// It is deliberately in Start and not in config.Validate. Validate decides
+// whether a configuration document is well formed; this decides whether THIS
+// MACHINE, right now, has the hardware that document describes — a different
+// question with a different answer on a different day, and one that has to be
+// asked again at every Start rather than once when a field was typed.
+//
+// # What it will NOT refuse
+//
+// An enumeration that fails, or that comes back empty, is treated as a device
+// monitor hiccup and is not by itself a reason a match does not go out — the
+// rule preflightAudioDevice states at length. The one exception is the case
+// where the enumeration is the only thing that could have supplied an answer:
+// a camera seat that names no card at all, where "carry on anyway" would mean
+// silently transmitting a slate to a switcher the operator expects to be
+// receiving their camera. That is a wrong-source failure with every lamp green,
+// which is the class of defect this application exists to make impossible, so
+// it refuses.
+func (a *App) preflightCapture(cfg *config.Config) (string, error) {
+	// ============ THE DECKLINK AUDIO LEG IS NOT BUILT IN THIS REVISION ======
+	//
+	// The VIDEO leg is: gst.PipelineOpts.VideoCaptureID opens the card and
+	// conforms its input in place of the slate. The AUDIO leg is not —
+	// PipelineOpts still carries AudioDeviceID alone and pipelineDescription
+	// still builds the platform's own source unconditionally — so the two halves
+	// of this feature landed apart and this gate is what keeps the unbuilt half
+	// from being reachable.
+	//
+	// WITHOUT IT THAT COMBINATION IS A SILENT WRONG-DEVICE FAILURE.
+	// config.Validate stopped requiring audioDeviceId for a DeckLink seat —
+	// correctly, since its commentary never touches CoreAudio or WASAPI — so a
+	// seat set to "decklink" passes validation with that field EMPTY, and an
+	// empty device on osxaudiosrc or wasapi2src is not an error: it is the SYSTEM
+	// DEFAULT INPUT. The match would go out from the laptop's built-in microphone
+	// with every lamp green.
+	//
+	// THIS BLOCK, AND THE `if` BELOW IT, ARE WHAT TO DELETE WHEN THE AUDIO LEG
+	// LANDS. Nothing else in this function is temporary. The guard below is
+	// already written the way it has to be afterwards — a DeckLink seat must not
+	// be pre-flighted against a CoreAudio endpoint it never opens — so removing
+	// this refusal is a deletion and not a rewrite.
+	if cfg.UsesDeckLinkAudio() {
+		return "", fmt.Errorf("wslcomms: cannot start: audioSourceKind is %q, so the commentary "+
+			"input is a Blackmagic DeckLink card — and this version cannot capture AUDIO from one "+
+			"yet. The card is offered in the device list and its VIDEO can now be sent, but the "+
+			"audio capture leg for it is not built. Set the commentary input back to the computer "+
+			"sound input on the Settings screen and choose the device there; videoSource is a "+
+			"separate setting and is unaffected",
+			config.AudioSourceDeckLink)
+	}
+	if !cfg.UsesDeckLinkAudio() {
+		if err := a.preflightAudioDevice(cfg.AudioDeviceID); err != nil {
+			return "", err
+		}
+	}
+
+	if !cfg.UsesDeckLinkVideo() {
+		// The slate: no card, no enumeration, nothing to resolve. A seat that has
+		// configured nothing must reach the pipeline having done exactly what it
+		// did before this function existed, which includes not having asked the
+		// device monitor a question.
+		return "", nil
+	}
+
+	return a.resolveDeckLinkCard(cfg)
+}
+
+// resolveDeckLinkCard turns "the operator wants the camera" into the one
+// persistent-id gst.PipelineOpts.VideoCaptureID can be given, or into a refusal
+// that names the field and the hardware.
+//
+// # The empty id is a real answer and it has to be resolved, not passed through
+//
+// decklinkPersistentId is documented as MEANINGFUL when empty — "the card this
+// machine has" — and that is right for a commentary position, which has one. But
+// an empty VideoCaptureID means THE SLATE to internal/gst, which is the opposite
+// instruction, so the emptiness cannot simply be forwarded. This is the one
+// place the two vocabularies meet and it is where the translation belongs: ask
+// the machine which card it has, and hand the leg that card's id.
+//
+// # The id that comes back is the ENUMERATED spelling, not the typed one
+//
+// A hand-typed id that differs only in case is accepted here and then handed on
+// exactly as the device monitor spelled it, so that the string reaching the
+// element is one this build produced. Matching case-insensitively is the same
+// judgement preflightAudioDevice records: refusing a card that is plainly
+// present, over the case of a hex digit, would be this function causing the
+// outage it exists to prevent.
+func (a *App) resolveDeckLinkCard(cfg *config.Config) (string, error) {
+	want := strings.TrimSpace(cfg.DeckLinkPersistentID)
+
+	devices, err := a.ListInputDevices()
+	if err != nil || len(devices) == 0 {
+		if want == "" {
+			// The enumeration was the ONLY thing that could have said which card,
+			// so there is nothing to carry on with. Starting anyway would send the
+			// slate to a switcher the operator believes is receiving their camera.
+			return "", fmt.Errorf(
+				"wslcomms: cannot start: videoSource is %q, so the video leg is a Blackmagic card, "+
+					"but decklinkPersistentId is empty and this machine's capture devices could not be "+
+					"listed, so there is nothing to say WHICH card. Set decklinkPersistentId on the "+
+					"Settings screen, or set videoSource back to %q to send the slate",
+				config.VideoSourceDeckLink, config.VideoSourceSlate)
+		}
+		// A card WAS named, so the enumeration is not the only source of truth
+		// and a monitor hiccup must not be a new way to be unable to start. The
+		// element gets the operator's id and says its own piece if it is wrong.
+		log.Printf("wslcomms: could not list capture devices during the video pre-flight (%v, %d "+
+			"devices); starting anyway with the configured decklinkPersistentId %q",
+			err, len(devices), want)
+		return want, nil
+	}
+
+	var cards []gst.Device
+	for _, d := range devices {
+		if gst.NormaliseDeviceKind(d.Kind) == gst.KindDeckLink {
+			cards = append(cards, d)
+		}
+	}
+
+	if want != "" {
+		for _, c := range cards {
+			if strings.EqualFold(c.ID, want) {
+				return c.ID, nil
+			}
+		}
+		return "", fmt.Errorf(
+			"wslcomms: cannot start: videoSource is %q and decklinkPersistentId is %s, which is not "+
+				"a Blackmagic card on this machine — %s. A persistent-id is minted by the card and "+
+				"survives a reboot, so an id that no longer resolves means a different card, or none. "+
+				"Choose the card on the Settings screen, clear decklinkPersistentId if this machine "+
+				"has only one, or set videoSource back to %q to send the slate",
+			config.VideoSourceDeckLink, want, describeDeckLinkCards(cards, len(devices)),
+			config.VideoSourceSlate)
+	}
+
+	switch len(cards) {
+	case 1:
+		// The ordinary case at a commentary position, and it is logged because
+		// "which card did it pick" is the first question anybody asks when the
+		// picture is not the one they expected.
+		log.Printf("wslcomms: video leg: decklinkPersistentId is empty and this machine has one "+
+			"Blackmagic card, %q (%s); capturing from it", cards[0].Name, cards[0].ID)
+		return cards[0].ID, nil
+	case 0:
+		return "", fmt.Errorf(
+			"wslcomms: cannot start: videoSource is %q, so the video leg is a Blackmagic card, but "+
+				"there is no Blackmagic capture card on this machine — %d capture devices were found "+
+				"and none of them is one. Without the Desktop Video driver installed the card is not "+
+				"offered at all, even when it is plugged in. Set videoSource back to %q on the "+
+				"Settings screen to send the slate",
+			config.VideoSourceDeckLink, len(devices), config.VideoSourceSlate)
+	default:
+		return "", fmt.Errorf(
+			"wslcomms: cannot start: videoSource is %q and decklinkPersistentId is empty, which means "+
+				"\"the card this machine has\" — but this machine has %d: %s. The card is EXCLUSIVE, "+
+				"so guessing would take a card another application may be holding and would send "+
+				"whichever one the driver happened to enumerate first. Name the one you want in "+
+				"decklinkPersistentId on the Settings screen",
+			config.VideoSourceDeckLink, len(cards), describeDeckLinkCards(cards, len(devices)))
+	}
+}
+
+// describeDeckLinkCards renders the cards an enumeration found, for the message
+// an operator reads when the one they asked for is not among them.
+//
+// It names the cards rather than counting them because the id is a 16-digit hex
+// string nobody can hold in their head: the operator's next move is to copy one
+// of these into the Settings screen, and a message that said "2 cards" would
+// send them looking for a list that exists nowhere in the application.
+func describeDeckLinkCards(cards []gst.Device, total int) string {
+	if len(cards) == 0 {
+		return fmt.Sprintf("%d capture devices were found and none of them is a Blackmagic card", total)
+	}
+	parts := make([]string, 0, len(cards))
+	for _, c := range cards {
+		parts = append(parts, fmt.Sprintf("%q (%s)", c.Name, c.ID))
+	}
+	return "the Blackmagic cards on this machine are " + strings.Join(parts, ", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -2568,6 +3031,15 @@ func conformTargetView(t gst.ConformTarget, source, raw string) *ConformTargetVi
 // It is separate from Start so that what the sender is actually given can be
 // asserted without running a session — including the one field with behaviour
 // attached to it, OnConnectError.
+//
+// TWO OPTIONS ARE DELIBERATELY NOT SET HERE and startSession adds them after
+// this returns: the video leg's DeckLink persistent-id and the preview's window
+// handle. Neither is a function of the configuration. One is a card id resolved
+// against what this machine is actually offering — an empty decklinkPersistentId
+// means "the card this machine has", which only an enumeration can turn into an
+// id — and the other is a native surface that has to exist. Deriving either
+// here would make this function reach hardware, which is exactly what it is for
+// not doing.
 //
 // passphrase is a secret. It goes into gst.SinkOpts, which internal/gst sets
 // with g_object_set rather than in the URI, and must not be logged or returned

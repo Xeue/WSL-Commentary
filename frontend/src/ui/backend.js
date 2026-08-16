@@ -246,6 +246,8 @@ function defaultFakeConfig() {
     pbkeylen: 0,
     statusKey: '',
     audioDeviceId: '',
+    videoSource: 'slate', // config.DefaultVideoSource — the still slate, as ever
+    decklinkPreviewEnabled: false, // config's default: the operator's monitor starts off
     headphoneDeviceId: '', // a browser mediaDeviceId — the WebRTC return path
     headphoneEndpointId: '', // a WASAPI endpoint GUID — the SRT return path
     returnSource: 'webrtc', // config.DefaultReturnSource
@@ -2108,4 +2110,120 @@ export function onChannelLevels(cb) {
 /** Subscribes to the "signal" event. Returns an unsubscribe function. */
 export function onSignal(cb) {
   return subscribe(EVENT_SIGNAL, cb);
+}
+
+// ---------------------------------------------------------------------------
+// The DeckLink confidence preview surface
+// ---------------------------------------------------------------------------
+//
+// Two bindings, for the operator's own small picture of what the card is
+// capturing. They are appended at the END of this file on purpose, alongside the
+// channel-map block above: several work packages are editing this module at
+// once, and a section that depends on nothing but hasBinding/callGoBound can sit
+// here without colliding with any of them.
+//
+// ===================== IT IS THE SAME MECHANISM AS THE SRT PICTURE ==========
+//
+// A native child window, positioned by this page, painted over it. It is NOT a
+// <video> element and there is nothing here that could be one: the frames never
+// leave the Go process, and a browser element cannot be handed a GStreamer sink.
+// So the frontend's whole job is the same one overlay.js already does for the
+// return picture — reserve a rectangle, describe it in CSS pixels with the ratio
+// it was measured at, and say when it must be hidden — and app.js drives BOTH
+// surfaces through one createOverlay each rather than inventing a second
+// mechanism for the second window.
+//
+// ===================== BUT THERE IS NO START AND NO STOP ====================
+//
+// And that asymmetry with the picture is the whole shape of this feature. The
+// preview is a BRANCH OF THE CONTRIBUTION PIPELINE — a tee off the one capture,
+// because the card is exclusive and a second decklinkvideosrc is impossible —
+// so it exists exactly when a session that was started with it exists. It is
+// built at Start from the saved configuration and it cannot be added or removed
+// afterwards: MEASURED, a set_state(NULL) inside a blocking pad probe took the
+// ON-AIR leg from 50 fps to 0 permanently, with the pipeline still reporting
+// PLAYING. There is therefore nothing for a StartPreview binding to do that
+// would not be a way of doing that.
+//
+// It also means there is deliberately NO "preview" state event to mirror the
+// "picture" one. The page cannot learn from Go whether a branch was built, and
+// it does not need to: the native window is opaque and on top, so the caption
+// this page draws inside the reserved box is visible exactly when there is no
+// picture over it. See ui/videosource.js's describePreviewBox.
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const PREVIEW_METHODS = Object.freeze({
+  rect: 'SetPreviewRect',
+  visible: 'SetPreviewVisible',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const PREVIEW_METHOD_NAMES = Object.freeze(Object.values(PREVIEW_METHODS));
+
+/**
+ * previewAvailable reports whether this build can position the preview surface
+ * at all.
+ *
+ * BOTH, all-or-nothing, for the reason pictureAvailable spells out at length: a
+ * build with SetPreviewRect but not SetPreviewVisible would reserve a box, paint
+ * a native window into it, and then have no way to take it off the Settings
+ * screen or the mixer drawer — an opaque rectangle over a form the operator is
+ * trying to read, which is worse than no preview at all.
+ *
+ * It is FALSE on a remote client, and that is correct rather than incidental:
+ * these are host-only, the surface is drawn by the commentary PC's own graphics
+ * hardware, and no rectangle measured in a browser on the LAN describes anything
+ * that exists. A remote seat reserves no box.
+ */
+export function previewAvailable() {
+  return PREVIEW_METHOD_NAMES.every(hasBinding);
+}
+
+let fakePreviewRect = null;
+let fakePreviewVisible = false;
+
+/**
+ * Positions the preview surface.
+ *
+ * CSS PIXELS AND THE RATIO, IN ONE CALL — identical to setPictureRect, and for
+ * the identical reason: gst.ScaleRect multiplies on the Go side because the
+ * factor Go could read for itself is a different number measured at a different
+ * moment, and the two travel together so a rectangle can never be paired with a
+ * ratio from before or after it. See setPictureRect's comment; there is one
+ * conversion rule in this application and overlay.js owns it.
+ *
+ * @param {{x: number, y: number, width: number, height: number}} cssRect
+ * @param {number} devicePixelRatio  window.devicePixelRatio, as measured
+ */
+export async function setPreviewRect(cssRect, devicePixelRatio) {
+  const { x, y, width, height } = cssRect || {};
+  if (hasWails()) {
+    return callGoBound(PREVIEW_METHODS.rect, x, y, width, height, devicePixelRatio);
+  }
+  fakePreviewRect = { x, y, width, height, devicePixelRatio };
+}
+
+/**
+ * Shows or hides the preview surface without touching the pipeline branch that
+ * feeds it.
+ *
+ * Hiding is what Settings and the mixer drawer need. It must never be answered
+ * by tearing the branch down instead: that is the set_state(NULL) that stops the
+ * feed going to air, and it would be reached by nothing more exotic than opening
+ * Settings mid-match.
+ *
+ * @param {boolean} visible
+ */
+export async function setPreviewVisible(visible) {
+  if (hasWails()) return callGoBound(PREVIEW_METHODS.visible, visible === true);
+  fakePreviewVisible = visible === true;
+}
+
+/**
+ * The fake preview surface's last known geometry, for a dev session in the
+ * browser where there is no native window to look at. Diagnostics only; nothing
+ * reads it. Mirrors fakePictureOverlay.
+ */
+export function fakePreviewSurface() {
+  return { rect: fakePreviewRect, visible: fakePreviewVisible };
 }

@@ -83,6 +83,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"wslcomms/internal/config"
@@ -458,6 +459,23 @@ func (a *App) newPictureOverlay() (gst.PictureOverlay, error) {
 	return gst.NewPictureOverlay(windowTitle)
 }
 
+// newPreviewOverlay builds the PREVIEW's surface, through the same overlayDial
+// seam so the tests can substitute the same fake.
+//
+// It is a separate constructor rather than a second call to newPictureOverlay
+// because of the PURPOSE argument. There are two overlay views in this
+// process's window now, installed the same way into the same contentView, and
+// internal/gst's overlay files report all three of their lifecycle events
+// through one set of log lines. Without a word telling them apart, a field log
+// from a machine where one of the two ended up in the wrong place says only
+// that "the overlay" moved — which is the moment the distinction is worth most.
+func (a *App) newPreviewOverlay() (gst.PictureOverlay, error) {
+	if a.overlayDial != nil {
+		return a.overlayDial()
+	}
+	return gst.NewOverlaySurface(windowTitle, gst.PreviewSurfacePurpose)
+}
+
 // applyPictureVisibilityViewLocked pushes the effective visibility to the
 // overlay. a.picViewMu must be held.
 //
@@ -707,6 +725,260 @@ func (a *App) forwardPictureStates(states <-chan gst.PictureState, diag string) 
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The DeckLink preview: the operator's own confidence monitor
+// ---------------------------------------------------------------------------
+//
+// A SECOND native surface, on screen at the same time as the picture: the
+// programme return the commentator is watching above, and what THIS position is
+// actually sending below. It exists because a green SENDING lamp and a healthy
+// bitrate say nothing whatever about whether the camera is pointing at the
+// pitch, and until this there was nothing anywhere in the application that
+// could.
+//
+// It lives in this file because this is the file that owns native overlays, and
+// it duplicates the picture's shape deliberately rather than sharing it. The
+// picture's trio — picMu, picViewMu, picStateMu — belongs to a MONITOR that
+// starts and stops on its own; the preview has no monitor, no state machine and
+// no lock of its own beyond prevViewMu, because it is not a thing that runs. It
+// is a branch of the contribution pipeline.
+//
+// # THREE RULES, EACH OF WHICH IS A MEASUREMENT
+//
+//  1. IT IS BUILT AT START, FROM THE CONFIGURATION, AND NEVER ATTACHED LIVE.
+//     set_state(NULL) inside a blocking pad probe took the on-air leg from 50
+//     fps to 0 PERMANENTLY, with the pipeline still reporting PLAYING. There is
+//     therefore no "show the preview" that reaches into a running graph, and the
+//     bound setters below can only position and hide a surface that either
+//     exists for this session or does not.
+//
+//  2. IT SHARES THE ONE CAPTURE THROUGH A tee, BECAUSE A SECOND
+//     decklinkvideosrc IS IMPOSSIBLE. The card admits exactly one user: two in
+//     one process fail 3 of 3, and in two processes fail 3 of 3. So the preview
+//     is not a monitor that could be built beside the feed the way the SRT
+//     picture is — it is downstream of the same element, and everything about
+//     how it is throttled (12.5 fps, scale before convert, leaky=downstream on
+//     the head queue) exists to keep it from costing the feed anything. Those
+//     are internal/gst's business; what matters here is that the two are not
+//     independent and must not be reasoned about as though they were.
+//
+//  3. ITS FAILURES ARE SPARED. A preview that cannot get a window does not fail
+//     Start, does not stop the session and does not change one byte of what is
+//     transmitted: it logs, it tells the operator once, and the feed goes out
+//     without it. That is the same principle as internal/gst's bus filter
+//     treating a VIDEO capture error as recoverable, applied one layer up. A
+//     confidence monitor that could take the match off air would be worse than
+//     no confidence monitor.
+
+// SetPreviewRect tells the preview surface where it goes, in the same units and
+// with the same contract as SetPictureRect: CSS pixels relative to the page's
+// viewport, plus the page's own devicePixelRatio measured at the same moment.
+// Read that method's comment for why both halves are required and why the
+// frontend must call this from a ResizeObserver.
+//
+// # The one way it differs, and it is deliberate
+//
+// IT NEVER CREATES THE SURFACE. SetPictureRect does — the first layout call
+// after the window appears is what brings the picture's overlay into being —
+// and that is right there, because the picture's monitor can be started at any
+// time by the operator. The preview's cannot: it exists only while a session
+// whose video leg is a camera is running, and a surface created outside one
+// would be an opaque black rectangle over the page with nothing rendering into
+// it. So this records the rectangle and applies it if there is something to
+// apply it to; the surface is created by Start and by nothing else.
+//
+// It is HOST-ONLY. A remote seat must not move or resize a window on somebody
+// else's screen.
+func (a *App) SetPreviewRect(x, y, w, h, ratio float64) error {
+	rect := gst.ScaleRect(x, y, w, h, ratio)
+
+	// prevViewMu ONLY, and it NEVER takes sessMu. The order everywhere in this
+	// application is sessMu → prevViewMu — startSession holds sessMu while
+	// building the surface — so a layout call that reached for sessMu would be
+	// the reverse edge, and this one is called from the page's layout code on a
+	// Wails message-handler goroutine, where waiting on a pipeline state change
+	// is exactly what must not happen.
+	a.prevViewMu.Lock()
+	defer a.prevViewMu.Unlock()
+
+	a.prevRect = rect
+	if a.prevOverlay == nil {
+		// No session, or a session sending the slate. The rectangle is kept, so
+		// the next Start positions its surface before it is ever shown.
+		return nil
+	}
+	if err := a.prevOverlay.SetRect(rect); err != nil {
+		return err
+	}
+	// A rectangle can turn the surface from empty into non-empty, which is a
+	// visibility change nobody asked for.
+	a.applyPreviewVisibilityViewLocked()
+	return nil
+}
+
+// SetPreviewVisible tells the preview surface whether the page wants it on
+// screen. Like the picture's, it is an explicit statement rather than something
+// this side could infer, because the surface is OPAQUE and ALWAYS ON TOP OF ITS
+// RECTANGLE: anything the page draws there is invisible underneath it.
+//
+// It is a request. The surface is shown only when the page has asked for it AND
+// this session actually has a preview branch AND the rectangle has area — see
+// applyPreviewVisibilityViewLocked, where the middle condition is what stops a
+// black rectangle appearing over the controls of every seat that is sending a
+// slate.
+//
+// It is HOST-ONLY, for the same reason SetPictureVisible is.
+func (a *App) SetPreviewVisible(visible bool) error {
+	a.prevViewMu.Lock()
+	defer a.prevViewMu.Unlock()
+
+	a.prevWantVisible = visible
+	a.applyPreviewVisibilityViewLocked()
+	return nil
+}
+
+// startSessionPreview creates the preview surface for the session about to be
+// built and returns the window handle its branch renders into, or 0 for no
+// preview at all.
+//
+// It is called from startSession, under sessMu, BEFORE the pipeline exists,
+// because the handle is a build-time option — rule 1 in this section's header.
+// videoLegIsCamera is the pre-flight's verdict rather than the configuration's
+// intention: a seat that asked for a preview but whose video leg resolved to the
+// slate has nothing to preview, and it is the resolved answer that decides.
+//
+// # Every failure here is spared and none of them reaches the caller
+//
+// It returns 0 rather than an error, and startSession has no branch for it,
+// which is rule 3 made structural instead of remembered. The operator is still
+// told — an overlay that will not appear is a control they can see is missing —
+// but through the error event, beside a session that started perfectly.
+func (a *App) startSessionPreview(cfg *config.Config, videoLegIsCamera bool) uintptr {
+	if !cfg.DeckLinkPreviewEnabled || !videoLegIsCamera {
+		return 0
+	}
+
+	a.prevViewMu.Lock()
+	defer a.prevViewMu.Unlock()
+
+	overlay, err := a.previewOverlayViewLocked()
+	if err != nil {
+		log.Printf("wslcomms: the DeckLink preview could not get a window (%v); starting the "+
+			"session without it — the contribution feed is unaffected", err)
+		a.emitError(fmt.Errorf(
+			"wslcomms: the preview could not be shown, so the feed is going out without it — "+
+				"nothing about what is being transmitted has changed: %w", err))
+		return 0
+	}
+
+	a.prevRunning = true
+	a.applyPreviewVisibilityViewLocked()
+	return overlay.Handle()
+}
+
+// stopSessionPreview takes the preview surface away at the end of a session.
+//
+// It is called from the sender-state forwarder's exit, which runs after the
+// sender has closed its states channel — the last thing it does when stopping —
+// so the pipeline is already at NULL and nothing is rendering into the surface
+// by the time it is released. That ordering is the one stopPictureForTeardown
+// argues at length for both platforms, and it is not negotiable in either
+// direction.
+//
+// Unlike the picture's overlay, this surface does NOT outlive its session. The
+// picture's is kept because its monitor is rebuilt whenever the configuration
+// changes and a window destroyed and recreated under a running web view is a
+// z-order fight with nothing to gain; the preview's has no such churn — there is
+// exactly one per session — and keeping an idle opaque window over the page
+// between matches would be all cost.
+func (a *App) stopSessionPreview() {
+	a.prevViewMu.Lock()
+	defer a.prevViewMu.Unlock()
+
+	a.prevRunning = false
+
+	overlay := a.prevOverlay
+	a.prevOverlay = nil
+	if overlay == nil {
+		return
+	}
+
+	// Hidden before it is closed, so that the last thing the operator sees is the
+	// page rather than a frozen final frame while the surface is torn down. Both
+	// calls record and post rather than blocking; see overlay_windows.go's and
+	// overlay_darwin.go's headers.
+	if err := overlay.SetVisible(false); err != nil {
+		log.Printf("wslcomms: hiding the preview surface at the end of the session: %v", err)
+	}
+	if err := overlay.Close(); err != nil {
+		log.Printf("wslcomms: closing the preview surface at the end of the session: %v", err)
+	}
+}
+
+// previewOverlayViewLocked creates the preview surface. a.prevViewMu must be
+// held, and the caller must be startSessionPreview — nothing else may bring one
+// into being, for the reason SetPreviewRect gives.
+//
+// The window is created hidden and positioned from whatever rectangle the page
+// last gave, in that order, so it can never appear at 0,0 for a frame before
+// moving. On the first session after a launch the page has usually already laid
+// out and the rectangle is real; if it has not, the rectangle is empty, the
+// surface stays hidden, and the next SetPreviewRect brings it on screen.
+func (a *App) previewOverlayViewLocked() (gst.PictureOverlay, error) {
+	if a.prevOverlay != nil {
+		// A surface left from a previous session. startSession holds sessMu and
+		// the previous session's cleanup ran before it could, so this should not
+		// arise — but reusing it is the answer that cannot leak a window, and
+		// creating a second one over it is the answer that can.
+		return a.prevOverlay, nil
+	}
+	if a.closing.Load() {
+		return nil, errShuttingDown
+	}
+
+	overlay, err := a.newPreviewOverlay()
+	if err != nil {
+		return nil, err
+	}
+	a.prevOverlay = overlay
+
+	if err := overlay.SetRect(a.prevRect); err != nil {
+		// The surface exists and is hidden; it is recorded so stopSessionPreview
+		// will close it rather than leaving a window nothing owns.
+		return nil, err
+	}
+	return overlay, nil
+}
+
+// applyPreviewVisibilityViewLocked pushes the effective visibility to the
+// preview surface. a.prevViewMu must be held.
+//
+// Effective visibility is the AND of three facts, and the middle one is the
+// preview's own:
+//
+//	the page asked for it       or a preview covers the Settings screen
+//	this session HAS a preview  or a black rectangle covers the controls
+//	the rectangle has area      or the sink resizes its surface to nothing
+//
+// The picture's equivalent asks whether its monitor is SHOWING. The preview has
+// no state to ask, because it is not a thing that connects and reconnects: it is
+// either in the pipeline that is running or there is no pipeline. prevRunning is
+// that fact, recorded at Start.
+func (a *App) applyPreviewVisibilityViewLocked() {
+	if a.prevOverlay == nil {
+		return
+	}
+
+	visible := a.prevWantVisible && a.prevRunning && !a.prevRect.Empty()
+	if err := a.prevOverlay.SetVisible(visible); err != nil {
+		// Reported rather than swallowed, for the reason the picture's is: a
+		// surface that will not hide is a window over the operator's controls,
+		// which they can see and cannot explain.
+		a.emitError(fmt.Errorf("wslcomms: the preview surface would not %s: %w",
+			map[bool]string{true: "appear", false: "hide"}[visible], err))
+	}
+}
+
 // stopPictureForTeardown is the picture's step of the ordered shutdown: stop the
 // monitor, then take the overlay surface away.
 //
@@ -791,6 +1063,14 @@ func (a *App) stopPictureForTeardown() error {
 	if err := a.StopPicture(); err != nil && !errors.Is(err, errPictureNotRunning) {
 		problems = append(problems, err)
 	}
+
+	// The preview surface, as a BELT. It normally went with its session, which
+	// teardownOrdered stops several steps before this one — but a sender step
+	// that overran was ABANDONED rather than waited for, and this is the last
+	// chance to take a window off the operator's screen before the process ends.
+	// It is idempotent and costs one dispatch when there is nothing there, which
+	// is every ordinary quit.
+	a.stopSessionPreview()
 
 	// picViewMu, which is where the overlay lives. StopPicture has already
 	// released picMu by now, so this takes nothing while holding anything.

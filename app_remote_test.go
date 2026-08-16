@@ -71,6 +71,10 @@ func TestRemoteHostOnlySet(t *testing.T) {
 		"SetPictureRect": true, "SetPictureVisible": true,
 		"StartPicture": true, "StopPicture": true,
 		"StartReturn": true, "StopReturn": true,
+		// the DeckLink preview's surface: the same argument as the picture's two
+		"SetPreviewRect": true, "SetPreviewVisible": true,
+		// what this position puts ON AIR, and the window on the operator's screen
+		"SetVideoSource": true, "SetDeckLinkPreviewEnabled": true,
 		// remote administration (local Settings screen only)
 		"GetRemoteState": true, "SetRemoteListener": true,
 	}
