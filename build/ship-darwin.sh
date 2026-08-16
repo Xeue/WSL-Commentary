@@ -66,6 +66,45 @@ cd "$REPO"
 IDENTITY="${WSLCOMMS_SIGN_IDENTITY:-Developer ID Application: Sygnal TV Ltd (5P76UVY5WF)}"
 PROFILE="${WSLCOMMS_NOTARY_PROFILE:-sygnal-notary}"
 
+# HOW WE AUTHENTICATE TO THE NOTARY SERVICE, and why there are two ways.
+#
+# The keychain profile is the documented, convenient one and stays the default.
+# But it is a single keychain item, and on this machine it has DISAPPEARED TWICE
+# in one evening: `xcrun notarytool store-credentials` reports "Success.
+# Credentials validated." and the very next `notarytool history` says
+# "No Keychain password item found for profile: sygnal-notary". Unlocked
+# keychain, item absent from every keychain in the search list. Cause unknown.
+#
+# A release that cannot be signed because a keychain item evaporated an hour ago
+# is not an acceptable failure mode at 16:00 on the day of an event, so the App
+# Store Connect API key is supported directly as a fallback. It is the SAME
+# credential the profile is built from — store-credentials just wraps it — so
+# this is not a second secret to manage, it is the first one used without the
+# wrapper. Set all three:
+#
+#   WSLCOMMS_NOTARY_KEY      path to the AuthKey_*.p8
+#   WSLCOMMS_NOTARY_KEY_ID   the key id, e.g. GNL2MN586N
+#   WSLCOMMS_NOTARY_ISSUER   the issuer uuid
+#
+# Neither the key id nor the issuer is secret — Apple's own documentation prints
+# both freely; only the .p8 bytes are. The .p8 must NOT live in this repo.
+NOTARY_KEY="${WSLCOMMS_NOTARY_KEY:-}"
+NOTARY_KEY_ID="${WSLCOMMS_NOTARY_KEY_ID:-}"
+NOTARY_ISSUER="${WSLCOMMS_NOTARY_ISSUER:-}"
+
+# NOTARY_AUTH is the notarytool authentication arguments, as an ARRAY so the
+# three call sites cannot disagree about which credential is in use.
+#
+# An array and not a string, and that is not style: the .p8 lives beside another
+# product whose checkout directory has a SPACE in its name, so a string here is
+# word-split into "--key /Users/sam/Documents/SYGNAL" and the credential check
+# fails with a message about the credential rather than about the quoting.
+if [ -n "$NOTARY_KEY" ]; then
+    NOTARY_AUTH=(--key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+else
+    NOTARY_AUTH=(--keychain-profile "$PROFILE")
+fi
+
 APP_NAME="WSL Commentary"
 BIN_DIR="$REPO/build/bin"
 APP="$BIN_DIR/$APP_NAME.app"
@@ -142,8 +181,16 @@ fi
 # The notary credentials, checked with the cheapest call that proves them —
 # about a second, against minutes for a submission that fails on auth.
 if [ "${SKIP_NOTARIZE:-}" != "1" ]; then
-    if ! xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
-        fail "notary keychain profile '$PROFILE' does not work.
+    if [ -n "$NOTARY_KEY" ] && { [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER" ]; }; then
+        fail "WSLCOMMS_NOTARY_KEY is set but WSLCOMMS_NOTARY_KEY_ID or WSLCOMMS_NOTARY_ISSUER is not.
+       All three are needed together, or none of them (which uses the keychain
+       profile instead)."
+    fi
+    if [ -n "$NOTARY_KEY" ] && [ ! -f "$NOTARY_KEY" ]; then
+        fail "WSLCOMMS_NOTARY_KEY points at $NOTARY_KEY, which is not a file."
+    fi
+    if ! xcrun notarytool history "${NOTARY_AUTH[@]}" >/dev/null 2>&1; then
+        fail "the notary credential does not work.
        Create it once with:
          xcrun notarytool store-credentials $PROFILE \\
            --apple-id <apple-id> --team-id 5P76UVY5WF --password <app-specific-password>
@@ -153,7 +200,7 @@ fi
 
 echo "  version           $VERSION"
 echo "  identity          $IDENTITY"
-echo "  notary profile    $PROFILE$([ "${SKIP_NOTARIZE:-}" = "1" ] && echo "   (SKIPPED)")"
+echo "  notary credential $([ -n "$NOTARY_KEY" ] && echo "API key $NOTARY_KEY_ID" || echo "keychain profile $PROFILE")$([ "${SKIP_NOTARIZE:-}" = "1" ] && echo "   (SKIPPED)")"
 echo "  entitlements      ${ENTITLEMENTS#"$REPO"/}"
 echo "  output            build/dist/wslcomms-$VERSION-macos-arm64.dmg"
 
@@ -456,7 +503,7 @@ echo "  self-contained: zero /opt/homebrew load commands in the signed bundle"
 notarize() {
     local what="$1" submit="$2" staple="$3" out id status
     echo "  submitting $(basename "$submit") — this takes minutes, and waiting is the point"
-    out="$(xcrun notarytool submit "$submit" --keychain-profile "$PROFILE" --wait 2>&1)" || {
+    out="$(xcrun notarytool submit "$submit" "${NOTARY_AUTH[@]}" --wait 2>&1)" || {
         echo "$out" >&2
         fail "notarytool submit failed for $what."
     }
@@ -468,7 +515,7 @@ notarize() {
         # means the failure is diagnosable from this script's own output rather
         # than from a submission id somebody has to go and look up.
         echo "  fetching the notary log for $id" >&2
-        xcrun notarytool log "$id" --keychain-profile "$PROFILE" >&2 || true
+        xcrun notarytool log "$id" "${NOTARY_AUTH[@]}" >&2 || true
         fail "$what was not accepted (status: $status)."
     fi
     xcrun stapler staple "$staple"
