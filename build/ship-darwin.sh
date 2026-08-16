@@ -560,22 +560,38 @@ STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-# THE VOLUME NAME MUST NOT EQUAL THE BUNDLE NAME. This used to be -volname
-# "$APP_NAME", i.e. "WSL Commentary", while the bundle inside it is
-# "WSL Commentary.app" — and hdiutil then fails the whole build with
+# THE VOLUME NAME CONTAINS NO SPACES, and it is worth knowing why before
+# somebody makes it prettier.
 #
-#	could not access /Volumes/WSL Commentary/WSL Commentary.app - Operation not permitted
+# hdiutil fails the whole build with a message that reads like a permissions
+# problem and is not one:
+#
+#	could not access /Volumes/WSL Commentary 0.1.0/WSL Commentary.app
+#	  - Operation not permitted
 #	hdiutil: create failed - Operation not permitted
 #
-# It is a name collision, not a permissions problem, and it was worth pinning
-# down because "Operation not permitted" on macOS 26 reads like TCC and sends
-# you looking for a Full Disk Access grant that changes nothing. Measured, three
-# ways: the same bundle into a volume called "WSL Commentary 0.1.0" succeeds;
-# a bundle renamed plain.app into a volume called "WSL Commentary" succeeds;
-# the two together fail every time. Appending the version also gives the mounted
-# volume a name that says which build is being installed, which is worth having
-# on a machine that has mounted three of them this week.
-hdiutil create -volname "$APP_NAME $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
+# On macOS 26 that wording sends you looking for a TCC grant or Full Disk
+# Access, and none of it is relevant. Isolated by bisection, 2026-08-16, with
+# the real signed bundle:
+#
+#	plain folder, any volname                    created
+#	app bundle, NO /Applications symlink         created
+#	app + symlink, -volname "PlainVol"           created
+#	app + symlink, -volname "WSL-Commentary-0.1.0"  created
+#	app + symlink, -volname "WSL Commentary 0.1.0"  FAILS
+#
+# So it is the SPACES in the volume name, in combination with the symlink, and
+# hyphens are reliable. HONESTLY STATED: the spaced name succeeded once earlier
+# the same day under what looked like identical conditions, so something about
+# this is stateful and is not fully understood — a stale /Volumes entry is the
+# obvious suspect and was not present when the failures were reproduced. The
+# hyphenated name is therefore a WORKAROUND for a mechanism that is only
+# partly characterised, not a fix for one that is.
+#
+# It costs nothing: the volume name is what Finder shows while the image is
+# mounted, and "WSL-Commentary-0.1.0" says which build is being installed just
+# as well as the spaced form did. The .app inside it keeps its proper name.
+hdiutil create -volname "$(printf %s "$APP_NAME" | tr " " "-")-$VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
 rm -rf "$STAGE"
 # The disk image is signed too, but WITHOUT the hardened runtime and without
 # entitlements: it is a container, not code, and codesign's runtime option on a
