@@ -118,6 +118,42 @@ export function isSilentFrame(frame) {
 }
 
 /**
+ * frameChannels normalises one levels frame to EXACTLY `count` channels of peak
+ * and RMS, clamped at the silence floor: short frames are padded with silence,
+ * long ones are truncated, and missing or non-numeric entries read as silence.
+ *
+ * It exists because the DeckLink channel map draws one meter per NEGOTIATED
+ * capture channel (ui/channelmap.js), and the number of meters on screen and the
+ * number of channels in a frame are decided by different things at different
+ * moments — the pad negotiates once, the frames arrive twenty times a second,
+ * and a capture that renegotiates mid-session moves one before the other. The
+ * failure being closed is not a crash: it is a bar left standing at the last
+ * level it was painted with after the channel behind it stopped existing, which
+ * an operator reads as a live commentator.
+ *
+ * The stereo pair beside the picture does not need it — home.js indexes two
+ * fixed meters and an absent channel simply paints nothing — which is why this
+ * is a separate function rather than a change to what that path does.
+ *
+ * @param {{peak?: unknown, rms?: unknown}|null|undefined} frame
+ * @param {number} count how many channels the caller has meters for
+ * @returns {{peak: number[], rms: number[]}}
+ */
+export function frameChannels(frame, count) {
+  const width = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  const take = (values) => {
+    const list = Array.isArray(values) ? values : [];
+    const out = new Array(width);
+    for (let i = 0; i < width; i += 1) {
+      const db = list[i];
+      out[i] = typeof db === 'number' && Number.isFinite(db) ? Math.max(LEVELS_SILENCE_DB, db) : LEVELS_SILENCE_DB;
+    }
+    return out;
+  };
+  return { peak: take(frame?.peak), rms: take(frame?.rms) };
+}
+
+/**
  * PEAK_HOLD_MS is how long a peak-hold marker sits at the highest level seen
  * before it starts to fall. ~1.5 s is the broadcast convention: long enough to
  * read after a glance away, short enough that it is this passage and not the

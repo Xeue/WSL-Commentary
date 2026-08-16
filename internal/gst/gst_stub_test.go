@@ -850,7 +850,14 @@ func TestPipelineDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
 		t.Fatal("the audio branch pins a sample rate upstream of audioresample; " +
 			"a DVS endpoint at 44.1 or 96 kHz will fail negotiation at Start")
 	}
-	if !strings.Contains(body, "audioconvert ! audioresample") {
+	// audioconvert acquired a NAME when the channel map landed — the mapping
+	// mechanism needs a handle on the element whose mix-matrix carries it — so
+	// the two elements are checked as a sequence rather than as one literal.
+	// The property being asserted is unchanged: convert and resample whatever
+	// the endpoint gives us, in that order, with nothing pinned above them.
+	convert := strings.Index(body, "audioconvert name=")
+	resample := strings.Index(body, "audioresample")
+	if convert < 0 || resample < 0 || convert > resample {
 		t.Fatal("the audio branch no longer converts and resamples whatever the endpoint gives us")
 	}
 	if !strings.Contains(body, "audio/x-raw,format=S16LE,rate=48000,channels=2") {
@@ -1817,6 +1824,129 @@ func TestStubEmitsLevelsWhileStarted(t *testing.T) {
 	}
 }
 
+// TestStubEmitsPerChannelLevelsAtTheNegotiatedWidth is the picker meter's Gate A
+// life-support: without it the sixteen-strip UI can only be driven by the real
+// card, which is EXCLUSIVE — one process, one holder — so at most one person on
+// the project could ever watch it move.
+//
+// The width is the fake pad's, not a constant, because the whole point of the
+// picker is that the count is whatever the card negotiated. Sixteen distinct
+// starting phases is the other assertion worth making here: a picker that has
+// drawn one channel four times looks exactly like four groups of four bars
+// moving together, and stubChannelLevelsAt spreads the phases evenly precisely
+// so the fake cannot manufacture the failure it exists to expose.
+func TestStubEmitsPerChannelLevelsAtTheNegotiatedWidth(t *testing.T) {
+	const channels = 16
+
+	frames := make(chan Levels, 128)
+	p := NewStubPipeline()
+	p.SetStubInputChannels(channels)
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		OnChannelLevels: func(l Levels) {
+			select {
+			case frames <- l:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop()
+
+	deadline := time.After(3 * time.Second)
+	var got []Levels
+	for len(got) < 3 {
+		select {
+		case l := <-frames:
+			got = append(got, l)
+		case <-deadline:
+			t.Fatalf("only %d per-channel frames arrived in 3s at a 100ms interval; want at least 3",
+				len(got))
+		}
+	}
+
+	for i, l := range got {
+		if len(l.PeakDB) != channels || len(l.RMSDB) != channels {
+			t.Fatalf("frame %d has %d peak / %d rms channels, want %d of each: the frame's LENGTH "+
+				"is what the renderer lays its strips out from, so a wrong width is a wrong grid",
+				i, len(l.PeakDB), len(l.RMSDB), channels)
+		}
+	}
+
+	// No two channels in lockstep, in the frame the fake actually produced.
+	seen := map[float64]int{}
+	for ch, v := range got[0].PeakDB {
+		if prev, dup := seen[v]; dup {
+			t.Errorf("channels %d and %d have identical levels (%v); the fake must not produce "+
+				"bars that move together, because that is indistinguishable from a UI drawing "+
+				"one channel twice", prev, ch, v)
+		}
+		seen[v] = ch
+	}
+}
+
+// TestStubSendsNoPerChannelLevelsForAPositionedDevice is the parity that keeps
+// the stub honest about the on-air Windows path.
+//
+// The real build creates chlevel with post-messages=false and arms it only when
+// a mix matrix was written — which happens only for an unpositioned source. An
+// ordinary microphone therefore posts not one per-channel frame for a whole
+// match, and a stub that produced them anyway would let the UI come to depend on
+// a stream the shipped build does not send.
+func TestStubSendsNoPerChannelLevelsForAPositionedDevice(t *testing.T) {
+	var mu sync.Mutex
+	channelFrames, programmeFrames := 0, 0
+
+	p := NewStubPipeline() // the default fake pad: two channels, positioned
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: stubCaptureID,
+		OnLevels: func(Levels) {
+			mu.Lock()
+			programmeFrames++
+			mu.Unlock()
+		},
+		OnChannelLevels: func(Levels) {
+			mu.Lock()
+			channelFrames++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop()
+
+	// Long enough for several of both, if both were running.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		prog := programmeFrames
+		mu.Unlock()
+		if prog >= 8 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	prog, chans := programmeFrames, channelFrames
+	mu.Unlock()
+
+	if prog == 0 {
+		t.Fatal("the programme meter never fired; this test cannot say anything about the picker")
+	}
+	if chans != 0 {
+		t.Errorf("the stub delivered %d per-channel frames for a POSITIONED two-channel device "+
+			"(after %d programme frames). The real build posts none: there is no matrix on such a "+
+			"pipeline, so there is nothing the picker could show that the programme meter does not",
+			chans, prog)
+	}
+}
+
 func TestStubLevelsStopWhenThePipelineStops(t *testing.T) {
 	var mu sync.Mutex
 	calls := 0
@@ -1982,7 +2112,11 @@ func TestPipelineDescriptionMetersWhatIsEncoded(t *testing.T) {
 		t.Fatal("the audio branch has no level element named alevel; the input meters have " +
 			"nothing to measure and the levels event will never fire on a real build")
 	}
-	resample := strings.Index(body, "audioconvert ! audioresample")
+	// audioresample rather than the old "audioconvert ! audioresample" literal:
+	// audioconvert is named since the channel map landed, so the two are no
+	// longer adjacent in the source text. The ORDER this guard is about —
+	// resample, then level, then the encoder — is unaffected.
+	resample := strings.Index(body, "audioresample")
 	// The encoder is named through aacEncoderFactory rather than as a literal
 	// since the macOS port — mfaacenc on Windows, atenc on macOS. The ORDER is
 	// what this guard is about and it is unaffected;
@@ -2056,5 +2190,374 @@ func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
 	if store > parse {
 		t.Error("Start stores OnLevels after building the pipeline; level messages posted " +
 			"during startup race the store on a streaming thread")
+	}
+}
+
+// TestStartPublishesOnChannelLevelsBeforeBuildingThePipeline is the same
+// guarantee for the PER-CHANNEL picker, and it matters more rather than less.
+//
+// The programme meter that drops its first few frames looks like a meter coming
+// up. The picker is what the operator is staring at while they decide whether
+// the mapping screen works at all, so frames dropped at the start read as a dead
+// meter and send them looking for the fault somewhere else entirely.
+func TestStartPublishesOnChannelLevelsBeforeBuildingThePipeline(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+
+	store := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.onChannelLevels.Store(")
+	})
+	parse := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "gogst.ParseLaunch(")
+	})
+	if store < 0 {
+		t.Fatal("Start never stores PipelineOpts.OnChannelLevels; the per-channel meters would " +
+			"have no consumer and every chlevel frame would be dropped")
+	}
+	if parse < 0 {
+		t.Fatal("Start no longer calls gogst.ParseLaunch; re-derive this guard from the new shape")
+	}
+	if store > parse {
+		t.Error("Start stores OnChannelLevels after building the pipeline; the level element " +
+			"starts posting the moment the pipeline reaches PLAYING, which happens inside Start")
+	}
+}
+
+// TestBusHandlerRoutesEachMeterToItsOwnCallback is the cross-wire guard, at the
+// receive end.
+//
+// The two level elements post an identically named structure, so the ONLY thing
+// keeping the picker's sixteen-entry frames out of the programme meter is that
+// each kind loads a different callback. MEASURED with both in one pipeline: 39
+// level messages a second, every one of them matching the structure name. A
+// programme meter fed alternately with two-entry and sixteen-entry frames does
+// not fail — it flickers between two different signals, which is a meter reading
+// as live while showing something that is not going to air.
+func TestBusHandlerRoutesEachMeterToItsOwnCallback(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+
+	if !strings.Contains(body, "p.onChannelLevels.Load()") {
+		t.Error("onBusMessage no longer loads onChannelLevels; chlevel's frames would be dropped " +
+			"and the routing screen's meters would never move, with nothing in the log to say why")
+	}
+	prog := strings.Index(body, "p.onLevels.Load()")
+	chans := strings.Index(body, "p.onChannelLevels.Load()")
+	if prog < 0 || chans < 0 {
+		t.Fatal("onBusMessage no longer loads both meter callbacks; re-derive this guard")
+	}
+	// Each callback is loaded exactly once. Two loads of the same field would be
+	// two delivery paths for one meter, which is how a frame ends up on both.
+	if strings.Count(body, "p.onLevels.Load()") != 1 || strings.Count(body, "p.onChannelLevels.Load()") != 1 {
+		t.Error("a meter callback is loaded more than once in onBusMessage; there must be exactly " +
+			"one delivery path per meter, or a frame can reach both")
+	}
+}
+
+// TestPerChannelMeterIsArmedFromTheMatrixDecision pins the property that keeps a
+// seat with no capture card exactly as it was.
+//
+// chlevel is built with post-messages=false, so it is silent until something
+// arms it, and the condition it is armed on is "a mix matrix was written" —
+// which is precisely the statement "this source presents channels nobody has
+// positioned". Every microphone and every Dante endpoint presents a positioned
+// stereo pair, for which this meter would report the same two numbers the
+// programme meter already reports: a duplicate, ten times a second, over the
+// webview bridge, for a whole match.
+func TestPerChannelMeterIsArmedFromTheMatrixDecision(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+
+	desc := funcBody(t, fset, file, "", "pipelineDescription")
+	if !strings.Contains(desc, "post-messages=false") {
+		t.Error("the per-channel level element is no longer built with post-messages=false; " +
+			"every native capture would start posting sixteen-channel frames nobody asked for")
+	}
+
+	start := funcBody(t, fset, file, "cgoPipeline", "Start")
+	arm := strings.Index(start, "p.armChannelMeterLocked(")
+	if arm < 0 {
+		t.Fatal("Start never arms the per-channel meter; it is built silent, so the routing " +
+			"screen's meters would never move on any machine")
+	}
+	if !strings.Contains(start[arm:arm+len("p.armChannelMeterLocked(")+120], "p.matrixWidth > 0") {
+		t.Error("the per-channel meter is no longer armed from whether a matrix was written; " +
+			"that condition IS the test for an unpositioned source, and without it the on-air " +
+			"Windows path grows a second meter it has no use for")
+	}
+	if !strings.Contains(start[arm:arm+len("p.armChannelMeterLocked(")+120], "opts.OnChannelLevels != nil") {
+		t.Error("the per-channel meter is armed without checking that anybody wants its frames; " +
+			"messages posted for a consumer that does not exist are cost with no reader")
+	}
+}
+
+// TestStopStopsTheSignalWatchdogBeforeTheTeardown is an ordering guard on the
+// one thing in Stop that touches a GStreamer element from another goroutine.
+//
+// The watchdog's reader closure holds the capture element. teardownLocked takes
+// the pipeline to NULL and drops it, so a poll that ran afterwards would be a
+// property read on freed memory. Stop JOINS, which additionally guarantees no
+// report can arrive after the session has ended — a lamp coming back on for a
+// pipeline that no longer exists is the direction this project never lets a
+// status display be wrong in.
+func TestStopStopsTheSignalWatchdogBeforeTheTeardown(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Stop"), "\n")
+
+	stop := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.sigWatch.Stop()")
+	})
+	teardown := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.teardownLocked()")
+	})
+	if stop < 0 {
+		t.Fatal("Stop never stops the signal watchdog; its goroutine would outlive the pipeline " +
+			"and go on reading a property off a disposed element")
+	}
+	if teardown < 0 {
+		t.Fatal("Stop no longer calls teardownLocked; re-derive this guard from the new shape")
+	}
+	if stop > teardown {
+		t.Error("Stop tears the pipeline down before stopping the watchdog; the reader closure " +
+			"holds the capture element, and a read after disposal is a read on freed memory")
+	}
+}
+
+// TestStartStartsTheWatchdogOnlyAfterPlaying pins the other half of the
+// watchdog's lifecycle: it is the last thing Start does before returning nil, so
+// that no abort() path can leak the goroutine.
+func TestStartStartsTheWatchdogOnlyAfterPlaying(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+
+	watch := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "startSignalWatch(")
+	})
+	play := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "gogst.StatePlaying")
+	})
+	abort := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "return abort(")
+	})
+	if watch < 0 {
+		t.Fatal("Start never starts the signal watchdog; the lamp would stay UNKNOWN for the " +
+			"whole of every match and the one fault nothing else can see would be invisible")
+	}
+	if play < 0 {
+		t.Fatal("Start no longer sets the pipeline PLAYING; re-derive this guard")
+	}
+	if watch < play {
+		t.Error("the signal watchdog is started before the pipeline is PLAYING; it would be " +
+			"polling an element that has not opened its device")
+	}
+	if abort >= 0 && watch < abort {
+		t.Error("the signal watchdog is started before Start's last abort() path; a failure " +
+			"after it would leak the goroutine and its ticker for the life of the process")
+	}
+}
+
+// --- The channel map ------------------------------------------------------
+//
+// The tests below drive the STUB, but almost everything they assert is decided
+// by the shared model in channelmap.go, which the real twin writes from
+// unchanged. What is genuinely stub-specific is the plumbing: which pipeline
+// states accept a map, what a positioned device does, and that a refused write
+// leaves the previous map in force.
+
+// TestStubStartAppliesTheZeroChannelMapToAWideDevice is requirement five seen
+// from the pipeline: an operator who never opens the mapping UI gets audio off
+// a sixteen-channel card.
+func TestStubStartAppliesTheZeroChannelMapToAWideDevice(t *testing.T) {
+	p := NewStubPipeline()
+	defer p.Stop()
+	p.SetStubInputChannels(16)
+
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
+		t.Fatalf("Start with no channel map: %v", err)
+	}
+	if got := p.InputChannels(); got != 16 {
+		t.Fatalf("InputChannels = %d, want 16", got)
+	}
+	m, written := p.ChannelMap()
+	if !written {
+		t.Fatal("no matrix was written for a sixteen-channel device; audioconvert cannot map an " +
+			"unpositioned stream to stereo without one and the pipeline would die with not-negotiated")
+	}
+	if !m.IsDefault() {
+		t.Errorf("the map in force is %v, want the zero value", m)
+	}
+	// The zero value has to resolve to something audible against the width the
+	// pad reported, which is the whole of the requirement.
+	matrix, err := m.MixMatrix(p.InputChannels())
+	if err != nil {
+		t.Fatalf("the map in force cannot be built against the negotiated width: %v", err)
+	}
+	if matrix[OutputLeft][0] != 1 || matrix[OutputRight][1] != 1 {
+		t.Errorf("the unset map does not put channels 1 and 2 on air at unity: %v", matrix)
+	}
+}
+
+// TestStubStartRefusesAMapTheDeviceCannotSatisfy proves the validation happens
+// at Start rather than at the first buffer. A map naming channel 12 on an
+// eight-channel device is refused with the pipeline still stopped, because the
+// alternative is a matrix of the wrong width, and a matrix of the wrong width
+// stops the capture chain rather than degrading it.
+func TestStubStartRefusesAMapTheDeviceCannotSatisfy(t *testing.T) {
+	p := NewStubPipeline()
+	defer p.Stop()
+	p.SetStubInputChannels(8)
+
+	err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: "2747401380",
+		ChannelMap:    ChannelMap{{Output: OutputLeft, Input: 11, Gain: 1}},
+	})
+	if err == nil {
+		t.Fatal("Start accepted a map naming input 11 on an eight-channel device")
+	}
+	if !errors.Is(err, ErrChannelMap) {
+		t.Errorf("Start's refusal does not wrap ErrChannelMap: %v", err)
+	}
+}
+
+// TestStubSetChannelMapIsLiveAndValidatesFirst covers the live control and the
+// order that makes it safe. The pipeline stays where it was, and a refused map
+// leaves the PREVIOUS one in force — which is what the element does too, except
+// that the element does it silently and this can be observed.
+func TestStubSetChannelMapIsLiveAndValidatesFirst(t *testing.T) {
+	p := NewStubPipeline()
+	defer p.Stop()
+	p.SetStubInputChannels(16)
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.ReplaceSink(SinkOpts{Host: "m2lx.example", Port: 9000}); err != nil {
+		t.Fatalf("ReplaceSink: %v", err)
+	}
+
+	good := ChannelMap{{Output: OutputLeft, Input: 4, Gain: 0.5}, {Output: OutputRight, Input: 5, Gain: 0.5}}
+	if err := p.SetChannelMap(good); err != nil {
+		t.Fatalf("SetChannelMap while running: %v", err)
+	}
+	if p.State() != StubStateSinkAttached {
+		t.Errorf("state is %s after a live channel map change; the real element renegotiates "+
+			"nothing and the pipeline never leaves PLAYING", p.State())
+	}
+
+	// 1.0000001 is the measured boundary: the element rejects it and keeps
+	// running the previous matrix, so the map recorded here must not change.
+	bad := ChannelMap{{Output: OutputLeft, Input: 0, Gain: 1.0000001}}
+	if err := p.SetChannelMap(bad); err == nil {
+		t.Fatal("a coefficient of 1.0000001 was accepted; audioconvert refuses it silently")
+	}
+	m, _ := p.ChannelMap()
+	if len(m) != len(good) || m[0] != good[0] {
+		t.Errorf("a refused map changed what is in force: %v, want %v. The element leaves the "+
+			"previous matrix running on a rejected write, so anything that recorded the bad map "+
+			"would make the application disagree with the hardware about what is on air", m, good)
+	}
+}
+
+// TestStubSetChannelMapRefusesAPositionedDevice covers the case that is every
+// microphone and the whole of the on-air Windows path: audioconvert maps a
+// positioned stream on its own, no matrix is written, and there is therefore
+// nothing to change live. Writing one would renegotiate the caps the feed is
+// running on to achieve a routing the device has no channels for.
+func TestStubSetChannelMapRefusesAPositionedDevice(t *testing.T) {
+	p := NewStubPipeline()
+	defer p.Stop()
+	if err := p.Start(PipelineOpts{
+		SlatePath:     "slate.png",
+		AudioDeviceID: "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, written := p.ChannelMap(); written {
+		t.Error("a matrix was written for a two-channel positioned device; the on-air path must " +
+			"set no property at all and behave exactly as it did before this mechanism existed")
+	}
+	if err := p.SetChannelMap(ChannelMap{{Output: OutputLeft, Input: 0, Gain: 1}}); err == nil {
+		t.Error("SetChannelMap was accepted on a positioned device")
+	}
+}
+
+// TestStubInputChannelsIsZeroWhenNothingIsNegotiated pins the contract the real
+// twin keeps by reading the pad's CURRENT caps: before Start and after Stop
+// there is no negotiated width, and 0 is the honest answer rather than the last
+// one that happened to be true.
+func TestStubInputChannelsIsZeroWhenNothingIsNegotiated(t *testing.T) {
+	p := NewStubPipeline()
+	p.SetStubInputChannels(16)
+	if got := p.InputChannels(); got != 0 {
+		t.Errorf("InputChannels before Start = %d, want 0", got)
+	}
+	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := p.InputChannels(); got != 16 {
+		t.Errorf("InputChannels while running = %d, want 16", got)
+	}
+	p.Stop()
+	if got := p.InputChannels(); got != 0 {
+		t.Errorf("InputChannels after Stop = %d, want 0", got)
+	}
+	if err := p.SetChannelMap(nil); err == nil {
+		t.Error("SetChannelMap was accepted on a stopped pipeline")
+	}
+}
+
+// TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad is a source guard over the
+// half of this mechanism Gate A cannot run.
+//
+// The decisive property is that SetChannelMap takes NO WIDTH FROM ITS CALLER.
+// It reads the pad's negotiated caps itself, so a caller cannot pass a stale
+// count saved in config.json or the max-channels the device advertises. A
+// matrix of the wrong width does not attenuate or misroute — measured on the
+// card, a 2x8 matrix written live onto a sixteen-channel stream was accepted by
+// the property and killed the capture chain before the next level message.
+func TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+
+	set := funcBody(t, fset, file, "cgoPipeline", "SetChannelMap")
+	if !strings.Contains(set, "p.negotiatedInputChannelsLocked()") {
+		t.Error("SetChannelMap no longer reads the width off the pad; the only widths it may use " +
+			"are the pad's own, because every other source of one can be stale")
+	}
+	if !strings.Contains(set, "p.writeChannelMapLocked(m, width)") {
+		t.Error("SetChannelMap no longer writes through writeChannelMapLocked, which is where " +
+			"validation happens before anything reaches the element")
+	}
+
+	write := funcBody(t, fset, file, "cgoPipeline", "writeChannelMapLocked")
+	matrix := strings.Index(write, "m.MixMatrix(width)")
+	arg := strings.Index(write, "gogst.UtilSetObjectArg(")
+	if matrix < 0 || arg < 0 {
+		t.Fatal("writeChannelMapLocked has been restructured out of the shape this guard reads; " +
+			"re-derive it from the new one rather than deleting it")
+	}
+	if matrix > arg {
+		t.Error("writeChannelMapLocked writes the property before validating the map. " +
+			"audioconvert rejects an out-of-range coefficient SILENTLY and leaves the previous " +
+			"matrix in force, so validation after the write can never happen")
+	}
+
+	// The matrix has to be in place before the pipeline leaves NULL: it is a
+	// negotiation constraint, not a gain on a running stream. Measured —
+	// sixteen unpositioned channels into this chain with no matrix die 0.069 s
+	// after PLAYING with not-negotiated (-4).
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Start"), "\n")
+	apply := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "p.applyStartChannelMapLocked(")
+	})
+	playing := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "gogst.StatePlaying")
+	})
+	if apply < 0 || playing < 0 {
+		t.Fatal("Start no longer applies a channel map before going to PLAYING; re-derive this " +
+			"guard from the new shape")
+	}
+	if apply > playing {
+		t.Error("Start writes the mix-matrix after the state change. A matrix is a negotiation " +
+			"constraint, not a gain: a pipeline that reaches PLAYING without one on an " +
+			"unpositioned device never reaches it at all")
 	}
 }

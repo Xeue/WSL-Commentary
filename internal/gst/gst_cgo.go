@@ -278,16 +278,41 @@ const (
 	nameSRTQueue   = "srtq"   // the leaky queue whose src pad feeds the sink
 	nameSlateSrc   = "slate"  // filesrc reading the slate PNG
 	nameAudioSrc   = "asrc"   // the platform capture source: captureSourceFactory
+	nameAudioConv  = "aconv"  // audioconvert, whose mix-matrix carries the channel map
 	nameVideoEncod = "venc"   // the H.264 encoder chosen at runtime
 	nameVideoScale = "vscale" // videoscale, so a slate that is not the conform size still starts
 )
 
+// propMixMatrix is audioconvert's routing matrix: the property that says which
+// input channel reaches which output, and at what gain. It is the whole of the
+// channel-map mechanism at the GStreamer end; channelmap.go is the model above
+// it and holds the measurements.
+//
+// It is named here rather than written as a literal for the reason
+// propPersistentID is: the name appears in a setter, in a hasProperty guard and
+// in the error a build without it would produce, and those three must agree.
+const propMixMatrix = "mix-matrix"
+
+// propPostMessages is the level element's gboolean switch for whether it posts
+// its measurements to the bus at all.
+//
+// It is what makes the per-channel picker meter something that can be turned on
+// when there is a reason to have it and left off otherwise, on a pipeline
+// already carrying commentary: measured live at 61 us, with that element's
+// messages stopping dead and the other level element in the same pipeline
+// carrying on untouched. See armChannelMeterLocked.
+const propPostMessages = "post-messages"
+
 // levelStructureName is the name of the GstStructure a level element posts in
 // its GST_MESSAGE_ELEMENT bus messages ("level", fixed by gst-plugins-good).
-// onBusMessage matches on the STRUCTURE name rather than on the element name,
-// because the structure name is the documented contract and survives the
-// element being renamed; element messages carrying any other structure pass
-// through the handler untouched.
+//
+// onBusMessage matches on it FIRST, because it is the documented contract for a
+// level message and is what separates a level report from every other element
+// message on this bus. It is not, on its own, enough to say which meter the
+// report belongs to: EVERY level element in the process posts this same name,
+// so the source element is tested straight afterwards. The element names, and
+// the routing they drive, are levelElementName / channelLevelElementName and
+// levelKindForSource in levels.go — untagged, so Gate A can check them.
 const levelStructureName = "level"
 
 // Package-level GStreamer initialisation state. Init is idempotent because
@@ -984,6 +1009,43 @@ type cgoPipeline struct {
 	// bus is the pipeline's bus, held so that Stop can detach the sync handler.
 	bus gogst.Bus
 
+	// aconv is the audioconvert element carrying the channel map, and
+	// aconvSinkPad is the pad whose NEGOTIATED caps size the matrix written to
+	// it. The pad is held rather than looked up per call because
+	// InputChannels() is a UI-facing read that may arrive many times a second
+	// while the mapping panel is open, and a GetByName plus a GetStaticPad per
+	// call would be two cgo round trips to answer a question the pad itself
+	// answers in one.
+	//
+	// Both are nil until Start has parsed the pipeline, and are cleared by
+	// teardownLocked. Everything that touches them holds mu — see
+	// InputChannels for why that is the right lock even though it is the one
+	// held across state changes.
+	aconv        gogst.Element
+	aconvSinkPad gogst.Pad
+
+	// matrixWidth is the input channel count the mix-matrix currently written to
+	// aconv was built for, and is ZERO WHEN NO MATRIX HAS BEEN WRITTEN — the
+	// ordinary state on a positioned capture source, where audioconvert's own
+	// downmix is doing the work and there is nothing for SetChannelMap to
+	// change without renegotiating the caps the feed is running on. Guarded by
+	// mu.
+	//
+	// The MAP itself is deliberately not kept beside it. There is nothing to
+	// compare it against — mix-matrix is a GST_TYPE_ARRAY and does not marshal
+	// back, so the element cannot be asked what it is running — and a field
+	// nothing reads is a second, unverifiable account of the same fact. The
+	// record of what was written is the log line each write emits, which is
+	// where a field engineer looks anyway.
+	matrixWidth int
+
+	// sigWatch is the video signal watchdog, or nil when this pipeline has no
+	// element with a "signal" property to poll — every native capture, and the
+	// slate-only video leg shipping today. The nil is usable: Stop on it does
+	// nothing, so there is one unconditional call at teardown rather than a guard
+	// somebody can widen without noticing what it was for.
+	sigWatch *signalWatch
+
 	// encoder is the H.264 encoder element, kept for ForceKeyUnit.
 	encoder gogst.Element
 
@@ -1030,6 +1092,14 @@ type cgoPipeline struct {
 	// before the pipeline is built, and never cleared: busSilenced already
 	// stops delivery at teardown.
 	onLevels atomic.Pointer[func(Levels)]
+
+	// onChannelLevels is PipelineOpts.OnChannelLevels — the per-channel picker
+	// meter's frames, from chlevel rather than alevel. Same type, same atomic,
+	// same reason, and deliberately a SEPARATE field rather than a wider
+	// callback: the two elements measure different points, and the whole of the
+	// routing in onBusMessage exists so that a frame from one can never be
+	// delivered as a frame from the other.
+	onChannelLevels atomic.Pointer[func(Levels)]
 
 	// busSilenced makes onBusMessage return immediately once the pipeline is
 	// being torn down. It exists because the bus sync handler is NEVER
@@ -1115,6 +1185,16 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if opts.OnLevels != nil {
 		cb := opts.OnLevels
 		p.onLevels.Store(&cb)
+	}
+	// The per-channel picker's callback, published here for exactly the same
+	// reason and with one extra consequence. chlevel is the meter the operator
+	// stares at while deciding whether the mapping screen is working at all, so
+	// frames dropped because the callback was stored a moment too late do not
+	// read as a slow start — they read as a dead meter, and the operator goes
+	// looking for the fault somewhere else.
+	if opts.OnChannelLevels != nil {
+		cb := opts.OnChannelLevels
+		p.onChannelLevels.Store(&cb)
 	}
 
 	encoderName, err := selectH264Encoder()
@@ -1202,6 +1282,45 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	if err := configureCaptureSource(asrc, opts.AudioDeviceID); err != nil {
 		return abort(err)
 	}
+
+	// The channel map, and it has to happen HERE — after the capture source has
+	// been pointed at a device and BEFORE the pipeline leaves NULL.
+	//
+	// Not earlier, because the source's pad cannot say what it will produce
+	// until it knows which device it is. Not later, because a matrix is not a
+	// gain applied to a running stream, it is a NEGOTIATION CONSTRAINT:
+	// audioconvert cannot map sixteen unpositioned channels to stereo without
+	// one, so a pipeline that reaches PLAYING first never reaches it at all.
+	// Measured — decklinkaudiosrc channels=16 into this chain with no matrix
+	// dies 0.069 s after PLAYING with "streaming stopped, reason
+	// not-negotiated (-4)", and written without the resampler in between it
+	// does not even parse.
+	p.aconv = pipeline.GetByName(nameAudioConv)
+	if p.aconv == nil {
+		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioConv))
+	}
+	p.aconvSinkPad = p.aconv.GetStaticPad("sink")
+	if p.aconvSinkPad == nil {
+		return abort(errors.New("gst: " + nameAudioConv + " has no sink pad"))
+	}
+	if err := p.applyStartChannelMapLocked(asrc, opts.ChannelMap); err != nil {
+		return abort(err)
+	}
+
+	// ARM THE PICKER METER, and only now, because the condition is what
+	// applyStartChannelMapLocked just decided. chlevel is built with
+	// post-messages=false (see pipelineDescription) so that a seat with a
+	// positioned capture source — every microphone, every Dante endpoint, the
+	// whole of the on-air Windows path — posts not one per-channel frame for the
+	// length of a match. A matrix having been written is exactly the statement
+	// "this source presents channels nobody has positioned", which is the only
+	// case in which sixteen bars mean anything that the two on the programme
+	// meter do not already say.
+	//
+	// A nil callback disarms it just as firmly: frames posted for a consumer that
+	// does not exist are cost with no reader, and the element's own property is a
+	// cheaper way to not have them than a nil check on a streaming thread.
+	p.armChannelMeterLocked(pipeline, p.matrixWidth > 0 && opts.OnChannelLevels != nil)
 
 	p.encoder = pipeline.GetByName(nameVideoEncod)
 	if p.encoder == nil {
@@ -1328,8 +1447,414 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 		return abort(err)
 	}
 
+	// CONFIRM THE MATRIX AGAINST WHAT THE PAD REALLY NEGOTIATED.
+	//
+	// The width the matrix was built for came from a caps QUERY, made before
+	// the pipeline left NULL and therefore before negotiation had happened. The
+	// number below comes from the pad's CURRENT CAPS, which is negotiation's
+	// own answer. They are the same number on every device measured, and the
+	// point of asking twice is that a disagreement is otherwise undiagnosable:
+	// a matrix of the wrong width does not produce a degraded feed, it produces
+	// "streaming stopped, reason error (-5)" out of the capture source, which
+	// reads as a broken card rather than as a bad matrix.
+	//
+	// A ZERO here is NOT a failure and must not be treated as one. The capture
+	// source is live; BlockSetState returns NO_PREROLL as soon as the state
+	// change completes, which can be before the first CAPS event has travelled
+	// downstream, so "the pad has not settled yet" is an ordinary race and not
+	// a fault. It is logged and nothing more; InputChannels() re-reads the pad
+	// on every call and will have the answer by the time any UI asks.
+	if p.matrixWidth > 0 {
+		switch got := p.negotiatedInputChannelsLocked(); {
+		case got == 0:
+			log.Printf("gst: Start: the %s matrix was written for %d input channels; the pad has "+
+				"not published its negotiated caps yet, so the width is confirmed on the first "+
+				"InputChannels call rather than here", nameAudioConv, p.matrixWidth)
+		case got != p.matrixWidth:
+			return abort(fmt.Errorf("gst: the %s mix-matrix was built for %d input channels and "+
+				"%s:sink negotiated %d. A matrix of the wrong width does not attenuate or misroute, "+
+				"it stops the capture chain with a flow error naming the source rather than the "+
+				"matrix, so this is refused here while it can still be read as what it is",
+				nameAudioConv, p.matrixWidth, nameAudioConv, got))
+		default:
+			log.Printf("gst: Start: %s:sink negotiated %d input channels, matching the matrix",
+				nameAudioConv, got)
+		}
+	}
+
+	// THE VIDEO SIGNAL WATCHDOG, and it is the last thing Start does before
+	// returning nil so that no abort() path above can leak its goroutine.
+	//
+	// signalwatch.go has the measurements. The short version is that a DeckLink
+	// which loses its input keeps emitting black frames at full rate forever — no
+	// error, no EOS, the muxer never starves — so every other indicator in this
+	// application goes on saying the feed is healthy, and the bus warning that
+	// would say otherwise is edge-triggered and routed to logWarnings. Polling
+	// the element's own "signal" property is the only reading that tracks it.
+	//
+	// ONE PROPERTY READ DECIDES WHETHER TO WATCH AT ALL, and that read doubles as
+	// the debouncer's seed. triUnknown — no element with a signal property, which
+	// is every native capture and the slate-only video leg shipping today — means
+	// no goroutine, no ticker and nothing paid for the life of the pipeline.
+	//
+	// NOTE FOR WHOEVER LANDS THE DECKLINK VIDEO LEG: neither name below exists in
+	// pipelineDescription yet, so on today's pipeline both lookups return nil,
+	// signalWatchWanted is never even asked, and this costs one nil check at
+	// Start. It becomes live the day the capture leg lands under those names,
+	// which are capturefault.go's and are already used by the fault classifier.
+	if vsrc := videoCaptureElement(pipeline); vsrc != nil {
+		probe := boolPropertyTriState(vsrc, propSignal)
+		if signalWatchWanted(opts.OnSignal, probe) {
+			p.sigWatch = startSignalWatch(probe,
+				func() triState { return boolPropertyTriState(vsrc, propSignal) },
+				opts.OnSignal)
+			log.Printf("gst: Start: watching %s for input lock every %v; the card's own signal "+
+				"property is the only thing in this process that can tell", nameVideoCaptureSrc,
+				signalPollInterval)
+		}
+	}
+
 	p.started = true
 	log.Printf("gst: pipeline PLAYING with no sink; base time %d ns, encoder %s", uint64(base), encoderName)
+	return nil
+}
+
+// videoCaptureElement finds the element the signal watchdog polls: the video
+// capture source, or the capture element that exists only to clock a DeckLink's
+// audio when the video leg is a slate.
+//
+// Both names are capturefault.go's and are already what the capture-fault
+// classifier looks for, which is the point of reusing them rather than minting a
+// third name for the same element. Nil — neither present — is the ordinary
+// answer on every pipeline shipping today and is not a fault.
+func videoCaptureElement(pipeline gogst.Pipeline) gogst.Element {
+	if el := pipeline.GetByName(nameVideoCaptureSrc); el != nil {
+		return el
+	}
+	if el := pipeline.GetByName(nameVideoCaptureClock); el != nil {
+		return el
+	}
+	return nil
+}
+
+// armChannelMeterLocked turns the per-channel picker meter's messages on or off
+// on a pipeline that may already be PLAYING. p.mu is held.
+//
+// post-messages is a plain gboolean on the level element and is LIVE-SETTABLE:
+// measured on a PLAYING pipeline at 61 us, stopping that element's messages dead
+// — 0 in two seconds — while the other level element in the same pipeline
+// carried on at its own rate, undisturbed, with the pipeline still in PLAYING
+// and nothing renegotiated. That is what makes arming a decision this function
+// can take at Start and a later work package can take when a drawer opens,
+// rather than a decision baked into the parse string until the next restart.
+//
+// A missing element is LOGGED AND SURVIVED. The name is a literal in
+// pipelineDescription and a const here, and a source guard keeps them in step,
+// so a nil is not something a shipped build can produce — but the failure it
+// would cause is a meter that never moves with nothing anywhere saying why, and
+// that is exactly the failure worth one log line rather than a refusal to carry
+// commentary.
+func (p *cgoPipeline) armChannelMeterLocked(pipeline gogst.Pipeline, on bool) {
+	el := pipeline.GetByName(channelLevelElementName)
+	if el == nil {
+		log.Printf("gst: the pipeline has no element named %s, so the per-channel meters cannot be "+
+			"armed and the mapping screen's bars will never move", channelLevelElementName)
+		return
+	}
+	// The same hasProperty discipline applyEncoderProperties and the videoscale
+	// add-borders write keep, and for the same reason: a property write against
+	// an element that does not have it is a GLib CRITICAL on stderr, where no
+	// shipped build is looking, rather than an error anybody can act on.
+	if !hasProperty(el, propPostMessages) {
+		log.Printf("gst: %s has no %s property, so the per-channel meters cannot be armed or "+
+			"silenced", channelLevelElementName, propPostMessages)
+		return
+	}
+	el.SetObjectProperty(propPostMessages, on)
+	log.Printf("gst: per-channel metering %s (%s %s=%t)",
+		map[bool]string{true: "ON", false: "off"}[on],
+		channelLevelElementName, propPostMessages, on)
+}
+
+// applyStartChannelMapLocked decides whether this capture source needs a mix
+// matrix at all and, if it does, writes the first one. p.mu is held and the
+// pipeline is still in NULL.
+//
+// # The discriminator: can the source give this pipeline a stereo pair by itself?
+//
+// The question is asked of the SOURCE'S OWN PAD, by intersecting its caps with
+// the two-channel caps the rest of the audio leg needs. If the intersection is
+// non-empty the source can produce the pair unaided — which is every native
+// microphone, every Dante endpoint and the whole of the on-air Windows path —
+// and NOTHING IS WRITTEN. That silence is the most important property of this
+// function: a build with no capture card behaves exactly as it did before this
+// file's mechanism existed, byte for byte, because no property is set.
+//
+// If the intersection is empty the source cannot, and the only reason a capture
+// source cannot produce stereo is that its channels are UNPOSITIONED — sixteen
+// of them, channel-mask=0x0, which is what a DeckLink card presents and what
+// audioconvert has nothing to derive a downmix from.
+//
+// It is phrased as "what does this pipeline need, and can the source give it"
+// rather than as "is the channel mask zero" deliberately. The mask is the
+// CAUSE, but a mask test asks a question about a bitmask type this build's
+// bindings do not marshal, and answers it for a condition that could equally
+// arise another way. Intersecting caps is GStreamer's own way of asking whether
+// two ends can agree, it needs no new type support, and it stays correct for
+// any future source whose problem is not the mask.
+//
+// Measured on the port machine on 2026-08-16, every source this application can
+// meet, with the pipeline still in NULL:
+//
+//	source                        stereo unaided   fixed width
+//	decklinkaudiosrc channels=16       no               16
+//	decklinkaudiosrc channels=8        no                8
+//	decklinkaudiosrc channels=2        YES               2
+//	osxaudiosrc                        YES        (a range)
+//	audiotestsrc                       YES        (a range)
+//
+// The two columns say the whole design: exactly the sources that need a matrix
+// are refused a stereo pair, and exactly those publish a fixed width to size it
+// against. A source that can do stereo never reaches the width question at all,
+// which is why "a range" in the last column is not a problem to solve.
+//
+// # Why the width can be read before negotiation has happened
+//
+// The count comes from a caps QUERY on the source's own pad, and decklinkaudiosrc
+// answers it from its channels property without opening anything. That is not
+// the same as trusting the property: the pad is asked, the pad's answer is what
+// is used, and the number is CONFIRMED against gst_pad_get_current_caps once the
+// pipeline is PLAYING — see the end of Start, where a disagreement is a hard
+// failure. Asking earlier is unavoidable, because the matrix is a negotiation
+// constraint and negotiation is the thing it has to happen before.
+//
+// The one setting this cannot resolve is channels=max, which publishes a CHOICE
+// in NULL (2, or 8-or-16) and only fixes itself once the card has been opened.
+// fixedChannelCount refuses it by name rather than guessing, and the refusal
+// says to set the property explicitly. That is the right answer for this
+// application anyway: sixteen has to be the steady state, because the channels
+// property is not live-settable and reaching pairs 3/4 and up any other way
+// costs a pipeline restart.
+func (p *cgoPipeline) applyStartChannelMapLocked(asrc gogst.Element, m ChannelMap) error {
+	srcPad := asrc.GetStaticPad("src")
+	if srcPad == nil {
+		return errors.New("gst: " + nameAudioSrc + " has no src pad, so the channel layout it will " +
+			"produce cannot be read")
+	}
+
+	stereo := gogst.CapsFromString("audio/x-raw,channels=" + strconv.Itoa(ChannelMapOutputs))
+	if stereo == nil {
+		return errors.New("gst: gst_caps_from_string for the stereo probe caps returned nil")
+	}
+	// The source is named from its own FACTORY rather than from
+	// captureSourceFactory, and that is not pedantry: the whole point of this
+	// branch is that the capture source may be a decklink element rather than
+	// the platform's own, and a log line that says "osxaudiosrc presents
+	// sixteen channels" about a Blackmagic card sends the reader to the wrong
+	// half of the system.
+	factory := elementFactoryNameOf(asrc)
+
+	if direct := srcPad.QueryCaps(stereo); direct != nil && !direct.IsEmpty() {
+		log.Printf("gst: Start: %s can deliver the %d-channel pair this pipeline needs on its own; "+
+			"no %s is written and audioconvert maps the layout as it always has",
+			factory, ChannelMapOutputs, propMixMatrix)
+		return nil
+	}
+
+	width, err := fixedChannelCount(srcPad.QueryCaps(nil))
+	if err != nil {
+		return fmt.Errorf("gst: %s cannot produce %d channels and %w. Without a channel count there "+
+			"is no matrix to build, and without a matrix audioconvert has no way to map an "+
+			"unpositioned stream to stereo",
+			factory, ChannelMapOutputs, err)
+	}
+	if err := p.writeChannelMapLocked(m, width); err != nil {
+		return err
+	}
+	log.Printf("gst: Start: %s presents %d channels it will not position; %s set to route %s",
+		factory, width, propMixMatrix, m)
+	return nil
+}
+
+// elementFactoryNameOf names the factory an element was made from, falling back
+// to the element's own name when the factory cannot be reached.
+//
+// The fallback is never expected — every element in this pipeline came out of
+// gst_parse_launch and therefore out of a factory — and it exists because this
+// is used only in log lines and diagnostics, where an unknown name is worth
+// less than an approximate one but far more than a crash.
+func elementFactoryNameOf(el gogst.Element) string {
+	if f := el.GetFactory(); f != nil {
+		if name := f.GetName(); name != "" {
+			return name
+		}
+	}
+	return el.GetName()
+}
+
+// fixedChannelCount reads the ONE channel count a set of caps describes.
+//
+// It refuses anything else, and the refusal is the useful part. Caps carrying a
+// choice — "channels: { 8, 16 }", which is what decklinkaudiosrc publishes in
+// NULL when its channels property is left at "max" — describe a stream nobody
+// has decided about yet, and a matrix built against either of those two numbers
+// is a coin toss whose losing side stops the capture chain. Caps carrying
+// several structures with different counts are the same problem.
+//
+// The caller's own message says what could not be done; this one names what was
+// found, because "the source published channels: { 8, 16 }" points straight at
+// the channels property, and "no channel count" does not.
+func fixedChannelCount(caps *gogst.Caps) (int, error) {
+	if caps == nil {
+		return 0, errors.New("its pad published no caps at all")
+	}
+	if caps.IsAny() || caps.IsEmpty() {
+		return 0, fmt.Errorf("its pad published %s, which fixes no channel count", caps.String())
+	}
+
+	width := 0
+	for i := uint(0); i < caps.GetSize(); i++ {
+		s := caps.GetStructure(i)
+		if s == nil {
+			continue
+		}
+		n, ok := s.GetInt("channels")
+		if !ok {
+			return 0, fmt.Errorf("its pad published %s, in which the channel count is not a fixed "+
+				"integer. Set the source's channels property explicitly: a source still choosing "+
+				"cannot be given a matrix", caps.String())
+		}
+		if width == 0 {
+			width = int(n)
+			continue
+		}
+		if int(n) != width {
+			return 0, fmt.Errorf("its pad published %s, which offers more than one channel count "+
+				"(%d and %d) and therefore fixes none", caps.String(), width, int(n))
+		}
+	}
+	if width <= 0 {
+		return 0, fmt.Errorf("its pad published %s, which fixes no channel count", caps.String())
+	}
+	return width, nil
+}
+
+// writeChannelMapLocked validates a map against a width and writes the matrix.
+// p.mu is held.
+//
+// VALIDATION HAPPENS FIRST AND NOTHING IS WRITTEN IF IT FAILS, because the
+// element's own rejection is invisible: an out-of-range coefficient makes
+// GObject log a CRITICAL to stderr and LEAVE THE PREVIOUS MATRIX IN FORCE, and
+// there is nothing readable afterwards that says which of the two is running.
+// ChannelGainLimit carries the measurement. Everything this function could get
+// wrong is therefore decided in channelmap.go, at Gate A, under -race.
+//
+// gst_util_set_object_arg rather than a typed setter: mix-matrix is a
+// GST_TYPE_ARRAY, which neither go-gst nor go-glib v0.0.2 binds, so the
+// property's own gst_value_deserialize is the only way in. mixMatrixArg renders
+// the string it parses. This is the same mechanism applyEncoderProperties uses
+// and for the same reason.
+func (p *cgoPipeline) writeChannelMapLocked(m ChannelMap, width int) error {
+	matrix, err := m.MixMatrix(width)
+	if err != nil {
+		return err
+	}
+	if !hasProperty(p.aconv, propMixMatrix) {
+		return fmt.Errorf("gst: this build's audioconvert has no %s property, so an unpositioned "+
+			"capture device cannot be mapped to stereo at all (GStreamer has had it since 1.16)",
+			propMixMatrix)
+	}
+	gogst.UtilSetObjectArg(p.aconv, propMixMatrix, mixMatrixArg(matrix))
+	p.matrixWidth = width
+	return nil
+}
+
+// negotiatedInputChannelsLocked reads the channel count from aconv's sink pad's
+// CURRENT caps — negotiation's own answer, not a query about what might happen.
+// It returns 0 when nothing has negotiated. p.mu is held.
+func (p *cgoPipeline) negotiatedInputChannelsLocked() int {
+	if p.aconvSinkPad == nil {
+		return 0
+	}
+	caps := p.aconvSinkPad.GetCurrentCaps()
+	if caps == nil || caps.GetSize() == 0 {
+		return 0
+	}
+	s := caps.GetStructure(0)
+	if s == nil {
+		return 0
+	}
+	n, ok := s.GetInt("channels")
+	if !ok || n <= 0 {
+		return 0
+	}
+	return int(n)
+}
+
+// InputChannels reports how many channels the capture pad has negotiated.
+//
+// It takes p.mu, which is the lock held across state changes and therefore for
+// seconds at a time during Start and ReplaceSink. That is deliberate rather
+// than an oversight: this method reads two fields that Start writes and
+// teardownLocked clears, and a caller who arrives during a state change has
+// nothing to be told anyway — there is no negotiated width until Start has
+// finished, and a Stop in progress is about to make the answer 0. Blocking
+// until the truth exists is better than answering from a cache that Start is
+// halfway through invalidating.
+func (p *cgoPipeline) InputChannels() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return 0
+	}
+	return p.negotiatedInputChannelsLocked()
+}
+
+// SetChannelMap rewrites the routing on a running pipeline.
+//
+// It is sized against the pad's NEGOTIATED count read at this moment, never
+// against the count Start used and never against anything the caller supplies.
+// That is the whole discipline: the caller cannot pass a width, so the caller
+// cannot pass a wrong one.
+//
+// The pipeline never changes state and the feed is never interrupted. Measured
+// on the real card on 2026-08-16: 119 us for the write, PLAYING throughout with
+// nothing pending, and the change visible in the next level message — a known
+// -9 dBFS tone read -8.9996 dBFS at unity, -15.0195 dBFS after a live write of
+// 0.5, and -90.3 dBFS after a live rewrite that routed two silent channels
+// instead. Routing and gain alike take effect immediately.
+func (p *cgoPipeline) SetChannelMap(m ChannelMap) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return errors.New("gst: pipeline is stopped")
+	}
+	if !p.started || p.aconv == nil {
+		return errors.New("gst: pipeline has not been started")
+	}
+	if p.matrixWidth == 0 {
+		// No matrix was written at Start, which means the capture source
+		// produces a positioned stream that audioconvert already maps. There is
+		// nothing to change, and writing a matrix now would pin a channel count
+		// on a pad that has negotiated without one — a renegotiation on a live
+		// feed, to achieve a routing the device has no channels to route.
+		return fmt.Errorf("%w: the capture device presents a positioned stream, which audioconvert "+
+			"maps to stereo on its own; there is no channel map on this pipeline to change. A "+
+			"channel map applies to a device that presents unpositioned channels, such as a "+
+			"DeckLink card's sixteen", ErrChannelMap)
+	}
+
+	width := p.negotiatedInputChannelsLocked()
+	if width == 0 {
+		return fmt.Errorf("%w: %s:sink has not published negotiated caps, so there is no width to "+
+			"size a matrix against. A matrix of the wrong width stops the capture chain",
+			ErrChannelMap, nameAudioConv)
+	}
+	if err := p.writeChannelMapLocked(m, width); err != nil {
+		return err
+	}
+	log.Printf("gst: channel map set live on %d input channels: %s", width, m)
 	return nil
 }
 
@@ -1534,7 +2059,112 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 		// elements_darwin.go, so neither port can be silently repointed at a
 		// different encoder.
 		captureSourceFactory + " name=" + nameAudioSrc +
-		" ! audioconvert ! audioresample" +
+		// The PER-CHANNEL PICKER meter, and everything about where it sits is
+		// deliberate. It is UPSTREAM of the audioconvert below, so it measures
+		// the capture device's OWN channels — all sixteen of a DeckLink card's
+		// unpositioned ones — before any routing decision has been applied to
+		// them. alevel, further down, cannot answer this question at any price:
+		// it sits after the capsfilter that pins channels=2, so by construction
+		// it measures the post-mix stereo and can never say which of the
+		// sixteen inputs the commentator is on. That is the whole reason the
+		// mapping UI is usable — the operator asks the commentator to talk and
+		// watches which bar moves.
+		//
+		// The name is a LITERAL and must stay one. levels.go's
+		// channelLevelElementName holds the same string and onBusMessage routes
+		// on it; TestEveryLevelElementInThePipelineIsRouted reads this literal
+		// out of the source and fails BY NAME if levelKindForSource does not
+		// know it, because a level element the handler does not recognise posts
+		// frames that are silently dropped — a meter that never moves with
+		// nothing in the log to say why.
+		//
+		// post-messages=false IS THE STEADY STATE, and it is what keeps a seat
+		// with no capture card exactly as it was. Every native microphone and
+		// every Dante endpoint presents a POSITIONED stereo pair, for which
+		// this meter would report the same two numbers alevel already reports —
+		// a duplicate of the programme meter, ten times a second, over the
+		// webview bridge, for the whole of a ninety-minute match. So the
+		// element is built silent and armed only when there is something worth
+		// metering: applyStartChannelMapLocked writes a matrix exactly when the
+		// source is unpositioned, and arms this element in the same breath.
+		// MEASURED live on a PLAYING pipeline — setting post-messages took
+		// 61 us, stopped that element's messages dead (0 in two seconds) and
+		// left the OTHER level element in the same pipeline posting at its own
+		// rate, undisturbed, with the pipeline still in PLAYING.
+		//
+		// It stays in the graph on a native seat rather than being built
+		// conditionally, because whether the source is positioned is not
+		// knowable until the element exists and its pad can be asked — which is
+		// after gst_parse_launch has run.
+		//
+		// WHAT THAT COSTS THE ON-AIR PATH WAS MEASURED, because adding an
+		// element to the audio chain every shipping seat runs is not something
+		// to reason about from first principles. Four paired runs of the real
+		// stereo chain (audiotestsrc, 2 channels, through audioconvert,
+		// audioresample, the 2-channel capsfilter and alevel into a synced
+		// fakesink), 32 seconds of audio each, on the port machine 2026-08-16:
+		//
+		//	without chlevel   user 0.11, 0.11, 0.10, 0.18 s
+		//	with chlevel      user 0.12, 0.12, 0.12, 0.10 s
+		//
+		// The difference is smaller than the run-to-run noise — one run WITHOUT
+		// the element was the most expensive of the eight. A SILENT level
+		// element is nearly free, which is not what the posting measurements in
+		// levels.go would have led you to expect: those bracket an element that
+		// is analysing and posting, and post-messages=false takes that work out
+		// rather than merely dropping the message at the end of it. So the
+		// ability to arm this meter live, on a pipeline already carrying
+		// commentary, is bought for no measurable cost on the path that never
+		// uses it.
+		//
+		// The tidier end state is still to build this element only on the
+		// DeckLink capture leg, which becomes possible the day that leg exists:
+		// it is one condition in this string, decided by the same thing that
+		// decides which capture source to build.
+		// AN audioconvert ABOVE chlevel, AND IT IS NOT COSMETIC. level's sink
+		// template accepts five formats — S8, S16LE, S32LE, F32LE, F64LE — and
+		// interleaved only. audioconvert's accepts thirty, plus non-interleaved.
+		// Putting chlevel directly on the capture source therefore NARROWS what
+		// a capture device is allowed to negotiate, on every seat, including the
+		// on-air Windows build where nothing here can be compiled or run.
+		//
+		// Measured on this machine, the failure it prevents:
+		//
+		//	audiotestsrc ! audio/x-raw,format=S24_32LE,... ! chlevel ! ...
+		//	  WARNING: erroneous pipeline: could not link audiotestsrc0 to
+		//	  chlevel, chlevel can't handle caps audio/x-raw,
+		//	  format=(string)S24_32LE, rate=(int)48000, channels=(int)2
+		//
+		// osxaudiosrc negotiates S16LE either way, so darwin never sees it —
+		// which is precisely why it would have shipped. wasapi2src takes its
+		// caps from the device's WASAPI mix format and gst-plugins-bad's wasapi2
+		// does emit S24_32LE for some devices, so the seat this breaks is a
+		// Windows one, on hardware nobody here owns, on the platform that is
+		// broadcasting.
+		//
+		// This converter costs one element and restores the old tolerance
+		// exactly. It does NOT flatten the channel layout: measured, chlevel's
+		// sink still sees channels=16 channel-mask=0x0 through it, so the meter
+		// still reports every one of a DeckLink's unpositioned channels. The
+		// mix-matrix conversion is still the NAMED audioconvert below; this one
+		// only makes the format legal.
+		" ! audioconvert" +
+		" ! level name=chlevel interval=" + strconv.Itoa(channelLevelIntervalNs) +
+		" post-messages=false" +
+		// audioconvert IS NAMED, and the name is the routing engine's handle on
+		// it. Its mix-matrix property is where a DeckLink card's sixteen
+		// UNPOSITIONED channels are turned into the stereo pair pinned below,
+		// and it is live-settable while the pipeline is PLAYING — measured at
+		// 119 us with no renegotiation, which is what lets the mapping UI be a
+		// real-time control rather than an apply-and-restart form. Start writes
+		// the matrix before the first buffer; SetChannelMap rewrites it
+		// afterwards. channelmap.go holds the model and every measurement.
+		//
+		// Nothing else about this element changes, and on a POSITIONED source —
+		// every microphone, every Dante endpoint, the whole of the on-air
+		// Windows path — no matrix is written at all and the element behaves
+		// exactly as it did before it had a name.
+		" ! audioconvert name=" + nameAudioConv + " ! audioresample" +
 		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
 		" ! level name=alevel interval=50000000" +
 		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
@@ -1905,23 +2535,88 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		p.deliverWarning(fmt.Sprintf("gst: warning: %s: %v (%s)", source, gerr, debug))
 
 	case gogst.MessageElement:
-		// The level element's measurement reports. Matched on the STRUCTURE
-		// name — the documented contract for level messages — and element
-		// messages carrying any other structure fall through untouched, which
-		// matters because other elements in this pipeline are free to post
-		// their own. Everything here runs on the posting streaming thread, so
-		// the whole path is: read two fields, convert, hand to a callback that
-		// the contract in gst.go requires not to block. No locks, no logging.
-		f := p.onLevels.Load()
-		if f == nil || *f == nil {
-			break
-		}
+		// A level element's measurement reports. Everything here runs on the
+		// posting streaming thread, so the whole path is: two cheap rejections,
+		// name the source, convert, hand to a callback that the contract in
+		// gst.go requires not to block. No locks, no logging.
+		//
+		// TWO TESTS, IN THIS ORDER, AND THE ORDER IS THE POINT.
+		//
+		// The STRUCTURE name comes first because it is nearly free — a string
+		// compare against a name the message already carries — and because it
+		// is what rejects the element messages this handler is not interested
+		// in at all. Other elements in this pipeline are free to post their
+		// own and several do.
+		//
+		// The SOURCE ELEMENT comes second, and it used not to be tested at all.
+		// That was the defect: every level element in the process posts a
+		// structure named "level", so matching the structure alone means
+		// matching EVERY level element there will ever be. With one element it
+		// was merely sloppy. This tier makes a second one possible — chlevel on
+		// the capture device's own sixteen unpositioned channels for the
+		// picker, alevel on the mixed-down stereo that is actually encoded —
+		// and then it is a silent cross-wire. MEASURED with both in one
+		// pipeline: 39 level messages a second, every one of them matching the
+		// structure name, so OnLevels would have been fed a sixteen-entry frame
+		// and a two-entry frame alternately, twenty times a second each. The
+		// programme meter would not have failed; it would have flickered
+		// between two different signals at two different widths, and a meter
+		// that reads as live while showing the wrong signal is the one failure
+		// this application refuses to ship. msg.Source() separated them
+		// perfectly in that measurement — 39 attributed, 0 unattributed.
+		//
+		// Naming the source costs a cgo call, a GObject lock and a string, so
+		// it is deliberately BELOW the structure test: it is paid only for
+		// messages that really are level reports, at most a few tens a second,
+		// and never for the element messages of anything else.
 		s := msg.GetStructure()
 		if s == nil || s.GetName() != levelStructureName {
 			break
 		}
-		if levels, ok := levelsFromStructure(s); ok {
-			(*f)(levels)
+		source := ""
+		if src := msg.Source(); src != nil {
+			source = src.GetName()
+		}
+		switch levelKindForSource(source) {
+		case levelKindProgramme:
+			// alevel: the stereo that is being encoded and sent. Unchanged,
+			// and it is the on-air path, so the callback load stays where it
+			// was — after the match, so that a session with no metering does
+			// no work per message beyond the two rejections above.
+			f := p.onLevels.Load()
+			if f == nil || *f == nil {
+				break
+			}
+			if levels, ok := levelsFromStructure(s); ok {
+				(*f)(levels)
+			}
+
+		case levelKindChannels:
+			// chlevel: the capture device's own channels, upstream of the mix
+			// down to the encoder's two. It is what the mapping UI meters, and
+			// it is the only measurement in this pipeline that can say WHICH
+			// input the commentator is on — alevel sits after the capsfilter
+			// that pins channels=2 and by construction cannot.
+			//
+			// The three lines are deliberately identical to the programme
+			// case's, and the callbacks are two fields rather than one so that
+			// this frame cannot reach OnLevels however the code above it is
+			// later rearranged. A sixteen-entry frame delivered to the
+			// programme meter is not a crash; it is a meter that reads as live
+			// while showing a signal that is not going to air.
+			f := p.onChannelLevels.Load()
+			if f == nil || *f == nil {
+				break
+			}
+			if levels, ok := levelsFromStructure(s); ok {
+				(*f)(levels)
+			}
+
+		default:
+			// A level message this pipeline did not ask for. Dropped. An
+			// unattributable level frame is precisely the cross-wire the
+			// source test exists to prevent, and a meter fed from an unknown
+			// element is worse than a meter that does not move.
 		}
 	}
 
@@ -1943,15 +2638,18 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 // degradation for a display: silent absence, never a crash on a streaming
 // thread and never invented numbers.
 //
+// The message also carries a "decay" array of the same length, and this
+// deliberately ignores it: decay is peak with peak-ttl's fall-back applied, and
+// the fall-back the meters use is the UI's own, so reading it here would be a
+// second opinion about the same number.
+//
 // It runs on a streaming thread: no locks, no logging, allocation limited to
-// the two output slices.
+// the two output slices. The unwrapping is the ONLY part of this that needs
+// GStreamer; every decision about what the numbers mean — the channel count,
+// the equal-length invariant the renderers rely on, the silence floor — is
+// levelsFrom's, in levels.go, where Gate A runs it under -race.
 func levelsFromStructure(s *gogst.Structure) (Levels, bool) {
-	peak := levelListToDB(anyList(s.GetValue("peak")))
-	rms := levelListToDB(anyList(s.GetValue("rms")))
-	if peak == nil || rms == nil {
-		return Levels{}, false
-	}
-	return Levels{PeakDB: peak, RMSDB: rms}, true
+	return levelsFrom(anyList(s.GetValue("peak")), anyList(s.GetValue("rms")))
 }
 
 // anyList unwraps the two list shapes go-glib may hand back for a GValueArray
@@ -2866,6 +3564,18 @@ func (p *cgoPipeline) Stop() error {
 	p.gateClosed.Store(true)
 	p.route.Store(nil)
 
+	// Stop the signal watchdog BEFORE the pipeline goes to NULL. Its reader
+	// closure holds the capture element, and a property read against a disposed
+	// element is a read on freed memory. Stop JOINS, so no report can arrive after
+	// this line — a lamp coming back on for a pipeline that no longer exists is
+	// the direction this project never lets a status display be wrong in.
+	//
+	// Joining under p.mu is safe: the watchdog goroutine never takes p.mu, and its
+	// emit path is the application's, which the interface contract requires not to
+	// block. Nil-safe, so there is no guard here.
+	p.sigWatch.Stop()
+	p.sigWatch = nil
+
 	err := p.teardownLocked()
 
 	// Close the channels last, after teardownLocked has silenced the bus
@@ -2962,6 +3672,13 @@ func (p *cgoPipeline) teardownLocked() error {
 	p.srtq = nil
 	p.srtqSrcPad = nil
 	p.srtqSinkPad = nil
+	p.aconv = nil
+	p.aconvSinkPad = nil
+	// matrixWidth goes back to zero with the pad it described. Leaving it set
+	// would make SetChannelMap on a torn-down pipeline get as far as reading a
+	// nil pad rather than being refused by the started/stopped guards above it,
+	// which is a longer path to the same answer through more nil checks.
+	p.matrixWidth = 0
 	p.bus = nil
 	p.clock = nil
 	p.pipeline = nil

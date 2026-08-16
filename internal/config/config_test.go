@@ -4,10 +4,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+// Config stopped being a comparable struct when decklinkChannelMap was added:
+// it holds a slice now, and == on a struct containing one does not compile. The
+// two whole-struct comparisons in this file therefore use reflect.DeepEqual,
+// which is the right answer for both anyway — they are asking whether two
+// configurations say the same thing, and for a routing list that is
+// element-by-element rather than by identity.
 
 // withAppData points the user config directory at a fresh temp directory for
 // the duration of the test, so Path/Load/Save exercise a real filesystem
@@ -72,7 +80,7 @@ func TestLoad_MissingFileReturnsDefaults(t *testing.T) {
 	}
 
 	want := Defaults()
-	if *cfg != *want {
+	if !reflect.DeepEqual(*cfg, *want) {
 		t.Errorf("Load() on missing file = %+v, want Defaults() = %+v", *cfg, *want)
 	}
 }
@@ -177,7 +185,7 @@ func TestSave_CreatesDirectoryAndIsReadable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() after Save() error = %v", err)
 	}
-	if *got != *cfg {
+	if !reflect.DeepEqual(*got, *cfg) {
 		t.Errorf("Load() after Save() = %+v, want %+v", *got, *cfg)
 	}
 }

@@ -629,14 +629,30 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	// the feed is up. The sender only emits on transitions, so the current state
 	// is replayed here instead.
 	//
-	// domReady replays THREE, not one: the return monitor and the picture monitor
+	// domReady replays FIVE, not one: the return monitor and the picture monitor
 	// both emit only on transitions for the same reason, and a reloaded page
 	// would otherwise show the RETURN lamp grey with audio in the commentator's
 	// ears, and draw the fallback mosaic over a working high-resolution picture.
-	// The count is asserted exactly so that a fourth replay has to be a decision
+	// The count is asserted exactly so that a sixth replay has to be a decision
 	// — every event queued here is delivered to a page that has just loaded, and
 	// the ones the status lamps would need are deliberately NOT replayed because
 	// a cached Status risks showing stale green (specification section 8).
+	//
+	// The fourth is the video signal lamp, and it needs the replay MORE than the
+	// three above it rather than less. A sender reconnects and a return monitor
+	// retries, so those lamps repopulate themselves from live traffic within
+	// seconds of a reload; a locked capture input reports ONCE at the start of
+	// the match and is then silent for ninety minutes, because silence is what
+	// healthy looks like. Without the replay a page reloaded at half-time shows
+	// the lamp grey — "this application cannot tell you" — over a picture the
+	// operator can see perfectly well.
+	//
+	// The fifth is the DeckLink routing state, and it is the one replay that must
+	// come from the CACHE rather than from the pipeline. Reading the pad would
+	// take a lock internal/gst holds across state changes, on the Wails MAIN
+	// THREAD — so a page reloaded during a reconnect would freeze the window for
+	// as long as the sink swap took. The routing screen calls GetChannelMap when
+	// it opens, and that call does read the pad.
 	a, _ := newTestApp(t)
 	silencePump(a)
 
@@ -647,9 +663,9 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 3 {
-		t.Fatalf("domReady queued %d events, want the sender, return and picture replays: %+v",
-			len(queued), queued)
+	if len(queued) != 5 {
+		t.Fatalf("domReady queued %d events, want the sender, return, picture, signal and "+
+			"channel-map replays: %+v", len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[0], EventSender, sender.StateConnected)
@@ -660,6 +676,23 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	if queued[2].name != EventPicture || queued[2].data != gst.PictureStateStopped {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[2], EventPicture, gst.PictureStateStopped)
 	}
+	if queued[3].name != EventSignal || queued[3].data != (signalPayload{State: gst.SignalUnknown}) {
+		t.Fatalf("domReady queued %+v, want %s = %s", queued[3], EventSignal, gst.SignalUnknown)
+	}
+	// Zero channels and an empty map: no session has negotiated a pad, so there
+	// is no width to size a routing grid against and nothing is in force. The map
+	// must be an EMPTY LIST rather than a null — the frontend tests
+	// Array.isArray before adopting one, and null would take the "this build
+	// cannot tell me" path instead of "nobody has chosen".
+	gotMap, ok := queued[4].data.(channelMapPayload)
+	if queued[4].name != EventChannelMap || !ok {
+		t.Fatalf("domReady queued %+v, want a %s carrying a channelMapPayload",
+			queued[4], EventChannelMap)
+	}
+	if gotMap.InputChannels != 0 || gotMap.Map == nil || len(gotMap.Map) != 0 || !gotMap.IsDefault {
+		t.Fatalf("domReady queued %+v, want no negotiated channels and an empty, non-nil map",
+			gotMap)
+	}
 }
 
 func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
@@ -669,8 +702,9 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 3 {
-		t.Fatalf("domReady queued %+v, want a sender, a return and a picture replay", queued)
+	if len(queued) != 5 {
+		t.Fatalf("domReady queued %+v, want a sender, a return, a picture, a signal and a "+
+			"channel-map replay", queued)
 	}
 	if queued[0].data != sender.StateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any session has run", queued, sender.StateStopped)
@@ -682,6 +716,18 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	if queued[2].data != gst.PictureStateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any picture monitor has run",
 			queued, gst.PictureStateStopped)
+	}
+	// UNKNOWN and not LOST. Before any session has run there is no capture
+	// element to poll, and on a machine with no card there never will be — the
+	// lamp must say "this application cannot tell", which is a different claim
+	// from a card telling us there is nothing on its input.
+	if queued[3].data != (signalPayload{State: gst.SignalUnknown}) {
+		t.Fatalf("domReady queued %+v, want %s before any capture has been measured",
+			queued, gst.SignalUnknown)
+	}
+	if got, ok := queued[4].data.(channelMapPayload); !ok || got.InputChannels != 0 {
+		t.Fatalf("domReady queued %+v, want no negotiated channels before any pipeline has run",
+			queued)
 	}
 }
 
@@ -923,6 +969,17 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // no secret, keeping the "no secret crosses this boundary outbound" rule that
 // GetPresetCredentialStatus is the only recorded narrowing of.
 //
+// GetChannelMap and SetChannelMap are the newest pair, added with the DeckLink
+// routing screen. They are the two halves of ONE control and neither is useful
+// alone: the read reports what the capture pad NEGOTIATED, which is the only
+// number a mix matrix may be sized against — the device's advertised
+// max-channels is not that number, and a matrix of the wrong width stops the
+// capture chain rather than degrading it — and the write applies a routing to
+// the running pipeline in about 119 microseconds with no state change. There is
+// no Apply button on the screen that calls them, which is why the write is a
+// binding rather than a field on SaveConfig: config.json records the routing for
+// the next launch, and this changes what the commentator is heard on now.
+//
 // GetConformTarget is the last, added with the conform work. It is read-only and
 // carries no secret: the raster and rate the video leg is — or would be — built
 // to, plus the provenance of that answer. It is on this surface because the
@@ -977,6 +1034,9 @@ func assertBoundSurface(t *testing.T) {
 		"SetRemoteListener": true,
 
 		"GetConformTarget": true,
+
+		"GetChannelMap": true,
+		"SetChannelMap": true,
 	}
 
 	got := exportedMethodsOfApp()

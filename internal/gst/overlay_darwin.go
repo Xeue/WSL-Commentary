@@ -23,6 +23,16 @@
 //	DestroyWindow on the pump thread    -[NSView removeFromSuperview] on the main queue
 //	d3d11videosink into an HWND         glimagesink into an NSView*
 //
+// The correspondence breaks in exactly ONE place, and it is the z-order. Windows
+// re-applies HWND_TOP on every apply and that is free, because SetWindowPos moves
+// an entry in a list and never unparents the HWND. AppKit has no such call: the
+// only way to reorder an existing subview is to addSubview: it again, which takes
+// it out of its window and puts it back — through a view that is hosting a live
+// GL surface. So this side asks first, and asks the question that is actually
+// load-bearing: am I above every sibling that is not one of MY OWN KIND. See
+// WSLCommsOverlayView and the raise in wslcomms_overlay_apply, both of which
+// exist because Tier 3 puts a second one of these surfaces in the same window.
+//
 // # It is deliberately dumb, for the same reason
 //
 // This view paints nothing but its own black backing layer, decodes nothing and
@@ -181,6 +191,54 @@ typedef struct {
     double  contentHeight;
 } wslcomms_overlay_info;
 
+// WSLCommsOverlayView behaves in every respect like the NSView it derives from.
+// It exists so that one of these views can RECOGNISE ANOTHER, and for nothing
+// else — there is not a line of behaviour in it, on purpose, because the whole
+// argument of this file is that the surface must be something nothing in the
+// process reasons about.
+//
+// It is needed because there is about to be more than one of them. Tier 3 puts a
+// DeckLink confidence preview on the same contentView as the SRT return picture,
+// and the moment there are two the z-order question changes shape: what each view
+// needs is to be ABOVE THE WEBVIEW, and what it emphatically does not need is to
+// be above its own kind. Two opaque rectangles that do not overlap have no
+// ordering requirement between themselves, and imposing one on them makes them
+// fight — see the raise in wslcomms_overlay_apply for what that fight costs.
+//
+// Recognising our own by class rather than recognising the WEBVIEW by its class
+// is deliberate. Naming the webview means importing WebKit into this preamble and
+// hard-coding WailsWebView, which is a Wails implementation detail we do not
+// control; and it would still be the wrong test the day Wails adds a sibling of
+// its own that the picture also has to be above. "Above every sibling that is not
+// one of ours" is the property that survives both, and it costs one empty class.
+@interface WSLCommsOverlayView : NSView
+@end
+
+@implementation WSLCommsOverlayView
+@end
+
+// wslcomms_overlay_raise_above answers "is this view low enough to need moving,
+// and if it is, what does it have to go above". nil means DO NOTHING AT ALL,
+// which on a settled window is the answer on every single apply.
+//
+// subs is the superview's subview list, BOTTOM FIRST, and self_idx is where our
+// view sits in it. The answer is the topmost sibling above us that is not one of
+// ours: inserting above that one clears every foreign sibling in a single move,
+// and leaves our own kind to fall wherever they fall.
+//
+// overlayRaiseAbove in overlay_zorder.go is the same scan written in Go, unit
+// tested at Gate A — where this file is not even compiled — and
+// overlay_zorder_test.go asserts that this function is still spelled the same
+// way, for the same reason picture_test.go pins the coordinate flip: two
+// expressions of one rule drift.
+static NSView *wslcomms_overlay_raise_above(NSArray *subs, NSUInteger self_idx) {
+    for (NSUInteger i = [subs count]; i > self_idx + 1; i--) {
+        NSView *other = [subs objectAtIndex:(i - 1)];
+        if (![other isKindOfClass:[WSLCommsOverlayView class]]) return other;
+    }
+    return nil;
+}
+
 // wslcomms_overlay_create_on_main finds the host window and installs the view.
 // MAIN THREAD ONLY.
 //
@@ -212,7 +270,11 @@ static int wslcomms_overlay_create_on_main(const char *title, wslcomms_overlay_i
     // screen until the frontend has measured a rectangle AND there are pictures
     // to put in it; an opaque black rectangle over the fallback mosaic is worse
     // than the soft picture it covers.
-    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
+    //
+    // WSLCommsOverlayView rather than NSView so that a second one of these can
+    // tell it apart from the webview; see the class above. It adds no behaviour
+    // whatever, and glimagesink is handed the same NSView* it always was.
+    NSView *view = [[WSLCommsOverlayView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
     [view setHidden:YES];
 
     // wantsLayer, so the view has a backing layer of its own before glimagesink
@@ -232,6 +294,14 @@ static int wslcomms_overlay_create_on_main(const char *title, wslcomms_overlay_i
     // HWND_TOP on the other platform. The sibling that matters is Wails'
     // WailsWebView, which is added to the same contentView in
     // WailsContext.m's CreateWindow.
+    //
+    // The blunt form is right HERE and wrong in wslcomms_overlay_apply, and the
+    // difference is worth stating because the two lines otherwise look like the
+    // same line written twice. This view is one second old, it is 1x1, it is
+    // hidden, and no sink has attached anything to it — so putting it on top of
+    // a sibling overlay costs nothing, and that sibling will be back above it,
+    // or not, without either of them caring. At apply time the same call would
+    // be moving a live GL surface.
     [content addSubview:view positioned:NSWindowAbove relativeTo:nil];
 
     out->view = (void *)view;
@@ -332,14 +402,45 @@ static void wslcomms_overlay_apply(void *v, int x, int y, int w, int h, int show
         if (!(scale > 0)) scale = 1.0;
         [view setFrame:wslcomms_overlay_frame(sup, scale, x, y, w, h)];
 
-        // Re-raised only if something has got above us. The Windows twin
-        // re-applies HWND_TOP unconditionally because WebView2 reorders its own
-        // windows without notice; here the sibling list is Wails' and changes
-        // only when Wails changes it, and re-adding a view that is hosting a
-        // live GL surface takes it out of its window for an instant. Checking
-        // first costs one pointer comparison and avoids that entirely.
-        if ([[sup subviews] lastObject] != view) {
-            [sup addSubview:view positioned:NSWindowAbove relativeTo:nil];
+        // THE RAISE, AND WHY IT IS A TEST RATHER THAN AN UNCONDITIONAL addSubview.
+        //
+        // The Windows twin re-applies HWND_TOP on every apply because WebView2
+        // reorders its own windows with no notification. Here the sibling list is
+        // Wails' and changes only when Wails changes it — and the cost of raising
+        // when it was not needed is far higher on this side, because the only way
+        // AppKit offers to reorder an existing subview is -[NSView addSubview:],
+        // which takes the view OUT OF ITS WINDOW and puts it back. This view is
+        // hosting a GL surface that glimagesink has attached to that window. The
+        // test in front of the call is therefore not an optimisation; it is what
+        // keeps the surface attached.
+        //
+        // WHAT THE TEST USED TO BE, AND WHY IT HAD TO CHANGE BEFORE TIER 3.
+        //
+        // It was "am I the last subview", which is true, cheap and entirely
+        // sufficient while there is exactly one of these views in the process —
+        // which is the case up to and including today. With TWO, which is what a
+        // DeckLink confidence preview alongside the SRT picture means, only one of
+        // them can be last. The other one would find the condition true on EVERY
+        // apply and re-add itself; and re-adding puts the FIRST one second, so the
+        // next apply on that one re-adds it in turn. Two surfaces taking each
+        // other's place, forever. Every rectangle change is one of those applies,
+        // and during a live resize drag a rectangle change is every frame, on the
+        // surface carrying the commentator's programme picture.
+        //
+        // What actually matters is being above the WEBVIEW, not being last in an
+        // absolute sense, so that is what is asked. On a settled window the answer
+        // is nil and this whole block is one array read and one loop that finds
+        // nothing.
+        NSArray *subs = [sup subviews];
+        NSUInteger self_idx = [subs indexOfObjectIdenticalTo:view];
+        if (self_idx != NSNotFound) {
+            // NSNotFound cannot happen — sup came from [view superview] — but the
+            // arithmetic below is on an unsigned index and the failure mode of
+            // getting that wrong is a wild objectAtIndex:, so it is asked anyway.
+            NSView *below = wslcomms_overlay_raise_above(subs, self_idx);
+            if (below != nil) {
+                [sup addSubview:view positioned:NSWindowAbove relativeTo:below];
+            }
         }
         [view setHidden:NO];
     });

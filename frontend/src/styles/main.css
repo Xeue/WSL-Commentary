@@ -1466,3 +1466,258 @@ input[type='range'] {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* ==================================================================== */
+/* DECKLINK CHANNEL ROUTING (appended block — see the note below)       */
+/*                                                                      */
+/* The sixteen-in, two-out routing grid inside Settings: ui/            */
+/* channelmap.js builds it, this paints it. It draws only from the      */
+/* :root token set and from the input meters' own fill colours, so it   */
+/* depends on nothing above except those, and it is appended at the END */
+/* of the file for the reason the two blocks before it were — another   */
+/* change was editing the middle of this stylesheet at the same time.   */
+/*                                                                      */
+/* NOTHING HERE CARRIES A THRESHOLD. The meter's zone widths come from  */
+/* meters.js (the mixer's own dB boundaries) and are set inline, as     */
+/* home.js sets them for the stereo pair; the classes below carry paint */
+/* alone, so the two meters cannot drift into different calibrations.   */
+/* ==================================================================== */
+
+/* Every child owns the whole row. The group holds no ordinary fields —
+   the grid, its caveat and its lamps are all composite items — and a
+   350px track would cut the sixteen-row grid in half. `1 / -1` and never
+   `span N`, for the reason the .settings-group rule records. */
+.settings-group--channelmap > * {
+  grid-column: 1 / -1;
+}
+
+.channelmap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+/* THE CAVEAT IS PERMANENT FURNITURE, NOT A NOTICE TO BE DISMISSED. It is
+   the amber-edged block at the top of the group because the fact it
+   carries — that this path has no headroom and two channels at 0 dB will
+   clip — has to be read before the second crosspoint is pressed, not
+   after the feed distorts. It is deliberately not a `title` tooltip:
+   a tooltip is found only by somebody who already suspected it. */
+.channelmap-caveat {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.channelmap-lamps {
+  flex: 0 0 auto;
+}
+
+.channelmap-pad-note,
+.channelmap-save-hint {
+  margin: 0;
+}
+
+/* A saved map wider than the pad negotiated has lost columns. That is a
+   commentator who is no longer in the feed, so it reads as the error it
+   is — the same danger colours as the error banner — rather than as one
+   more grey hint. */
+.channelmap-dropped {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius);
+  background: var(--danger-bg);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+/* Four columns: the channel number, its meter, and one crosspoint per
+   output. The meter column takes the slack, because it is the one the
+   operator is watching while somebody talks and the other three are
+   read once. No breakpoint: the grid is sixteen rows of four cells at
+   every width this application supports. */
+.channelmap-grid {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(7rem, 1fr) 6.5rem 6.5rem;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+}
+
+.channelmap-head {
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.channelmap-name {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The horizontal twin of .input-meter-bar. Same instrument, same scale,
+   same three zones — only the axis differs, so the segments are slices
+   of the WIDTH here and the fills grow rightwards. */
+.channelmap-meter {
+  position: relative;
+  display: flex;
+  height: 10px;
+  border-radius: 3px;
+  background: #10151b; /* the mixer meter's trough colour, same instrument */
+  overflow: hidden;
+}
+
+.channelmap-meter-seg {
+  position: relative;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+/* The hairline sits on the LEFT edge of each segment after the first, so
+   the -18 and -6 boundaries stay readable as POSITIONS even with the bar
+   dark. Left rather than bottom: this bar runs across, not up. */
+.channelmap-meter-seg + .channelmap-meter-seg {
+  box-shadow: inset 1px 0 0 #0a0e12;
+}
+
+.channelmap-meter-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0;
+}
+
+.channelmap-meter-peak {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: #e8edf2;
+  pointer-events: none;
+}
+
+/* No session: the METERS dim, and nothing else does. The crosspoints stay
+   at full strength because they stay usable — routing is set up before
+   the feed comes up as often as during it. */
+.channelmap-grid--idle .channelmap-meter {
+  opacity: 0.35;
+}
+
+/* A crosspoint. The dB value IS the state: an unrouted cell shows an em
+   dash and a routed one shows its level, so the routing is readable with
+   the colour removed entirely — the same rule the lamps follow. */
+.channelmap-cell {
+  min-height: 34px;
+  padding: 0.25rem 0.3rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.channelmap-cell:hover {
+  border-color: var(--accent);
+}
+
+.channelmap-cell--routed {
+  border-color: var(--green);
+  background: var(--ok-bg);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* The trim panel points at exactly one crosspoint, so which one has to be
+   visible on the grid as well as named in the panel. An outline rather
+   than another colour: the cell is already carrying routed/not in its
+   border colour, and a second meaning on the same property is how a grid
+   stops being readable. */
+.channelmap-cell--selected {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.channelmap-sums {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.channelmap-sum {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Marked as well as worded. The sentence says what will happen and what to
+   do; the red edge is what makes it findable from across the room. Never
+   the edge alone — the sentence is the signal, this is the flag. */
+.channelmap-sum--clip {
+  padding-left: 0.5rem;
+  border-left: 3px solid var(--red);
+  color: var(--red);
+  font-weight: 600;
+}
+
+/* ONE trim, aimed at the selected crosspoint, rather than thirty-two
+   sliders too small to hit. */
+.channelmap-trim {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.channelmap-trim-title {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.channelmap-trim-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* The slider's top end is 0 dB and there is no travel above it: the clamp
+   made visible. A control that could ask for +3 dB would be a control
+   whose request GStreamer silently discards, leaving the previous value
+   in place. */
+.channelmap-trim-slider {
+  flex: 1 1 12rem;
+  min-width: 8rem;
+}
+
+.channelmap-trim-readout {
+  min-width: 5.5rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.channelmap-trim-invert {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}

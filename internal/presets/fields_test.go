@@ -81,7 +81,7 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 	}
 }
 
-// TestClassificationCounts pins the 14 + 6 + 2 + 1 = 23 split (srtHost was
+// TestClassificationCounts pins the 14 + 7 + 2 + 1 = 24 split (srtHost was
 // removed — the SRT host is always derived from m2lxHost — and eventId moved
 // from the whitelist to DiscoveredFields), so growth in any table is a
 // deliberate, reviewed change.
@@ -93,12 +93,18 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 // both. audioSourceKind and decklinkPersistentId are MACHINE — which subsystem
 // this PC captures from, and which card in it — and a preset carrying either
 // would deliver another machine's hardware by post.
+//
+// The seventh MACHINE field is decklinkChannelMap, and it is the sharpest case
+// on the list. The other six fail LOUDLY when they arrive somewhere they are not
+// true — a missing device or an absent card does not go on air at all — whereas
+// a routing from another building starts perfectly, shows every lamp green, and
+// carries the wrong channel or silence until somebody listens.
 func TestClassificationCounts(t *testing.T) {
 	if got := len(InstanceFields); got != 14 {
 		t.Errorf("len(InstanceFields) = %d, want 14", got)
 	}
-	if got := len(MachineFields); got != 6 {
-		t.Errorf("len(MachineFields) = %d, want 6", got)
+	if got := len(MachineFields); got != 7 {
+		t.Errorf("len(MachineFields) = %d, want 7", got)
 	}
 	if got := len(UIFields); got != 2 {
 		t.Errorf("len(UIFields) = %d, want 2", got)
@@ -128,7 +134,7 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 	}
 }
 
-// TestInstanceFieldsExcludeEveryDeviceField names all six MACHINE tags: the
+// TestInstanceFieldsExcludeEveryDeviceField names all seven MACHINE tags: the
 // guarantee "a preset cannot carry a device id" reduced to a table lookup.
 //
 // audioSourceKind and decklinkPersistentId are on this list for exactly the
@@ -138,10 +144,14 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 // not-negotiated (-4)" in about 100 microseconds, naming neither the device nor
 // the cause — so a preset that could carry it would be a fault delivered by
 // post with no return address.
+//
+// decklinkChannelMap is the seventh and it does NOT fail hard, which is why it
+// belongs here most of all: a routing from another building negotiates, starts,
+// and carries the wrong channel — or nothing — behind a screen full of green.
 func TestInstanceFieldsExcludeEveryDeviceField(t *testing.T) {
 	for _, tag := range []string{
 		"audioDeviceId", "headphoneDeviceId", "headphoneEndpointId", "slatePath",
-		"audioSourceKind", "decklinkPersistentId",
+		"audioSourceKind", "decklinkPersistentId", "decklinkChannelMap",
 	} {
 		if slices.Contains(InstanceFields, tag) {
 			t.Errorf("InstanceFields contains %q: a preset carrying it would deliver another "+
@@ -172,6 +182,7 @@ func TestClassify(t *testing.T) {
 		{"slatePath", ClassMachine, true},
 		{"audioSourceKind", ClassMachine, true},
 		{"decklinkPersistentId", ClassMachine, true},
+		{"decklinkChannelMap", ClassMachine, true},
 		{"returnSource", ClassUI, true},
 		{"returnChannel", ClassUI, true},
 		{"eventId", ClassDiscovered, true},

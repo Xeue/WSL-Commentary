@@ -354,7 +354,9 @@ fi
 #
 # RETRIES, and they are not defensive programming for its own sake. A secure
 # timestamp is a live network call to Apple's timestamp authority, once per
-# Mach-O — 48 of them in this bundle — and it flakes. Observed on the first
+# Mach-O — 51 of them in this bundle since the capture path was added, 48 when
+# this was written, and it goes up every time a plugin does — and it flakes.
+# Observed on the first
 # real run of this script:
 #
 #   .../Contents/Frameworks/libXau.6.dylib: A timestamp was expected but was

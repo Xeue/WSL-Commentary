@@ -699,6 +699,74 @@ type PipelineOpts struct {
 	// element reports -inf for digital silence, and -inf neither survives JSON
 	// nor draws on a meter. Nil means no metering; nothing else changes.
 	OnLevels func(Levels)
+
+	// OnChannelLevels, if set, is called with the level of the CAPTURE DEVICE'S
+	// OWN CHANNELS — one entry per channel the input pad negotiated, sixteen on
+	// a DeckLink card — ten times a second. It is the meter the operator uses to
+	// find which channel the commentator is on, and it measures UPSTREAM of the
+	// audioconvert that mixes those channels down to the encoder's two.
+	//
+	// It is a second callback rather than a wider OnLevels because the two
+	// measure different points and answering one question with the other is a
+	// meter that reads as live while showing the wrong signal. OnLevels is the
+	// on-air stereo, after the matrix, and it is what a clipping indicator is
+	// allowed to watch; this is what is arriving, before any routing decision has
+	// been applied, and it is by definition unable to say what is going out. Both
+	// elements post a GstStructure named "level", so the two are told apart by
+	// the posting element's name — MEASURED, with both in one pipeline: 39 level
+	// messages a second, every one of them matching the structure name, which
+	// without that attribution would have fed one meter a sixteen-entry frame and
+	// a two-entry frame alternately, twenty times a second each.
+	//
+	// The same thread rule as OnLevels applies without weakening: it is called on
+	// a GStreamer streaming thread and MUST NOT BLOCK.
+	//
+	// The frame's LENGTH is the channel count, and it changes only when the
+	// pipeline is rebuilt — index i is input channel i for the life of the
+	// pipeline, which is what lets a renderer lay out its strips once. Nil means
+	// no per-channel metering, and on a positioned capture source (every
+	// microphone, every Dante endpoint) it is redundant rather than wrong: the
+	// channels it would report are the two OnLevels already reports.
+	OnChannelLevels func(Levels)
+
+	// OnSignal, if set, is called when the VIDEO CAPTURE's input lock changes:
+	// whether the card can see a picture at all, debounced. It is what feeds the
+	// signal lamp, and it exists because nothing else in this application can
+	// tell — a DeckLink that loses signal keeps emitting black GAP-flagged frames
+	// at full rate forever, so the muxer never starves, the sender stays
+	// CONNECTED and the switcher reports a healthy feed. See signalwatch.go.
+	//
+	// Unlike OnLevels this is NOT called on a streaming thread: the watchdog
+	// polls from an ordinary goroutine of its own, so a callback here cannot
+	// stall the capture chain. It must still not block — that goroutine is the
+	// only thing taking readings, so an emit that waits delays every later sample
+	// and the hold-offs quietly stop meaning seconds.
+	//
+	// Nil means no watchdog at all, and so does a pipeline whose video leg has no
+	// element with a "signal" property: not a goroutine, not a ticker, nothing.
+	OnSignal func(SignalReport)
+
+	// ChannelMap is which of the capture device's input channels reach the
+	// left and right of the commentary feed, and at what gain. It is applied
+	// before the pipeline first produces a buffer, and can be changed at any
+	// time afterwards with SetChannelMap.
+	//
+	// THE ZERO VALUE IS THE DEFAULT MAP, not silence — input 1 on the left,
+	// input 2 on the right, at unity — and channelmap.go argues both halves of
+	// that: why an unset map must produce audio rather than nothing, and why
+	// that particular default is bit-for-bit what this application already sent
+	// from a DeckLink card configured for two channels. An operator who never
+	// opens the mapping UI hears exactly what they heard before it existed.
+	//
+	// It is IGNORED on a capture source that presents a positioned stream,
+	// which is every native microphone and every Dante endpoint: audioconvert's
+	// own downmix already knows what those channels are, and pinning a matrix
+	// over it would be a change to the on-air Windows path for no gain. The
+	// matrix is written only for an UNPOSITIONED stream — the sixteen channels
+	// with channel-mask=0x0 a DeckLink card presents, which is the case
+	// audioconvert cannot resolve on its own. Start logs which of the two it
+	// found.
+	ChannelMap ChannelMap
 }
 
 // Levels is one audio level report from the send pipeline: what the level
@@ -809,6 +877,50 @@ type Pipeline interface {
 	// the picture recovers at once instead of waiting up to two seconds for the
 	// next scheduled IDR.
 	ForceKeyUnit() error
+
+	// InputChannels reports how many channels the capture source's pad ACTUALLY
+	// NEGOTIATED, read from that pad's current caps at the moment of the call.
+	// It is 0 before Start, and 0 whenever nothing has negotiated.
+	//
+	// It is the ONLY number a caller may size a channel map against, and it is
+	// deliberately not the same number as the device's advertised max-channels:
+	// a DeckLink card publishes max-channels=16 whatever its element is
+	// configured to produce, and a matrix built against a width the pad did not
+	// negotiate does not degrade the feed, it stops it — measured, "streaming
+	// stopped, reason error (-5)", with the capture chain dead before the next
+	// level message. ChannelMap.MixMatrix takes the count as an argument for
+	// that reason, so that the only way to build a matrix is to have asked.
+	//
+	// It is also what the mapping UI draws: sixteen faders on a card presenting
+	// sixteen channels, two on a microphone.
+	InputChannels() int
+
+	// SetChannelMap changes the routing WHILE THE PIPELINE IS PLAYING, with no
+	// state change, no renegotiation and no interruption to the feed. The
+	// mapping UI is therefore a real-time control rather than an
+	// apply-and-restart form.
+	//
+	// Measured on the real card on 2026-08-16: the property write took 119 µs,
+	// the pipeline stayed PLAYING with nothing pending, and the change was
+	// audible in the very next level message — a known -9 dBFS tone read
+	// -8.9996 dBFS at unity and -15.0195 dBFS after a live write of 0.5, a
+	// delta of -6.0199 dB against the -6.0206 dB the arithmetic says.
+	//
+	// The map is validated against InputChannels() BEFORE anything is written,
+	// and a map that does not fit is refused with an error wrapping
+	// ErrChannelMap and NOTHING IS SENT TO THE ELEMENT. That order is not
+	// defensive tidiness: audioconvert rejects an out-of-range coefficient
+	// silently, leaving the previous matrix in force, so a rejected write and a
+	// successful one are indistinguishable at the property level and the
+	// application can never learn afterwards which matrix is running. See
+	// ChannelGainLimit for the measurement.
+	//
+	// It returns an error, and does not write, on a pipeline that is not
+	// started, that has been stopped, or whose capture source presents a
+	// POSITIONED stream — the last because there is no matrix in force on such
+	// a pipeline to change, and installing one live would renegotiate the very
+	// caps the feed is running on.
+	SetChannelMap(m ChannelMap) error
 
 	// Errors returns the pipeline's asynchronous error channel, carrying
 	// GST_ELEMENT_ERROR messages from the bus — in practice, srtout losing its

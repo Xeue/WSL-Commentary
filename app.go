@@ -181,6 +181,9 @@
 //	"error"               a string
 //	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
 //	"levels"              a levelsPayload {peak:[...], rms:[...]} — the input meters
+//	"channelLevels"       a levelsPayload, one entry per CAPTURE channel — the picker
+//	"channelMap"          a channelMapPayload {inputChannels, map, isDefault}
+//	"signal"              a signalPayload {state, flaps} — the video capture's input lock
 //
 // The "error" event carries first-run configuration problems, gst.Init failures,
 // sign-in failures, and — rate-limited, because the sender retries forever — the
@@ -412,6 +415,72 @@ const (
 	// final all-silence frame when the session ends, so the meters fall to
 	// nothing rather than freezing at the last level and reading as live.
 	EventLevels = "levels"
+
+	// EventChannelLevels carries a levelsPayload measured at a DIFFERENT POINT
+	// from EventLevels, and the two must never be treated as substitutes.
+	//
+	// EventLevels is the stereo that is actually encoded and sent. This is the
+	// capture device's OWN channels — sixteen of them on a DeckLink card —
+	// measured upstream of the audioconvert that mixes them down to that stereo,
+	// so it can say WHICH input the commentator is on and the programme meter
+	// cannot. That question is the entire reason the routing grid is usable: the
+	// operator asks the commentator to talk and watches which bar moves.
+	//
+	// TEN frames a second against the programme meter's twenty, deliberately. The
+	// measurements are on gst.channelLevelIntervalNs; the short version is that
+	// what is rationed is the webview bridge rather than GStreamer, and that
+	// speech syllables run 150-250 ms so a talker is unmistakable at 10 Hz. There
+	// is NO app-side throttle on this event for that reason — the element's own
+	// interval already puts it below the floor a throttle would check against, so
+	// a second one could only add jitter.
+	//
+	// It is emitted only while a session is running AND only when the capture
+	// source presents unpositioned channels: internal/gst builds the element with
+	// post-messages=false and arms it only when a mix matrix was written, so an
+	// ordinary microphone produces not one frame of this for a whole match.
+	EventChannelLevels = "channelLevels"
+
+	// EventChannelMap carries a channelMapPayload: how many channels the capture
+	// pad NEGOTIATED, the routing in force, and whether that routing is the
+	// unchosen default.
+	//
+	// The width is the load-bearing half. The routing grid is sized from it and
+	// from nothing else, because a mix matrix whose width does not match what the
+	// pad negotiated does not degrade the feed — it stops it, measured, with the
+	// capture chain dead before the next level message and every coefficient in
+	// the matrix perfectly legal. What a DeckLink ADVERTISES is not that number:
+	// the device publishes max-channels=16 whatever its element is configured to
+	// produce. Zero is a normal value and means "nothing has negotiated" — before
+	// the first Start, and after a session ends — and it draws no grid at all.
+	//
+	// It is emitted when a session starts (which is when the pad negotiates) and
+	// when one ends, and replayed on domReady, so a Settings screen left open
+	// across a START sizes its grid without being reopened.
+	EventChannelMap = "channelMap"
+
+	// EventSignal carries a signalPayload: whether the DeckLink video capture
+	// has a locked input, debounced by internal/gst's signal watchdog.
+	//
+	// It is the one event that exists because NOTHING ELSE IN THIS APPLICATION
+	// CAN TELL. A DeckLink that loses signal keeps emitting black frames at full
+	// rate forever — no error, no EOS, the muxer never starves — so the sender
+	// stays CONNECTED, the switcher reports a healthy correctly-formatted feed,
+	// and the level meters keep moving on commentary audio that is untouched.
+	// Every lamp on the screen is green and the picture going out is black. See
+	// internal/gst/signalwatch.go for the measurements and for why the hold-offs
+	// are asymmetric.
+	//
+	// It is emitted only while a session is running, only when the debounced
+	// state CHANGES (or the raw reading has been rattling; see
+	// gst.SignalReport.Flaps), plus one final UNKNOWN frame when the session
+	// ends — for the same reason the levels event sends a silent frame, and with
+	// the same consequence if it did not: a lamp left on for a pipeline that no
+	// longer exists.
+	//
+	// gst.SignalUnknown IS NOT A FAULT and must not be drawn as one. It is the
+	// state of every machine with no capture card in it, which is every machine
+	// running this application today.
+	EventSignal = "signal"
 )
 
 const (
@@ -780,6 +849,69 @@ type App struct {
 	senderMu   sync.Mutex
 	lastSender sender.State
 
+	// sigMu guards lastSignal, the most recent gst.SignalReport the video signal
+	// watchdog delivered. It is a leaf lock, like senderMu: nothing is taken
+	// while it is held, and the only thing done under it is one assignment.
+	//
+	// It exists for the reason lastSender and lastReturn do — the watchdog emits
+	// only on transitions, so a page that reloaded mid-match would show the
+	// signal lamp grey over a perfectly good picture — and for one reason they
+	// do not. The other two lamps have a state that changes: a sender
+	// reconnects, a return monitor retries. A LOCKED CAPTURE INPUT EMITS ONCE
+	// AND THEN NEVER AGAIN for the whole of a ninety-minute match, which is
+	// exactly what a healthy input looks like, so without this cache a reload at
+	// half-time would leave the lamp grey until the signal was lost.
+	//
+	// It is written from internal/gst's watchdog goroutine (NOT a GStreamer
+	// streaming thread; see signalForwarder) and read by domReady.
+	sigMu      sync.Mutex
+	lastSignal gst.SignalReport
+
+	// chanMu guards lastChannelMap, the DeckLink routing CURRENTLY IN FORCE on
+	// the running pipeline. Another leaf lock, held for one assignment.
+	//
+	// It is not the same thing as config.Config.DeckLinkChannelMap and the
+	// difference is the whole reason it exists. The config field is what was
+	// SAVED; this is what the pipeline was started with and what every live
+	// SetChannelMap since has written. They agree on a normal launch and diverge
+	// the moment somebody re-routes without pressing Save — and at that moment
+	// the routing screen must show what the commentator is actually being heard
+	// on, not what the file says. internal/gst deliberately keeps no copy of its
+	// own: mix-matrix cannot be read back, so a second account down there would
+	// be unfalsifiable. Up here it is falsifiable, because this is the only code
+	// that ever calls SetChannelMap.
+	//
+	// Empty means "nobody has chosen", exactly as it does in gst.ChannelMap and
+	// in config.json, and it is what the cache goes back to when a session ends.
+	//
+	// lastInputChannels is the width that went out with the last "channelMap"
+	// event. It is a CACHE and not the authority: GetChannelMap re-reads the pad
+	// itself, because that is the call that must recover from a pad which had not
+	// yet published caps when the session started. This copy exists for domReady,
+	// which runs on the Wails main thread and therefore may not take a lock
+	// internal/gst holds across state changes — a page reloaded during a
+	// reconnect would freeze the window for the length of it.
+	chanMu            sync.Mutex
+	lastChannelMap    gst.ChannelMap
+	lastInputChannels int
+
+	// chanLevelWidth is how many channels the per-channel picker meter was last
+	// drawn at, or 0 if it has never been fed this session.
+	//
+	// It is written by the channel-levels forwarder on a GStreamer streaming
+	// thread — hence the atomic, and hence a store per frame rather than a lock —
+	// and read once, when the session ends, to size the all-silence frame.
+	//
+	// The width MUST be the one the meter was last drawn at. Under the wire
+	// contract a changed array length means "the pipeline was rebuilt, lay
+	// yourself out again", so a two-channel zero-frame sent to a sixteen-strip
+	// meter would make fourteen channels VANISH at the moment the session ended
+	// rather than fall silent — the exact failure the zero-frame exists to
+	// prevent. Zero means no frame at all was forwarded, which is every session
+	// on a positioned capture source, and then no zero-frame is sent either:
+	// laying out strips for a meter that never ran would be inventing a display.
+	chanLevelWidth atomic.Int64
+
 	// mixMu guards mixCtl, the mixer write path. It is a leaf lock: nothing
 	// else is taken while it is held, and the two facts ArmMixer needs from
 	// elsewhere — the m2lx client and the configuration — are read and
@@ -1027,6 +1159,11 @@ func NewApp(appDir string, gstInitErr error) *App {
 		lastSender:  sender.StateStopped,
 		lastReturn:  gst.ReturnStateStopped,
 		lastPicture: gst.PictureStateStopped,
+		// UNKNOWN and not OK. Nothing has been measured yet, and on every machine
+		// without a capture card in it nothing ever will be; claiming a locked
+		// input from an absence of evidence is the exact dishonesty the watchdog
+		// was added to remove.
+		lastSignal:  gst.SignalReport{State: gst.SignalUnknown},
 		exitProcess: forceExit,
 	}
 	// The credential store is reached ONLY through the scope decorator, installed
@@ -1155,6 +1292,30 @@ func (a *App) domReady(ctx context.Context) {
 	lastPic := a.lastPicture
 	a.picStateMu.Unlock()
 	a.events.send(EventPicture, lastPic)
+
+	// The video signal lamp, and this replay does MORE work than the three above
+	// it. A sender reconnects and a return monitor retries, so both of those
+	// lamps repopulate themselves within seconds of a reload even without a
+	// replay; a locked capture input reports once at the start of the match and
+	// is then silent for ninety minutes, because silence is what healthy looks
+	// like. Without this line a page reloaded at half-time would show the lamp
+	// grey — "this application cannot tell you" — over a picture it can see
+	// perfectly well.
+	a.sigMu.Lock()
+	lastSig := a.lastSignal
+	a.sigMu.Unlock()
+	a.events.send(EventSignal, signalPayloadFrom(lastSig))
+
+	// The routing grid, from the CACHE and never from the pad. This is the one
+	// replay that could block the main thread if it asked the pipeline directly:
+	// internal/gst holds its lock across state changes, so a page reloaded during
+	// a reconnect would freeze the window until the sink swap finished. The
+	// routing screen calls GetChannelMap when it opens, which does read the pad,
+	// so the live number is one screen-open away and this one is free.
+	a.chanMu.Lock()
+	chanWidth, chanMap := a.lastInputChannels, a.lastChannelMap
+	a.chanMu.Unlock()
+	a.events.send(EventChannelMap, channelMapPayloadFrom(chanWidth, chanMap))
 }
 
 // secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
@@ -1642,6 +1803,21 @@ func (a *App) startSession() error {
 	}
 
 	sess := &session{snd: snd, pipe: pipe}
+
+	// The routing that is now in force, recorded before anything can change it.
+	// It is taken from the options the pipeline was ACTUALLY started with rather
+	// than re-derived from the config, so there is one derivation and no way for
+	// the cache and the pipeline to disagree about what was written.
+	a.chanMu.Lock()
+	a.lastChannelMap = opts.Pipeline.ChannelMap
+	a.chanMu.Unlock()
+
+	// And the width, which exists only now: the pad negotiates as the pipeline
+	// goes to PLAYING, so this is the first moment there is a real number to
+	// size a routing grid against. A Settings screen left open across a START
+	// therefore sizes itself without being reopened.
+	a.publishChannelMap(pipe)
+
 	// The forwarder is started only after sender.Start has succeeded. On failure
 	// sender.run never launches, so the states channel is never closed, and a
 	// forwarder ranging over it would be a goroutine leaked per failed Start.
@@ -1663,6 +1839,27 @@ func (a *App) startSession() error {
 		// assumption another is 50 ms behind, and this is the frame after
 		// which nothing follows.
 		a.events.send(EventLevels, silentLevelsPayload())
+		// The per-channel picker gets its own zero-frame, AT ITS OWN WIDTH, and
+		// only if it ever ran. Swap rather than Load, so the width belongs to the
+		// session that recorded it and a later session starts from nothing. A
+		// zero here is a session in which no per-channel frame was ever forwarded
+		// — every positioned capture source, which is every microphone — and
+		// sending a silent frame then would lay out strips for a meter that never
+		// existed.
+		if n := int(a.chanLevelWidth.Swap(0)); n > 0 {
+			a.events.send(EventChannelLevels, silentLevelsPayloadFor(n))
+		}
+		// The routing grid goes back to "no pad, nothing negotiated". Its
+		// crosspoints are controls over a capture pad, and the pad is gone.
+		a.forgetChannelMap()
+		// And the signal lamp goes back to "cannot tell", for the same reason
+		// and with a sharper consequence. The watchdog dies with the pipeline,
+		// so whatever it last said — OK or LOST — would stand forever: a green
+		// signal lamp beside a grey SENDING lamp, describing a capture element
+		// that no longer exists. UNKNOWN is the truth once there is nothing left
+		// to poll. It clears the replay cache too, so a page loaded after the
+		// session ends does not resurrect it.
+		a.forgetSignal()
 	}()
 	a.session = sess
 
@@ -2415,6 +2612,26 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// (gst.PipelineOpts.OnLevels: MUST NOT BLOCK) — the forwarder is a
 			// throttle in front of the non-blocking event pump, so it cannot.
 			OnLevels: a.levelsForwarder(nil),
+
+			// The per-channel picker meter, from the OTHER level element: the
+			// capture device's own channels, upstream of the routing. It is a
+			// separate callback because it is a separate measurement, and the
+			// separation is what stops a sixteen-entry frame ever being drawn on
+			// the meter that is supposed to show what is going to air.
+			OnChannelLevels: a.channelLevelsForwarder(),
+
+			// The signal lamp. Unlike OnLevels this is not called on a streaming
+			// thread — internal/gst's watchdog polls from a goroutine of its own —
+			// so the forwarder may take sigMu for the one assignment it makes.
+			OnSignal: a.signalForwarder(),
+
+			// The routing the card starts with. The zero value is not silence: it
+			// means nobody has chosen, and internal/gst resolves it to the card's
+			// first two embedded channels — bit-for-bit what this application sent
+			// before the routing screen existed. It is IGNORED on a positioned
+			// capture source, which is every microphone and the whole of the
+			// on-air Windows path.
+			ChannelMap: gstChannelMap(cfg.DeckLinkChannelMap),
 		},
 		Sink: gst.SinkOpts{
 			Host:       srtHost,
@@ -3005,11 +3222,31 @@ type levelsPayload struct {
 // freezing at the last reported level. A frozen meter reads as a live one,
 // which is the direction the status display must never be wrong in — the same
 // reasoning that makes the lamps prefer grey over stale green.
+// It is the PROGRAMME meter's zero-frame, and its width is the stereo pair the
+// AAC encoder is pinned to. The per-channel picker needs the same thing at
+// whatever width IT was running at, which is silentLevelsPayloadFor and is not
+// interchangeable with this.
 func silentLevelsPayload() levelsPayload {
-	return levelsPayload{
-		Peak: []float64{levelsSilenceDB, levelsSilenceDB},
-		RMS:  []float64{levelsSilenceDB, levelsSilenceDB},
+	return silentLevelsPayloadFor(gst.ChannelMapOutputs)
+}
+
+// silentLevelsPayloadFor is silentLevelsPayload at an arbitrary channel count:
+// the zero-frame for a meter that was showing N strips.
+//
+// THE COUNT MUST BE THE ONE THE METER WAS LAST DRAWN AT, and not a default.
+// Under the wire contract a changed array length means "the pipeline was
+// rebuilt, lay yourself out again" — so a two-channel zero-frame sent to a
+// sixteen-strip picker would rebuild it as two strips at the exact moment the
+// session ended, and the operator would watch fourteen channels VANISH rather
+// than fall silent. Falling to nothing is the entire purpose of the frame.
+func silentLevelsPayloadFor(channels int) levelsPayload {
+	peak := make([]float64, channels)
+	rms := make([]float64, channels)
+	for i := range peak {
+		peak[i] = levelsSilenceDB
+		rms[i] = levelsSilenceDB
 	}
+	return levelsPayload{Peak: peak, RMS: rms}
 }
 
 // levelsForwarder returns the OnLevels callback for one session: it forwards
@@ -3046,6 +3283,308 @@ func (a *App) levelsForwarder(now func() time.Time) func(gst.Levels) {
 		}
 		a.events.send(EventLevels, levelsPayload{Peak: l.PeakDB, RMS: l.RMSDB})
 	}
+}
+
+// channelLevelsForwarder returns the OnChannelLevels callback for one session:
+// it records the width the picker is being drawn at and forwards the frame on
+// the "channelLevels" event.
+//
+// THERE IS DELIBERATELY NO THROTTLE, unlike levelsForwarder. The level element
+// behind this one runs at gst.channelLevelIntervalNs — 100 ms, ten frames a
+// second — which is already SLOWER than levelsMinInterval, the floor a throttle
+// would compare against. A throttle here could therefore never drop a frame for
+// being too soon; all it could do is add jitter to a stream that is already
+// under the limit, by making one frame's arrival time depend on the last one's.
+// The rate is enforced where it is decided, in the element.
+//
+// It runs on a GStreamer streaming thread, so the whole body is one atomic store
+// and a non-blocking pump send: no locks, no allocation beyond the payload, and
+// nothing that can wait.
+func (a *App) channelLevelsForwarder() func(gst.Levels) {
+	return func(l gst.Levels) {
+		// The width, for the zero-frame the session's end will need. A store per
+		// frame rather than a compare-and-store, because ten stores a second of a
+		// value that has not changed is cheaper than the branch that would avoid
+		// them and this runs where nothing may be slow.
+		a.chanLevelWidth.Store(int64(len(l.PeakDB)))
+		a.events.send(EventChannelLevels, levelsPayload{Peak: l.PeakDB, RMS: l.RMSDB})
+	}
+}
+
+// channelMapPayload is the "channelMap" event's wire shape and GetChannelMap's
+// return value: what the capture pad negotiated, the routing in force against
+// it, and whether that routing is the one nobody chose.
+//
+// The three fields answer three different questions and the UI needs all three.
+// InputChannels sizes the grid — and ONLY it may, because a matrix built against
+// any other number stops the capture chain rather than degrading it. Map is what
+// is in force right now, which after a live re-route is not what config.json
+// says. IsDefault is what separates "nobody has routed this position" from "one
+// contribution happens to look like the default", so the screen can say the
+// first rather than implying somebody chose it.
+type channelMapPayload struct {
+	InputChannels int            `json:"inputChannels"`
+	Map           gst.ChannelMap `json:"map"`
+	IsDefault     bool           `json:"isDefault"`
+}
+
+// channelMapPayloadFrom builds one payload, copying the map.
+//
+// The copy is not defensiveness about aliasing so much as about lifetime: the
+// event pump holds a queued payload until the webview reads it, and the cached
+// map behind it can be replaced by a live SetChannelMap in the meantime. A
+// sixteen-entry copy is nothing; a payload that changed after it was queued
+// would be a routing screen showing a state that never existed.
+//
+// The map is always a non-nil slice, so the wire form is [] rather than null:
+// the frontend tests Array.isArray before adopting a map, and null would take
+// the "this build cannot tell me" path rather than the "nobody has chosen" one.
+func channelMapPayloadFrom(inputChannels int, m gst.ChannelMap) channelMapPayload {
+	out := make(gst.ChannelMap, 0, len(m))
+	out = append(out, m...)
+	return channelMapPayload{
+		InputChannels: inputChannels,
+		Map:           out,
+		IsDefault:     m.IsDefault(),
+	}
+}
+
+// gstChannelMap transcribes the persisted routing into internal/gst's model.
+//
+// It is a field-by-field copy of two structs that are deliberately identical —
+// see config.ChannelContribution for why they cannot simply be the same type —
+// and it preserves the ONE semantic that everything else rests on: an empty
+// saved map stays an empty gst.ChannelMap, which means "nobody has chosen" and
+// resolves to the default routing at the width the pad negotiated. Returning
+// an explicit default here instead would freeze today's default into the
+// pipeline and hide the fact that nobody had chosen from the screen that says
+// so.
+func gstChannelMap(saved []config.ChannelContribution) gst.ChannelMap {
+	if len(saved) == 0 {
+		return nil
+	}
+	m := make(gst.ChannelMap, len(saved))
+	for i, c := range saved {
+		m[i] = gst.ChannelContribution{Output: c.Output, Input: c.Input, Gain: c.Gain}
+	}
+	return m
+}
+
+// currentPipeline returns the running session's pipeline, or nil when no session
+// is running.
+//
+// sessMu is held only to read the pointer and is released before the caller
+// touches the pipeline, which is the same discipline GetConformTarget keeps and
+// for the same reason: internal/gst takes its own lock across state changes, so
+// calling into it under sessMu would couple a UI read to a reconnect.
+func (a *App) currentPipeline() gst.Pipeline {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	if a.session == nil {
+		return nil
+	}
+	return a.session.pipe
+}
+
+// GetChannelMap reports the DeckLink routing state: the negotiated channel
+// count, the map in force, and whether that map is the unchosen default.
+//
+// THE WIDTH IS READ LIVE, from the pad, on every call — never from the cache the
+// event and the domReady replay use. That is what makes this the recovery path
+// for the one race the capture chain has: a live source returns NO_PREROLL as
+// soon as its state change completes, which can be before the first CAPS event
+// has travelled downstream, so the count can genuinely be 0 for a moment after
+// Start. Asking again is the whole answer, and the routing screen asks when it
+// opens.
+//
+// It costs a lock internal/gst also holds across state changes, so a call
+// arriving during a reconnect waits for it. That is correct here and would not
+// be on the main thread: Wails runs a bound method on a goroutine of its own,
+// and there is no honest answer to give while the pipeline is being rebuilt
+// anyway. domReady, which DOES run on the main thread, replays the cache instead.
+//
+// No session is not an error. Zero channels draws no grid and the screen says
+// why, which is the truth on every machine that has not pressed START.
+func (a *App) GetChannelMap() (channelMapPayload, error) {
+	width := 0
+	if pipe := a.currentPipeline(); pipe != nil {
+		width = pipe.InputChannels()
+	}
+
+	a.chanMu.Lock()
+	a.lastInputChannels = width
+	m := a.lastChannelMap
+	a.chanMu.Unlock()
+
+	return channelMapPayloadFrom(width, m), nil
+}
+
+// SetChannelMap changes which of the capture device's channels reach the feed's
+// left and right, LIVE, on the running pipeline.
+//
+// Measured on the real card: the property write took 119 µs, the pipeline stayed
+// PLAYING with nothing pending, and the change was audible in the very next level
+// message. That is why the screen calling this has no Apply button.
+//
+// IT DOES NOT SAVE. The routing screen writes the same map into the Settings form
+// and the operator presses Save to keep it for the next launch; this is the live
+// control and config.json is the record. Doing both here would mean a routing
+// experiment mid-match rewrote the file the next launch reads.
+//
+// The error is returned VERBATIM and must reach the operator. internal/gst
+// validates the map against the negotiated width and writes NOTHING if it does
+// not fit — because audioconvert rejects an out-of-range coefficient silently,
+// leaving the previous matrix in force with nothing readable afterwards to say
+// which one is running. A caller that swallowed this would leave the grid showing
+// a routing that is not the one on air.
+func (a *App) SetChannelMap(m gst.ChannelMap) error {
+	pipe := a.currentPipeline()
+	if pipe == nil {
+		return errors.New("wslcomms: nothing is sending, so there is no capture pad to route. " +
+			"Press START once; the routing can then be changed live, while the feed is running")
+	}
+	if err := pipe.SetChannelMap(m); err != nil {
+		return err
+	}
+
+	// Only now is the cache updated, and only on success: it is the record of
+	// what is IN FORCE, and a refused write left the previous matrix in force.
+	a.chanMu.Lock()
+	a.lastChannelMap = m
+	width := a.lastInputChannels
+	a.chanMu.Unlock()
+
+	// Republished so that a SECOND SEAT follows the change. A remote operator's
+	// routing grid must not go on showing the map it last read while somebody at
+	// the desk re-routes the commentator; two seats disagreeing about where the
+	// audio is coming from is worse than either answer alone.
+	a.events.send(EventChannelMap, channelMapPayloadFrom(width, m))
+	return nil
+}
+
+// publishChannelMap emits the current routing state and refreshes the cache the
+// domReady replay reads. It is called once when a session starts, which is when
+// the capture pad negotiates and therefore the first moment the width is real.
+func (a *App) publishChannelMap(pipe gst.Pipeline) {
+	width := 0
+	if pipe != nil {
+		width = pipe.InputChannels()
+	}
+
+	a.chanMu.Lock()
+	a.lastInputChannels = width
+	m := a.lastChannelMap
+	a.chanMu.Unlock()
+
+	a.events.send(EventChannelMap, channelMapPayloadFrom(width, m))
+}
+
+// forgetChannelMap publishes the end-of-session state — no negotiated channels,
+// no map in force — and clears the cache with it.
+//
+// Both halves matter, exactly as they do in forgetSignal. Without the EVENT a
+// routing grid stays drawn at sixteen channels for a pipeline that no longer
+// has a pad, and every crosspoint on it is a control over nothing. Without the
+// CACHE CLEAR a page loaded a minute later is told the same width again, which is
+// worse because it looks freshly measured.
+//
+// The MAP is cleared rather than kept, and that is the deliberate half. An empty
+// map means "nobody has chosen", which is precisely what the routing screen must
+// fall back to once there is no pipeline: it then draws what config.json says,
+// rather than a live routing that has stopped being live.
+func (a *App) forgetChannelMap() {
+	a.chanMu.Lock()
+	a.lastChannelMap = nil
+	a.lastInputChannels = 0
+	a.chanMu.Unlock()
+
+	a.events.send(EventChannelMap, channelMapPayloadFrom(0, nil))
+}
+
+// signalPayload is the "signal" event's wire shape.
+//
+// The lower-case JSON keys are the contract with frontend/src/ui/backend.js, and
+// gst.SignalReport is not sent directly for the reason levelsPayload is not:
+// its exported Go field names would cross the boundary as State/Flaps and tie
+// the frontend to this package's internal naming.
+//
+// State is one of gst.SignalUnknown/SignalOK/SignalLost — "UNKNOWN", "OK",
+// "LOST" — and the frontend MUST NOT draw UNKNOWN as a fault. It is the state of
+// every machine with no capture card in it, and of every session before the
+// first measurement; it means this application cannot tell, which is a different
+// thing from a card telling us there is nothing there.
+//
+// Flaps is how many times the raw property reading changed between the previous
+// report and this one, and it exists because the hysteresis deliberately hides
+// something. An input dropping lock twice a second never accumulates a long
+// enough run to move the lamp, so it reads as steady OK — correctly, because a
+// strobing lamp helps nobody — and this number is what stops that being a lie.
+// A non-zero count on a report whose state did not change is a marginal input,
+// and a frontend may render it as an "unstable" qualifier beside a lamp that is
+// otherwise green.
+type signalPayload struct {
+	State gst.SignalState `json:"state"`
+	Flaps int             `json:"flaps"`
+}
+
+// signalPayloadFrom converts one watchdog report to the wire shape. It exists so
+// that the field mapping is written once, rather than at the forwarder, the
+// replay and the session-end frame separately.
+func signalPayloadFrom(r gst.SignalReport) signalPayload {
+	// A zero gst.SignalReport — nothing has run yet — carries the empty state
+	// rather than "UNKNOWN", and the empty string would reach the frontend as a
+	// value no lamp has a case for. Naming it here means every path out of this
+	// file speaks the same three words.
+	if r.State == "" {
+		r.State = gst.SignalUnknown
+	}
+	return signalPayload{State: r.State, Flaps: r.Flaps}
+}
+
+// signalForwarder returns the OnSignal callback for one session: it records the
+// report for the domReady replay and publishes it on the "signal" event.
+//
+// THERE IS NO THROTTLE HERE, and that is a decision rather than an omission.
+// internal/gst already bounds this: a report is produced only when the debounced
+// state changes, or when the raw reading has flapped signalFlapAlert times since
+// the last report — which needs at least that many poll intervals, so the worst
+// case is about one event per second, the rate m2lx.Watcher emits status at. The
+// levels throttle exists because a level element posts twenty messages a second
+// whatever is happening; nothing analogous applies to a lamp that speaks when
+// something changes.
+//
+// It takes sigMu, unlike levelsForwarder, which takes nothing. The difference is
+// the thread: OnLevels is called on a GStreamer streaming thread, where this
+// package's rule is that no lock may be taken at all, whereas the signal
+// watchdog polls from an ordinary goroutine of its own. sigMu is a leaf and the
+// only thing done under it is one assignment, so it cannot block the watchdog
+// past the next poll.
+func (a *App) signalForwarder() func(gst.SignalReport) {
+	return func(r gst.SignalReport) {
+		a.sigMu.Lock()
+		a.lastSignal = r
+		a.sigMu.Unlock()
+
+		a.events.send(EventSignal, signalPayloadFrom(r))
+	}
+}
+
+// forgetSignal publishes the UNKNOWN frame that ends a session and clears the
+// replay cache with it.
+//
+// Both halves matter and they fail differently. Without the EVENT, the lamp
+// keeps whatever it last showed for a pipeline that has been torn down — a green
+// signal lamp beside a grey SENDING lamp. Without the CACHE CLEAR, the event is
+// right and a page loaded a minute later is told the stale value all over again,
+// which is the worse of the two because it looks freshly measured.
+func (a *App) forgetSignal() {
+	cleared := gst.SignalReport{State: gst.SignalUnknown}
+
+	a.sigMu.Lock()
+	a.lastSignal = cleared
+	a.sigMu.Unlock()
+
+	a.events.send(EventSignal, signalPayloadFrom(cleared))
 }
 
 // forwardSenderStates republishes the sender's transitions on the "sender"

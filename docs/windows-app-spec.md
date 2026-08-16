@@ -87,6 +87,7 @@ from a named operator gesture made inside a two-minute armed window (§11).
 | Video encoder (send) | **`mfh264enc`, chosen by preference, not by rank** | part of Windows | §5.1. Denylisted: `x264enc` (GPL, cannot ship in a commercial deliverable). |
 | Audio encoder (send) | `mfaacenc` | part of Windows | AAC-LC 48 kHz stereo, no extra library, no AAC patent licence. |
 | Audio capture | `wasapi2src` | GStreamer bundle | Takes the IMMDevice endpoint ID in `device=`, and is the maintained plugin. |
+| **SDI capture** | **`decklinkvideosrc` / `decklinkaudiosrc`**, always behind `videorate`, and `deinterlace` when the feed is interlaced | GStreamer bundle (`libgstdecklink.dll`, `libgstvideorate.dll`, `libgstdeinterlace.dll`) — **plus Blackmagic Desktop Video, which the operator installs and this product does not ship** | A commentary position in a sports facility takes its programme feed off SDI, so the card is a Blackmagic one. All three plugins are LGPL. **`videorate` is mandatory, not decoration:** `decklinkvideosrc` emits a 720x486 NTSC placeholder as its first buffer on every start and the real caps arrive ~170 ms later, so a fixed capsfilter with nothing in between dies in 0.088 s with `not-negotiated` (-4) — measured 3/3 runs. `deinterlace` is the only thing in the bundle that can take a 1080i50 camera. **The driver is a deployment prerequisite in the same class as the WebView2 runtime**, and unlike WebView2 there is no bootstrapper to embed: without Desktop Video there is no DeckLink API, so there are no devices, no capture, and no error the operator can act on. |
 | **Video decoder (picture)** | **`d3d11h265dec` → `d3d11videosink`** | GStreamer bundle (`libgstd3d11.dll`) | D3D11/DXVA, LGPL, wrapping a decoder in the GPU driver. **Rejected: `avdec_h265` / gst-libav** — FFmpeg is the same commercial-shipping concern as x264enc, and `build/bundle-gst.ps1` refuses to copy anything matching `*libav*` or `*avcodec*`. **`mfh265dec` is absent on the target**: the Windows HEVC video extension is not installed, and requiring the operator to buy it from the Microsoft Store is not a deployment step. |
 | Audio decoder (SRT return) | `mfaacdec` → `wasapi2sink` | part of Windows / bundle | Same argument: an OS codec, not `avdec_aac`. |
 | SRT | `srtsink` (send) and `srtsrc` (picture, return), all with `auto-reconnect=false` | libsrt DLL in the bundle | Reference implementation. Rejected: `datarhei/gosrt` in the product — it stays a **mock-only** dependency. |
@@ -104,7 +105,18 @@ GStreamer installation elsewhere on the machine is invisible to the app, and vic
 GPL `x264enc` and LGPL-plus-patent-encumbered `gst-libav` into a commercial deliverable:
 `coreelements`, `typefindfunctions`, `videoconvertscale`, `audioconvert`, `audioresample`,
 `imagefreeze`, `png`, `audioparsers`, `videoparsersbad`, `wasapi2`, `mediafoundation`, `mpegtsmux`,
-**`mpegtsdemux`**, `srt`, **`d3d11`**. The last two additions are the picture path.
+**`mpegtsdemux`**, `srt`, **`d3d11`**, **`level`**, **`decklink`**, **`videorate`**,
+**`deinterlace`** — nineteen.
+
+Six of those nineteen were added after this section was first written, and they are marked here
+rather than folded in silently, because `build\bundle-gst.ps1` **throws** when its file list and this
+paragraph disagree: adding a plugin is a specification change, so the two move together or the build
+stops. `mpegtsdemux` is the return monitor's demuxer, `d3d11` the picture's HEVC decoder and video
+sink, `level` the input meters' analyser, and `decklink` + `videorate` + `deinterlace` the SDI
+capture path added on 2026-08-16 — before which the shipped app could not use a Blackmagic card on
+either platform, whatever the Go side did. The same three are in the macOS bundler's
+`WANTED_ELEMENTS`, where the cost was measured rather than reasoned: three plugin files, 0.5 MB, and
+not one new library — see `build\README-darwin.md` §9.
 
 ---
 

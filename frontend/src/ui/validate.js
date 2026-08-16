@@ -33,6 +33,12 @@ import {
   CAPTURE_ENDPOINT_PREFIX,
   RENDER_ENDPOINT_PREFIX,
 } from './devices.js';
+// The routing bounds, from the one module that mirrors internal/gst's own
+// constants (channelmap.test.js asserts them against that package's source).
+// Imported rather than restated, for the reason RETURN_CHANNEL_VALUES is: a
+// validator with its own copy of a bound is how a value becomes savable here and
+// refused by the element it was written for.
+import { MAX_INPUT_CHANNELS, GAIN_LIMIT, OUTPUTS } from './channelmap.js';
 
 const PBKEYLEN_VALUES = [0, 16, 32];
 
@@ -78,6 +84,73 @@ const NTSC_TOLERANCE = 0.005;
 
 function isBlank(v) {
   return typeof v !== 'string' || v.trim().length === 0;
+}
+
+/**
+ * channelMapError mirrors internal/gst's ChannelMap.MixMatrix refusals and
+ * returns an operator-facing message, or '' when the routing is one the element
+ * will accept.
+ *
+ * IT IS A MIRROR, NOT A SECOND MODEL, for the same reason videoFormatError is.
+ * Go refuses these maps by name before a byte reaches audioconvert; this exists
+ * so a hand-edited config.json is caught at the FIELD rather than at START. What
+ * makes the mirror worth having HERE rather than only there is that
+ * audioconvert's own rejection is SILENT — it leaves the previous matrix in
+ * force and there is nothing readable afterwards to say which of the two is
+ * running — so a bad coefficient that gets as far as the element is not a fault
+ * anybody can diagnose from the outside.
+ *
+ * The one bound NOT checked is the input channel ceiling against what the pad
+ * negotiated, because this function has no pad: MAX_INPUT_CHANNELS is the widest
+ * card this application supports, and a map naming a channel a particular card
+ * did not negotiate is refused by Go at the moment it is written, with the
+ * actual width in the message. Checking a guessed width here would refuse a
+ * perfectly good sixteen-channel map on a machine whose card was unplugged.
+ *
+ * @param {unknown} raw
+ * @returns {string} the message, or '' if the routing is acceptable
+ */
+function channelMapError(raw) {
+  if (!Array.isArray(raw)) {
+    return 'Channel routing must be a list of contributions, each naming an output, an input ' +
+      'channel and a gain. Leave it out entirely to use the card’s first two channels.';
+  }
+
+  const seen = new Set();
+  for (let i = 0; i < raw.length; i += 1) {
+    const c = raw[i];
+    const at = `Contribution ${i + 1}`;
+    if (!c || typeof c !== 'object' || Array.isArray(c)) {
+      return `${at} is not a routing entry. Each one needs an output, an input and a gain.`;
+    }
+    if (!isInt(c.output) || !OUTPUTS.some((o) => o.index === c.output)) {
+      return `${at} routes to output ${c.output}, and this feed has two: ` +
+        `${OUTPUTS.map((o) => `${o.index} (${o.label})`).join(' and ')}. The commentary feed is a ` +
+        'stereo pair and there is no third channel to send anything to.';
+    }
+    // Zero-based, as it is on the wire and in Go; the +1 in the message is the
+    // operator's numbering, because the number they can check is the one on the
+    // embedder.
+    if (!isInt(c.input) || c.input < 0 || c.input >= MAX_INPUT_CHANNELS) {
+      return `${at} takes input channel ${Number(c.input) + 1}, and a card presents at most ` +
+        `${MAX_INPUT_CHANNELS}. Channels are counted from 1 on the embedder and from 0 in this ` +
+        'file.';
+    }
+    if (typeof c.gain !== 'number' || !Number.isFinite(c.gain) || Math.abs(c.gain) > GAIN_LIMIT) {
+      return `${at} has a gain of ${c.gain}, and the routing accepts −${GAIN_LIMIT} to ` +
+        `${GAIN_LIMIT}. This is a router with attenuation, not a mixer: there is no gain above ` +
+        'unity anywhere in this path, and a value outside the range is rejected by the audio ' +
+        'element without saying so, leaving the previous routing in force.';
+    }
+    const cell = `${c.output}:${c.input}`;
+    if (seen.has(cell)) {
+      return `${at} routes input channel ${c.input + 1} to an output it is already routed to. ` +
+        'One crosspoint holds one gain; two entries for the same one would have to be added ' +
+        'together into a level nobody chose.';
+    }
+    seen.add(cell);
+  }
+  return '';
 }
 
 /**
@@ -318,6 +391,30 @@ export function validateConfig(config) {
       'A device number is a position in the enumeration and addresses a different card once ' +
       'one is added or moved; a persistent ID names the card itself and is a long number ' +
       '(e.g. 2747401380). Leave this blank if there is only one card.';
+  }
+
+  // THE CARD'S CHANNEL ROUTING. Absent or empty is VALID and is the normal state
+  // — it means nobody has chosen, and Go resolves it to the card's first two
+  // embedded channels, which is exactly what this application sent before the
+  // routing screen existed.
+  //
+  // The grid upstairs is INCAPABLE of producing an invalid map: it is drawn from
+  // the negotiated width, its crosspoints are a set, and it cannot express two
+  // contributions to one cell. A HAND-EDITED config.json is not, and this is the
+  // only thing between such a file and a Save. The bounds are internal/gst's, not
+  // a second opinion: two outputs because the AAC encoder is pinned to a stereo
+  // pair, and [-1, 1] because audioconvert HARD-CLAMPS the coefficient there —
+  // and rejects the whole matrix SILENTLY, leaving the previous one in force, so
+  // a value that reaches the element out of range is unrecoverable rather than
+  // merely wrong.
+  //
+  // The map is REFUSED WHOLE and never trimmed, which mirrors gst.MixMatrix's
+  // refusals. Dropping the offending entry would save a routing the operator did
+  // not write, and the entry most likely to be wrong is the one carrying the
+  // commentator.
+  if (config.decklinkChannelMap !== undefined && config.decklinkChannelMap !== null) {
+    const message = channelMapError(config.decklinkChannelMap);
+    if (message) errors.decklinkChannelMap = message;
   }
 
   // The RETURN path's key length. Same three values, a different endpoint, and

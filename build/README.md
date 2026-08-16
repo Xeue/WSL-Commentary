@@ -50,7 +50,8 @@ C:\Program Files\WSL Studios\WSL Commentary\
   wslcomms.exe                     20.3 MB  Go + Wails + embedded frontend + embedded WebView2 bootstrapper
   slate.png                                 1920x1080 slate, fed to filesrc ! pngdec ! imagefreeze
   *.dll                            21.5 MB  GStreamer / GLib / MinGW runtime (default AppDir layout — see section 6)
-  gst\lib\gstreamer-1.0\*.dll       1.4 MB  the fifteen allowlisted plugins
+  gst\lib\gstreamer-1.0\*.dll       1.4 MB  the allowlisted plugins — fifteen when this was
+                                            measured, nineteen now (sections 2.10 and 5)
   gst\BUNDLE-MANIFEST.txt                   what was shipped, with SHA-256 for every file
   licenses\                                 LGPL-2.1 text, written offer, third-party notice
 ```
@@ -279,6 +280,32 @@ Nothing to do. Evergreen is part of Windows 11 (specification section 3), and
 `wails build -webview2 embed` puts Microsoft's ~150 KB bootstrapper in the
 executable for the cases where it is not.
 
+### 2.10 Blackmagic Desktop Video — the prerequisite with no bootstrapper
+
+Nothing to do **on the build host**, because `bundle-gst.ps1` copies
+`libgstdecklink.dll` by name and does not need the driver to do it. Everything
+to do **on the commentary machine**, if that position captures off SDI.
+
+The plugin is in the bundle; the DeckLink API it wraps is not, and cannot be —
+it arrives with Blackmagic's Desktop Video installer, under Blackmagic's
+licence, and this product does not redistribute it. The plugin reaches it
+through COM, so nothing in the import table names it and `-DependencyReport`
+will never mention it. Its absence from `gst\BUNDLE-MANIFEST.txt` is not
+evidence that the driver is unnecessary.
+
+Same class as WebView2 above, minus the bootstrapper: a manual,
+administrator-privileged install that wants a reboot. Without it there is no
+API, so there are no devices and no capture, and the failure is silent — an
+input list with no card in it and no error anywhere. `build\installer.iss`
+records why there is deliberately no install-time check, and
+`licenses\NOTICE.txt` section F3 records the licence position.
+
+The two other plugins added with it, `videorate` and `deinterlace`, need
+nothing installed. `videorate` is not optional: `decklinkvideosrc` emits a
+720x486 NTSC placeholder as its first buffer on every start and the real caps
+arrive ~170 ms later, so a fixed capsfilter with nothing in between dies in
+0.088 s with `not-negotiated` (-4).
+
 ---
 
 ## 3. Build
@@ -339,7 +366,10 @@ because a directory copy would drag GPL `x264enc` into a commercial deliverable.
 It fails loudly if a listed file is missing, refuses to copy anything matching
 the patterns in `build\forbidden-names.ps1`, audits its own output, walks the
 import table of everything it copied, and prints the total size (expect
-**22.9 MB**; measured 2026-08-12, 15 plugins and 35 runtime files).
+**22.9 MB**; measured 2026-08-12, 15 plugins and 35 runtime files — four plugins
+have been added since, `level` and then the three of the capture path, and none of
+them has been measured on Windows. The macOS equivalents cost 0.5 MB, so the band
+in the script is unchanged and deliberately so).
 
 Two behaviours are worth knowing about before you run it.
 
@@ -426,7 +456,9 @@ What the design buys:
 | Failures are visible | It is linked `-H windowsgui` and has no console, so errors go to a message box, never to a stderr nobody can see |
 | An archive cannot write outside the unpack directory | Zip-slip check on every entry (`safeRelPath`), tested |
 
-The script verifies the staged folder before packing: 15 plugins, all four
+The script verifies the staged folder before packing: as many plugins as
+`BUNDLE-MANIFEST.txt` records — it derives the number rather than restating it,
+so an allowlist change does not have to be made in two places — all four
 required files present, and `BUNDLE-MANIFEST.txt` recording a **passing**
 dependency check — a bundle whose closure was never verified is exactly the one
 that fails on a machine that is not the build host. It packs an **explicit file
@@ -484,7 +516,8 @@ cache; a stale one will happily report a plugin that is no longer there.
 
 ## 5. Extending the DLL list — the loop you will actually run
 
-The thirteen plugins are fixed by specification section 3. What could not be
+The plugin allowlist is fixed by specification section 3, and is nineteen names
+as of 2026-08-16. What could not be
 computed without the files present is their **transitive dependency closure**:
 which other DLLs each plugin imports. `bundle-gst.ps1` computes it for you at
 Gate B, from the real binaries.
@@ -568,7 +601,7 @@ band was written before anyone could build one and is superseded.
 | | Measured | Note |
 |---|---|---|
 | `wslcomms.exe` | 20.3 MB | |
-| GStreamer bundle, stripped | **22.9 MB** | 15 plugins, 35 runtime files |
+| GStreamer bundle, stripped | **22.9 MB** | 15 plugins, 35 runtime files, 2026-08-12. Four plugins added since; unmeasured here |
 | GStreamer bundle, `-NoStrip` | 54.1 MB | the 31.2 MB difference is all DWARF |
 | Staged `build\bin\` total | 43.3 MB | exe + bundle + slate + licences, 60 files |
 | `wslcomms-portable.exe` | **19.8 MB** | the whole thing in one file; payload compresses 43.3 → 17.4 MB |
@@ -663,7 +696,7 @@ check for itself.
 | `bundle-gst.ps1` says `The destination is locked` | `wslcomms.exe` is running and holding its plugin DLLs | close the app and re-run; **nothing was changed**, the existing bundle still works |
 | `gst.Init: the bundled GStreamer … is incomplete` naming specific plugins | a `bundle-gst.ps1` run was interrupted after cleaning but before copying | close the app, delete `%LOCALAPPDATA%\WSLComms\registry.bin`, re-run `bundle-gst.ps1` |
 | `STRIPPING DAMAGED <file>` | `strip` changed a DLL's export count — should be impossible | re-run with `-NoStrip` and report it; do not ship the stripped bundle |
-| `pack-portable.ps1`: `Expected 15 GStreamer plugins, found N` | the staged bundle is incomplete | run `bundle-gst.ps1` first, with the app closed |
+| `pack-portable.ps1`: `The staged tree has N GStreamer plugins but BUNDLE-MANIFEST.txt records M` | the staged bundle is incomplete, or something changed it after staging | run `bundle-gst.ps1` first, with the app closed |
 | Portable exe does nothing when double-clicked | it always reports failures in a message box, so this means the child started and exited | check `%LOCALAPPDATA%\WSLComms\runtime\` was written, then run the unpacked `wslcomms.exe` directly to see its error |
 | ISCC: `dist\gst\BUNDLE-MANIFEST.txt is missing` | the bundle was not produced by `bundle-gst.ps1` | section 3.4 |
 | ISCC: `Unknown directive: ArchitecturesAllowed` value | Inno older than 6.3 | section 2.8 |

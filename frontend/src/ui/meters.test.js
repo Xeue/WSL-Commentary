@@ -26,6 +26,7 @@ import {
   meterZones,
   zoneFills,
   isSilentFrame,
+  frameChannels,
   createPeakHold,
   PEAK_HOLD_MS,
   PEAK_DECAY_DB_PER_S,
@@ -129,6 +130,33 @@ test('isSilentFrame recognises the zero-frame, absence, and nothing else', () =>
   );
   assert.equal(isSilentFrame({ peak: [LEVELS_SILENCE_DB, -40] }), false, 'one live channel is a live frame');
   assert.equal(isSilentFrame({ peak: [-12, -14] }), false);
+});
+
+test('frameChannels always yields exactly the number of meters that are on screen', () => {
+  // The DeckLink routing grid draws one meter per NEGOTIATED capture channel,
+  // and the meter count and the frame width are decided by different things at
+  // different moments. The failure being closed is not a crash: it is a bar left
+  // standing at its last level after the channel behind it stopped existing,
+  // which an operator reads as a live commentator.
+  const four = frameChannels({ peak: [-12, -18, -24, -30], rms: [-20, -26, -32, -38] }, 4);
+  assert.deepEqual(four.peak, [-12, -18, -24, -30]);
+  assert.deepEqual(four.rms, [-20, -26, -32, -38]);
+
+  // Short frames pad with SILENCE, not with the last value and not with undefined.
+  const padded = frameChannels({ peak: [-12, -18] }, 4);
+  assert.deepEqual(padded.peak, [-12, -18, LEVELS_SILENCE_DB, LEVELS_SILENCE_DB]);
+  assert.deepEqual(padded.rms, new Array(4).fill(LEVELS_SILENCE_DB), 'a frame with no rms draws no rms');
+
+  // Long frames truncate: a channel with no meter must not shift the others.
+  assert.deepEqual(frameChannels({ peak: [-1, -2, -3] }, 2).peak, [-1, -2]);
+
+  // Absence, garbage and out-of-range values all read as silence.
+  assert.deepEqual(frameChannels(null, 2).peak, [LEVELS_SILENCE_DB, LEVELS_SILENCE_DB]);
+  assert.deepEqual(frameChannels({ peak: ['x', -Infinity] }, 2).peak, [LEVELS_SILENCE_DB, LEVELS_SILENCE_DB]);
+  assert.deepEqual(frameChannels({ peak: [-400] }, 1).peak, [LEVELS_SILENCE_DB], 'the clamp floor is the floor');
+
+  // No meters is no work, not a throw.
+  assert.deepEqual(frameChannels({ peak: [-12] }, 0), { peak: [], rms: [] });
 });
 
 /* ------------------------------------------------------------------------ */

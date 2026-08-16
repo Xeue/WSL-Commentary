@@ -282,19 +282,92 @@ echo "==> licence gate: $FORBIDDEN_N patterns parsed from forbidden-names.ps1"
 #                                would not otherwise contain, and a fallback
 #                                that is not in the bundle is not a fallback.
 #
+# THE DECKLINK CAPTURE PATH — three plugins, added 2026-08-16
+# -----------------------------------------------------------
+# A commentary position in a sports facility takes its programme feed off SDI,
+# not off the machine's own audio stack, and that means a Blackmagic card. The
+# elements below were in NEITHER bundler until this change: `grep -c decklink`
+# returned 0 for this script and for build/bundle-gst.ps1 alike, so however good
+# the Go side got, the shipped app could not use a DeckLink at all on either
+# platform.
+#
+#   decklinkvideosrc  the SDI video capture source, and
+#   decklinkaudiosrc  the embedded-audio source. ONE FILE, libgstdecklink.dylib,
+#                     so naming both costs nothing and makes the hermetic proof
+#                     at step 5 cover the audio leg too. The audio leg is not
+#                     wired up in the Go code yet (app.go says so, and
+#                     CONTRACT.md records the single line that refuses it), but
+#                     a fallback — or a next leg — that is not in the bundle is
+#                     not one, which is the same reasoning that puts vtdec and
+#                     osxvideosink in this list.
+#
+#   videorate         MANDATORY, and not a nicety. MEASURED, 3/3 runs:
+#                     decklinkvideosrc emits the 720x486 NTSC PLACEHOLDER as its
+#                     first buffer on EVERY start, and the real caps arrive
+#                     ~170 ms later. A fixed capsfilter downstream of it and
+#                     nothing else therefore sees a frame it cannot accept
+#                     before it ever sees a real one, and the pipeline dies in
+#                     0.088 s with not-negotiated (-4). videorate is what
+#                     absorbs that first buffer and the rate change behind it.
+#                     Leaving it out does not degrade the capture; it prevents
+#                     it, in under a tenth of a second, with an error message
+#                     about caps that names no plugin.
+#
+#   deinterlace       the only element in this bundle that can handle a 1080i50
+#                     camera, which is a likely feed in a UK sports facility and
+#                     is handled NOWHERE today. Everything downstream of the
+#                     capture in this product's pipeline is progressive.
+#
+# All three are LGPL — verified with gst-inspect against 1.26.10, not assumed:
+# decklink is gst-plugins-bad, videorate gst-plugins-base, deinterlace
+# gst-plugins-good, and all three report License LGPL. Note in passing that
+# deinterlace's own description says "Deinterlace Methods ported from
+# DScaler/TvTime"; the plugin as GStreamer ships it is LGPL and that is what the
+# licence gate and NOTICE.txt section A record.
+#
+# THE PART THAT IS NOT A BUILD PROBLEM AND WILL BE FORGOTTEN ANYWAY.
+# libgstdecklink.dylib has NO load command naming anything Blackmagic. MEASURED:
+# it carries the string /Library/Frameworks/DeckLinkAPI.framework together with
+# the symbols InitDeckLinkAPI, IsDeckLinkAPIPresent and gDeckLinkAPIBundleRef,
+# which is to say it opens that framework as a CFBundle AT RUN TIME, from an
+# absolute path outside the .app. Three consequences, none of them obvious:
+#
+#   1. it costs this closure nothing. otool cannot see a CFBundle path, so
+#      step 2 does not follow it, step 4 does not audit it and the bundle does
+#      not grow by a byte on its account;
+#   2. it cannot be bundled even if we wanted to. That framework belongs to
+#      Blackmagic's Desktop Video installer and is not ours to redistribute. It
+#      is a USER-INSTALLED PREREQUISITE, exactly the class WebView2 is in on
+#      Windows — see build/licenses/NOTICE.txt section F3 and README-darwin.md
+#      section 2;
+#   3. THIS BUILD HOST needs it too. Step 1 resolves every wanted element
+#      through gst-inspect and step 5 resolves them again from inside the
+#      bundle, so on a Mac without Desktop Video this script now FAILS —
+#      "gst-inspect-1.0 cannot find these elements: decklinkvideosrc
+#      decklinkaudiosrc" — rather than quietly shipping a bundle that cannot
+#      capture. Measured against Desktop Video 16.0 with a card present.
+#
+# What the failure looks like on a TARGET Mac without Desktop Video was NOT
+# measured, because this host has it installed and there is no way to hide a
+# framework at an absolute path from one process. It is quiet either way: with
+# no DeckLinkAPI.framework there is no iterator, so there are no devices, and
+# whether the elements are absent from the registry or merely find nothing is a
+# distinction the operator cannot make and does not care about.
+#
 # typefindfunctions is wanted because it is not optional: GStreamer's own
 # typefinding is a plugin, and a registry without it produces caps negotiation
 # failures that read like anything but a missing plugin.
 WANTED_ELEMENTS="
 filesrc queue capsfilter fakesink typefindfunctions
 pngdec imagefreeze
-videoconvert videoscale
+videoconvert videoscale videorate deinterlace
 audioconvert audioresample
 h264parse h265parse aacparse
 level
 mpegtsmux tsdemux
 srtsink srtsrc
 osxaudiosrc osxaudiosink
+decklinkvideosrc decklinkaudiosrc
 atenc atdec
 vtenc_h264 vtenc_h264_hw vtdec_hw vtdec
 glimagesink osxvideosink
@@ -359,6 +432,20 @@ if [ -n "$MISSING" ]; then
     echo "       install all of them are present (measured against 1.26.10);" >&2
     echo "       'brew install gstreamer gst-plugins-base gst-plugins-good" >&2
     echo "       gst-plugins-bad' is the full set this needs." >&2
+    case "$MISSING" in
+        *decklink*)
+            # A different remedy from every other name in that list, so it is
+            # said rather than left to be discovered: the plugin file IS in a
+            # stock Homebrew GStreamer, and reinstalling GStreamer will not
+            # bring these two elements back.
+            echo "" >&2
+            echo "       decklink* is NOT a GStreamer packaging problem. libgstdecklink.dylib" >&2
+            echo "       opens /Library/Frameworks/DeckLinkAPI.framework as a CFBundle at run" >&2
+            echo "       time, and that framework comes from Blackmagic's DESKTOP VIDEO" >&2
+            echo "       installer. Install Desktop Video on this build host and re-run." >&2
+            echo "       See build/README-darwin.md section 2." >&2
+            ;;
+    esac
     exit 1
 fi
 

@@ -259,6 +259,30 @@ Two of them change rules stated above and so are recorded here rather than only 
   against Go's parser directly, plus source-text assertions on the bounds. A string they disagree
   about is a defect either way round.
 
+**A fifth field added 2026-08-16, rule 3** — `decklinkChannelMap`, MACHINE, an array of
+`{output, input, gain}` with `input` **zero-based** and `gain` linear in `[-1, 1]`. Three things
+about it are load-bearing:
+
+- **It is MACHINE and it is the sharpest case on that list.** It says which XLR in **this room**
+  carries the commentator. The other six machine fields fail loudly when they arrive somewhere they
+  are not true — a missing device or an absent card does not go on air at all — whereas a routing
+  from another building negotiates, starts, shows every lamp green, and carries the wrong channel
+  or silence until somebody listens.
+- **Absent means "nobody has chosen" and MUST NOT be materialised into an explicit default.** It
+  resolves, at the width the pad negotiated, to the card's first two embedded channels — bit-for-
+  bit what this application already sent. A migration that wrote that default out would freeze
+  today's default into every config file on every machine. It is the one field in `Config` carrying
+  `omitempty`, so a seat that has never routed writes the same `config.json` it writes today.
+- **`internal/config` keeps its own `ChannelContribution`, field-for-field identical to
+  `gst.ChannelContribution`**, for the reason `VideoFormatSpec` is not `gst.ConformTarget`: this
+  package must not import the one package allowed a cgo import. `app.go` transcribes, and the
+  structs are identical so the transcription has nothing to get subtly wrong.
+- **`validate.js` mirrors `ChannelMap.MixMatrix`'s refusals**, and refuses a map **whole** rather
+  than trimming it — the entry most likely to be wrong is the one carrying the commentator. It is
+  worth mirroring here rather than only in Go because `audioconvert` rejects an out-of-range
+  coefficient **silently**, leaving the previous matrix in force with nothing readable afterwards
+  to say which of the two is running.
+
 ### `internal/secrets` — WP-1
 `Store` with `Get(key)`/`Set(key, value)`. **Three** keys, not two: `KeyM2LX` (`"m2lx"`), `KeySRT`
 (`"srt"`) and `KeySRTReturn` (`"srtreturn"`), mapping to Credential Manager targets
@@ -682,6 +706,32 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetRemoteState()` | `RemoteState` | WP-5b | **host-only** |
 | `SetRemoteListener(enabled, bind, httpPort, httpsPort)` | `error` | WP-5b | **host-only** |
 | `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
+| `GetChannelMap()` | `channelMapPayload {inputChannels, map, isDefault}` | WP-3a | open |
+| `SetChannelMap(map)` | `error` | WP-3a | open |
+
+`GetChannelMap` and `SetChannelMap` are added 2026-08-16 with the DeckLink routing screen. They
+are the two halves of one control and neither is useful alone.
+
+`inputChannels` is what the capture pad **actually negotiated**, read from that pad's current caps
+at the moment of the call, and it is the **only** number a channel map may be sized against. It is
+NOT the device's advertised `max-channels`, which a DeckLink publishes as 16 whatever its element
+is configured to produce. A matrix of the wrong width does not attenuate or misroute — it stops the
+capture chain, measured, with `streaming stopped, reason error (-5)` out of the source and every
+coefficient in the matrix perfectly legal. `0` is a normal answer (before Start, and after a
+session ends) and draws no grid.
+
+`SetChannelMap` applies a routing to the **running** pipeline — measured at 119 µs, no state
+change, no renegotiation, audible in the next level message — which is why the screen that calls it
+has no Apply button. It does **not** persist: `decklinkChannelMap` in `config.json` is the record
+for the next launch, and `SaveConfig` writes it. It is `open` for remote and audit-logged, for the
+same reason the mixer commands are: the seat that notices the wrong channel is often not the seat
+at the desk.
+
+The **empty map is load-bearing** on both. It means "nobody has chosen", resolves to the card's
+first two embedded channels, and is bit-for-bit what this application sent before the routing
+screen existed. Nothing anywhere may materialise it into an explicit default: doing so freezes
+today's default into every config file and takes away the screen's ability to say that nobody has
+chosen.
 
 `GetConformTarget` is added 2026-08-15 with the conform work. It returns
 `{width, height, frameRate, source, raw}` or **null**, and null is the
@@ -722,6 +772,18 @@ either answer alone.
   `internal/gst` can currently **build**, not about whether the configuration is well formed, and
   the same value becomes valid the day the element exists with no change to `config` at all.
 
+  **Still true as of 2026-08-16, and now it is the ONLY thing missing.** The routing engine, the
+  mix-matrix write, the per-channel meters, the signal watchdog, the persisted field and the whole
+  operator-facing screen are built, wired end to end and tested; `pipelineDescription` still builds
+  `captureSourceFactory` (the platform's own source) unconditionally. Everything downstream of that
+  one substitution already asks the pad rather than the device — `applyStartChannelMapLocked` writes
+  a matrix only when the source cannot deliver a stereo pair unaided, and does nothing at all on a
+  positioned one — so landing the capture leg means adding `decklinkaudiosrc` with
+  `channels=16` **explicitly** (never `channels=max`: it publishes a caps *choice* until the card is
+  opened, and `fixedChannelCount` refuses it by name rather than guessing a width) alongside a
+  `decklinkvideosrc` for the same card in the same pipeline, because DeckLink audio **cannot preroll
+  without it**.
+
 The two remote-access methods live in `app_remote.go` and are BOTH host-only: they change WHETHER
 the listener runs and on WHAT address and ports, so a remote connection must never reach them — the
 remote dispatcher refuses them from every connection. They are on the bound surface solely so the
@@ -752,6 +814,22 @@ session runs, one all-`-100` zero-frame on stop), and — added 2026-08-12 with 
 so a SECOND controller can refresh; `origin` is the id of the seat that saved, so a page ignores the
 echo of its own save) and **`remote`** (`[]{name, addr}`, the currently-connected remote seats, for
 the home-screen indicator that lets the operator at the desk see that someone else has a seat).
+
+Added 2026-08-16 with the DeckLink capture work, three more:
+**`channelLevels`** (the same `{peak, rms []float64}` shape as `levels`, but one entry per
+**capture** channel and measured **upstream** of the routing — 10/s, not 20/s, and emitted only on
+an unpositioned source, so a native seat sends none at all),
+**`channelMap`** (`{inputChannels, map, isDefault}`, on session start and end, replayed on
+`domReady` from a cache rather than from the pad), and
+**`signal`** (`{state: 'UNKNOWN'|'OK'|'LOST', flaps: number}`, the capture card's input lock,
+debounced in `internal/gst`).
+
+Two rules on those three. **`levels` and `channelLevels` must never be treated as substitutes**:
+both level elements post a GstStructure named `level` — reproduced here, 65 messages in one run,
+all named `level`, 16 entries from one and 2 from the other — so they are told apart by the posting
+element's name, and a frame from the wrong one makes a meter read as live while showing a signal
+that is not going to air. And **`UNKNOWN` is not a fault and must not render red**: it is the state
+of every machine with no capture card in it, which is every machine running this application today.
 
 **Every event ALSO reaches the LAN bridge.** `app.go`'s event pump tees each event to
 `remote.Server.Broadcast` at the single `wailsruntime.EventsEmit` tap point, so a remote seat sees

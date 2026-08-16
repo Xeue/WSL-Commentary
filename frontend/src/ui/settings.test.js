@@ -59,6 +59,20 @@ const repoRoot = join(here, '..', '..', '..');
 const read = (...parts) => readFileSync(join(...parts), 'utf8');
 const ui = (name) => read(here, name);
 
+/**
+ * jsonTagName is the NAME half of a Go struct tag: everything before the first
+ * comma. `json:"decklinkChannelMap,omitempty"` names the key
+ * "decklinkChannelMap" and says one thing about how it is encoded, and the tests
+ * below mirror KEYS.
+ *
+ * It exists because two of them used the whole tag text, which was right only
+ * for as long as no field carried an option — and the first one that did failed
+ * them by asserting that settings.js must restate the literal
+ * "decklinkChannelMap,omitempty". Go's own reflection does exactly this split
+ * (internal/presets/fields_test.go), which is the authority both sides mirror.
+ */
+const jsonTagName = (tag) => tag.split(',')[0];
+
 /** A configuration validateConfig accepts, so a case can change one field. */
 function validForm() {
   return {
@@ -325,6 +339,64 @@ test('a DeckLink device NUMBER is refused by name, and a persistent ID is not', 
     const { decklinkPersistentId } = validateConfig({ ...validForm(), decklinkPersistentId: value });
     assert.equal(decklinkPersistentId, undefined, `${JSON.stringify(value)} must be accepted`);
   }
+});
+
+test('the channel routing is refused whole, never trimmed, and absent is valid', () => {
+  // ABSENT IS THE NORMAL STATE. Empty means nobody has chosen, and Go resolves
+  // it to the card's first two embedded channels — which is bit-for-bit what
+  // this application sent before the routing screen existed. A validator that
+  // required a routing would make every native seat's Settings screen unsavable.
+  for (const map of [undefined, null, []]) {
+    const errors = validateConfig({ ...validForm(), decklinkChannelMap: map });
+    assert.equal(errors.decklinkChannelMap, undefined, `${JSON.stringify(map)} must be accepted`);
+  }
+
+  // The routing an operator can actually build in the grid: two mics summed to
+  // one leg, one of them trimmed, one polarity-inverted leg.
+  const good = [
+    { output: 0, input: 0, gain: 1 },
+    { output: 0, input: 4, gain: 0.5 },
+    { output: 1, input: 15, gain: -1 },
+  ];
+  assert.equal(validateConfig({ ...validForm(), decklinkChannelMap: good }).decklinkChannelMap, undefined);
+
+  // Every refusal is a HAND-EDITED file's, because the grid cannot express any
+  // of these — which is exactly why they have to be caught here rather than at
+  // the element, whose own rejection is silent and leaves the previous routing
+  // in force.
+  const bad = [
+    [{ output: 2, input: 0, gain: 1 }, /two/],           // a third output
+    [{ output: 0, input: 16, gain: 1 }, /at most 16/],   // past the widest card
+    [{ output: 0, input: -1, gain: 1 }, /at most 16/],   // counted from zero
+    [{ output: 0, input: 0, gain: 1.0001 }, /router with attenuation/],
+    [{ output: 0, input: 0, gain: Number.NaN }, /router with attenuation/],
+    [{ output: 0, input: 0 }, /router with attenuation/], // no gain at all
+    [{ output: 0, gain: 1 }, /at most 16/],               // no input
+    ['nonsense', /not a routing entry/],
+  ];
+  for (const [entry, expected] of bad) {
+    const errors = validateConfig({ ...validForm(), decklinkChannelMap: [entry] });
+    assert.ok(errors.decklinkChannelMap, `${JSON.stringify(entry)} must be refused`);
+    assert.match(errors.decklinkChannelMap, expected);
+  }
+
+  // TWO CONTRIBUTIONS TO ONE CROSSPOINT is the refusal worth its own case: one
+  // cell of the matrix holds one coefficient, so the two would have to be summed
+  // into a gain nobody typed.
+  const doubled = [
+    { output: 0, input: 3, gain: 1 },
+    { output: 0, input: 3, gain: 0.25 },
+  ];
+  assert.match(
+    validateConfig({ ...validForm(), decklinkChannelMap: doubled }).decklinkChannelMap,
+    /already routed to/,
+  );
+
+  // Not an array at all — a hand-edited file with an object where the list goes.
+  assert.match(
+    validateConfig({ ...validForm(), decklinkChannelMap: { output: 0 } }).decklinkChannelMap,
+    /must be a list/,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -775,7 +847,7 @@ test('the return passphrase never reaches config.json', () => {
   // passphrases at length and should go on doing so.
   const struct = read(repoRoot, 'internal', 'config', 'config.go').match(/type Config struct \{[\s\S]*?\n\}/);
   assert.ok(struct, 'internal/config must still declare type Config struct');
-  const tags = [...struct[0].matchAll(/json:"([^"]+)"/g)].map((m) => m[1]);
+  const tags = [...struct[0].matchAll(/json:"([^"]+)"/g)].map((m) => jsonTagName(m[1]));
   assert.ok(tags.includes('srtReturnPBKeyLen'), 'the key length is not a secret and belongs here');
   for (const tag of tags) {
     assert.equal(
@@ -1021,7 +1093,7 @@ test('collectConfig still restates every config.Config json tag and no preset ke
   const struct = read(repoRoot, 'internal', 'config', 'config.go').match(/type Config struct \{[\s\S]*?\n\}/);
   assert.ok(struct);
   const tags = [...struct[0].matchAll(/json:"([^"]+)"/g)]
-    .map((m) => m[1])
+    .map((m) => jsonTagName(m[1]))
     // The Tile's nested x/y/w/h tags live under monitorTile and are restated
     // as monitorTile.{x,y,w,h}; the top-level key is what collectConfig owns.
     .filter((tag) => !['x', 'y', 'w', 'h'].includes(tag));
@@ -1753,4 +1825,27 @@ test('the four new fields are classified in the Go whitelist, two each way', () 
     );
     assert.equal(instance.includes(`"${tag}"`), false);
   }
+});
+
+test('the DeckLink channel map is loaded and restated, though it has no box', () => {
+  // THE SAME DATA-LOSS RULE AS EVERY OTHER FIELD, applied to the one value on
+  // this screen that is a MATRIX rather than a box: collectConfig replaces the
+  // whole document, so a field it does not restate is a field a Save deletes.
+  // What would be deleted here is which of a card's sixteen embedded channels
+  // the commentary arrives on — and it would be deleted by a seat that is not
+  // even using the card, because the group is hidden on a native input.
+  //
+  // The routing itself is proved in channelmap.test.js; this is the settings
+  // screen's half of the contract.
+  const js = ui('settings.js');
+  const collect = js.slice(js.indexOf('function collectConfig()'), js.indexOf('function clearAllErrors()'));
+  const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('function refreshSecretBadges'));
+  assert.ok(collect.includes('decklinkChannelMap'), 'collectConfig must restate the channel map');
+  assert.ok(populate.includes('decklinkChannelMap'), 'populate must read it, or the form saves a blank over it');
+  assert.match(
+    js,
+    /decklinkChannelMap: \[\],/,
+    'blankConfig must default it to an EMPTY map: empty means "whatever the capture does by ' +
+      'itself", which is the first two embedded channels — the routing every seat already had',
+  );
 });

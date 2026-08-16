@@ -415,6 +415,10 @@ function fakeStart() {
   // the level element measures upstream of the sink, so the meters move even
   // while the SRT caller is still dialling. The fake keeps that property.
   startFakeLevels();
+  // And the card comes up with the session: the pad negotiates, the video
+  // signal appears and the sixteen per-channel meters start moving. See
+  // fakeCardUp, at the foot of this file with the rest of the DeckLink fake.
+  fakeCardUp();
   fakeEmit(EVENT_SENDER, SENDER_STATE.CONNECTING);
   fakeSenderTimers.push(
     setTimeout(() => {
@@ -437,6 +441,7 @@ function fakeStop() {
   fakeSenderRunning = false;
   clearFakeSenderTimers();
   stopFakeLevels();
+  fakeCardDown();
   fakeEmit(EVENT_SENDER, SENDER_STATE.STOPPED);
   fakeEmit(EVENT_STATUS, makeFakeStatus({ streamState: STREAM_STATE.STOPPED, healthy: false }));
   return Promise.resolve();
@@ -466,6 +471,25 @@ function installFakeConsoleHandle() {
     // impossible.
     setConformTarget: (format) => {
       fakeConformTarget = format && typeof format === 'object' ? { ...format } : null;
+    },
+    // Drive the DeckLink routing screen without a card.
+    //
+    // setSignal('LOST') is the one worth reaching for: a real signal loss is
+    // debounced in Go and reported once in a ninety-minute match, so the red and
+    // the flapping-input amber are otherwise unreachable in a dev session.
+    // setSignal('OK', 6) is the marginal cable — an OK report the watchdog was
+    // FORCED to send because the raw reading rattled.
+    //
+    // setChannelCount(8) is the other: a pad that negotiates fewer channels than
+    // the saved map was written against is what the dropped-routing warning
+    // exists for, and 0 is the "press START once" state.
+    setSignal: (state, flaps) => {
+      fakeSignal = { state: String(state || SIGNAL_STATE.UNKNOWN), flaps: Number(flaps) || 0 };
+      fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
+    },
+    setChannelCount: (channels) => {
+      fakeChannelMap.inputChannels = Number(channels) || 0;
+      fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
     },
   };
 }
@@ -1807,4 +1831,281 @@ export async function setRemoteListener(enabled, bind, httpPort, httpsPort) {
   fakeRemote.bind = String(bind).trim();
   fakeRemote.httpPort = Number(httpPort);
   fakeRemote.httpsPort = Number(httpsPort);
+}
+
+// ---------------------------------------------------------------------------
+// The DeckLink channel map, its per-channel meters, and the card's video signal
+// ---------------------------------------------------------------------------
+//
+// Two bindings and three events, for the three questions the DeckLink routing
+// screen (ui/channelmap.js, drawn inside Settings) has to answer:
+//
+//   HOW WIDE IS THE GRID, AND WHAT IS ROUTED   GetChannelMap / "channelMap"
+//   WHICH CHANNEL IS THE COMMENTATOR ON        "channelLevels"
+//   IS THE CARD SEEING A PICTURE               "signal"
+//
+// The MODEL is internal/gst/channelmap.go's and nothing here restates it. A map
+// is a LIST of contributions — [{output, input, gain}], input counted from ZERO,
+// gain linear in [-1, 1] — because that is the shape the operator's intent has
+// and because a list survives a change of input width without silently meaning
+// something else. A dense 2x16 grid saved and reloaded against a device
+// presenting eight channels has to be truncated by somebody; a list is refused
+// by name.
+//
+// ===================== WHY THE WIDTH IS A BINDING AND NOT A CONSTANT ========
+//
+// A matrix whose width does not match what the capture pad NEGOTIATED kills the
+// pipeline instantly — measured on the card: writing a 2x8 matrix to a pipeline
+// running 2x16 gave "Internal data stream error ... streaming stopped, reason
+// error (-5)", with the capture chain dead before the next level message and
+// every coefficient in the matrix perfectly legal. And what a DeckLink
+// ADVERTISES is not what it negotiates: the device structure publishes
+// max-channels=16 whatever the element is configured to produce. So the count
+// crosses this boundary as gst.Pipeline.InputChannels(), read from the pad's own
+// caps, and ui/channelmap.js's MAX_INPUT_CHANNELS is a ceiling on that report
+// rather than a size. Zero is a normal answer — it is what InputChannels()
+// returns before Start — and it draws no grid at all.
+//
+// ===================== THE LEVELS HERE ARE NOT THE LEVELS ON THE MAIN SCREEN =
+//
+// There are TWO level elements in the contribution pipeline and they answer
+// different questions. alevel meters the stereo that is actually encoded and
+// sent (EVENT_LEVELS, 50 ms) — the meter that goes quiet when the wrong device
+// is selected. chlevel meters the CAPTURE's own channels upstream of the mix
+// down to two (EVENT_CHANNEL_LEVELS, 100 ms) — the meter that answers "which of
+// these sixteen moves when I talk", which is the entire reason the mapping UI is
+// usable.
+//
+// KEEPING THEM APART IS LOAD-BEARING, and it was measured: every level element
+// in the process posts a GstStructure named "level", so a handler matching on the
+// name alone sees 39 messages a second from both and would feed one meter a
+// two-entry frame and a sixteen-entry frame alternately, twenty times a second
+// each. internal/gst routes on msg.Source(); this side keeps the two events
+// apart for the same reason and must never treat one as a fallback for the other.
+//
+// ARRAY INDEX i IS INPUT CHANNEL i, for the life of the pipeline — measured with
+// sixteen sources at 3 dB steps, which came back in input order. Nothing on this
+// side re-derives it per frame.
+//
+// ===================== THE SIGNAL EVENT IS ALREADY DEBOUNCED ================
+//
+// It exists because NOTHING ELSE IN THIS APPLICATION CAN TELL: a DeckLink that
+// loses signal goes on emitting black frames at full rate forever — no error, no
+// EOS, the muxer never starves — so the sender stays CONNECTED, the switcher
+// reports a healthy correctly-formatted feed, the audio meters keep moving, and
+// the picture going out is black with every lamp green.
+//
+// The hysteresis is internal/gst's, with asymmetric hold-offs measured against
+// the real card, and THIS SIDE MUST NOT ADD A SECOND ONE — two filters in series
+// lag a real loss by however long both take to agree. What the frontend does with
+// the payload is decide what the three states LOOK like; see
+// channelmap.js's deriveSignalLamp, including why UNKNOWN is never a fault.
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const CHANNEL_MAP_METHODS = Object.freeze({
+  state: 'GetChannelMap',
+  set: 'SetChannelMap',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const CHANNEL_MAP_METHOD_NAMES = Object.freeze(Object.values(CHANNEL_MAP_METHODS));
+
+// EventChannelMap: {inputChannels, map, isDefault} — what the capture pad
+// negotiated and the routing in force. Emitted when the pad negotiates, which is
+// when a session starts, so a Settings screen left open across a START sizes its
+// grid without being reopened.
+export const EVENT_CHANNEL_MAP = 'channelMap';
+
+// EventChannelLevels: {peak: number[], rms: number[]}, one entry per NEGOTIATED
+// capture channel, dBFS, silence clamped to -100 — the same wire shape as
+// EVENT_LEVELS on purpose, because both meters are drawn by the same model
+// (ui/meters.js) and a second frame shape would be a second scale waiting to
+// happen. Ten frames a second, not twenty: speech syllables run 150-250 ms, so a
+// talker is unmistakable at that rate, and the traffic is linear in channels
+// TIMES rate on a bridge that also carries the programme meter.
+export const EVENT_CHANNEL_LEVELS = 'channelLevels';
+
+// EventSignal: {state, flaps}, mirroring app.go's signalPayload. state is one of
+// SIGNAL_STATE below; flaps is how many times the RAW property reading changed
+// between the previous report and this one, which is how a marginal input shows
+// through a hysteresis that deliberately hides it.
+export const EVENT_SIGNAL = 'signal';
+
+/**
+ * SIGNAL_STATE mirrors gst.SignalState EXACTLY, and it is UPPERCASE.
+ *
+ * UNKNOWN IS NOT A FAULT. It is the state of every machine with no capture card
+ * in it — which is every machine running this application today — and of every
+ * session before the first measurement. It means this application cannot tell,
+ * which is a different claim from a card telling us there is nothing there, and
+ * the difference is why the payload carries three states rather than a boolean.
+ */
+export const SIGNAL_STATE = Object.freeze({
+  UNKNOWN: 'UNKNOWN',
+  OK: 'OK',
+  LOST: 'LOST',
+});
+
+/**
+ * channelMapAvailable reports whether this build can route the card's channels
+ * at all.
+ *
+ * BOTH, for the reason presetsAvailable and pictureAvailable spell out: reading
+ * the pad's width and writing a map are two halves of one control. A build that
+ * could report sixteen channels but not set a map would draw a full grid of
+ * buttons that throw on the first press — a routing screen that cannot route,
+ * offered to somebody looking for the commentator they cannot hear.
+ */
+export function channelMapAvailable() {
+  return CHANNEL_MAP_METHOD_NAMES.every(hasBinding);
+}
+
+// --- the fake card ---------------------------------------------------------
+//
+// A `npm run dev` session has no card, so the fake stands one up: sixteen
+// channels negotiated the moment the fake session starts, a signal, and
+// per-channel frames in which only SOME channels carry audio. That asymmetry is
+// the point — a fake where all sixteen moved together would let the whole
+// find-the-commentator interaction break without anybody noticing in the dev
+// loop, which is the same trap internal/gst's stubChannelLevelsAt documents when
+// it refuses to reuse the stereo stub's quarter-period phase rule.
+
+/** Which fake channels carry audio. Zero-based, so these draw as Ch 3 and Ch 8. */
+const FAKE_LIVE_CHANNELS = [2, 7];
+const FAKE_INPUT_CHANNELS = 16;
+
+let fakeChannelMap = {
+  // 0 until the fake session starts, exactly as gst.Pipeline.InputChannels() is
+  // 0 before Start: there are no caps until something has negotiated, and the
+  // screen's "press START once" state is a real state that must be reachable.
+  inputChannels: 0,
+  map: [],
+};
+let fakeChannelLevelsInterval = null;
+let fakeChannelLevelsStep = 0;
+let fakeSignal = { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
+
+function fakeChannelMapState() {
+  return {
+    inputChannels: fakeChannelMap.inputChannels,
+    map: fakeChannelMap.map.map((c) => ({ ...c })),
+    // gst.ChannelMap.IsDefault: an empty map means nobody has chosen, and the Go
+    // side resolves it to channel 1 left / channel 2 right.
+    isDefault: fakeChannelMap.map.length === 0,
+  };
+}
+
+/**
+ * startFakeChannelLevels drives the per-channel meters off the same triangle
+ * waveform the stereo fake uses, at the real element's 100 ms interval. The
+ * silent channels emit the clamped floor rather than nothing at all: an absent
+ * entry and a silent one must look different, and only the second is what a live
+ * card with nothing plugged into that pair actually sends.
+ */
+function startFakeChannelLevels() {
+  if (fakeChannelLevelsInterval) return;
+  fakeChannelLevelsStep = 0;
+  fakeChannelLevelsInterval = setInterval(() => {
+    const peak = [];
+    for (let i = 0; i < FAKE_INPUT_CHANNELS; i += 1) {
+      const live = FAKE_LIVE_CHANNELS.indexOf(i);
+      peak.push(live < 0 ? FAKE_LEVELS_SILENCE_DB : fakeLevelAt(fakeChannelLevelsStep, live));
+    }
+    fakeEmit(EVENT_CHANNEL_LEVELS, {
+      peak,
+      rms: peak.map((p) => Math.max(FAKE_LEVELS_SILENCE_DB, p - FAKE_LEVELS_RMS_BELOW_PEAK_DB)),
+    });
+    fakeChannelLevelsStep += 2; // 100 ms steps against fakeLevelAt's 50 ms phase
+  }, 100);
+}
+
+function stopFakeChannelLevels() {
+  if (fakeChannelLevelsInterval) {
+    clearInterval(fakeChannelLevelsInterval);
+    fakeChannelLevelsInterval = null;
+  }
+  const silence = new Array(FAKE_INPUT_CHANNELS).fill(FAKE_LEVELS_SILENCE_DB);
+  fakeEmit(EVENT_CHANNEL_LEVELS, { peak: silence, rms: silence.slice() });
+}
+
+/**
+ * fakeCardUp / fakeCardDown are what the fake session does either side of a
+ * start: the pad negotiates, the signal is measured, the per-channel meters run
+ * — and all three go away again on stop, because a lamp still green after STOP
+ * is the fake teaching a habit the real thing will punish. It mirrors app.go's
+ * forgetSignal, which publishes UNKNOWN for exactly that reason.
+ */
+function fakeCardUp() {
+  fakeChannelMap.inputChannels = FAKE_INPUT_CHANNELS;
+  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
+  fakeSignal = { state: SIGNAL_STATE.OK, flaps: 0 };
+  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
+  startFakeChannelLevels();
+}
+
+function fakeCardDown() {
+  fakeChannelMap.inputChannels = 0;
+  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
+  fakeSignal = { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
+  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
+  stopFakeChannelLevels();
+}
+
+/**
+ * Reads what the capture pad negotiated and the routing in force:
+ * {inputChannels, map, isDefault}. inputChannels is the width every map sent
+ * back must fit inside; map is the list of contributions, empty when nobody has
+ * chosen; isDefault says which of those two an empty list is.
+ *
+ * NEVER THROWS, for the reason getConformTarget does not: this is called on the
+ * Settings screen's open path, and an older build without the binding must leave
+ * the rest of the screen intact. Zero channels is the honest answer to every way
+ * of not knowing, and it is the answer that draws no grid.
+ */
+export async function getChannelMap() {
+  if (hasWails()) {
+    try {
+      const got = await callGoBound(CHANNEL_MAP_METHODS.state);
+      return got && typeof got === 'object' ? got : { inputChannels: 0, map: [], isDefault: true };
+    } catch {
+      return { inputChannels: 0, map: [], isDefault: true };
+    }
+  }
+  return fakeChannelMapState();
+}
+
+/**
+ * Sets the routing LIVE: a list of {output, input, gain}, input counted from
+ * zero. Measured on the real card at 119 µs, with the pipeline staying PLAYING,
+ * nothing pending, and the change audible in the very next level message — which
+ * is why the screen that calls this has no Apply button.
+ *
+ * REFUSAL IS GO'S JOB AND IT MATTERS THAT IT HAPPENS BEFORE THE WRITE.
+ * audioconvert rejects an out-of-range coefficient SILENTLY, leaving the previous
+ * matrix in force, so a rejected write and a successful one are indistinguishable
+ * at the property level and the application could never learn afterwards which
+ * matrix is running. gst.SetChannelMap validates against InputChannels() first
+ * and writes nothing if the map does not fit; a caller that swallowed the error
+ * would be showing a routing that is not the one in force.
+ *
+ * @param {Array<{output: number, input: number, gain: number}>} map
+ */
+export async function setChannelMap(map) {
+  if (hasWails()) return callGoBound(CHANNEL_MAP_METHODS.set, map);
+  fakeChannelMap.map = Array.isArray(map) ? map.map((c) => ({ ...c })) : [];
+}
+
+/** Subscribes to the "channelMap" event. Returns an unsubscribe function. */
+export function onChannelMap(cb) {
+  return subscribe(EVENT_CHANNEL_MAP, cb);
+}
+
+/** Subscribes to the "channelLevels" event. Returns an unsubscribe function. */
+export function onChannelLevels(cb) {
+  return subscribe(EVENT_CHANNEL_LEVELS, cb);
+}
+
+/** Subscribes to the "signal" event. Returns an unsubscribe function. */
+export function onSignal(cb) {
+  return subscribe(EVENT_SIGNAL, cb);
 }

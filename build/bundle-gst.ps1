@@ -149,6 +149,16 @@ $ScriptVersion = '1.0.0'
 # (the whole install is 2.4 GB) or a silently dropped plugin still does.
 #
 # RE-MEASURED 2026-08-12, after stripping became the default: 22.9 MB. The
+# NOT re-measured 2026-08-16, when decklink, videorate and deinterlace were
+# added for the capture path, because no Windows host was available to measure
+# on. The macOS equivalents of those three are 246 KB, 115 KB and 205 KB
+# stripped of nothing, and they pulled in no library the bundle did not already
+# have, so the expected Windows cost is well under 1 MB against a 22.9 MB
+# bundle inside a 15-40 MB band. THE BAND IS THEREFORE UNCHANGED and this note
+# exists so that the next person to run this on Windows knows the 22.9 MB
+# figure above predates three plugins and compares against a slightly larger
+# number rather than going looking for the difference.
+#
 # GStreamer mingw distribution ships its DLLs with full DWARF debug sections,
 # and they are 58% of the bundle by size. libstdc++-6.dll alone is 25.3 MB, of
 # which 23 MB is .debug_info and friends; stripped it is 2.2 MB with all 17,800
@@ -223,21 +233,28 @@ function New-BundleEntry {
 function Get-PluginEntries {
     <#
     .SYNOPSIS
-        The thirteen plugins of specification section 3, plus mpegtsdemux for
-        the return path, and nothing else.
+        The plugins of specification section 3, plus the six additions
+        enumerated below, and nothing else.
     .DESCRIPTION
         This list is closed. Adding to it is a specification change, not a build
         change: every plugin here was chosen because the pipeline in section 5
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
 
-        There have been exactly three additions since section 3 was written,
+        There have been exactly six additions since section 3 was written,
         and all are stated here rather than slipped into the list, because that
         is the rule this function exists to enforce on everyone else:
 
           mpegtsdemux   for the SRT return monitor.
           d3d11         for the SRT PICTURE. See its Why line below.
           level         for the INPUT METERS, 2026-08-12. See its Why line.
+          decklink      the SDI CAPTURE PATH, 2026-08-16, and the two below
+          videorate     exist only to make it work. See their Why lines, and
+          deinterlace   note that videorate is not optional decoration: without
+                        it the pipeline dies in 0.088 s. All three were absent
+                        from BOTH platforms' bundlers until that date, so the
+                        shipped app could not use a Blackmagic card at all
+                        however good the Go code was.
 
         One plugin was CONSIDERED and deliberately NOT added:
 
@@ -306,6 +323,13 @@ function Get-PluginEntries {
         New-BundleEntry -Kind Plugin -Names 'libgstd3d11.dll' `
             -Why 'd3d11h265dec AND d3d11videosink: the commentator''s PICTURE. The programme feed arrives as H.265 1920x1080 50p on an M2L-X output and there is no other way to decode or show it here. mfh265dec is ABSENT on the target (the Windows HEVC extension is not installed and buying it from the Store is not a deployment step) and avdec_h265 is FFmpeg, which $ForbiddenPatterns refuses. d3d11h265dec is DXVA in the GPU driver, wrapped LGPL by gst-plugins-bad; measured on 2026-08-07 decoding 1178 frames in 25 s off port 40501, hardware=true, NV12 1920x1080 50/1. One plugin file supplies both the decoder and the sink, so this single entry is the whole picture path.' `
             -Fix 'If this file is missing, the machine has a partial GStreamer install: libgstd3d11.dll ships with gst-plugins-bad in every official build. Do NOT substitute libav.'
+        New-BundleEntry -Kind Plugin -Names 'libgstdecklink.dll' `
+            -Why 'decklinkvideosrc and decklinkaudiosrc: the SDI CAPTURE PATH. A commentary position in a sports facility takes its programme feed off SDI, not off the machine''s own audio stack, and that means a Blackmagic card. One plugin file supplies both the video and the audio source and the device provider that fills the input dropdown. gst-plugins-bad, LGPL (verified by gst-inspect, not assumed). *** IT NEEDS A DRIVER THIS INSTALLER DOES NOT SHIP: Blackmagic DESKTOP VIDEO. That is a user-installed prerequisite in the same class as the WebView2 runtime - see installer.iss and licenses\NOTICE.txt section F3. Without it there is no DeckLinkAPI, so there are no devices and no capture, and the failure is quiet. ***' `
+            -Fix 'This file ships with gst-plugins-bad in every official GStreamer build, so a missing FILE means -GstRoot points at a partial install. A file that is PRESENT but whose elements do not appear in gst-inspect means Desktop Video is not installed on this machine, which is a different problem with a different fix.'
+        New-BundleEntry -Kind Plugin -Names 'libgstvideorate.dll' `
+            -Why 'videorate, and it is MANDATORY rather than a nicety. MEASURED 3/3 runs: decklinkvideosrc emits the 720x486 NTSC PLACEHOLDER as its first buffer on EVERY start and the real caps arrive ~170 ms later, so a fixed capsfilter downstream of it and nothing else sees a frame it cannot accept before it ever sees a real one - the pipeline dies in 0.088 s with not-negotiated (-4). videorate is what absorbs that first buffer and the rate change behind it. Leaving it out does not degrade the capture, it prevents it, with an error about caps that names no plugin. gst-plugins-base, LGPL.'
+        New-BundleEntry -Kind Plugin -Names 'libgstdeinterlace.dll' `
+            -Why 'deinterlace: the only element in this bundle that can handle a 1080i50 camera, which is a likely feed in a UK sports facility and is handled NOWHERE today - everything downstream of the capture in section 5''s pipeline is progressive. gst-plugins-good, LGPL. Its own description says "Deinterlace Methods ported from DScaler/TvTime"; the plugin as GStreamer ships it is LGPL and that is what the licence gate and NOTICE.txt section A record.'
     )
 }
 
@@ -318,6 +342,28 @@ function Get-RuntimeEntries {
         real C:\gstreamer\1.0\mingw_x86_64\bin, and against the output of
         -DependencyReport. See the header block. The candidate-name lists exist
         because MinGW and MSVC builds disagree about the "lib" prefix.
+
+        THE 2026-08-16 CAPTURE-PATH ADDITION ADDED NOTHING HERE, and that is a
+        claim rather than an omission, so here is what it rests on. On macOS,
+        where the closure is COMPUTED rather than listed, adding decklink,
+        videorate and deinterlace grew the bundle by exactly three files - the
+        three plugins themselves - and by not one library: `otool -L` on all
+        three names only libgstreamer, libgstbase, libgstvideo, libgstaudio,
+        liborc, libglib and libgobject, every one of which was already in the
+        closure. The Windows builds of the same three plugins are the same
+        source against the same libraries plus the MinGW C++ runtime that
+        libgstmediafoundation, libgstwasapi2 and libgstsrt already require.
+
+        That is REASONING, not a Windows measurement, and this file does not
+        pretend otherwise: -DependencyReport at Gate B is the authority. If it
+        reports an unresolved import from any of the three, add it here with a
+        one-line reason exactly as gstcodecs and gstdxva were added for d3d11.
+        Note in particular that libgstdecklink.dll does NOT import the
+        Blackmagic API - on macOS it opens the framework as a CFBundle at run
+        time and on Windows it goes through COM, so no dependency walker on
+        either platform will ever name DeckLinkAPI, and its absence from this
+        list is not evidence that the driver is unnecessary. It is a deployment
+        prerequisite; see the plugin's Why line and installer.iss.
     #>
     return @(
         # -- GStreamer core and libraries -----------------------------------
@@ -467,17 +513,24 @@ function Assert-ManifestSane {
     }
 
     # The plugin allowlist is closed and must equal specification section 3, plus
-    # the three deliberate additions since: mpegtsdemux, the return monitor's
-    # demuxer; d3d11, the picture's HEVC decoder and video sink; and level, the
-    # input meters' analyser. Adding a plugin remains a specification change and
-    # this list is where it has to be made, not somewhere it can be drifted into
-    # - which is why this check exists at all and why it caught d3d11 on the
-    # first run of this change.
+    # the six deliberate additions since: mpegtsdemux, the return monitor's
+    # demuxer; d3d11, the picture's HEVC decoder and video sink; level, the
+    # input meters' analyser; and decklink, videorate and deinterlace, the SDI
+    # capture path. Adding a plugin remains a specification change and this list
+    # is where it has to be made, not somewhere it can be drifted into - which is
+    # why this check exists at all and why it caught d3d11 on the first run of
+    # that change.
+    #
+    # THIS LIST AND SECTION 3 OF docs\windows-app-spec.md MOVE TOGETHER. The
+    # throw below is the mechanism that makes that true: an edit here alone
+    # fails the build, and an edit there alone leaves this list disagreeing with
+    # the document it names. Both were changed for the capture path on
+    # 2026-08-16.
     $expectedPlugins = @(
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
         'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11',
-        'level'
+        'level', 'decklink', 'videorate', 'deinterlace'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {
@@ -764,7 +817,8 @@ $entries += Get-RuntimeEntries
 Write-Host "Validating the file list ($($entries.Count) entries)..."
 Assert-ManifestSane -Entries $entries
 Write-Host "  file list OK: no wildcards, no forbidden names, no duplicate destinations,"
-Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, d3d11 and level, exactly."
+Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, d3d11, level and the"
+Write-Host "  three capture-path plugins (decklink, videorate, deinterlace), exactly."
 Write-Host ''
 
 $srcBin = Join-Path $GstRoot 'bin'

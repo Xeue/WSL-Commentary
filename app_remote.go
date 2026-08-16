@@ -77,6 +77,7 @@ import (
 	"time"
 
 	"wslcomms/internal/config"
+	"wslcomms/internal/gst"
 	"wslcomms/internal/mixer"
 	"wslcomms/internal/remote"
 )
@@ -122,6 +123,9 @@ func remoteEventNames() []string {
 		EventError,
 		EventStatusKeys,
 		EventLevels,
+		EventChannelLevels,
+		EventChannelMap,
+		EventSignal,
 		EventConfig,
 		EventRemote,
 	}
@@ -177,16 +181,22 @@ var remoteAllowlist = map[string]methodPolicy{
 	// correctly conforming 720p50 feed would see a red lamp the operator at the
 	// desk does not. Two seats disagreeing about a lamp is worse than either
 	// answer alone. It returns a raster, a rate and where they came from.
-	"GetConfig":                 {},
-	"GetConformTarget":          {},
-	"GetKVSCredentials":         {},
-	"GetStatusKeyCandidates":    {},
-	"ListEvents":                {},
-	"CredentialStoreName":       {},
-	"GetMixerSnapshot":          {},
-	"GetMixerGolden":            {},
-	"GetPictureState":           {},
-	"GetReturnState":            {},
+	"GetConfig":              {},
+	"GetConformTarget":       {},
+	"GetKVSCredentials":      {},
+	"GetStatusKeyCandidates": {},
+	"ListEvents":             {},
+	"CredentialStoreName":    {},
+	"GetMixerSnapshot":       {},
+	"GetMixerGolden":         {},
+	"GetPictureState":        {},
+	"GetReturnState":         {},
+	// GetChannelMap is a read and is reachable, for the same shape of reason
+	// GetConformTarget is: it returns what the capture pad negotiated and the
+	// routing in force, and a remote seat that could not ask would draw the
+	// routing grid with no channels in it — telling an operator who is looking
+	// for a commentator they cannot hear that there is nothing there to route.
+	"GetChannelMap":             {},
 	"IsSRTReturnSelected":       {},
 	"ListInputDevices":          {},
 	"ListOutputDevices":         {},
@@ -205,6 +215,16 @@ var remoteAllowlist = map[string]methodPolicy{
 	"SavePreset":   {mutating: true},
 	"RenamePreset": {mutating: true},
 	"DeletePreset": {mutating: true},
+	// SetChannelMap is a LIVE OPERATIONAL CONTROL, reachable exactly as the mixer
+	// commands are and audit-logged for the same reason: it changes what the
+	// commentator is heard on, on air, in about 119 microseconds. It is not
+	// host-only, because the seat that notices the wrong channel is often the
+	// remote one — a producer watching the meters while the operator is on
+	// talkback — and refusing it there would leave them able to SEE the fault and
+	// not to fix it. It cannot damage anything a remote seat could not already
+	// damage with Stop, and internal/gst refuses any map that does not fit the
+	// negotiated width before a byte reaches the element.
+	"SetChannelMap": {mutating: true},
 
 	// ---- the arm-gated write path and its baseline (audit-logged) ----
 	// SendMixerCommands is still additionally gated on the caller being the seat
@@ -331,6 +351,8 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetPictureState()
 	case "GetReturnState":
 		return a.GetReturnState()
+	case "GetChannelMap":
+		return a.GetChannelMap()
 	case "IsSRTReturnSelected":
 		return a.IsSRTReturnSelected()
 	case "ListInputDevices":
@@ -403,6 +425,18 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 			return nil, err
 		}
 		return nil, a.DeletePreset(id, alsoDeleteCredentials)
+	case "SetChannelMap":
+		// Decoded into gst.ChannelMap itself rather than into a []map[string]any
+		// and re-read: the wire form IS that type's json tags, so this is the one
+		// place the shape is stated and there is no second grammar to drift from
+		// it. An entry naming a channel the pad did not negotiate, or a gain
+		// outside the [-1, 1] audioconvert clamps to, is refused BY NAME inside
+		// SetChannelMap before anything is written.
+		var m gst.ChannelMap
+		if err := decodeArg(args, 0, &m); err != nil {
+			return nil, err
+		}
+		return nil, a.SetChannelMap(m)
 
 	// -------- mixer --------
 	case "SendMixerCommands":

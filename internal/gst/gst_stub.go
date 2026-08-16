@@ -281,13 +281,29 @@ type StubPipeline struct {
 	// checks fatalError() before anything else that can fail.
 	fatal error
 
+	// inputChannels is the width the fake capture pad has "negotiated", and
+	// channelMap is the map written against it. matrixWritten mirrors the real
+	// twin's matrixWidth > 0 test: false means the fake device presents a
+	// POSITIONED stream that audioconvert would map on its own, so there is no
+	// matrix on this pipeline to change.
+	//
+	// The default is stubInputChannels — two, positioned, no matrix — because
+	// that is what the stub's fake device list is mostly made of and what every
+	// Gate A test written before this mechanism existed assumes. A test that
+	// wants the DeckLink case calls SetStubInputChannels.
+	inputChannels int
+	channelMap    ChannelMap
+	matrixWritten bool
+
 	// levelStop ends the synthetic-levels ticker goroutine, and levelDone is
 	// closed by that goroutine as it exits so Stop can JOIN it rather than
 	// merely signal it. The join matters: without it a Stop-then-assert test
 	// could observe one more OnLevels callback delivered after Stop returned,
 	// which the real build cannot do either — busSilenced is checked on the
 	// posting thread before the callback runs. Both are nil when Start was
-	// given no OnLevels.
+	// asked for neither meter — ONE goroutine drives both, because they are two
+	// rates of the same fake clock and a second ticker would be a second phase
+	// for the picker's bars to drift against the programme meter's.
 	levelStop chan struct{}
 	levelDone chan struct{}
 
@@ -298,6 +314,17 @@ type StubPipeline struct {
 // dropped. The real implementation drops rather than blocks too: a bus callback
 // must never wait on a Go consumer.
 const stubErrorBuffer = 16
+
+// stubInputChannels is the channel count a StubPipeline's fake capture pad
+// negotiates unless a test says otherwise.
+//
+// Two, POSITIONED — the ordinary microphone case — because that is what the
+// stub's device list is mostly made of and because it is the state in which no
+// mix matrix is written at all. Keeping it as the default means every Gate A
+// test written before the channel map existed still describes the same
+// pipeline, and the DeckLink case is something a test opts into rather than
+// something every test has to opt out of.
+const stubInputChannels = ChannelMapOutputs
 
 // New creates a StubPipeline. It never fails.
 func New() (Pipeline, error) {
@@ -310,8 +337,9 @@ func New() (Pipeline, error) {
 // Stub build only.
 func NewStubPipeline() *StubPipeline {
 	return &StubPipeline{
-		state: StubStateStopped,
-		errs:  make(chan error, stubErrorBuffer),
+		state:         StubStateStopped,
+		errs:          make(chan error, stubErrorBuffer),
+		inputChannels: stubInputChannels,
 	}
 }
 
@@ -368,6 +396,27 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	// and the resolved value in StartedWith() is the equivalent record.
 	opts.ConformTo, _ = opts.ConformTo.resolve()
 
+	// The channel map, through the SAME MixMatrix the real twin writes from, so
+	// that a map Gate A accepts is a map the card accepts and a map Gate A
+	// refuses is one the real build would have refused before touching the
+	// element. Nothing here fakes the validation; the shared model does it.
+	//
+	// The discriminator is simplified and the simplification is deliberate. The
+	// real twin asks the capture source's pad whether it can produce a stereo
+	// pair unaided; a stub has no pad to ask, so it uses the condition that
+	// question separates in practice — a source presenting MORE channels than
+	// the pipeline's two has no way to say what they are, and is the case a
+	// matrix exists for. Two channels or one behave as they always did: no
+	// matrix, and SetChannelMap refuses with the same message the real twin
+	// gives for a positioned device.
+	if p.inputChannels > ChannelMapOutputs {
+		if _, err := opts.ChannelMap.MixMatrix(p.inputChannels); err != nil {
+			return err
+		}
+		p.channelMap = opts.ChannelMap
+		p.matrixWritten = true
+	}
+
 	p.opts = opts
 	p.state = StubStateRunning
 
@@ -378,8 +427,25 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	// without holding the lock, and what makes a callback that (wrongly)
 	// blocks unable to deadlock anything except the Stop that must wait for
 	// it, mirroring the real contract's "MUST NOT BLOCK".
-	if opts.OnLevels != nil {
-		cb := opts.OnLevels
+	//
+	// The PER-CHANNEL picker rides the same goroutine, on the same conditions the
+	// real twin arms chlevel on: a callback to deliver to, AND a matrix having
+	// been written. That second condition is the parity that matters. In the real
+	// build chlevel is built with post-messages=false and armed only for an
+	// unpositioned source, so a seat with an ordinary microphone posts not one
+	// per-channel frame; a stub that produced them anyway would let a UI depend
+	// on a stream the shipped build does not send.
+	//
+	// The width is p.inputChannels rather than a constant, so the fake frames are
+	// as wide as the fake pad negotiated — sixteen for a test that called
+	// SetStubInputChannels(16), which is the DeckLink shape the picker exists for.
+	if opts.OnLevels != nil || (opts.OnChannelLevels != nil && p.matrixWritten) {
+		programme := opts.OnLevels
+		channels := opts.OnChannelLevels
+		width := p.inputChannels
+		if !p.matrixWritten {
+			channels = nil
+		}
 		stop := make(chan struct{})
 		done := make(chan struct{})
 		p.levelStop = stop
@@ -397,7 +463,21 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 				case <-stop:
 					return
 				case <-ticker.C:
-					cb(stubLevelsAt(step))
+					if programme != nil {
+						programme(stubLevelsAt(step))
+					}
+					// EVERY OTHER TICK, because chlevel really does run at half
+					// the programme meter's rate (channelLevelIntervalNs, 100 ms
+					// against 50 ms) and the difference is deliberate. A stub
+					// that delivered both at 20 Hz would let a decay animation or
+					// a smoothing window be sized against a rate the shipped
+					// build does not produce, and the picker would lag by a
+					// factor of two — which on a find-the-commentator meter reads
+					// as "that channel is not the one" a beat after they stopped
+					// talking.
+					if channels != nil && step%2 == 0 {
+						channels(stubChannelLevelsAt(step, width))
+					}
 					step++
 				}
 			}
@@ -485,6 +565,83 @@ func (p *StubPipeline) ForceKeyUnit() error {
 	return nil
 }
 
+// InputChannels reports the channel count the fake capture pad has negotiated,
+// or 0 when the pipeline is not running.
+//
+// The zero-when-stopped answer is contract rather than convenience: the real
+// twin reads the pad's CURRENT caps, and a pad that has gone to NULL has none,
+// so a caller that treats 0 as "no device" behaves identically at Gate A and at
+// Gate B.
+func (p *StubPipeline) InputChannels() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.state == StubStateStopped {
+		return 0
+	}
+	return p.inputChannels
+}
+
+// SetChannelMap validates a map against the negotiated width and records it,
+// exactly as the real twin validates before writing.
+//
+// The refusals are the same refusals, produced by the same MixMatrix, and the
+// order matters as much here as it does there: NOTHING IS RECORDED when
+// validation fails, because the real element leaves its previous matrix in
+// force on a rejected write and a stub that stored the bad map anyway would
+// make Gate A disagree with the hardware about what is running.
+func (p *StubPipeline) SetChannelMap(m ChannelMap) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed || p.state == StubStateStopped {
+		return errStubStopped
+	}
+	if !p.matrixWritten {
+		return fmt.Errorf("%w: the capture device presents a positioned stream, which audioconvert "+
+			"maps to stereo on its own; there is no channel map on this pipeline to change. A "+
+			"channel map applies to a device that presents unpositioned channels, such as a "+
+			"DeckLink card's sixteen", ErrChannelMap)
+	}
+	if _, err := m.MixMatrix(p.inputChannels); err != nil {
+		return err
+	}
+	p.channelMap = m
+	return nil
+}
+
+// SetStubInputChannels sets the channel count the fake capture pad negotiates
+// on the NEXT Start. Passing 0 restores stubInputChannels.
+//
+// It is how a Gate A test reaches the DeckLink case: sixteen channels, a matrix
+// written at Start, and SetChannelMap live afterwards. It has no effect on a
+// pipeline that is already running, because a real pad does not renegotiate its
+// channel count under a running feed either — decklinkaudiosrc's channels
+// property is not live-settable, which is exactly why sixteen has to be the
+// steady state once mapping exists.
+//
+// Stub build only.
+func (p *StubPipeline) SetStubInputChannels(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n <= 0 {
+		n = stubInputChannels
+	}
+	p.inputChannels = n
+}
+
+// ChannelMap returns the map currently recorded, and whether a matrix was
+// written at all. It is the stub's equivalent of reading the element's
+// property, which the real build cannot do — GST_TYPE_ARRAY does not marshal
+// back — and is what lets a Gate A test assert that a refused SetChannelMap
+// left the previous map in place.
+//
+// Stub build only.
+func (p *StubPipeline) ChannelMap() (ChannelMap, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.channelMap, p.matrixWritten
+}
+
 // Errors returns the asynchronous error channel. It is closed by Stop.
 func (p *StubPipeline) Errors() <-chan error {
 	p.mu.Lock()
@@ -518,6 +675,11 @@ func (p *StubPipeline) Stop() error {
 	p.counters.Stops++
 	p.state = StubStateStopped
 	p.hasSk = false
+	// The matrix goes with the pipeline, as it does in the real twin where
+	// teardownLocked drops the element and zeroes matrixWidth. The recorded map
+	// itself stays readable, so a test can assert what was in force when the
+	// pipeline stopped.
+	p.matrixWritten = false
 	if !p.closed {
 		p.closed = true
 		close(p.errs)

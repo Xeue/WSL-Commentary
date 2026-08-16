@@ -41,6 +41,22 @@ prerequisites of any kind on the target Mac.** No Homebrew. No GStreamer. No
 Xcode. The `.app` contains its own GStreamer runtime, relinked so that it can
 only ever load from inside itself.
 
+**With exactly one exception, added 2026-08-16, and it is stated here rather
+than in a footnote because that requirement above is the one everybody quotes.**
+A commentary position that takes its programme feed off SDI needs **Blackmagic
+Desktop Video** installed, and this product does not and cannot ship it. The
+GStreamer `decklink` plugin *is* in the bundle; the DeckLink API it wraps lives
+in `/Library/Frameworks/DeckLinkAPI.framework`, belongs to Blackmagic, and the
+plugin opens it as a `CFBundle` at run time from that absolute path — outside
+the `.app`, invisible to `otool`, and therefore invisible to the audit in
+section 5 as well. Without it there is no API, so there are no devices and no
+capture, and **the failure is silent**: no dialog, just an input list with no
+card in it. It is the same class of dependency as the WebView2 runtime on
+Windows, minus the bootstrapper. See `licenses/NOTICE.txt` section F3.
+
+Everything else in that paragraph still holds. A position that does not use a
+DeckLink needs nothing at all.
+
 A `.pkg` was not chosen. Windows ships an installer because Windows expects
 one; macOS does not, and a `.pkg` would mean an admin prompt and a second
 certificate (Developer ID **Installer**) for a product that installs nothing.
@@ -56,7 +72,7 @@ WSL Commentary.app/Contents/
     slate.png                           symlink -> ../Resources/slate.png
   Frameworks/                    28 dylibs, the core GStreamer/GLib runtime
   Resources/
-    gstreamer-1.0/               17 plugins
+    gstreamer-1.0/               20 plugins
     gio-modules/                        deliberately empty — see section 6
     slate.png                           1920x1080 slate for filesrc ! pngdec ! imagefreeze
     licenses/                           LGPL text, written offer, third-party notice
@@ -65,7 +81,9 @@ WSL Commentary.app/Contents/
     GST-ELEMENT-RESOLUTION.txt          which element came from which plugin dylib
 ```
 
-Bundle total **41 MB**, disk image **18 MB**.
+Bundle total **42 MB**, disk image **18 MB** (the disk image figure is from the
+0.1.0 build and predates the three capture-path plugins, which cost 0.5 MB
+before compression).
 
 ---
 
@@ -139,6 +157,7 @@ Perhaps twenty minutes, most of it Homebrew downloading.
 | Node | for the frontend; `npm` must be on `PATH` |
 | Wails CLI v2.13.0 | `go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0` — must match the `go.mod` version, the packager and the runtime are one product |
 | GStreamer | `brew install gstreamer` — **build host only.** The shipped `.app` contains its own and the target Mac needs none of this |
+| Blackmagic **Desktop Video** | from Blackmagic's support site; admin install, wants a reboot. **This one is needed on the build host AND on any target Mac that uses a card** — unlike everything else in this table. Without it `gst-inspect` cannot find `decklinkvideosrc`, so `bundle-gst-darwin.sh` fails at step 1 with a message naming this row rather than shipping a bundle that cannot capture. Section 0 explains why it cannot be bundled |
 | Developer ID **Application** certificate | in the login keychain, with its private key. `Developer ID Installer` is not used and not looked for |
 | notarytool keychain profile | `xcrun notarytool store-credentials sygnal-notary --apple-id <id> --team-id 5P76UVY5WF --password <app-specific-password>` |
 
@@ -267,14 +286,27 @@ So the macOS bundler **computes** the list:
 
 ### 5.1 The measured closure
 
-| | Measured 2026-08-14 |
-|---|---|
-| Wanted elements | 29 |
-| Unique plugin dylibs | 17 |
-| Transitive closure | **48 Mach-O files, 21.9 MB** |
-| The whole Homebrew keg, for comparison | ~190 MB, 268 plugins |
-| `/opt/homebrew` load commands in the finished bundle | **0 of 49 Mach-O files** |
-| Licence patterns applied | 17, zero matches |
+| | Measured 2026-08-14 | Measured 2026-08-16 |
+|---|---|---|
+| Wanted elements | 29 | **33** |
+| Unique plugin dylibs | 17 | **20** |
+| Transitive closure | 48 Mach-O files, 21.9 MB | **51 Mach-O files, 22.4 MB** |
+| The whole Homebrew keg, for comparison | ~190 MB, 268 plugins | ~190 MB, 268 plugins |
+| `/opt/homebrew` load commands in the finished bundle | 0 of 49 Mach-O files | **0 of 52 Mach-O files** |
+| Licence patterns applied | 19, zero matches | 19, zero matches |
+
+The second column is the SDI capture path — `decklinkvideosrc`,
+`decklinkaudiosrc`, `videorate` and `deinterlace`. **The three new files are the
+three plugins and nothing else**: `libgstdecklink.dylib` (246,240 bytes),
+`libgstdeinterlace.dylib` (204,512) and `libgstvideorate.dylib` (114,880). Not
+one new library, because `otool -L` on all three names only `libgstreamer`,
+`libgstbase`, `libgstvideo`, `libgstaudio`, `liborc`, `libglib` and `libgobject`
+— every one already in the closure. That is a diff of the two manifests, not an
+estimate.
+
+Nothing Blackmagic appears in either column, and section 0 says why: the
+DeckLink API is opened as a `CFBundle` from an absolute path, which no load
+command names and no `otool` walk can see.
 
 ### 5.2 The ad-hoc signatures are not optional
 
@@ -573,15 +605,17 @@ on `PATH` and nothing in the environment but the bundle.
 
 ## 9. Sizes to expect
 
-All measured 2026-08-14.
+Measured 2026-08-16, except the disk image, which is the 0.1.0 figure and
+predates the capture path.
 
 | | Measured | Note |
 |---|---|---|
 | `wslcomms` binary | 29 MB | Go + Wails + embedded frontend, cgo |
-| GStreamer closure | **21.9 MB** | 48 Mach-O files: 28 core dylibs, 17 plugins, 3 tools |
+| GStreamer closure | **22.4 MB** | 51 Mach-O files: 28 core dylibs, 20 plugins, 3 tools |
+| — of which the SDI capture path | 0.5 MB | `decklink` 246 KB, `deinterlace` 205 KB, `videorate` 115 KB, and no new library |
 | Whole Homebrew keg, for comparison | ~190 MB | 268 plugins |
-| `WSL Commentary.app` | **41 MB** | |
-| `wslcomms-<v>-macos-arm64.dmg` | **18 MB** | UDZO |
+| `WSL Commentary.app` | **42 MB** | 41 MB before the capture path |
+| `wslcomms-<v>-macos-arm64.dmg` | 18 MB | UDZO, 0.1.0 — re-measure at the next release |
 
 The bundler warns if the finished bundle falls outside 25–90 MB, on the same
 reasoning as the Windows script's band: under, something did not get staged;
@@ -655,6 +689,8 @@ dependency.
 | `pattern all:frontend/dist: no matching files found` | `wails build` on a clean checkout | section 3.1 — build the frontend first |
 | `ORC: ERROR: … Failed to create write and exec mmap regions` | `liborc` on Apple silicon under the hardened runtime | harmless and unfixable by entitlement; `ORC_CODE=backup` silences it. Section 7 |
 | App launches, then reports missing elements | plugins not found | run the section 8.1 command; if `gst-inspect` finds them and the app does not, the environment `internal/gst` sets before `gst_init` is wrong, not the bundle |
+| `gst-inspect-1.0 cannot find these elements: decklinkvideosrc decklinkaudiosrc` from the bundler | **Desktop Video is not installed on the build host** | install it and re-run. This is not a GStreamer packaging problem and reinstalling GStreamer will not help: `libgstdecklink.dylib` is in a stock Homebrew install, and it is the Blackmagic framework it opens at run time that is missing. The bundler says so in its own error |
+| App runs, DeckLink input list is empty, no error anywhere | **Desktop Video is not installed on the operator's Mac**, or the card is claimed by another application | section 0. `system_profiler SPExtensionsDataType \| grep -i blackmagic` should name `com.blackmagic-design.BlackmagicIO.DExt`, and `ls /Library/Frameworks/DeckLinkAPI.framework` should exist. Blackmagic's own Desktop Video Setup is the quickest confirmation that the card is seen at all |
 | `spctl: rejected` on the customer's Mac | not notarised, or not stapled | re-run without `SKIP_NOTARIZE`; check `xcrun stapler validate` |
 
 ---

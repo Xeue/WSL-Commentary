@@ -242,6 +242,15 @@ func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 	return err
 }
 
+// InputChannels and SetChannelMap are the channel-map half of gst.Pipeline,
+// and they are inert here on purpose. internal/sender reconnects a sink; it has
+// no opinion about which of a capture device's channels reach the feed, and a
+// fake that grew routing state would be modelling a coupling the state machine
+// deliberately does not have. The answers are those of a pipeline with a
+// positioned capture device: no negotiated width, no matrix to change.
+func (p *fakePipeline) InputChannels() int                 { return 0 }
+func (p *fakePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
+
 // ForceKeyUnit records the request, runs onForceKeyUnit if one is installed,
 // and then — if a gate is installed — blocks until the test releases it. Both
 // happen with the lock released so that either can inject an error —

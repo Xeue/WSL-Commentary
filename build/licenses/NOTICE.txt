@@ -52,27 +52,40 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
     and plugins only: coreelements, typefindfunctions, videoconvertscale,
     audioconvert, audioresample, imagefreeze, png, audioparsers,
     videoparsersbad, wasapi2, mediafoundation, mpegtsmux, mpegtsdemux, srt,
-    d3d11, level.
+    d3d11, level, decklink, videorate, deinterlace.
     (mpegtsdemux was added for the SRT return monitor, d3d11 for the SRT
-    picture, and level for the input meters - each is recorded in
+    picture, level for the input meters, and decklink, videorate and
+    deinterlace for the SDI capture path - each is recorded in
     build\bundle-gst.ps1 beside the closed allowlist it extends.)
+    All nineteen are LGPL-2.1-or-later, the three most recent verified with
+    gst-inspect rather than assumed: decklink is gst-plugins-bad, videorate is
+    gst-plugins-base and deinterlace is gst-plugins-good, and all three report
+    License LGPL. deinterlace's own description reads "Deinterlace Methods
+    ported from DScaler/TvTime", which is recorded here because it is the kind
+    of line that starts a licensing question later: the plugin as the GStreamer
+    project ships it is LGPL and that is what is redistributed.
+    The decklink plugin needs a driver this product does not ship. See section
+    F3 - it is a user-installed prerequisite, not a component of this work.
     The complete file list, with SHA-256 for every file, is in
     gst\BUNDLE-MANIFEST.txt in the program folder.
 
   GStreamer (macOS)               LGPL-2.1-or-later
     Version 1.26.10, arm64, from Homebrew's gstreamer formulae. A DIFFERENT
     build from the Windows one above, and a different plugin set, because the
-    platform-specific halves have no overlap. Seventeen plugins:
+    platform-specific halves have no overlap. Twenty plugins:
 
       coreelements typefindfunctions videoconvertscale audioconvert
       audioresample imagefreeze png audioparsers videoparsersbad
-      mpegtsmux mpegtsdemux srt level          - the same twelve as Windows
+      mpegtsmux mpegtsdemux srt level
+      decklink videorate deinterlace           - the same fifteen as Windows
       osxaudio applemedia opengl osxvideo      - in place of wasapi2,
                                                  mediafoundation and d3d11
 
     osxaudio supplies osxaudiosrc, osxaudiosink, atenc and atdec; applemedia
     supplies vtenc_h264, vtenc_h264_hw, vtdec_hw and vtdec. Both are thin
-    wrappers over macOS itself - see section F2.
+    wrappers over macOS itself - see section F2. decklink supplies
+    decklinkvideosrc and decklinkaudiosrc and is the one plugin in this bundle
+    that wraps something the operator must install separately - section F3.
 
     Unlike the Windows bundle, which is copied from an explicit allowlist, the
     macOS bundle is a COMPUTED transitive dependency closure: build/bundle-gst-
@@ -159,12 +172,29 @@ the ARTEFACT instead. Every file named below was read out of
 
   WSL Commentary.app/Contents/Resources/GST-BUNDLE-MANIFEST.txt
 
-of a built bundle - 48 Mach-O files, and the same 48 in the notarised 0.1.0
-.dmg and in a fresh run of build/bundle-gst-darwin.sh, compared file by file -
-which carries a SHA-256 for every file that shipped. Each licence was then read
-from the COPYING or LICENSE file in the corresponding Homebrew keg on the build
-host, and NOT from `brew info`: section G already gives this file cause to
-distrust that metadata, which is wrong about fdk-aac.
+of a built bundle - 51 Mach-O files - which carries a SHA-256 for every file
+that shipped. Each licence was then read from the COPYING or LICENSE file in
+the corresponding Homebrew keg on the build host, and NOT from `brew info`:
+section G already gives this file cause to distrust that metadata, which is
+wrong about fdk-aac.
+
+That count was 48 when this section was written, and was verified as 48 across
+the notarised 0.1.0 .dmg and a fresh bundler run compared file by file. It
+became 51 on 2026-08-16, when decklink, videorate and deinterlace were added
+for the SDI capture path. THE THREE NEW FILES ARE THE THREE PLUGINS THEMSELVES
+AND NOTHING ELSE - libgstdecklink.dylib (246,240 bytes), libgstdeinterlace.dylib
+(204,512) and libgstvideorate.dylib (114,880), 0.5 MB in total, taking the
+closure from 21.9 MB to 22.4 MB. That is a measurement and not an expectation:
+the manifest file lists before and after the change were diffed, and the diff is
+exactly those three lines. Not one library was added, because `otool -L` on all
+three names only libgstreamer, libgstbase, libgstvideo, libgstaudio, liborc,
+libglib and libgobject, every one of which the closure already contained.
+
+So nothing below changes. All three are LGPL GStreamer plugins and belong to
+section A, which is where they are listed; this section enumerates what the
+otool walk pulled in that is NEITHER GStreamer NOR GLib, and the capture path
+pulled in nothing of that kind. The Blackmagic API the decklink plugin uses is
+not in the closure either, and cannot be: see section F3.
 
 FIRST, WHAT SECTIONS B AND C LIST THAT THE macOS BUNDLE DOES NOT CONTAIN. It is
 recorded rather than left to inference, because an absence that is only inferred
@@ -463,6 +493,64 @@ F2. APPLE COMPONENTS - the macOS equivalents of section F
     Part of macOS, and the macOS counterpart of the WebView2 runtime above.
     Not distributed by this product. Unlike WebView2 there is no bootstrapper
     to embed, because WKWebView cannot be absent from a supported macOS.
+
+------------------------------------------------------------------
+F3. BLACKMAGIC DESIGN COMPONENTS - a prerequisite the OPERATOR installs,
+    on both platforms
+------------------------------------------------------------------
+
+  Blackmagic Desktop Video           NOT DISTRIBUTED BY THIS PRODUCT
+
+    Sections F and F2 record components that are part of the operating system
+    and therefore already present. This one is not part of either operating
+    system and is NOT already present: somebody has to install it. It is
+    recorded here, in the same place and the same style as those, because the
+    licence question and the deployment question have the same answer - this
+    product does not ship it, does not link it, and does not redistribute it.
+
+    WHAT IS SHIPPED is the GStreamer decklink plugin - libgstdecklink.dll on
+    Windows, libgstdecklink.dylib on macOS - which is LGPL, is part of
+    gst-plugins-bad, and is listed in section A with the rest of the GStreamer
+    runtime. What it WRAPS is Blackmagic's DeckLink API, which arrives with
+    Blackmagic's Desktop Video installer under Blackmagic's own licence, and
+    which is neither in the bundle nor in the installer.
+
+    The coupling is late and it is invisible to every tool that inspects the
+    binaries, which is precisely why it is written down. MEASURED on macOS
+    against Desktop Video 16.0: libgstdecklink.dylib has NO load command naming
+    anything Blackmagic, and instead carries the string
+
+      /Library/Frameworks/DeckLinkAPI.framework
+
+    alongside the symbols InitDeckLinkAPI, IsDeckLinkAPIPresent and
+    gDeckLinkAPIBundleRef - it opens that framework as a CFBundle at run time,
+    from an absolute path outside the .app. On Windows the same plugin reaches
+    the API through COM, whose class is registered by the same installer. So
+    `otool -L` on macOS and any dependency walker on Windows will report
+    nothing, and the absence of a Blackmagic entry in gst\BUNDLE-MANIFEST.txt
+    or in Contents/Resources/GST-BUNDLE-MANIFEST.txt is NOT evidence that the
+    driver is unnecessary.
+
+    Consequences worth stating plainly, because each one is a support call:
+
+      - On a machine without Desktop Video there is no DeckLink API, so there
+        are no devices and no capture. The failure is quiet: no dialog, no
+        error the operator can act on, just an input list that has no card in
+        it.
+      - This is the same class of dependency as the WebView2 runtime in section
+        F, with one difference that matters - WebView2 has a bootstrapper this
+        product embeds, and Desktop Video has nothing of the kind. It is a
+        manual, administrator-privileged install from Blackmagic's support site
+        and it wants a reboot.
+      - The BUILD HOSTS need it too, not only the target machines.
+        build/bundle-gst-darwin.sh resolves every wanted element through
+        gst-inspect and then proves it again from inside the finished bundle,
+        so on a Mac without Desktop Video the macOS build now FAILS rather than
+        producing a bundle that cannot capture.
+
+    Nothing in this section creates an obligation on this product. It is here
+    so that the one component whose absence breaks the capture path silently is
+    written in the file that enumerates components.
 
 ------------------------------------------------------------------
 G. DELIBERATE EXCLUSIONS - read this before adding anything to the bundle

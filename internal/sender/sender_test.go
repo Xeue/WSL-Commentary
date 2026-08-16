@@ -1962,7 +1962,15 @@ func (p *rudePipeline) Start(gst.PipelineOpts) error   { return nil }
 func (p *rudePipeline) ReplaceSink(gst.SinkOpts) error { return nil }
 func (p *rudePipeline) RemoveSink() error              { return nil }
 func (p *rudePipeline) ForceKeyUnit() error            { return nil }
-func (p *rudePipeline) Errors() <-chan error           { return p.errs }
-func (p *rudePipeline) Stop() error                    { return nil }
+
+// The channel-map half of gst.Pipeline. internal/sender never touches routing —
+// it reconnects a sink and nothing else — so these are the inert answers of a
+// pipeline with a positioned capture device: no negotiated width to report, and
+// no matrix to change.
+func (p *rudePipeline) InputChannels() int                 { return 0 }
+func (p *rudePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
+
+func (p *rudePipeline) Errors() <-chan error { return p.errs }
+func (p *rudePipeline) Stop() error          { return nil }
 
 var _ gst.Pipeline = (*rudePipeline)(nil)

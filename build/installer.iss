@@ -88,7 +88,9 @@ DefaultDirName={autopf}\WSL Studios\{#AppName}
 DefaultGroupName={#AppName}
 
 ; Windows 11 x64 (specification section 1). WebView2 Evergreen is part of
-; Windows 11, which is why the app needs nothing else installed. 10.0.22000 is
+; Windows 11, which is why the app needs nothing else installed - with the one
+; exception documented in the block below, which applies only to positions that
+; capture off SDI. 10.0.22000 is
 ; the first Windows 11 build. If a Windows 10 test machine is ever needed,
 ; lower this AND confirm the WebView2 Evergreen runtime is present on it - the
 ; embedded bootstrapper can install it, but that is a network operation and
@@ -96,6 +98,48 @@ DefaultGroupName={#AppName}
 MinVersion=10.0.22000
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+
+; --------------------------------------------------------------------------
+; THE ONE PREREQUISITE THIS INSTALLER DOES NOT SATISFY: BLACKMAGIC DESKTOP
+; VIDEO. Read this before writing a check for it, and before repeating the
+; sentence above about the app needing nothing else installed.
+;
+; The comment above is true of WebView2 and no longer true of everything: from
+; 2026-08-16 the bundle contains the GStreamer decklink plugin
+; (libgstdecklink.dll, LGPL, gst-plugins-bad), which is how a commentary
+; position takes its programme feed off SDI. That plugin does not contain the
+; DeckLink API. It reaches it through COM, and the COM class is registered by
+; Blackmagic's DESKTOP VIDEO installer - a separate, administrator-privileged,
+; reboot-wanting download from Blackmagic's support site, under Blackmagic's
+; own licence, which this product may not and does not redistribute. See
+; licenses\NOTICE.txt section F3 and specification section 3.
+;
+; It is the same CLASS of dependency as the WebView2 runtime, with the one
+; difference that costs a support call: WebView2 has a bootstrapper the
+; executable embeds, and Desktop Video has nothing of the kind. No dependency
+; walker will ever report it either - bundle-gst.ps1's -DependencyReport reads
+; import tables, and a COM class is not an import - so its absence from
+; gst\BUNDLE-MANIFEST.txt is NOT evidence that the driver is unnecessary.
+;
+; WHY THERE IS NO [Code] CHECK HERE, which is a decision and not an omission:
+;
+;   1. Not every commentary position uses a card. A position on the machine's
+;      own audio stack needs nothing, and an installer that refuses - or even
+;      warns - on those machines is wrong more often than it is right.
+;   2. This installer has no wizard pages by design (see the Disable*Page
+;      directives above): one feature, no options, nothing to get wrong at two
+;      in the morning before a match. A message box is a page.
+;   3. The honest place to tell the operator is where the symptom appears -
+;      the app's own input list, which knows whether a card was asked for. An
+;      installer that ran an hour ago cannot say anything useful about a card
+;      plugged in since.
+;
+; If a facility ever does want the check at install time, the shape is a
+; [Code] InitializeSetup that reads the CLSID out of HKCR and warns without
+; blocking. It is deliberately not written here, because an unblocking warning
+; nobody reads is worse than the app saying it plainly at the moment it
+; matters. Do not turn it into an abort.
+; --------------------------------------------------------------------------
 
 ; No options, no configuration screens (specification section 11). One feature,
 ; no components, no tasks, no post-install checkbox, nothing to get wrong at

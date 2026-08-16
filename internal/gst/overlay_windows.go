@@ -662,6 +662,38 @@ func (o *overlay) apply() {
 	// above its siblings on every apply because WebView2 reorders its own
 	// windows without notice, and it must never take the activation from the
 	// page while doing it.
+	//
+	// # AND IT STAYS UNCONDITIONAL. DO NOT MAKE IT MATCH THE MAC.
+	//
+	// overlay_darwin.go used to raise on every apply too, and no longer does: it
+	// asks whether anything foreign is above it first, and moves only if
+	// something is. That is not a better idea that this file has yet to catch up
+	// with. It is a different cost.
+	//
+	// The only way AppKit offers to reorder an existing subview is
+	// -[NSView addSubview:], which takes the view OUT of its superview and puts
+	// it back — through a view that is hosting a live GL surface. SetWindowPos
+	// does nothing of the kind: it moves an entry in a z-order list, the HWND is
+	// never unparented, and gstd3d11's swapchain is bound to the HWND and not to
+	// its place among its siblings. The window is not recreated, the swapchain is
+	// not touched, and the device is not reset.
+	//
+	// Tier 3 puts a SECOND overlay child — the DeckLink confidence preview — in
+	// the same parent, which is what forced the question on the Mac: with two,
+	// only one can be topmost, so each would displace the other on every apply,
+	// for ever. The same exchange happens here and is worth nothing: both children
+	// are WS_CLIPSIBLINGS and they do not overlap, so their relative order does
+	// not change either one's visible region, no invalidation is generated, and
+	// nothing is repainted. What it costs is one SetWindowPos per apply, which
+	// this file was already paying for the move.
+	//
+	// Making it conditional would mean a GetWindow(GW_HWNDPREV) walk to buy that
+	// syscall back, and would put a test in front of the ONE defence there is
+	// against a WebView2 reorder that arrives with no notification at all. This
+	// is the on-air platform; the unconditional raise is what has shipped through
+	// every match. Reasoned from the API contracts and from what this file
+	// already documents, NOT re-measured — the cgo half of this package cannot be
+	// built on the machine the port is being done on.
 	procSetWindowPos.Call(
 		uintptr(hwnd), hwndTop,
 		uintptr(int32(rect.X)), uintptr(int32(rect.Y)),

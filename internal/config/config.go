@@ -48,6 +48,43 @@ type Tile struct {
 	H int `json:"h"`
 }
 
+// ChannelContribution is one cell of a DeckLink card's routing: one of its
+// embedded input channels reaching one side of the commentary feed, at one gain.
+//
+// It is the PERSISTED form of internal/gst's ChannelContribution, and the field
+// names and json tags are IDENTICAL to that type's on purpose — the same
+// discipline VideoFormatSpec keeps with gst.ConformTarget. This package cannot
+// import internal/gst (that package is the only one allowed a cgo import, and
+// config is loaded by tooling that must never link GStreamer), so the two
+// structs are transcribed field by field in app.go; making them identical is
+// what leaves the transcription nothing to get subtly wrong.
+//
+// A map is a LIST of these and not a dense 2xN grid, for a reason that shows up
+// exactly here, at the point where it is written to disk and read back on a
+// different day: a grid saved against a card presenting sixteen channels and
+// reloaded against one presenting eight has to be truncated by somebody, whereas
+// a list naming a channel that no longer exists is refused by name.
+type ChannelContribution struct {
+	// Output is which side of the commentary feed this contribution feeds:
+	// 0 is left, 1 is right. There are two and there is no path to a third —
+	// the AAC encoder is pinned to a stereo pair.
+	Output int `json:"output"`
+
+	// Input is the ZERO-BASED index of the card's input channel. Channel 1 on
+	// the operator's embedder is Input 0 here; the +1 belongs to the UI and is
+	// done in exactly one place there, because a conversion applied twice is
+	// a commentator routed one channel along from where they are.
+	Input int `json:"input"`
+
+	// Gain is the linear coefficient, and audioconvert HARD-CLAMPS it to
+	// [-1, 1]: 1.0 is accepted, 1.0000001 is refused, and the refusal is silent
+	// — it leaves the previous matrix in force with nothing readable afterwards
+	// to say which one is running. So this is a router with attenuation, not a
+	// mixer with make-up gain. A negative value inverts polarity, which is a
+	// real thing to want on a desk that has sent a leg out of phase.
+	Gain float64 `json:"gain"`
+}
+
 // Config is the whole of the application's persisted configuration.
 //
 // The JSON tags are normative: they are both the on-disk field names required by
@@ -274,6 +311,42 @@ type Config struct {
 	// fail 3/3), and the incumbent survives, so once this application holds the
 	// card nothing can take it away mid-match.
 	DeckLinkPersistentID string `json:"decklinkPersistentId"`
+
+	// DeckLinkChannelMap is which of the card's embedded audio channels reach
+	// the left and right of the commentary feed, and at what gain. It is read
+	// only when AudioSourceKind is "decklink"; a native seat has no unpositioned
+	// channels to route and the whole field is inert.
+	//
+	// # THE ABSENT VALUE IS NOT SILENCE, AND MUST NEVER BE MATERIALISED
+	//
+	// An empty or missing map means "NOBODY HAS CHOSEN", and internal/gst
+	// resolves that to input 1 on the left and input 2 on the right at unity —
+	// which is bit-for-bit what this application already sent from a card
+	// configured for two channels, so a seat whose operator never opens the
+	// routing screen hears exactly what it heard before the screen existed.
+	//
+	// A well-meaning migration that wrote that default out explicitly would
+	// freeze TODAY'S default into every config file on every machine, and the
+	// next change to it would silently not reach any of them. Leave the field
+	// absent. Nothing here defaults it, there is no EffectiveDeckLinkChannelMap,
+	// and that is deliberate: the resolution belongs to the one package that
+	// knows the negotiated channel count to resolve it against.
+	//
+	// It is the one field in this struct carrying omitempty, and that is the
+	// same decision said in the encoder: a seat that has never routed anything
+	// writes a config.json byte-identical to the one it writes today, rather than
+	// growing a "decklinkChannelMap": null nobody chose. Reading is unaffected —
+	// absent, null and [] are the same nil slice and the same meaning.
+	//
+	// # Why this is MACHINE state
+	//
+	// It describes which XLR on which embedder carries the commentator in THIS
+	// room — a property of the building's wiring, not of the facility being
+	// covered. It is classified in internal/presets/fields.go beside
+	// audioSourceKind and decklinkPersistentId, and for a sharper version of
+	// their reason: a preset carrying a routing would silently move somebody's
+	// microphone from a configuration screen, in a different building, mid-match.
+	DeckLinkChannelMap []ChannelContribution `json:"decklinkChannelMap,omitempty"`
 
 	// HeadphoneDeviceID is the browser mediaDeviceId of the commentator's
 	// headphone output, written by the output dropdown and consumed only by the

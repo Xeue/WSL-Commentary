@@ -152,6 +152,16 @@ var MachineFields = []string{
 	// reason: an index into this boot's enumeration order is not an identity, so
 	// it is not a thing that could travel even in principle.
 	"decklinkPersistentId",
+	// WHICH OF THAT CARD'S CHANNELS CARRY THE COMMENTATOR. It is the wiring of
+	// the room this PC is in — which XLR goes to which embedder input — and a
+	// preset carrying it would re-route somebody's microphone in a different
+	// building from a configuration screen, with the routing screen still
+	// showing what the operator there had chosen. The failure is worse than the
+	// two above rather than milder: a wrong capture kind or a wrong card fails
+	// loudly and does not go on air at all, whereas a wrong ROUTING starts
+	// perfectly, shows every lamp green and carries the wrong channel — or
+	// silence — for as long as nobody listens.
+	"decklinkChannelMap",
 }
 
 // UIFields are the json tags of live-operational choices. Instance-DERIVED is
