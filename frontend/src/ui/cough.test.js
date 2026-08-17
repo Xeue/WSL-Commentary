@@ -255,24 +255,45 @@ test('a mute made by a remote seat says so on the badge, not only in a tooltip',
   assert.match(r.detail, /10\.0\.0\.42:51001/, 'and the address is reachable for the moment it is wanted');
 });
 
-test('adopting an authoritative payload overrides whatever this page thought', async () => {
+test('an arriving payload changes what this seat SHOWS and never what it SENDS', async () => {
+  // ===================== THIS TEST USED TO ASSERT THE BUG ===================
+  //
+  // It read: "And then it re-pumps: this desk's controls say LIVE, so the model
+  // asks Go to return to what the operator has actually chosen." With one seat
+  // that is self-correction and it looks like care. With TWO seats it is a
+  // fight neither can win, because each seat holds its own intent and treats
+  // the shared value as something to be corrected towards it:
+  //
+  //   A latches   -> Go says muted     -> B observes, disagrees, unmutes
+  //   B's unmute  -> Go says unmuted   -> A observes, disagrees, mutes
+  //
+  // at network speed. The operator, with the app and a browser seat open:
+  // "the mute keys just flash on and off at a super high frequency when you try
+  // and use them".
+  //
+  // So the assertion is inverted, and it is the guard on the invariant: a
+  // payload from Go may change what a seat DISPLAYS and may never, by itself,
+  // cause a seat to CALL.
   const g = build();
   const before = g.readouts.length;
   g.mute.adopt(payload(true, { by: MUTE_BY_REMOTE, byAddr: '10.0.0.7:1' }));
 
-  // The FIRST readout after adopt is the adopted truth: this page is told the
-  // commentary is muted and by whom, whatever its own buttons say.
+  // It still tells the truth on the screen: this page is told the commentary is
+  // muted and by whom, whatever its own buttons say. That half was always right.
   const adopted = g.readouts[before];
   assert.equal(adopted.muted, true);
   assert.equal(adopted.text, 'MUTED (REMOTE)');
 
-  // And then it re-pumps: this desk's controls say LIVE, so the model asks Go to
-  // return to what the operator has actually chosen, and says it is asking.
-  assert.deepEqual(g.go.calls, [false]);
-  assert.equal(g.last().state, MUTE_STATE.UNMUTING);
+  // And it says NOTHING to Go.
+  assert.deepEqual(
+    g.go.calls,
+    [],
+    'a seat that merely heard about a mute must not answer back — that answer is ' +
+      'the other half of an infinite loop',
+  );
 
   await g.go.settle();
-  assert.equal(g.last().state, MUTE_STATE.LIVE);
+  assert.deepEqual(g.go.calls, [], 'and still nothing after the microtask queue drains');
 });
 
 // ---------------------------------------------------------------------------
