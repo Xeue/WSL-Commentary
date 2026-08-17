@@ -1,0 +1,27 @@
+# Line endings.
+#
+# This repository is developed on both macOS (LF) and Windows. Several tests
+# READ SOURCE FILES and match on multi-line patterns — e.g. app_test.go looks
+# for "\n}\n" to find a function's end, and the frontend tests slice settings.js
+# between "addField(\n    '..." markers. Under Windows' default
+# core.autocrlf=true those files are checked out with CRLF, the "\n"-based
+# patterns stop matching, and the tests fail (one panics on a negative slice)
+# on Windows only while passing on the Mac. Forcing LF for text files on every
+# platform makes the checkout, and therefore the tests and tooling, identical
+# everywhere.
+#
+# git auto-detects text vs binary (text=auto); eol=lf pins the ending for the
+# text ones. Known binary assets are marked explicitly so their bytes are never
+# touched.
+* text=auto eol=lf
+
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.zip  binary
+*.exe  binary
+*.dll  binary
+*.syso binary
+*.pdf  binary
