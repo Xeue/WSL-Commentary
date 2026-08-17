@@ -141,26 +141,91 @@ const (
 // refusal of everything unrecognised: an id that classifies as neither
 // namespace must not become an unstartable device. frontend's backend.js
 // carries the same pair with the same ids.
+// Channels is filled in here for the same reason it exists at all: the routing
+// panel is sized from what the ENUMERATION advertised, so a stub population in
+// which every device is silent about its width can only ever exercise the stereo
+// seat. The DeckLink entry advertises 0 on purpose: its provider offers
+// `{ 2, 8, 16 }`, which fixes nothing, and a card commentary's width is the
+// constant 16 by construction rather than by advertisement.
+//
+// # The list spans 1, 2, 3, 8, 16 and 32 channels, and that is the requirement
+//
+// The routing panel appears at EVERY width the pad negotiates — the operator
+// overruled a proposed `width > 2` gate on 2026-08-16: "I think we always show
+// it. You may want to flip the channels on a stereo source, on a mono you may
+// want to route it to be dual mono etc". A grid that has to READ WELL at 1 and 2
+// as well as work at 32 cannot be developed against a device list that is three
+// stereo entries and a card, so every width the panel must draw has a device here
+// to draw it from. StubCapture resolves an unstated width out of this same list,
+// so selecting one of these in a dev build sizes the panel to it.
+//
+// The widths are the shapes that exist on real desks rather than a sweep: a
+// headset microphone is mono, a 2i2 is a stereo pair, an aggregate of a mic and a
+// loopback is the measured 3-channel CoreAudio case, an 18i20's analogue bank is
+// 8, the UltraStudio through CoreAudio is the measured 16, and a MADI interface
+// is the 32 that MaxInputChannels was raised to cover.
 var defaultStubDevices = []Device{
 	{
-		ID:   "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
-		Name: "DVS Receive  1-2 (Dante Virtual Soundcard)",
-		Kind: KindNative,
+		ID:       "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
+		Name:     "DVS Receive  1-2 (Dante Virtual Soundcard)",
+		Kind:     KindNative,
+		Channels: 2,
 	},
 	{
-		ID:   "{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}",
-		Name: "DVS Receive  3-4 (Dante Virtual Soundcard)",
-		Kind: KindNative,
+		ID:       "{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}",
+		Name:     "DVS Receive  3-4 (Dante Virtual Soundcard)",
+		Kind:     KindNative,
+		Channels: 2,
 	},
 	{
-		ID:   "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}",
-		Name: "Microphone (Focusrite Scarlett 2i2 USB)",
-		Kind: KindNative,
+		ID:       "{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}",
+		Name:     "Microphone (Focusrite Scarlett 2i2 USB)",
+		Kind:     KindNative,
+		Channels: 2,
 	},
 	{
-		ID:   "{0.0.1.00000000}.{4b1e77a2-0004-438e-9003-51a46e13b7e0}",
-		Name: "Blackmagic UltraStudio 4K Mini",
-		Kind: KindNative,
+		// THE MONO CASE the operator named: one input, routed to both sides.
+		// DefaultChannelMap already produces exactly that, and the grid it draws
+		// is a 2x1 that has to say so in words rather than merely function.
+		ID:       "{0.0.1.00000000}.{7c2d4e91-0004-438e-9003-51a46e13c2f4}",
+		Name:     "Headset Microphone (Poly Blackwire 3220)",
+		Kind:     KindNative,
+		Channels: 1,
+	},
+	{
+		// THE MEASURED THREE. A real 3-channel CoreAudio device on this machine
+		// negotiated channels=3 channel-mask=0x0 — unpositioned, matrix
+		// mandatory — which is the case that proves "unpositioned" is not a
+		// synonym for "DeckLink".
+		ID:       "{0.0.1.00000000}.{a8b31f60-0004-438e-9003-51a46e13d5a7}",
+		Name:     "Aggregate Device (Mic + Loopback)",
+		Kind:     KindNative,
+		Channels: 3,
+	},
+	{
+		// A NON-SQUARE GRID, and the first place anyone will get the matrix
+		// orientation wrong: 2 outputs by 8 inputs, where a transpose is no
+		// longer invisible the way it is at 2x2.
+		ID:       "{0.0.1.00000000}.{d5e02a44-0004-438e-9003-51a46e13e8b2}",
+		Name:     "Analogue 1-8 (Focusrite Scarlett 18i20)",
+		Kind:     KindNative,
+		Channels: 8,
+	},
+	{
+		ID:       "{0.0.1.00000000}.{4b1e77a2-0004-438e-9003-51a46e13b7e0}",
+		Name:     "Blackmagic UltraStudio 4K Mini",
+		Kind:     KindNative,
+		Channels: 16,
+	},
+	{
+		// THE CEILING. MaxInputChannels is 32 and a 2x32 mix-matrix is measured
+		// passing audio with level reporting 32 rms entries per message, so the
+		// widest seat this build accepts is one a Gate A test can select rather
+		// than one nobody can reach.
+		ID:       "{0.0.1.00000000}.{f10c9b73-0004-438e-9003-51a46e13f9c5}",
+		Name:     "MADI 1-32 (RME MADIface USB)",
+		Kind:     KindNative,
+		Channels: 32,
 	},
 	{
 		ID:   "2747401380",

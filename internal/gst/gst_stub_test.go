@@ -26,12 +26,8 @@ func TestListInputDevicesReturnsFakes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInputDevices: %v", err)
 	}
-	// Five: the three native endpoints the stub has always carried, plus the
-	// UltraStudio TWIN PAIR — one card enumerating twice under names an operator
-	// cannot tell apart, which is the measured shape of the owner's original bug
-	// and the case the dropdown's labelling exists for. See defaultStubDevices.
-	if len(devices) != 5 {
-		t.Fatalf("want 5 fake devices, got %d", len(devices))
+	if len(devices) == 0 {
+		t.Fatal("the stub offered no devices at all")
 	}
 	if devices[0].Name != "DVS Receive  1-2 (Dante Virtual Soundcard)" {
 		t.Errorf("first device name = %q", devices[0].Name)
@@ -40,20 +36,45 @@ func TestListInputDevicesReturnsFakes(t *testing.T) {
 		t.Error("device ID must be the endpoint GUID, not the display name")
 	}
 
-	// The twin pair must be a pair of DIFFERENT KINDS sharing one piece of
-	// hardware, because a stub in which the two never collide is one where the
-	// labelling that separates them can be broken without any test noticing.
-	var native, deckLink int
+	// THE TWIN PAIR: one card enumerating twice, once through the platform's own
+	// audio stack and once through GStreamer's decklink provider, under names an
+	// operator cannot tell apart. It is the measured shape of the owner's original
+	// bug and the case the dropdown's labelling exists for, and a stub in which
+	// the two never collide is one where the labelling that separates them can be
+	// broken without any test noticing.
+	byName := map[string]map[DeviceKind]bool{}
 	for _, d := range devices {
-		switch NormaliseDeviceKind(d.Kind) {
-		case KindNative:
-			native++
-		case KindDeckLink:
-			deckLink++
+		if byName[d.Name] == nil {
+			byName[d.Name] = map[DeviceKind]bool{}
+		}
+		byName[d.Name][NormaliseDeviceKind(d.Kind)] = true
+	}
+	twins := 0
+	for _, kinds := range byName {
+		if kinds[KindNative] && kinds[KindDeckLink] {
+			twins++
 		}
 	}
-	if native != 4 || deckLink != 1 {
-		t.Errorf("stub device kinds = %d native, %d decklink; want 4 and 1", native, deckLink)
+	if twins != 1 {
+		t.Errorf("the stub offers %d name collisions between a native and a DeckLink entry, want "+
+			"exactly 1: without the twin pair nothing at Gate A exercises the labelling that "+
+			"separates them", twins)
+	}
+
+	// EVERY WIDTH THE ROUTING PANEL MUST DRAW has a device to draw it from. The
+	// panel appears at every width the pad negotiates — the operator overruled a
+	// `width > 2` gate, because flipping a stereo pair and routing a mono input to
+	// both sides are real routing decisions — so a device list that is three
+	// stereo entries and a card can only ever test one shape of grid.
+	widths := map[int]bool{}
+	for _, d := range devices {
+		widths[d.Channels] = true
+	}
+	for _, want := range []int{1, 2, 3, 8, 16, MaxInputChannels} {
+		if !widths[want] {
+			t.Errorf("no stub device presents %d input channels, so no Gate A test can size the "+
+				"routing panel to it", want)
+		}
 	}
 }
 
@@ -1076,9 +1097,25 @@ func pipelineDescriptionSource(t *testing.T) string {
 // somebody else's file.
 func TestCaptureLegNeverSetsTheConnectionProperty(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
+
+	// THE CAPTURE LAYER'S HALVES, added when the description was split in two.
+	// The comment above says a version of this test that went on reading one
+	// place would pass for ever by no longer being able to see the code it
+	// forbids, and splitting one description function into two is exactly that
+	// happening again. Both new functions and the new build sequence are named
+	// here so that dropping one of them is a compile-time failure of this test
+	// rather than a silent loss of coverage.
+	descFset, descFile := parseSource(t, captureDescSourceFile)
+	capFset, capFile := parseSource(t, captureCgoSourceFile)
+
 	for _, fn := range []struct{ name, body string }{
 		{"pipelineDescription", funcBody(t, fset, file, "", "pipelineDescription")},
 		{"the Start sequence", startSequence(t, fset, file)},
+		{"captureDescription", funcBody(t, descFset, descFile, "", "captureDescription")},
+		{"sendDescription", funcBody(t, descFset, descFile, "", "sendDescription")},
+		{"the capture Start sequence",
+			funcBody(t, capFset, capFile, "cgoCapture", "Start") + "\n" +
+				funcBody(t, capFset, capFile, "cgoCapture", "buildLocked")},
 	} {
 		if strings.Contains(fn.body, "connection") {
 			t.Errorf("%s mentions the DeckLink `connection` property. It is not a per-pipeline "+

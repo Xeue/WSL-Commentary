@@ -258,6 +258,48 @@ type Device struct {
 	// NormaliseDeviceKind stays the rule for anything DECODED — a Device read
 	// back out of a frame written by an older build still carries "".
 	Kind DeviceKind `json:"kind"`
+
+	// Channels is how many input channels this device ADVERTISES: structure 0 of
+	// the enumerated GstDevice's caps, read during the ordinary provider walk.
+	// Zero means it advertised nothing fixed.
+	//
+	// # It is a QUERY. Nothing is opened to answer it
+	//
+	// Measured on this machine, with no device opened: the built-in microphone
+	// advertises channels=1, NDI Audio channels=2 channel-mask=0x3, and the
+	// UltraStudio through CoreAudio channels=16 channel-mask=0x0. The DeckLink
+	// provider's own entry for the same card advertises `{ 2, 8, 16 }`, which
+	// fixes nothing and reads here as 0 — correctly, because a card commentary's
+	// width is the constant 16 BY CONSTRUCTION (the description states
+	// channels=16 on the element) rather than discovered.
+	//
+	// # What it is for, and why a seat cannot start without it
+	//
+	// It is what fills CaptureOpts.DeviceChannels, which is what SIZES THE
+	// MIX-MATRIX while the capture pipeline is still in NULL. A matrix is a
+	// negotiation constraint and not a gain: no CoreAudio source can emit a
+	// positioned channel-mask above two channels — gstosxcoreaudio.c:886-889 sets
+	// `layout = NULL; /* no supported for sources */` unconditionally for every
+	// source — so audioconvert cannot map a 16-in Focusrite or RME to stereo
+	// without one, and the leg dies about 0.07 s after PLAYING with
+	// not-negotiated (-4). The source pad cannot be asked instead: osxaudiosrc's
+	// src template is `channels: [1, 2147483647]`, which fixes nothing in NULL.
+	//
+	// So this field is not a decoration on the dropdown. It is the only thing in
+	// the process that can tell a multichannel commentary seat how wide it is
+	// before it has to commit.
+	//
+	// # There is deliberately no Positioned field beside it
+	//
+	// The plan proposed one. Nothing would read it: the matrix is written
+	// UNIFORMLY at every width including 1 and 2 (measured working at 1, 2, 3, 16
+	// and 32), so there is no decision anywhere in this package that positioning
+	// changes, and a field nothing consumes is a fact with nobody to keep it
+	// true. The one thing it would have encoded is already settled from
+	// GStreamer's own source and written down in capture.go. Reading it also is
+	// not free — channel-mask is a GST_TYPE_BITMASK with no typed getter in
+	// go-gst, so it can only be recovered by scanning the serialised structure.
+	Channels int `json:"channels"`
 }
 
 // DeviceKind names which family of capture device a Device belongs to, and

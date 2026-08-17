@@ -212,8 +212,34 @@ func classifyBusError(source string, legs captureLegs) busErrorClass {
 		// that must never depend on anything else being right. isPreviewSourced
 		// is preview.go's, which is where the naming rule and its test live.
 		return classPreview
+	case strings.HasPrefix(source, audioProxyNamePrefix):
+		// THE COMMENTARY LEG'S TAIL: aproxq and aproxsink, the leaky queue and
+		// the proxysink the send pipeline attaches to. It is the SAME FAULT as
+		// asrc failing — there is no commentary crossing the seam either way —
+		// so it is classified explicitly rather than left to fall through on a
+		// prefix accident. It does not begin with "asrc" and would otherwise
+		// have reached the nameless fatal default, which says "the capture or
+		// mux chain has failed" about a leg this file can name.
+		return classAudioCapture
 	case source == captureAudioSrcName:
 		return classAudioCapture
+	case strings.HasPrefix(source, videoProxyNamePrefix):
+		// THE PICTURE LEG'S TAIL: vproxq and vproxsink. It is a picture fault
+		// and it is NOT upgraded by AudioClockedByVideo the way the capture
+		// prefix below is, deliberately.
+		//
+		// The upgrade exists because a decklinkvideosrc is the CLOCK the
+		// commentary is captured against. These two elements are downstream of
+		// the tee, downstream of the conform chain and downstream of everything
+		// that clocks anything: the card goes on producing, the audio leg goes
+		// on being clocked, and the only thing that has died is the picture. An
+		// upgrade here would take the commentary off air on every fused seat for
+		// a queue.
+		//
+		// It is an explicit entry rather than a widening of the "vcap" prefix
+		// because the tail exists on a SLATE picture leg too, where nothing at
+		// all is named vcap-anything.
+		return classVideoCapture
 	case strings.HasPrefix(source, videoCaptureNamePrefix):
 		if legs.AudioClockedByVideo {
 			// Not a video fault. The commentary is captured against this

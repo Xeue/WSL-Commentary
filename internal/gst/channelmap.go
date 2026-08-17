@@ -89,18 +89,31 @@ const (
 
 // MaxInputChannels is the widest input this model will build a matrix for.
 //
-// It is a SANITY BOUND, not a hardware limit expressed twice. decklinkaudiosrc
-// offers 2, 8 and 16 and nothing else, so 16 is the widest stream this
-// application can meet today; the bound exists so that a channel count read
-// back as a garbled number — a caps query against a pad that has renegotiated
-// under us, a future element publishing something absurd — is refused here
-// rather than turned into an allocation of that many columns and a matrix
-// GStreamer will reject or, worse, accept.
+// It is a SANITY BOUND, not a hardware limit expressed twice. The bound exists
+// so that a channel count read back as a garbled number — a caps query against a
+// pad that has renegotiated under us, a future element publishing something
+// absurd — is refused here rather than turned into an allocation of that many
+// columns and a matrix GStreamer will reject or, worse, accept.
 //
-// A device genuinely presenting more than sixteen channels is a change to what
-// this application supports and should arrive as a change to this number with
-// a measurement beside it, not as a matrix nobody sized.
-const MaxInputChannels = 16
+// # It was 16 and is now 32, and the measurement this file asked for is here
+//
+// The old number was decklinkaudiosrc's: it offers 2, 8 and 16 and nothing else,
+// so 16 was the widest stream this application could meet. That stopped being
+// true the day the commentary source stopped being either a card or a positioned
+// stereo microphone — a Focusrite or an RME is unpositioned above two channels
+// exactly as the card is, because gstosxcoreaudio.c:886-889 sets
+// `layout = NULL; /* no supported for sources */` for every CoreAudio source, so
+// an 18-in interface is byte-for-byte the same problem as the card and needs the
+// same matrix.
+//
+// MEASURED on this machine before the number moved, which is what the comment
+// this replaces asked for: a 2x32 mix-matrix passes audio, and `level` reports 32
+// rms entries per message against it. levelMaxChannels is already 64, so nothing
+// downstream of the matrix has to move with it.
+//
+// Wider than 32 is a NAMED REFUSAL OF THAT DEVICE AT SELECTION TIME, off air —
+// never a Start that refuses, and never a matrix nobody sized.
+const MaxInputChannels = 32
 
 // ChannelGainLimit is the magnitude beyond which audioconvert refuses a
 // coefficient, and it is GStreamer's number rather than a policy of ours.

@@ -121,7 +121,7 @@ const levelStubChannels = 2
 // documented edge, and an empty one is no meter at all. Index i is still input
 // channel i for everything shown.
 //
-// # It is deliberately NOT channelmap.go's MaxInputChannels, which is 16
+// # It is deliberately NOT channelmap.go's MaxInputChannels, which is 32
 //
 // Whoever notices the two numbers next will want to unify them. They are two
 // ceilings on two different failures and unifying them would make one of the two
@@ -145,8 +145,8 @@ const levelStubChannels = 2
 // when a wider device is worth ROUTING, with a measurement beside it.
 const levelMaxChannels = 64
 
-// The names of the level elements in the send pipeline, and the only two names
-// this package will accept a level message from.
+// The names of the level elements, and the only two names this package will
+// accept a level message from.
 //
 // They live HERE rather than beside the other element-name constants in
 // gst_cgo.go for one concrete reason: this file is untagged, so Gate A compiles
@@ -155,9 +155,31 @@ const levelMaxChannels = 64
 // parsing. A guard that can only read the parse string cannot tell you that the
 // handler and the pipeline agree about which element is which.
 //
-// alevel is the PROGRAMME meter: it sits immediately before the AAC encoder and
-// measures the exact stereo signal that is encoded and sent. It is what feeds
-// OnLevels and it is unchanged by this tier.
+// alevel is the PROGRAMME meter: the exact S16LE 48 kHz stereo that is encoded
+// and sent, measured after the cough mute and after the routing. It is what feeds
+// OnLevels.
+//
+// # WHERE IT SITS, AND THE ONE PROMISE THAT CHANGED WITH IT
+//
+// In the shipping single pipeline it sits immediately before the AAC encoder, and
+// that is what made OnLevels' promise absolute: no meter could move while silence
+// went to air, because the buffers it measured were the buffers being encoded.
+//
+// In the ALWAYS-LIVE CAPTURE PIPELINE it sits immediately before aproxq and the
+// proxysink — a leaky, one-second queue and a whole pipeline boundary above the
+// encoder (capturedesc_cgo.go, seam.go). Same buffers in normal operation. During
+// a SEND-SIDE STALL OF MORE THAN ABOUT A SECOND THEY ARE NOT THE SAME BUFFERS:
+// aproxq is leaky=downstream, so the far end LOSES that second of audio while
+// this meter goes on moving. That is A3, answered by the operator on 2026-08-16 —
+// DROP, not delay, because a stall over a second is already a reconnect-class
+// event and late audio is useless to a live switcher, and because the non-leaky
+// alternative was measured dragging the preview to 7.2 fps and the meters to
+// 7.2 msg/s and making the card itself drop packets.
+//
+// So the promise now reads: no meter can move while silence goes to air IN NORMAL
+// OPERATION, and NOT during a stall. The detector for the stall is the send side's
+// muxer watchdog (livewatch.go), not this meter, and that is the division of
+// labour rather than an omission.
 //
 // chlevel is the PER-CHANNEL PICKER meter: it sits on the capture source's own
 // output, upstream of the audioconvert that mixes sixteen unpositioned channels

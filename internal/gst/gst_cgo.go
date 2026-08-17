@@ -438,7 +438,7 @@ type requiredElement struct{ factory, plugin string }
 // element". The H.264 encoder is deliberately absent from this list because it
 // is resolved by rank at runtime (specification open question 3).
 //
-// The fourteen entries below are the ones that are the SAME on every platform,
+// The seventeen entries below are the ones that are the SAME on every platform,
 // under identical factory AND plugin names — verified against Homebrew's
 // GStreamer 1.26.10 on macOS arm64 on 2026-08-14, factory by factory, because
 // "it is probably called the same thing" is how a bundle ships without a
@@ -468,6 +468,26 @@ var requiredElements = append([]requiredElement{
 	{"level", "level"},
 	{"mpegtsmux", "mpegtsmux"},
 	{"srtsink", "srt"},
+	// proxysink and proxysrc are THE SEAM: the always-live capture pipelines
+	// end in a proxysink and the per-session send pipeline begins in a
+	// proxysrc, which is what lets preview, the input meters and the channel
+	// routing panel run before anything goes to air. Both are in this list and
+	// not in one of the conditional ones because every seat has the seam —
+	// there is no configuration, card or microphone, slate or live picture,
+	// that builds a pipeline without one on each side.
+	//
+	// ONE FILE supplies both (libgstproxy.dylib, 75,344 bytes, gst-plugins-bad,
+	// License LGPL — read out of gst-inspect-1.0 proxysink against Homebrew's
+	// 1.26.10 on macOS arm64 on 2026-08-16, not assumed), so naming both costs
+	// the bundle nothing and buys a named plugin at Init instead of
+	// gst_parse_launch's bare no element "proxysink" at Start.
+	//
+	// The plugin name is "proxy" and neither factory is called after it, which
+	// is the whole reason this entry earns its keep: GStreamer's own failure
+	// names the ELEMENT, and nobody staging a bundle can turn "proxysink" into
+	// a file to copy without this mapping.
+	{"proxysink", "proxy"},
+	{"proxysrc", "proxy"},
 }, platformRequiredElements...)
 
 // videoCaptureRequiredElements are the four factories the LIVE CAPTURE video leg
@@ -952,12 +972,55 @@ func ListInputDevices() ([]Device, error) {
 		// today does not, so this is a belt-and-braces conversion at the single
 		// point every offered device passes through rather than a defence
 		// against a known caller.
-		out = append(out, Device{ID: id, Name: name, Kind: NormaliseDeviceKind(kind)})
+		out = append(out, Device{
+			ID:       id,
+			Name:     name,
+			Kind:     NormaliseDeviceKind(kind),
+			Channels: advertisedChannelCount(dev),
+		})
 	}
 	log.Printf("gst: ListInputDevices: offered %d of %d Audio/Source devices (%s); %d were skipped%s",
 		len(out), audioSources, captureSourceFactory, skipped, skipDetail())
 	reportSilentDeckLinkProvider()
 	return out, nil
+}
+
+// advertisedChannelCount reads Device.Channels off an enumerated GstDevice:
+// structure 0 of its caps, and nothing else. It OPENS NOTHING.
+//
+// # Structure 0, and not the whole caps
+//
+// A device's caps routinely carry more than one structure with more than one
+// channel count, and only structure 0's is the one that negotiates — measured
+// while settling this, which is also why fixedChannelCount is not simply pointed
+// at the whole caps here. The DeckLink provider's entry for the fitted card
+// advertises `channels={ 2, 8, 16 }`; that fixes nothing, this returns 0, and
+// that is right, because a card commentary's width is stated on the element by
+// the description rather than discovered.
+//
+// # It lives here rather than in deviceprovider_darwin.go / _windows.go
+//
+// The plan put it in the platform seams. It is not platform-specific: reading an
+// integer out of structure 0 of a GstCaps is the same operation on both, and
+// captureDeviceID above is where the two genuinely differ. Two copies of this
+// would be two places for one rule to rot.
+func advertisedChannelCount(dev gogst.Device) int {
+	if dev == nil {
+		return 0
+	}
+	caps := dev.GetCaps()
+	if caps == nil || caps.GetSize() == 0 {
+		return 0
+	}
+	s := caps.GetStructure(0)
+	if s == nil {
+		return 0
+	}
+	n, ok := s.GetInt("channels")
+	if !ok || n <= 0 {
+		return 0
+	}
+	return int(n)
 }
 
 // reportSilentDeckLinkProvider writes ONE line when the decklink plugin is
