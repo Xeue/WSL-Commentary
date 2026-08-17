@@ -427,6 +427,14 @@ export function createCoughMute({ apply, onChange, available = true, mode = DEFA
 
   let inFlight = false;
 
+  // `sent` is what THIS SEAT last successfully transmitted, and it is the ONLY
+  // thing local intent is ever compared against. See pump.
+  //
+  // It starts false because a seat that has sent nothing has sent nothing —
+  // deliberately NOT seeded from Go's first payload, because seeding it from a
+  // shared value is precisely the confusion this variable exists to end.
+  let sent = false;
+
   function emit() {
     if (onChange) onChange(describeMute(state));
   }
@@ -563,12 +571,57 @@ export function createCoughMute({ apply, onChange, available = true, mode = DEFA
      * which is also why pump() re-issues it as soon as the payload says a session
      * is available again.
      */
-    adopt(payload) {
+    /**
+     * observe takes a payload that ARRIVED FROM GO and updates what this seat
+     * DISPLAYS. It never calls.
+     *
+     * ================= THE INVARIANT, AND WHY IT IS THE WHOLE FIX ============
+     *
+     * A payload from Go may change what a seat DISPLAYS. It may never, by
+     * itself, cause a seat to CALL.
+     *
+     * This used to end in pump(), and with one seat that was self-correcting:
+     * the desk saw a stale value, disagreed, and put it right. With TWO seats it
+     * is a fight neither can win, because each seat holds its own intent and
+     * treats the shared value as something to be corrected towards it:
+     *
+     *   A latches   -> Go says muted     -> B observes, disagrees, unmutes
+     *   B's unmute  -> Go says unmuted   -> A observes, disagrees, mutes
+     *
+     * at network speed, for as long as both are open. The operator reported it
+     * as "the mute keys just flash on and off at a super high frequency".
+     *
+     * No amount of echo suppression, debouncing or rate limiting fixes this —
+     * measured by the diagnostic that reproduced it, echo suppression alone
+     * still oscillated 300 times in 300 turns — because B fighting A is not an
+     * echo. The only fix is that an arriving payload cannot cause a call.
+     *
+     * DO NOT ADD A pump() HERE to "correct a stale payload". That is the bug,
+     * and there is a test that fails by name if it comes back.
+     */
+    observe(payload) {
       absorb(payload);
       state.failure = '';
-      if (!state.available) state.held = false;
+      // Availability is the exception that proves the rule: it does not send
+      // anything, it releases a LOCAL hold that can no longer mean anything,
+      // because there is nothing to hold the mute on.
+      if (!state.available) {
+        state.held = false;
+        sent = false;
+      }
       emit();
-      pump();
+    },
+
+    /**
+     * adopt is observe, kept under its old name for the startup read.
+     *
+     * app.js calls this once with GetCommentaryMute's answer before any event
+     * can arrive. It is the same thing as observing an event — absorb and paint
+     * — and it is deliberately NOT a place to reconcile either: a page that has
+     * just loaded has no intent of its own to assert.
+     */
+    adopt(payload) {
+      this.observe(payload);
     },
 
     /** setMode records the operator's saved coughMuteMode preference. */
