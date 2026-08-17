@@ -108,19 +108,77 @@ func captureDescription(legs CaptureLegs, conform ConformTarget, preview string)
 			" ! "+videoProxyTail())
 
 	case PictureCard:
-		// THE LIVE CAPTURE LEG. Two things here are easiest to lose in a later
-		// tidy-up and neither may go: videorate is what survives the card's NTSC
-		// placeholder first buffer, and `connection` is NEVER set.
+		// THE LIVE CAPTURE LEG, element by element. Every line below was measured
+		// on the fitted UltraStudio 4K Mini; none of it is defensive habit, and
+		// the whole block moved here whole when pipelineDescription was deleted.
 		//
-		// drop-no-signal-frames=false because this element's job is to keep
-		// producing. A card that dropped its no-signal frames would starve the
-		// muxer on the very seat whose commentary it is also clocking.
+		//	mode=auto             ONLY. A pinned mode that DISAGREES with the input
+		//	                      does not fail — measured, mode=pal against a real
+		//	                      1080p25 input produced 50 clean PAL buffers with
+		//	                      nothing but a warning. Green lamp, real bitrate,
+		//	                      black picture.
+		//	connection            IS NEVER SET, not here and not anywhere in this
+		//	                      package. It is not a per-pipeline selection: it
+		//	                      PERSISTENTLY RECONFIGURES THE CARD, overrides what
+		//	                      the operator set in Blackmagic Desktop Video Setup,
+		//	                      and has had to be undone by hand twice. If a
+		//	                      capture is black or silent the answer is NEVER
+		//	                      another connection value.
+		//	drop-no-signal-frames Left at its default of false, and STATED so that
+		//	                      the default changing is a visible edit. False means
+		//	                      the card keeps emitting black GAP-flagged frames at
+		//	                      full rate FOREVER on signal loss — no error, no EOS,
+		//	                      the muxer never starves. That is why the feed's
+		//	                      continuity is not at risk, and also why nothing in
+		//	                      this pipeline can tell you the signal has gone: the
+		//	                      only thing that can is the card's own signal
+		//	                      property, which signalwatch.go polls. A card that
+		//	                      DROPPED them would starve the muxer on the very
+		//	                      seat whose commentary it is also clocking.
+		//	videoconvert          The card negotiates UYVY or v210 depending on the
+		//	                      input; the encoder wants NV12.
+		//	deinterlace           The only thing in this chain that handles a 1080i50
+		//	                      camera, which is still what a good deal of outside
+		//	                      broadcast kit produces. It passes progressive
+		//	                      through at essentially zero cost, so it is not a
+		//	                      trade — it is free insurance against the one input
+		//	                      format that would otherwise reach the encoder as
+		//	                      interlaced frames the switcher will not take.
+		//	videoscale            The camera's raster need not be the switcher's.
+		//	videorate             MANDATORY, and the least obvious element here.
+		//	                      decklinkvideosrc emits a 720x486 NTSC PLACEHOLDER
+		//	                      as its FIRST BUFFER on every start, with GAP set
+		//	                      and signal=false, and the real caps arrive about
+		//	                      170 ms later. A fixed capsfilter with no videorate
+		//	                      in front of it dies 0.088 s after PLAYING with
+		//	                      not-negotiated (-4), 3 runs out of 3. It also
+		//	                      absorbs a camera whose rate is not the switcher's.
+		//	tee allow-not-linked  Needed by the DEFAULT configuration, not by the
+		//	                      preview: without it a tee with an unlinked src pad
+		//	                      returns NOT_LINKED upstream and stops the leg. A
+		//	                      SECOND decklinkvideosrc IS NOT AN OPTION — the card
+		//	                      is exclusive, two sources in one process fail 3/3
+		//	                      and two processes fail 3/3 — so sharing this one
+		//	                      through a tee is the only shape a preview can have.
 		//
-		// tee allow-not-linked=true is needed by the DEFAULT configuration, not
-		// by the preview: without it a tee with an unlinked src pad returns
-		// NOT_LINKED upstream and stops the leg. A SECOND decklinkvideosrc is
-		// not an option — the card is exclusive — so sharing this one through a
-		// tee is the only shape a preview can have.
+		// THE TEE IS STILL A TEE AND THE SEAM IS STILL A PROXY, and the note that
+		// used to sit here saying "proxysrc was measured as an alternative to the
+		// tee and REJECTED" is answered rather than deleted, because a reader who
+		// finds proxysink two lines below will otherwise think it was overruled.
+		//
+		// The measurement stands: proxysrc's internal queue is leaky=0
+		// max-size-buffers=200 and exposes no tuning, so a wedged consumer stalls
+		// the producer from 50 fps to 0 in under two seconds, and the producer's
+		// death is silent across the boundary. Both objections are real and both
+		// are ANSWERED on the capture side rather than avoided: the leaky queue in
+		// front of every proxysink is what the wedge cannot reach through
+		// (measured under a 12 s wedge: 50.1 fps and 20.0 meter msg/s with
+		// leaky=downstream against 11.6 fps and 7.2 msg/s without), and the send
+		// side's muxer watchdog is what makes the silent death loud within two
+		// seconds. What was rejected was proxysrc INSTEAD OF the tee, inside one
+		// pipeline; what shipped is a tee for the preview and a proxy for the
+		// process boundary between two pipelines that must have separate
+		// lifetimes. See seam.go for both invariants.
 		chains = append(chains, ""+
 			videoCaptureFactory+" name="+nameVideoCaptureSrc+
 			" mode=auto drop-no-signal-frames=false"+

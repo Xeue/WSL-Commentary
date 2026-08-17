@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,55 @@ func TestRemoteAllowlistCoversEveryBoundMethod(t *testing.T) {
 	}
 }
 
+// TestRemoteEventNamesCoversEveryEvent is the drift guard for the OTHER half of
+// the remote surface. remoteAllowlist covers what a seat can CALL; this covers
+// what it is told to LISTEN for.
+//
+// The hello frame's event list is how a remote client wires its subscriptions
+// without guessing, so an event this application emits and does not advertise is
+// a panel that is simply never drawn on the second seat — silently, with no
+// error anywhere, because nothing on either side is expecting it. That is the
+// same class of fault TestRemoteDispatchCoversEveryReachableMethod was written
+// for after GetConformTarget spent a release allowlisted with no dispatch case.
+//
+// It reads app.go's own const block rather than a list kept here, so a new event
+// is covered by the guard the moment it is declared.
+func TestRemoteEventNamesCoversEveryEvent(t *testing.T) {
+	// Every file the bound object is spread over, because the constants are not
+	// all in one of them: EventPicture lives beside the picture path and
+	// EventConfig and EventRemote beside the bridge that emits them.
+	pattern := regexp.MustCompile(`Event[A-Za-z]+ += +"([a-zA-Z]+)"`)
+	var declared [][]string
+	for _, name := range []string{"app.go", "app_picture.go", "app_remote.go"} {
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		declared = append(declared, pattern.FindAllStringSubmatch(string(raw), -1)...)
+	}
+	if len(declared) < 15 {
+		t.Fatalf("found only %d Event constants; the pattern has stopped matching and this guard "+
+			"covers nothing", len(declared))
+	}
+
+	advertised := map[string]bool{}
+	for _, name := range remoteEventNames() {
+		advertised[name] = true
+	}
+	for _, m := range declared {
+		if !advertised[m[1]] {
+			t.Errorf("app.go emits the %q event and remoteEventNames() does not advertise it; a "+
+				"remote seat never subscribes, so whatever that event feeds is simply never drawn "+
+				"there — with no error on either side", m[1])
+		}
+	}
+	if len(advertised) != len(declared) {
+		t.Errorf("remoteEventNames() advertises %d events and the bound object declares %d; an "+
+			"advertised event nothing emits is a subscription that never fires",
+			len(advertised), len(declared))
+	}
+}
+
 // TestRemoteHostOnlySet pins exactly which methods are host-only, so neither the
 // native-surface six nor the two remote-admin methods can silently gain OR lose
 // that status. The per-client admin methods are gone — there are no clients.
@@ -77,6 +127,10 @@ func TestRemoteHostOnlySet(t *testing.T) {
 		"SetPreviewRect": true, "SetPreviewVisible": true,
 		// what this position puts ON AIR, and the window on the operator's screen
 		"SetVideoSource": true, "SetDeckLinkPreviewEnabled": true,
+		// the ALWAYS-LIVE CAPTURE LAYER's two controls: which microphone this
+		// position is heard on, and a rebuild that blanks the operator's picture
+		// and drops their meters for as long as the devices take to reopen
+		"SelectCommentaryInput": true, "RestartCapture": true,
 		// remote administration (local Settings screen only)
 		"GetRemoteState": true, "SetRemoteListener": true,
 	}

@@ -60,7 +60,7 @@
 //
 // # What this stub models about the input meters
 //
-// While started with PipelineOpts.OnLevels set, the stub emits SYNTHETIC
+// While started with CaptureOpts.OnLevels set, the stub emits SYNTHETIC
 // levels on a 50 ms ticker — the real level element's interval — as a
 // deterministic triangle wave, -40 up to -6 dBFS and back over six seconds,
 // with the right channel a quarter-period behind the left (levels.go,
@@ -79,8 +79,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // errStubStopped is returned by methods called on a stopped pipeline.
@@ -348,11 +346,20 @@ type StubCounters struct {
 type StubPipeline struct {
 	mu     sync.Mutex
 	state  StubState
-	opts   PipelineOpts
+	opts   SendOpts
 	sink   SinkOpts
 	hasSk  bool
 	errs   chan error
 	closed bool
+
+	// set is the capture layer this send pipeline was minted from, and seam is
+	// this session's claim on it. They are the whole of what the stub models
+	// about the seam, and modelling them is the point: the two failures they
+	// prevent — a second consumer stealing the stream, and a session that never
+	// re-armed — are both SILENT on the real element, so Gate A is the only place
+	// the refusals themselves can be exercised without a card.
+	set  CaptureSet
+	seam *SendSeam
 
 	startErr     error
 	sinkErr      error
@@ -364,43 +371,11 @@ type StubPipeline struct {
 	// checks fatalError() before anything else that can fail.
 	fatal error
 
-	// inputChannels is the width the fake capture pad has "negotiated", and
-	// channelMap is the map written against it. matrixWritten mirrors the real
-	// twin's matrixWidth > 0 test: false means the fake device presents a
-	// POSITIONED stream that audioconvert would map on its own, so there is no
-	// matrix on this pipeline to change.
-	//
-	// The default is stubInputChannels — two, positioned, no matrix — because
-	// that is what the stub's fake device list is mostly made of and what every
-	// Gate A test written before this mechanism existed assumes. A test that
-	// wants the DeckLink case calls SetStubInputChannels.
-	inputChannels int
-	channelMap    ChannelMap
-	matrixWritten bool
-
-	// levelStop ends the synthetic-levels ticker goroutine, and levelDone is
-	// closed by that goroutine as it exits so Stop can JOIN it rather than
-	// merely signal it. The join matters: without it a Stop-then-assert test
-	// could observe one more OnLevels callback delivered after Stop returned,
-	// which the real build cannot do either — busSilenced is checked on the
-	// posting thread before the callback runs. Both are nil when Start was
-	// asked for neither meter — ONE goroutine drives both, because they are two
-	// rates of the same fake clock and a second ticker would be a second phase
-	// for the picker's bars to drift against the programme meter's.
-	levelStop chan struct{}
-	levelDone chan struct{}
-
-	// muted is the cough mute, and it is an ATOMIC OUTSIDE p.mu for the same
-	// reason the real twin's is: CommentaryMuted is a UI-facing read that must
-	// never block, and in the real build the lock it would otherwise take is
-	// held for the whole of ReplaceSink. A stub whose read took the mutex would
-	// let a caller be written against a cheapness the shipped build cannot
-	// offer.
-	//
-	// It survives Stop, exactly as the real twin's does, so that a caller
-	// rebuilding a session that died muted can read the state off the pipeline
-	// it is discarding. See gst_cgo.go's teardownLocked.
-	muted atomic.Bool
+	// THE FAKE CAPTURE PAD, THE SYNTHETIC METERS AND THE MUTE ARE NOT HERE.
+	// StubCapture has all three, because the pipeline that owns the device is what
+	// owns them, and a Gate A test that wants a negotiated width or a moving meter
+	// now gets one with no send pipeline anywhere in the process — which is the
+	// behaviour it is supposed to be checking.
 
 	counters StubCounters
 }
@@ -410,42 +385,47 @@ type StubPipeline struct {
 // must never wait on a Go consumer.
 const stubErrorBuffer = 16
 
-// stubInputChannels is the channel count a StubPipeline's fake capture pad
-// negotiates unless a test says otherwise.
-//
-// Two, POSITIONED — the ordinary microphone case — because that is what the
-// stub's device list is mostly made of and because it is the state in which no
-// mix matrix is written at all. Keeping it as the default means every Gate A
-// test written before the channel map existed still describes the same
-// pipeline, and the DeckLink case is something a test opts into rather than
-// something every test has to opt out of.
-const stubInputChannels = ChannelMapOutputs
-
-// New creates a StubPipeline. It never fails.
-func New() (Pipeline, error) {
-	return NewStubPipeline(), nil
+// New mints a stub send pipeline over a capture set, with the identical refusal
+// of an empty one the real twin makes and for the identical reason: a send
+// pipeline with no capture behind it does not fail at runtime, it reaches PLAYING
+// and carries zero bytes with every lamp green.
+func New(set CaptureSet) (Pipeline, error) {
+	if len(set.Pipelines()) == 0 {
+		return nil, errors.New("gst: New was given an empty capture set. The send description is " +
+			"invariant — it always has a picture leg and a commentary leg — so a set with neither " +
+			"is a planning error, and a send pipeline built from it would reach PLAYING attached " +
+			"to nothing and carry zero bytes with SRT connected and every lamp green")
+	}
+	return NewStubPipeline(set), nil
 }
 
 // NewStubPipeline creates a StubPipeline with its concrete type, so that a
-// caller can reach the driving methods without a type assertion.
+// caller can reach the driving methods without a type assertion. It does NOT
+// apply New's empty-set refusal, so that a test can build one deliberately.
 //
 // Stub build only.
-func NewStubPipeline() *StubPipeline {
+func NewStubPipeline(set CaptureSet) *StubPipeline {
 	return &StubPipeline{
-		state:         StubStateStopped,
-		errs:          make(chan error, stubErrorBuffer),
-		inputChannels: stubInputChannels,
+		state: StubStateStopped,
+		errs:  make(chan error, stubErrorBuffer),
+		set:   set,
 	}
 }
 
-// Start validates opts and moves the pipeline to StubStateRunning without
-// installing a sink, exactly as the real implementation does.
+// Start claims and arms the capture seam, then moves the pipeline to
+// StubStateRunning without installing a sink, exactly as the real twin does.
 //
-// It fails if SlatePath or AudioDeviceID is empty — both are required by the
-// real pipeline, and finding that out at Gate A is the point of this stub. It
-// does not check that SlatePath exists on disk, because during development the
-// configured path points at the installed location rather than the repository.
-func (p *StubPipeline) Start(opts PipelineOpts) error {
+// THE CLAIM AND THE ARMING ARE THE PART WORTH MODELLING. Everything else a stub
+// Start can check is a string the real build also checks; these two are behaviour
+// that has no symptom on the real element at all. A second consumer attaching to
+// a live proxysink silently steals the stream and kills the first, and a session
+// that skipped the arming carries zero bytes with SRT connected — so the refusal
+// and the re-arm are exercised HERE, at Gate A, on every seat shape, where a
+// missing one is a failing test rather than a silent match.
+//
+// It takes them in NewSend's order — claim first, arm second, release everything
+// on either failure — because that is the object both twins share.
+func (p *StubPipeline) Start(opts SendOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -461,50 +441,6 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 		p.startErr = nil
 		return err
 	}
-	if opts.SlatePath == "" {
-		return errors.New("gst: PipelineOpts.SlatePath is required")
-	}
-	// The identical commentary-source rule the real twin applies, through the
-	// same shared helper, so the two builds cannot drift on either the rule or
-	// the wrapped ErrNotACaptureDevice sentinel: exactly one of AudioDeviceID and
-	// AudioCaptureID, a DeckLink id that converts, and no render endpoint. See
-	// refuseWrongAudioSource in gst.go, and device_id.go for the render half and
-	// its deliberate asymmetry.
-	if err := refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); err != nil {
-		return err
-	}
-	// The identical refusal the real twin makes of a video capture id that is
-	// not a DeckLink persistent-id, through the identical conversion, so that a
-	// value Gate A accepts is a value the card accepts. It is the whole of what
-	// a stub can check here: there is no element to open, and "would this card
-	// be there" is not a question a build with no GStreamer in it can answer.
-	// What it does close is the case that matters — a CoreAudio unique-id or a
-	// WASAPI endpoint GUID wired into the video option by a caller that reached
-	// for the wrong field, which on the real element is not an error at all but
-	// a silent fall back to whichever card enumerated first.
-	if opts.VideoCaptureID != "" {
-		if _, err := parseDeckLinkPersistentID(opts.VideoCaptureID); err != nil {
-			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID names the DeckLink card whose "+
-				"input becomes the video leg, and it must be a DeckLink persistent-id rather "+
-				"than an audio device id: %w", err)
-		}
-	}
-	// ONE CARD when both legs are on one, the identical refusal the real twin
-	// makes and for the identical reason: a DeckLink drives audio capture off
-	// the VIDEO clock, so a commentary leg on one card cannot be clocked by
-	// another card's video, and the card is exclusive so no third element is
-	// available to clock it. The real build discovers this as a seat that will
-	// not preroll and names neither card; here it is a sentence, at Gate A,
-	// before any hardware is involved.
-	if opts.AudioCaptureID != "" && opts.VideoCaptureID != "" &&
-		opts.AudioCaptureID != opts.VideoCaptureID {
-		return fmt.Errorf("gst: PipelineOpts.VideoCaptureID is card %s and "+
-			"PipelineOpts.AudioCaptureID is card %s. A DeckLink drives audio capture off the "+
-			"VIDEO clock, so a commentary leg on one card cannot be clocked by another card's "+
-			"video, and the card is exclusive so a third element is not available to clock it. "+
-			"Both legs must name the same card, or the video leg must be the slate",
-			opts.VideoCaptureID, opts.AudioCaptureID)
-	}
 
 	if opts.VideoBitrateKbps == 0 {
 		opts.VideoBitrateKbps = DefaultVideoBitrateKbps
@@ -512,126 +448,19 @@ func (p *StubPipeline) Start(opts PipelineOpts) error {
 	if opts.AudioBitrateBps == 0 {
 		opts.AudioBitrateBps = DefaultAudioBitrateBps
 	}
-	// The conform target is resolved here for the same reason the two bitrates
-	// are defaulted here: StartedWith() is what the Gate A tests read, and it
-	// must report what a pipeline would ACTUALLY have been built with, not what
-	// the caller happened to type. The resolution is the shared one in gst.go —
-	// there is deliberately no second copy of the fallback rule — so the two
-	// twins cannot drift on which formats are refused or on what they fall back
-	// to. The real twin logs the reason; the stub has no field log to write to
-	// and the resolved value in StartedWith() is the equivalent record.
-	opts.ConformTo, _ = opts.ConformTo.resolve()
-
-	// The channel map, through the SAME MixMatrix the real twin writes from, so
-	// that a map Gate A accepts is a map the card accepts and a map Gate A
-	// refuses is one the real build would have refused before touching the
-	// element. Nothing here fakes the validation; the shared model does it.
-	//
-	// The discriminator is simplified and the simplification is deliberate. The
-	// real twin asks the capture source's pad whether it can produce a stereo
-	// pair unaided; a stub has no pad to ask, so it uses the condition that
-	// question separates in practice — a source presenting MORE channels than
-	// the pipeline's two has no way to say what they are, and is the case a
-	// matrix exists for. Two channels or one behave as they always did: no
-	// matrix, and SetChannelMap refuses with the same message the real twin
-	// gives for a positioned device.
-	// A DECKLINK COMMENTARY SEAT NEGOTIATES SIXTEEN, and the stub says so rather
-	// than leaving the fake pad at its stereo default. decklinkaudiosrc is built
-	// with channels=16 and there is no configuration in which it presents a pair,
-	// so a Gate A test that started a DeckLink seat and got two channels would be
-	// exercising a shape the shipped build cannot produce — no matrix written, no
-	// per-channel meter armed, and a routing UI able to depend on both.
-	//
-	// A caller that has ALREADY widened the pad keeps its own number: 8 is a real
-	// card setting and a test that asked for it means it. Only the stereo default
-	// — the one value a DeckLink audio seat can never have — is replaced.
-	if opts.AudioCaptureID != "" && p.inputChannels <= ChannelMapOutputs {
-		p.inputChannels = deckLinkAudioChannels
+	if opts.VideoBitrateKbps < 0 || opts.AudioBitrateBps < 0 {
+		return fmt.Errorf("gst: negative bitrate: video %d kbps, audio %d bps",
+			opts.VideoBitrateKbps, opts.AudioBitrateBps)
 	}
 
-	if p.inputChannels > ChannelMapOutputs {
-		if _, err := opts.ChannelMap.MixMatrix(p.inputChannels); err != nil {
-			return err
-		}
-		p.channelMap = opts.ChannelMap
-		p.matrixWritten = true
+	seam, err := NewSend(p.set)
+	if err != nil {
+		return err
 	}
-
-	// The cough mute, applied at exactly the point the real twin applies it: with
-	// the pipeline still notionally in NULL, before it can be said to be
-	// carrying anything. The stub has no element to write, so the "read back
-	// what the element said" discipline collapses to storing the value — but the
-	// STATE MACHINE around it is the same one, and that is what Gate A is for. A
-	// pipeline started with MuteCommentary reports CommentaryMuted immediately,
-	// and never through a route that Start could have raced.
-	p.muted.Store(opts.MuteCommentary)
+	p.seam = seam
 
 	p.opts = opts
 	p.state = StubStateRunning
-
-	// The synthetic input meters. Only when the caller asked for metering:
-	// nil OnLevels means no goroutine, exactly as the real build installs no
-	// callback. The goroutine owns nothing but its own step counter and the
-	// two channels, so it never takes p.mu — which is what lets Stop join it
-	// without holding the lock, and what makes a callback that (wrongly)
-	// blocks unable to deadlock anything except the Stop that must wait for
-	// it, mirroring the real contract's "MUST NOT BLOCK".
-	//
-	// The PER-CHANNEL picker rides the same goroutine, on the same conditions the
-	// real twin arms chlevel on: a callback to deliver to, AND a matrix having
-	// been written. That second condition is the parity that matters. In the real
-	// build chlevel is built with post-messages=false and armed only for an
-	// unpositioned source, so a seat with an ordinary microphone posts not one
-	// per-channel frame; a stub that produced them anyway would let a UI depend
-	// on a stream the shipped build does not send.
-	//
-	// The width is p.inputChannels rather than a constant, so the fake frames are
-	// as wide as the fake pad negotiated — sixteen for a test that called
-	// SetStubInputChannels(16), which is the DeckLink shape the picker exists for.
-	if opts.OnLevels != nil || (opts.OnChannelLevels != nil && p.matrixWritten) {
-		programme := opts.OnLevels
-		channels := opts.OnChannelLevels
-		width := p.inputChannels
-		if !p.matrixWritten {
-			channels = nil
-		}
-		stop := make(chan struct{})
-		done := make(chan struct{})
-		p.levelStop = stop
-		p.levelDone = done
-		go func() {
-			defer close(done)
-			// The real level element's interval: 50 ms, twenty frames a
-			// second, so the app-side throttle and the UI see Gate A traffic
-			// with the same shape Gate B will produce.
-			ticker := time.NewTicker(50 * time.Millisecond)
-			defer ticker.Stop()
-			step := 0
-			for {
-				select {
-				case <-stop:
-					return
-				case <-ticker.C:
-					if programme != nil {
-						programme(stubLevelsAt(step))
-					}
-					// EVERY OTHER TICK, because chlevel really does run at half
-					// the programme meter's rate (channelLevelIntervalNs, 100 ms
-					// against 50 ms) and the difference is deliberate. A stub
-					// that delivered both at 20 Hz would let a decay animation or
-					// a smoothing window be sized against a rate the shipped
-					// build does not produce, and the picker would lag by a
-					// factor of two — which on a find-the-commentator meter reads
-					// as "that channel is not the one" a beat after they stopped
-					// talking.
-					if channels != nil && step%2 == 0 {
-						channels(stubChannelLevelsAt(step, width))
-					}
-					step++
-				}
-			}
-		}()
-	}
 	return nil
 }
 
@@ -714,115 +543,6 @@ func (p *StubPipeline) ForceKeyUnit() error {
 	return nil
 }
 
-// InputChannels reports the channel count the fake capture pad has negotiated,
-// or 0 when the pipeline is not running.
-//
-// The zero-when-stopped answer is contract rather than convenience: the real
-// twin reads the pad's CURRENT caps, and a pad that has gone to NULL has none,
-// so a caller that treats 0 as "no device" behaves identically at Gate A and at
-// Gate B.
-func (p *StubPipeline) InputChannels() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed || p.state == StubStateStopped {
-		return 0
-	}
-	return p.inputChannels
-}
-
-// SetChannelMap validates a map against the negotiated width and records it,
-// exactly as the real twin validates before writing.
-//
-// The refusals are the same refusals, produced by the same MixMatrix, and the
-// order matters as much here as it does there: NOTHING IS RECORDED when
-// validation fails, because the real element leaves its previous matrix in
-// force on a rejected write and a stub that stored the bad map anyway would
-// make Gate A disagree with the hardware about what is running.
-func (p *StubPipeline) SetChannelMap(m ChannelMap) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed || p.state == StubStateStopped {
-		return errStubStopped
-	}
-	if !p.matrixWritten {
-		return fmt.Errorf("%w: the capture device presents a positioned stream, which audioconvert "+
-			"maps to stereo on its own; there is no channel map on this pipeline to change. A "+
-			"channel map applies to a device that presents unpositioned channels, such as a "+
-			"DeckLink card's sixteen", ErrChannelMap)
-	}
-	if _, err := m.MixMatrix(p.inputChannels); err != nil {
-		return err
-	}
-	p.channelMap = m
-	return nil
-}
-
-// SetStubInputChannels sets the channel count the fake capture pad negotiates
-// on the NEXT Start. Passing 0 restores stubInputChannels.
-//
-// It is how a Gate A test reaches the DeckLink case: sixteen channels, a matrix
-// written at Start, and SetChannelMap live afterwards. It has no effect on a
-// pipeline that is already running, because a real pad does not renegotiate its
-// channel count under a running feed either — decklinkaudiosrc's channels
-// property is not live-settable, which is exactly why sixteen has to be the
-// steady state once mapping exists.
-//
-// Stub build only.
-func (p *StubPipeline) SetStubInputChannels(n int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if n <= 0 {
-		n = stubInputChannels
-	}
-	p.inputChannels = n
-}
-
-// ChannelMap returns the map currently recorded, and whether a matrix was
-// written at all. It is the stub's equivalent of reading the element's
-// property, which the real build cannot do — GST_TYPE_ARRAY does not marshal
-// back — and is what lets a Gate A test assert that a refused SetChannelMap
-// left the previous map in place.
-//
-// Stub build only.
-func (p *StubPipeline) ChannelMap() (ChannelMap, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.channelMap, p.matrixWritten
-}
-
-// SetCommentaryMute mutes the commentary on the send path, or unmutes it, with
-// the identical refusals the real twin makes: stopped, and not started.
-//
-// The pre-Start refusal is the one that matters at Gate A. It is not defensive
-// tidiness — it is the design decision coughmute.go argues, that the mute has
-// exactly one route before Start (PipelineOpts.MuteCommentary) and exactly one
-// after it, so that no two places can hold disagreeing memories of whether the
-// microphone is open. A stub that quietly accepted the call and latched it would
-// let a caller be written against a second route the real build does not have.
-func (p *StubPipeline) SetCommentaryMute(mute bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.counters.CommentaryMutes++
-
-	if p.closed {
-		return errStubStopped
-	}
-	if p.state == StubStateStopped {
-		return errors.New("gst: pipeline has not been started, so there is no element to mute; " +
-			"a pipeline that must begin muted is started with PipelineOpts.MuteCommentary, which " +
-			"is applied before it can produce a buffer")
-	}
-	p.muted.Store(mute)
-	return nil
-}
-
-// CommentaryMuted reports the mute state, without taking p.mu. See the field.
-func (p *StubPipeline) CommentaryMuted() bool {
-	return p.muted.Load()
-}
-
 // Errors returns the asynchronous error channel. It is closed by Stop.
 func (p *StubPipeline) Errors() <-chan error {
 	p.mu.Lock()
@@ -842,25 +562,21 @@ func (p *StubPipeline) Errors() <-chan error {
 // find nil.
 func (p *StubPipeline) Stop() error {
 	p.mu.Lock()
-	stop, done := p.levelStop, p.levelDone
-	p.levelStop, p.levelDone = nil, nil
-	p.mu.Unlock()
-	if stop != nil {
-		close(stop)
-		<-done
-	}
-
-	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.counters.Stops++
 	p.state = StubStateStopped
 	p.hasSk = false
-	// The matrix goes with the pipeline, as it does in the real twin where
-	// teardownLocked drops the element and zeroes matrixWidth. The recorded map
-	// itself stays readable, so a test can assert what was in force when the
-	// pipeline stopped.
-	p.matrixWritten = false
+
+	// THE SEAM IS RELEASED HERE AND THE CAPTURE IS NOT TOUCHED. The real twin
+	// releases it only after its pipeline has reached NULL, because a proxysink
+	// whose old consumer is still alive cannot be re-armed; a stub has no state
+	// change to sequence against, so what it models is the release itself — which
+	// is what lets the NEXT Start claim the seam, and what a Gate A test asserting
+	// three START/STOP cycles is actually asserting.
+	p.seam.Stop()
+	p.seam = nil
+
 	if !p.closed {
 		p.closed = true
 		close(p.errs)
@@ -972,7 +688,7 @@ func (p *StubPipeline) State() StubState {
 // substitution.
 //
 // Stub build only.
-func (p *StubPipeline) StartedWith() PipelineOpts {
+func (p *StubPipeline) StartedWith() SendOpts {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.opts

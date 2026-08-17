@@ -47,7 +47,7 @@ import (
 // Every ID being in the RENDER namespace ({0.0.0.00000000}.) is contract, the
 // mirror of defaultStubDevices being all-capture: these must fail
 // IsCaptureEndpointID and pass IsRenderEndpointID, so a Gate A test can prove
-// that wiring the headphone dropdown's value into PipelineOpts.AudioDeviceID
+// that wiring the headphone dropdown's value into CaptureOpts.AudioDeviceID
 // trips the render-endpoint refusal instead of silently "working" on stub
 // data the real build would reject. gst_stub_test.go asserts it.
 var defaultStubOutputDevices = []Device{

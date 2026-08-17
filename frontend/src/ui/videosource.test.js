@@ -498,15 +498,24 @@ test('the video leg is gated on the sending state and on being a local seat', ()
 });
 
 test('a remote Settings screen keeps its video-leg boxes fresh, or its next save is refused', () => {
-  // App.SaveConfig REFUSES a remote save whose videoSource or
-  // decklinkPreviewEnabled differ from the live ones — the enforcement that
-  // makes the two host-only setters mean anything. The Settings form is a page
-  // cache refreshed only by open(), so without this a remote seat that had the
-  // screen open across a host-side change would have its next save of ANYTHING
-  // refused, naming a field it is not allowed to change.
+  // App.SaveConfig REFUSES a remote save whose videoSource, decklinkPreviewEnabled
+  // or COMMENTARY DEVICE differ from the live ones — the enforcement that makes
+  // the host-only setters mean anything. The Settings form is a page cache
+  // refreshed only by open(), so without this a remote seat that had the screen
+  // open across a host-side change would have its next save of ANYTHING refused,
+  // naming a field it is not allowed to change.
+  //
+  // The guard was renamed from refuseRemoteVideoLegChange when the capture layer
+  // became always-live: a save now RE-POINTS a running capture, so the three
+  // commentary-device fields joined the two video-leg ones. A remote whole-document
+  // save could otherwise take the desk's microphone — and on a card seat the
+  // exclusive DeckLink — away from the person sitting in front of it.
   const go = read(repoRoot, 'app.go');
-  assert.match(go, /func \(a \*App\) refuseRemoteVideoLegChange\(c \*config\.Config\) error/);
+  assert.match(go, /func \(a \*App\) refuseRemoteCaptureChange\(c \*config\.Config\) error/);
   assert.match(go, /videoSource is %q here and this save would make it %q/);
+  assert.match(go, /audioSourceKind is %q here and this save would make it %q/);
+  assert.match(go, /audioDeviceId names the commentary microphone/);
+  assert.match(go, /decklinkPersistentId names the capture card/);
 
   const js = codeOnly(ui('settings.js'));
   assert.match(js, /function adoptVideoLeg\(config\) \{/);
@@ -833,6 +842,62 @@ test('a remote seat is told it cannot change what goes to air', () => {
   // state where one is offered to a remote seat and the other is not.
   assert.match(body, /fields\.videoSource\.input\.disabled = remote \|\|/);
   assert.match(body, /fields\.decklinkPreviewEnabled\.input\.disabled = remote \|\|/);
+
+  // AND THE MICROPHONE PICKER, which is the third control the Go refusal
+  // guards and the one it was silently missing.
+  //
+  // refuseRemoteCaptureChange covers audioSourceKind, audioDeviceId and
+  // decklinkPersistentId as well as the two video fields — without it a remote
+  // whole-document SaveConfig could take the desk's microphone, and on a card
+  // seat close and reopen the exclusive DeckLink, from another building. The one
+  // control that writes all three is this dropdown, and it used to be left
+  // enabled: a remote producer who touched it had EVERY subsequent save refused,
+  // naming a field they were never told they may not change.
+  assert.match(body, /audioInputSelect\.disabled = remote/);
+  assert.match(body, /audioInputSelect\.title = remote/, 'and the reason must be ON the control');
+  assert.equal(
+    /audioInputSelect\.disabled = remote \|\| sendingNow/.test(body),
+    false,
+    'the picker must NOT be disabled while sending: SelectCommentaryInput refuses with a ' +
+      'sentence of its own that names the reason, and that refusal reaches the operator',
+  );
+});
+
+test('a microphone another seat chose is adopted, so a stale cache cannot refuse a save', () => {
+  // adoptVideoLeg's twin, and it exists for the identical reason. This form is a
+  // page cache refreshed only by open(); App.SaveConfig refuses a remote save
+  // whose audioSourceKind, audioDeviceId or decklinkPersistentId differ from the
+  // live ones. A remote seat that had Settings open when the desk changed
+  // microphone would otherwise carry the OLD values in a disabled control, and
+  // its next save of anything at all — a port, a status key — would be refused,
+  // naming a field that seat cannot see a way to correct.
+  const js = codeOnly(ui('settings.js'));
+
+  const adopt = js.slice(js.indexOf('function adoptAudioLeg(config)'));
+  const body = adopt.slice(0, adopt.indexOf('\n  }'));
+  assert.ok(body.length > 0, 'settings.js must expose adoptAudioLeg');
+  for (const field of ['audioSourceKind', 'audioDeviceId', 'decklinkPersistentId']) {
+    assert.ok(
+      body.includes(`fields.${field}.input.value =`),
+      `adoptAudioLeg must write ${field}: it is one of the three refuseRemoteCaptureChange guards`,
+    );
+  }
+  // The picker's value is DERIVED from the three hidden fields, so the <select>
+  // is rebuilt from them rather than written here — renderAudioInput is the one
+  // function that knows the encoding.
+  assert.match(body, /renderAudioInput\(\)/);
+  // And the routing panel's gate re-runs, because it compares the SELECTED
+  // device's key against the one the negotiated width was stamped with: a device
+  // that moved under this seat leaves a grid offering crosspoints over a pad
+  // that is not there.
+  assert.match(body, /renderChannelMapGroup\(\)/);
+
+  // It is NOT populate(): re-drawing the whole form under somebody mid-edit is
+  // exactly what app.js's onConfig handler exists to avoid.
+  assert.equal(/\bpopulate\(/.test(body), false, 'adoptAudioLeg must not redraw the whole form');
+
+  // And app.js calls it from the same place it calls the video twin.
+  assert.match(ui('app.js'), /settings\.adoptAudioLeg\(payload\.config\)/);
 });
 
 test('validateConfig accepts both sources, an absent one, and nothing else', () => {

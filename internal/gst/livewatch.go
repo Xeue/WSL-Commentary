@@ -93,6 +93,23 @@ const liveWatchSilence = 2 * time.Second
 // the video leg's complaint ONLY, so it is not a substitute for this.
 const liveWatchStartGrace = 2 * time.Second
 
+// liveWatchStartPoll is how often Start re-reads the pads while it waits for the
+// first buffer inside that grace.
+//
+// It is much finer than liveWatchPollInterval because it is measured against a
+// different number: the poller is looking for a two-second silence and a quarter
+// second is eight reads inside it, while this is looking for a first buffer that
+// arrives in 20-60 ms, and a 250 ms tick would add up to a quarter second to
+// EVERY start to observe something that had already happened. Ten milliseconds
+// costs at most a handful of wake-ups on the one path where the operator is
+// already waiting for a state change.
+//
+// It is NOT a signal from the probe, deliberately. The probe runs on a GStreamer
+// streaming thread on the on-air path, and the whole of livewatch_cgo.go is
+// arranged so that thread does two stores and returns; a condition variable there
+// would put a Go scheduler wake-up inside the muxer's push.
+const liveWatchStartPoll = 10 * time.Millisecond
+
 // liveWatchSample is one watched pad's reading at one instant: how many buffers
 // have crossed it and when the last one did.
 //

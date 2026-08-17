@@ -33,6 +33,7 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (...parts) => readFileSync(join(...parts), 'utf8');
 const ui = (name) => read(here, name);
+const repoRoot = join(here, '..', '..', '..');
 
 /* ------------------------------------------------------------------------ */
 /* The bindings                                                              */
@@ -53,6 +54,46 @@ test('the capture seam names its three bindings in one table and exports all fou
     ['SelectCommentaryInput', 'RestartCapture', 'GetCaptureState'],
     'these three are app.go’s bound method names; they are not spelled anywhere else in the frontend',
   );
+
+  // ============ AND EACH ONE IS CHECKED AGAINST app.go, WHICH IS THE POINT ====
+  //
+  // This assertion used to compare the table against a LIST WRITTEN IN THIS FILE
+  // and nothing else. That is a spelling test of a literal against itself: the
+  // three methods did not exist in Go at all while it passed, which is precisely
+  // the state it was written to make impossible. A binding that is not there
+  // does not fail at build time in either language — Wails simply never installs
+  // it and callGoBound rejects at runtime, during a match — so the only guard
+  // available is textual and it has to read the OTHER side.
+  //
+  // The regex is the receiver form Wails binds on, so a method demoted to a
+  // helper (lower case) or moved off *App fails here rather than at the desk.
+  const go = read(repoRoot, 'app.go');
+  for (const method of names) {
+    assert.match(
+      go,
+      new RegExp(`func \\(a \\*App\\) ${method}\\(`),
+      `app.go must export ${method} on *App, or this binding rejects at runtime with "not bound"`,
+    );
+  }
+
+  // Every bound method needs a remoteAllowlist row (CONTRACT.md), and a missing
+  // one is a method that works at the desk and fails from the second seat. The
+  // two SETTERS are host-only — which microphone a broadcast switcher hears this
+  // position on, and a rebuild that blanks the operator's own picture — and the
+  // READ is reachable, so a remote seat can draw the same explanation.
+  const allowlist = read(repoRoot, 'app_remote.go');
+  for (const method of ['SelectCommentaryInput', 'RestartCapture']) {
+    assert.match(
+      allowlist,
+      new RegExp(`"${method}":\\s*\\{hostOnly: true\\}`),
+      `${method} must be host-only in remoteAllowlist`,
+    );
+  }
+  assert.match(allowlist, /"GetCaptureState":\s*\{\}/);
+
+  // And the event name is Go's spelling, not a second one invented here.
+  assert.match(go, /EventCapture = "capture"/);
+  assert.match(backend, /export const EVENT_CAPTURE = 'capture';/);
 
   for (const [fn, kind] of [
     ['selectCommentaryInput', 'async function'],
@@ -107,8 +148,38 @@ test('getCaptureState never throws, and says which kind of not-knowing it is', (
   const backend = ui('backend.js');
   const body = backend.slice(backend.indexOf('export async function getCaptureState()'));
   const fn = body.slice(0, body.indexOf('\n}'));
-  assert.match(fn, /if \(!captureAvailable\(\)\) return CAPTURE_UNAVAILABLE;/);
   assert.match(fn, /catch \{\s*return CAPTURE_UNAVAILABLE;/, 'a failed call must answer, not reject');
+
+  // ============ AND IT IS NOT GATED ON captureAvailable() ==================
+  //
+  // REWRITTEN. This assertion used to be the opposite — it required
+  // `if (!captureAvailable()) return CAPTURE_UNAVAILABLE;` — and the two halves
+  // of this file's contract could not both hold. captureAvailable() is
+  // all-or-nothing over three method names, two of which are host-only, so
+  // internal/remote's shim prunes them, hasBinding reads them back as undefined
+  // and the probe answers false on EVERY remote seat. GetCaptureState is on the
+  // OPEN side of the allowlist — the test below still pins that — so the gate
+  // made a method the dispatcher would happily serve unreachable from the only
+  // seat that needed it, and a producer joining after the card failed at launch
+  // saw nothing at all.
+  //
+  // The catch above is the real cover for an older build: callGoBound rejects
+  // with a BindingMissingError and this answers CAPTURE_UNAVAILABLE.
+  assert.equal(
+    /captureAvailable\(\)/.test(fn),
+    false,
+    'getCaptureState must not gate on captureAvailable(): two of the three methods it probes ' +
+      'are host-only, so the gate is always false on a remote seat — which is the seat this ' +
+      'read exists for',
+  );
+
+  // The sibling with the identical shape, as the precedent rather than as a
+  // coincidence: four of getPictureState's five methods are host-only too, and
+  // it has always called straight through.
+  assert.match(
+    backend,
+    /export async function getPictureState\(\)\s*\{\s*if \(hasWails\(\)\) return callGoBound\(PICTURE_METHODS\.state\);/,
+  );
 
   // CAPTURE_UNAVAILABLE has to be a COMPLETE payload with a reason, so no caller
   // branches on which kind of answer it got and no screen has an "off" to

@@ -624,7 +624,15 @@ func TestLiveReconnectPreservesStickyEvents(t *testing.T) {
 		t.Fatalf("the requested capture device %s is not present; %d devices were enumerated", devID, len(devices))
 	}
 
-	pipe, err := New()
+	// THE CAPTURE LAYER FIRST, because it is what mints the send pipeline. It also
+	// makes the rest of this test measure what it claims to: the proxysinks it owns
+	// are re-armed by the Start below, and the sticky events this whole test is
+	// about are restored on srtq — downstream of the seam, on a pipeline whose
+	// producer never leaves PLAYING.
+	mark(t, "capture(slate=%s device=%s)", slate, devID)
+	set := liveNativeCapture(t, slate, devID)
+
+	pipe, err := New(set)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -642,8 +650,8 @@ func TestLiveReconnectPreservesStickyEvents(t *testing.T) {
 		}
 	})
 
-	mark(t, "Start(slate=%s device=%s)", slate, devID)
-	if err := pipe.Start(PipelineOpts{SlatePath: slate, AudioDeviceID: devID}); err != nil {
+	mark(t, "Start(send)")
+	if err := pipe.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -1267,7 +1275,9 @@ func TestLivePeerLossDoesNotKillTheCaptureChain(t *testing.T) {
 	}
 	devID := env("WSLCOMMS_LIVE_AUDIO_DEVICE", defaultAudioDevice)
 
-	pipe, err := New()
+	set := liveNativeCapture(t, slate, devID)
+
+	pipe, err := New(set)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1286,7 +1296,7 @@ func TestLivePeerLossDoesNotKillTheCaptureChain(t *testing.T) {
 	mark(t, "Start(slate=%s device=%s); %d peer-loss cycles against %s; event gate %s",
 		slate, devID, cycles, control,
 		map[bool]string{true: "LIFTED (expecting the section 8.6 fault)", false: "installed"}[liftGate])
-	if err := pipe.Start(PipelineOpts{SlatePath: slate, AudioDeviceID: devID}); err != nil {
+	if err := pipe.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	assertCaptureChainPlaying(t, p, "immediately after Start")
@@ -1630,13 +1640,19 @@ func TestLiveListInputDevicesOffersOnlyCaptureEndpoints(t *testing.T) {
 	}
 }
 
-// TestLiveStartRefusesARenderEndpointUpFront proves the refusal against a real
+// TestLiveCaptureRefusesARenderEndpointUpFront proves the refusal against a real
 // render id — one taken from ListOutputDevices, so it is a genuine playback
 // endpoint on this machine, the exact class of id the operator selected. The
-// refusal must be synchronous and total: an error wrapping
-// ErrNotACaptureDevice from Start itself, with NO pipeline built, so no
-// asynchronous error-1551 bus message and no latched fatal.
-func TestLiveStartRefusesARenderEndpointUpFront(t *testing.T) {
+// refusal must be synchronous and total: an error wrapping ErrNotACaptureDevice
+// from NewCapture itself, with NO pipeline built, so no asynchronous error-1551
+// bus message and no latched fatal.
+//
+// IT IS THE CAPTURE LAYER THAT REFUSES NOW, because the capture layer is what
+// opens an endpoint. The refusal has moved EARLIER in the operator's day rather
+// than merely sideways in the source: capture is built when the application
+// opens, so a playback endpoint saved in config.json is refused at launch, on a
+// lamp, instead of at the START twenty minutes before kick-off.
+func TestLiveCaptureRefusesARenderEndpointUpFront(t *testing.T) {
 	liveInit(t)
 
 	outs, err := ListOutputDevices()
@@ -1651,37 +1667,71 @@ func TestLiveStartRefusesARenderEndpointUpFront(t *testing.T) {
 		t.Fatalf("sanity: ListOutputDevices returned %q which does not classify as a render "+
 			"endpoint; the classifier and the provider disagree about namespaces", renderID)
 	}
-	mark(t, "Start with the render endpoint %s (%s) — expecting the up-front refusal",
+	mark(t, "NewCapture with the render endpoint %s (%s) — expecting the up-front refusal",
 		renderID, outs[0].Name)
 
-	pipe, err := New()
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	// THE REFUSAL IS AT CONSTRUCTION AND NOT AT Start, which is stronger rather
+	// than merely different: there is no object to leak, no channel to drain and
+	// no pipeline to have been half built. A caller that ignored the error would
+	// have nil to work with, not a pipeline that opened the operator's monitor mix.
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:          CaptureLegs{Commentary: CommentaryNative},
+		AudioDeviceID: renderID,
+	})
+	if err == nil {
+		_ = pipe.Stop()
+		t.Fatal("NewCapture accepted a render endpoint; wasapi2 will fail asynchronously with " +
+			"error 1551 and the sender will retry the SRT link forever over a local device fault")
 	}
-	cp, ok := pipe.(*cgoPipeline)
-	if !ok {
-		t.Fatalf("New returned a %T, not a *cgoPipeline", pipe)
+	if pipe != nil {
+		t.Error("NewCapture returned both an error and a pipeline; the refused caller now has " +
+			"an object it must remember to stop, over a device that was never opened")
 	}
-	defer func() { _ = pipe.Stop() }()
+	if !errors.Is(err, ErrNotACaptureDevice) {
+		t.Errorf("the refusal does not wrap ErrNotACaptureDevice: %v", err)
+	}
+}
 
-	startErr := pipe.Start(PipelineOpts{SlatePath: "never-opened.png", AudioDeviceID: renderID})
-	if startErr == nil {
-		t.Fatal("Start accepted a render endpoint; wasapi2 will fail asynchronously with error " +
-			"1551 and the sender will retry the SRT link forever over a local device fault")
-	}
-	if !errors.Is(startErr, ErrNotACaptureDevice) {
-		t.Errorf("Start's refusal does not wrap ErrNotACaptureDevice: %v", startErr)
-	}
+// liveNativeCapture builds and starts the capture layer a live send test draws
+// from: a slate picture and the platform microphone, as the two independent
+// pipelines PlanCapture returns for that seat.
+//
+// EVERY LIVE SEND TEST GOES THROUGH IT, because a send pipeline is minted only by
+// capture and because the two things it sets up are the two the seam can get
+// silently wrong: the proxysinks that are claimed and armed at START, and the
+// devices that must still be open when the send pipeline reaches PLAYING.
+//
+// The captures are stopped through t.Cleanup, which runs
+// last-registered-first — so the send pipeline, registered later, is already at
+// NULL by the time CapturePipeline.Stop runs and refuses a still-held seam.
+func liveNativeCapture(t *testing.T, slate, deviceID string) CaptureSet {
+	t.Helper()
 
-	// The refusal ran before anything was built, so there must be no 1551 bus
-	// error and no latched fatal — the failure is synchronous, attributable
-	// and does not poison a pipeline that never existed.
-	if f := cp.fatalError(); f != nil {
-		t.Errorf("a fatal was latched by a Start that refused up front: %v", f)
+	var set CaptureSet
+	for _, legs := range PlanCapture(CaptureSources{AudioDeviceID: deviceID}) {
+		c, err := NewCapture(CaptureOpts{
+			Legs:          legs,
+			SlatePath:     slate,
+			AudioDeviceID: deviceID,
+			ConformTo:     FallbackConformTarget(),
+		})
+		if err != nil {
+			t.Fatalf("NewCapture(%s): %v", legs, err)
+		}
+		t.Cleanup(func() {
+			if err := c.Stop(); err != nil {
+				t.Errorf("stopping the %s capture: %v — the device may still be held", legs, err)
+			}
+		})
+		if err := c.Start(); err != nil {
+			t.Fatalf("starting the %s capture: %v", legs, err)
+		}
+		if legs.Picture != PictureNone {
+			set.Picture = c
+		}
+		if legs.Commentary != CommentaryNone {
+			set.Commentary = c
+		}
 	}
-	select {
-	case e := <-pipe.Errors():
-		t.Errorf("a bus error arrived from a pipeline that was never built: %v", e)
-	default:
-	}
+	return set
 }

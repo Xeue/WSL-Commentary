@@ -752,360 +752,72 @@ func (t ConformTarget) rateCapsField() string {
 		strconv.Itoa(t.FrameRateNum) + "/" + strconv.Itoa(t.FrameRateDen)
 }
 
-// PipelineOpts configures everything upstream of the sink: the slate branch, the
-// capture branch, the encoders and the muxer. These cannot be changed without
-// rebuilding the pipeline, which is why the SRT endpoint is not among them.
-type PipelineOpts struct {
-	// SlatePath is the PNG fed to filesrc ! pngdec ! imagefreeze. Required.
-	//
-	// It stays REQUIRED even when VideoCaptureID names a card and the slate leg
-	// is therefore not built, and that is deliberate rather than an oversight.
-	// The slate is what the video leg reverts to the moment a seat is configured
-	// without a card — which is every seat shipping today — so a caller that
-	// stopped supplying it would go on working on the one machine it was tested
-	// on and fail on all the others. Validating it unconditionally is what makes
-	// that a Start error on the developer's machine instead of at a commentary
-	// position.
-	SlatePath string
-
-	// AudioDeviceID is the PLATFORM capture endpoint to open — the WASAPI or
-	// CoreAudio device that wasapi2src / osxaudiosrc is pointed at. It is
-	// Device.ID, never Device.Name, and the whole of what that means —
-	// including the fact that macOS has to resolve it before the element will
-	// take it — is documented on Device.ID.
-	//
-	// IT IS REQUIRED WHENEVER AudioCaptureID IS EMPTY, and forbidden when it is
-	// not. The two fields are the two answers to one question and exactly one of
-	// them is given; refuseWrongAudioSource is the whole rule and both twins
-	// call it before anything is built.
-	//
-	// The emptiness is the dangerous half and is why the rule is a refusal
-	// rather than a convention. An empty device on wasapi2src or osxaudiosrc is
-	// NOT an error: it is THE SYSTEM DEFAULT INPUT. So a DeckLink seat that
-	// reached the platform element with this field empty would put the match on
-	// air off the laptop's built-in microphone with every lamp green — which is
-	// why the native element is built only when this field is non-empty, and
-	// why "the platform source exists and has no device" is unreachable by
-	// construction rather than merely unlikely.
-	AudioDeviceID string
-
-	// AudioCaptureID, when non-empty, turns the COMMENTARY CAPTURE into a
-	// DeckLink card's embedded audio: decklinkaudiosrc opens the card it names,
-	// presents its sixteen unpositioned channels, and the mix matrix on the
-	// named audioconvert routes the commentator's pair into the feed. It is a
-	// persistent-id, the same string VideoCaptureID takes, because one
-	// persistent-id names the CARD and serves its audio and video entries alike
-	// (measured: the fitted UltraStudio 4K Mini publishes 2747401380 for both).
-	//
-	// THE ZERO VALUE IS THE PLATFORM MICROPHONE, and that is the whole
-	// compatibility statement. A seat that leaves it empty builds byte-for-byte
-	// the audio leg the on-air Windows build has always run — captureSourceFactory
-	// pointed at AudioDeviceID — because the source is chosen by whether this
-	// field is empty and by nothing else.
-	//
-	// # It brings a decklinkvideosrc with it, and that is not an implementation detail
-	//
-	// MEASURED: decklinkaudiosrc CANNOT PREROLL ALONE. The card drives audio
-	// capture off the VIDEO clock, so with no decklinkvideosrc in the same
-	// pipeline the audio branch produces ZERO buffers — 0 level messages against
-	// 160 — and the leg never starts. So this field always builds a decklink
-	// VIDEO element too:
-	//
-	//	VideoCaptureID == AudioCaptureID   ONE decklinkvideosrc (vcapsrc) serves
-	//	                                   the video leg AND the audio clock. The
-	//	                                   card is EXCLUSIVE — two sources in one
-	//	                                   process fail 3/3 and two processes fail
-	//	                                   3/3 — so a second one is impossible,
-	//	                                   not merely wasteful.
-	//	VideoCaptureID == ""               a decklinkvideosrc named vcapclock is
-	//	                                   built beside the slate leg, feeding
-	//	                                   fakesink, purely to clock this. It
-	//	                                   costs 0.6-2.4 % of one core, measured,
-	//	                                   and touches nothing else in the graph.
-	//
-	// THE TWO IDS MUST NAME THE SAME CARD when both are set, and Start refuses
-	// when they do not. config.json carries ONE decklinkPersistentId for both
-	// legs, so the application cannot produce a disagreement; a caller that
-	// hand-built one is describing a two-card rig whose audio clock would have
-	// to be a THIRD decklink element on the other card, which nothing here has
-	// ever run. Refusing by name beats building a shape nobody has measured.
-	//
-	// It is IGNORED BY EVERYTHING BELOW THE MIX MATRIX. audioresample, the
-	// S16LE/48k/2ch capsfilter, alevel, the AAC encoder, aacparse, mpegtsmux and
-	// srtsink see exactly what they see on a microphone seat, which is what lets
-	// internal/sender and the timestamp discipline go on reasoning about one
-	// graph. See ChannelMap for the routing and channelmap.go for why the matrix
-	// is a NEGOTIATION CONSTRAINT rather than a gain.
-	AudioCaptureID string
-
-	// VideoCaptureID, when non-empty, turns the VIDEO LEG INTO A LIVE CAPTURE:
-	// the DeckLink card it names is opened, conformed to ConformTo and encoded,
-	// in place of the frozen slate. It is the persistent-id of a Device whose
-	// Kind is KindDeckLink — the same string, from the same dropdown, that
-	// AudioDeviceID takes for a card, because ONE persistent-id names the card
-	// and serves its audio and video entries alike (measured: the Audio/Source
-	// and Video/Source devices for the fitted UltraStudio 4K Mini both publish
-	// 2747401380).
-	//
-	// THE ZERO VALUE IS THE SLATE, and that is the whole compatibility statement
-	// for this feature. A seat that configures nothing builds byte-for-byte the
-	// graph the on-air Windows build has always run — filesrc, pngdec,
-	// imagefreeze — because the leg is chosen by whether this field is empty and
-	// by nothing else. There is no card to detect, no enumeration at Start and
-	// no way for a machine that happens to have a DeckLink fitted to start
-	// transmitting its input because somebody plugged it in.
-	//
-	// It is a SECOND SOURCE MODE rather than a rewrite of the first. Everything
-	// downstream of the H.264 encoder — h264parse, both queues, mpegtsmux,
-	// ReplaceSink and the whole of internal/sender — sees one fixed format
-	// forever, whichever leg is above it, which is what lets the timestamp
-	// discipline and the reconnect ladder go on reasoning about the same graph.
-	// The conform chain is what buys that: videoconvert, deinterlace, videoscale
-	// and videorate between the card and the capsfilter, so a 1080i50 camera, a
-	// 720p59.94 camera and the card's own 720x486 NTSC start-up placeholder all
-	// leave the leg as the one raster and rate ConformTo names.
-	//
-	// It is an ID and not a bool for the reason Device.ID is persisted rather
-	// than Device.Name: the machine may have two cards in it, and "the DeckLink"
-	// is not a thing that can be resolved on a rig where a second one is fitted
-	// for a different purpose. A value that is not a DeckLink persistent-id is
-	// refused at Start, before anything is built — a CoreAudio unique-id or a
-	// WASAPI endpoint GUID handed to the decklink element's persistent-id
-	// property would leave it at its own -1 default, which means "use
-	// device-number", which means whichever card the driver enumerated first.
-	//
-	// # What it costs, measured rather than reasoned about
-	//
-	// On the port machine (macOS arm64, GStreamer 1.26.10, the fitted
-	// UltraStudio 4K Mini), 2026-08-16, 500 frames per run, as a percentage of
-	// ONE core:
-	//
-	//	the card alone, straight to fakesink                     2.4 %
-	//	the card through the whole conform chain                18.5 %
-	//	the same, plus the tee, the queue and vtenc_h264 @10M   25.8 %
-	//	the SHIPPING SLATE LEG plus the same encoder @10M        4.8 %
-	//	the SHIPPING SLATE LEG plus the same encoder @2M         4.0 %
-	//	the whole application pipeline, through this package,
-	//	  capture and audio and mux and SRT to a cloud host,
-	//	  45.6 s including Init and the plugin registry scan     26.8 %
-	//
-	// READ THE CONFORM COST WITH ITS INPUT, because it is the entire story. The
-	// card was locked to 525i59.94 — 720x486, INTERLACED, bt601, pixel aspect
-	// 10:11, 29.97 fps — and the target was 1920x1080p50 bt709 progressive
-	// square-pixel NV12. That is the most expensive conversion this chain can
-	// ever be asked for: deinterlace, a four-and-a-half-times area upscale, a
-	// colorimetry conversion and a rate conversion, all at once. It is not the
-	// case a facility will run.
-	//
-	// The case a facility WILL run was measured beside it: a conforming
-	// 1920x1080p50 source through the identical chain and encoder cost 3.00 s
-	// of CPU per 500 frames against 3.00 s for the source on its own — the
-	// conform chain and the H.264 encode together were indistinguishable from
-	// nothing, because vtenc_h264 runs on the media engine and every element in
-	// the chain passes through when there is nothing to convert. That is what
-	// deinterlace and videoscale being "free on progressive input" means in
-	// numbers.
-	//
-	// So the honest summary is: there is no CPU argument against this feature,
-	// and the one number that could look alarming is the price of a standard
-	// definition interlaced input nobody is going to commentate over.
-	VideoCaptureID string
-
-	// Preview is the operator's choice about the CONFIDENCE MONITOR: a small,
-	// slow, cheap second rendering of the pictures the encoder is getting, taken
-	// off the capture leg's tee and drawn in a native surface. preview.go owns
-	// the whole of it — the branch, the measurements, and every reason it might
-	// decline to build.
-	//
-	// The ZERO VALUE IS OFF and off is the default everywhere. It is meaningful
-	// only on a pipeline whose video leg is a live capture: the tee it hangs off
-	// exists only there, and previewBranchFor refuses a preview on a slate
-	// pipeline rather than naming an element gst_parse_launch would not find —
-	// which would not be a missing preview, it would be a parse failure of the
-	// whole contribution pipeline.
-	//
-	// It is WIRED: Start renders the branch with previewBranchFor, appends it to
-	// the parse description, and hands the sink its surface with attachPreview
-	// before the pipeline leaves NULL. Two things had to be true first, and both
-	// are, so do not take either of them back out:
-	//
-	//   - capturefault.go classifies preview elements as classPreview and
-	//     onBusMessage spares them. Without it a preview sink erroring — a GPU
-	//     driver update mid-match, a display going away — falls through to the
-	//     FATAL default and takes the COMMENTARY off air over a monitor nobody
-	//     was looking at. preview_test.go's
-	//     TestAPreviewInThePipelineIsSparedByTheBusFilter fails by name if the
-	//     wiring is ever present without the classification.
-	//   - Start rebuilds ONCE WITHOUT the branch if the pipeline will not go to
-	//     PLAYING with it. A sink that exists and then will not start is a state
-	//     change failure, which the bus filter never sees, so it is the one way
-	//     an optional monitor could otherwise stop a seat going on air. See
-	//     cgoPipeline.startBuiltLocked.
-	Preview PreviewOpts
-
-	// ConformTo is the raster and rate the VIDEO LEG is conformed to: what the
-	// slate is scaled and paced into before it reaches the H.264 encoder. It is
-	// the switcher's configured format, and it has to be, because M2L-X can be
-	// configured into any format and requires every source to match the one it
-	// is configured for. Until this field existed the leg was hardcoded to
-	// 1920x1080p50, which is a live defect on any instance that is not.
-	//
-	// THE ZERO VALUE MEANS "NOTHING IS KNOWN" and resolves to
-	// FallbackConformTarget() — 1920x1080p50, the value that was written into
-	// the parse string. That is a normal state and not a fault: the switcher is
-	// routinely unread when Start is pressed, and refusing to go on air over it
-	// would be the wrong trade by a distance. Note that this is the OPPOSITE
-	// reading of a zero from ConformTarget.Valid, which reports a zero target as
-	// unusable — deliberately, so that a caller cannot pass a zero on to
-	// something that needs a real one by accident. The fallback decision is made
-	// once, here, in Start, and it is logged.
-	//
-	// The caller builds one with gst.ConformTargetFromRate — the switcher
-	// reports its rate as a decimal and GStreamer takes nothing but a fraction —
-	// or, for the operator-typed override, by transcribing the four fields of a
-	// config.VideoFormatSpec, which (*config.Config).VideoFormatOverrideSpec
-	// returns and config.ParseVideoFormat produces. app.go's conformFormat is
-	// the one place that does both.
-	//
-	// THERE IS DELIBERATELY NO PARSER IN THIS PACKAGE. One grammar, one parser:
-	// internal/config cannot import internal/gst — a config package that needs
-	// GStreamer installed to be tested stops being tested — so the parse has to
-	// live in config for config.Validate to be able to refuse a bad value at
-	// all. A second parser here would be a second grammar, and the two would
-	// drift into disagreeing about which strings are legal, which is a defect
-	// whose symptom is a value the Settings screen accepts and Start rejects.
-	// The field names of ConformTarget and config.VideoFormatSpec are identical
-	// so that the transcription has nothing to get subtly wrong.
-	ConformTo ConformTarget
-
-	// VideoBitrateKbps is the H.264 encoder's bitrate in kilobits per second.
-	// Zero means DefaultVideoBitrateKbps. Kilobits is the unit on mfh264enc and
-	// on vtenc_h264 alike.
-	//
-	// The default is sized for the still slate this leg carries today and the
-	// owner has ruled it far too low for live video; ~10000 is the figure
-	// asked for. Nothing here caps the value — see DefaultVideoBitrateKbps for
-	// why the default stays where it is anyway.
+// SendOpts is EVERYTHING a send pipeline can be configured with, and the whole
+// of the list is two bitrates.
+//
+// That is the seam's central claim made into a type. The send pipeline's source
+// of media is a proxysrc, so it opens no device, owns no card, holds no slate,
+// renders no preview, writes no channel map and carries no cough mute: every one
+// of those is upstream of the proxysink and belongs to CaptureOpts. A send
+// pipeline cannot be configured to open a device and a capture pipeline cannot be
+// configured to send, which is what makes "a send pipeline with no device behind
+// it" unconstructible rather than merely unlikely — see New, which takes the
+// CaptureSet the pipeline is minted from.
+//
+// The conform target is NOT here, and its absence is the most consequential of
+// them. It sits on the capture side so that the caps crossing the seam are pinned
+// for the life of the process: the card changing raster (a 720x486 NTSC
+// placeholder before it locks, the real input after, back again when the cable is
+// pulled) renegotiates videoscale's SINK caps only, and the encoder in this
+// pipeline never sees a caps change at all.
+type SendOpts struct {
+	// VideoBitrateKbps is the H.264 encoder's bitrate property, in KILOBITS per
+	// second. Zero means DefaultVideoBitrateKbps.
 	VideoBitrateKbps int
 
-	// AudioBitrateBps is the AAC encoder's bitrate in bits per second. Zero
-	// means DefaultAudioBitrateBps. Bits is the unit on mfaacenc and on atenc
-	// alike.
+	// AudioBitrateBps is the AAC encoder's bitrate property, in BITS per second.
+	// Zero means DefaultAudioBitrateBps. The two units differ because the two
+	// elements' properties do, on both platforms; see DefaultAudioBitrateBps.
 	AudioBitrateBps int
-
-	// OnLevels, if set, is called with the audio level of the commentary being
-	// sent — peak and RMS per channel, in dBFS — roughly twenty times a second
-	// (the level element's 50 ms interval). It is what feeds the input meters
-	// beside the big picture, and it measures the signal at the one point that
-	// answers the operator's actual question: after audioconvert and
-	// audioresample, immediately upstream of the AAC encoder, so what the meter
-	// shows is what is ACTUALLY being encoded and sent. A meter fed from the
-	// browser's idea of the microphone would keep moving while the wrong device
-	// was selected, which is a reassurance nobody should be given.
-	//
-	// It is called ON THE BUS/STREAMING GOROUTINE and MUST NOT BLOCK: in the
-	// real build the caller is a GStreamer streaming thread inside
-	// gst_element_post_message, and a callback that waits there stalls the
-	// capture chain the way the file comment in gst_cgo.go forbids at length.
-	// Hand the value to a queue or an atomic and return.
-	//
-	// Values are clamped to the -100 dBFS floor before delivery — the level
-	// element reports -inf for digital silence, and -inf neither survives JSON
-	// nor draws on a meter. Nil means no metering; nothing else changes.
-	OnLevels func(Levels)
-
-	// OnChannelLevels, if set, is called with the level of the CAPTURE DEVICE'S
-	// OWN CHANNELS — one entry per channel the input pad negotiated, sixteen on
-	// a DeckLink card — ten times a second. It is the meter the operator uses to
-	// find which channel the commentator is on, and it measures UPSTREAM of the
-	// audioconvert that mixes those channels down to the encoder's two.
-	//
-	// It is a second callback rather than a wider OnLevels because the two
-	// measure different points and answering one question with the other is a
-	// meter that reads as live while showing the wrong signal. OnLevels is the
-	// on-air stereo, after the matrix, and it is what a clipping indicator is
-	// allowed to watch; this is what is arriving, before any routing decision has
-	// been applied, and it is by definition unable to say what is going out. Both
-	// elements post a GstStructure named "level", so the two are told apart by
-	// the posting element's name — MEASURED, with both in one pipeline: 39 level
-	// messages a second, every one of them matching the structure name, which
-	// without that attribution would have fed one meter a sixteen-entry frame and
-	// a two-entry frame alternately, twenty times a second each.
-	//
-	// The same thread rule as OnLevels applies without weakening: it is called on
-	// a GStreamer streaming thread and MUST NOT BLOCK.
-	//
-	// The frame's LENGTH is the channel count, and it changes only when the
-	// pipeline is rebuilt — index i is input channel i for the life of the
-	// pipeline, which is what lets a renderer lay out its strips once. Nil means
-	// no per-channel metering, and on a positioned capture source (every
-	// microphone, every Dante endpoint) it is redundant rather than wrong: the
-	// channels it would report are the two OnLevels already reports.
-	OnChannelLevels func(Levels)
-
-	// OnSignal, if set, is called when the VIDEO CAPTURE's input lock changes:
-	// whether the card can see a picture at all, debounced. It is what feeds the
-	// signal lamp, and it exists because nothing else in this application can
-	// tell — a DeckLink that loses signal keeps emitting black GAP-flagged frames
-	// at full rate forever, so the muxer never starves, the sender stays
-	// CONNECTED and the switcher reports a healthy feed. See signalwatch.go.
-	//
-	// Unlike OnLevels this is NOT called on a streaming thread: the watchdog
-	// polls from an ordinary goroutine of its own, so a callback here cannot
-	// stall the capture chain. It must still not block — that goroutine is the
-	// only thing taking readings, so an emit that waits delays every later sample
-	// and the hold-offs quietly stop meaning seconds.
-	//
-	// Nil means no watchdog at all, and so does a pipeline whose video leg has no
-	// element with a "signal" property: not a goroutine, not a ticker, nothing.
-	OnSignal func(SignalReport)
-
-	// ChannelMap is which of the capture device's input channels reach the
-	// left and right of the commentary feed, and at what gain. It is applied
-	// before the pipeline first produces a buffer, and can be changed at any
-	// time afterwards with SetChannelMap.
-	//
-	// THE ZERO VALUE IS THE DEFAULT MAP, not silence — input 1 on the left,
-	// input 2 on the right, at unity — and channelmap.go argues both halves of
-	// that: why an unset map must produce audio rather than nothing, and why
-	// that particular default is bit-for-bit what this application already sent
-	// from a DeckLink card configured for two channels. An operator who never
-	// opens the mapping UI hears exactly what they heard before it existed.
-	//
-	// It is IGNORED on a capture source that presents a positioned stream,
-	// which is every native microphone and every Dante endpoint: audioconvert's
-	// own downmix already knows what those channels are, and pinning a matrix
-	// over it would be a change to the on-air Windows path for no gain. The
-	// matrix is written only for an UNPOSITIONED stream — the sixteen channels
-	// with channel-mask=0x0 a DeckLink card presents, which is the case
-	// audioconvert cannot resolve on its own. Start logs which of the two it
-	// found.
-	ChannelMap ChannelMap
-
-	// MuteCommentary starts the pipeline with the commentary muted on the SEND
-	// PATH: the volume element named coughmute is written while the pipeline is
-	// still in NULL, so a pipeline that is meant to be born muted never carries
-	// one buffer of live commentary. coughmute.go carries the whole argument for
-	// the mechanism and the measurements behind it.
-	//
-	// THE ZERO VALUE IS UNMUTED, which is what every seat that has never touched
-	// a cough button gets, and it renders the identical property write the
-	// element already has in the parse string.
-	//
-	// It exists because a Pipeline is SINGLE-USE. A reconnect does not need it —
-	// an SRT drop swaps the sink and never touches the audio leg, so a live mute
-	// survives it by construction — but the latched-fatal path discards the whole
-	// pipeline, and the next one has no memory of anything. A caller that holds a
-	// cough mute across such a rebuild reads CommentaryMuted off the pipeline it
-	// is discarding and passes it here, and the replacement is muted BEFORE its
-	// first buffer instead of a moment after it.
-	//
-	// It is the ONLY way to set the mute before Start. SetCommentaryMute refuses
-	// on a pipeline that has not started rather than latching a second copy of
-	// the same intent; see coughmute.go for why one control with two memories is
-	// the failure this design is avoiding.
-	MuteCommentary bool
 }
+
+// PipelineOpts IS DELETED, and this is where it was.
+//
+// It configured everything upstream of the sink when ONE pipeline carried both
+// capture and send: the slate, both capture ids, the conform target, both
+// bitrates, the channel map, the mute and the three callbacks. Nine of its
+// thirteen fields are now CaptureOpts', two are SendOpts', and it was kept for
+// one phase — unreferenced by New and by Start — so that the source-reading
+// guards over pipelineDescription went on running while app.go was re-pointed at
+// the capture layer. That phase is over and both are gone together.
+//
+// WHERE EACH FIELD WENT, because a reader arriving from a caller will look:
+//
+//	SlatePath        CaptureOpts.SlatePath
+//	AudioDeviceID    CaptureOpts.AudioDeviceID
+//	AudioCaptureID   CaptureOpts.AudioCaptureID
+//	VideoCaptureID   CaptureOpts.VideoCaptureID
+//	Preview          CaptureOpts.Preview
+//	ConformTo        CaptureOpts.ConformTo   — the move that pins the seam caps
+//	ChannelMap       CaptureOpts.ChannelMap
+//	MuteCommentary   CaptureOpts.MuteCommentary
+//	OnLevels         CaptureOpts.OnLevels
+//	OnChannelLevels  CaptureOpts.OnChannelLevels
+//	OnSignal         CaptureOpts.OnSignal
+//	VideoBitrateKbps SendOpts.VideoBitrateKbps
+//	AudioBitrateBps  SendOpts.AudioBitrateBps
+//
+// ConformTo's move is the consequential one and is the reason the whole split is
+// worth its cost. With the conform chain in the CAPTURE pipeline the caps
+// crossing the proxy are pinned for the life of the process, so the DeckLink
+// changing raster — a 720x486 NTSC placeholder before it locks, the real input
+// after, back again when the cable is pulled — renegotiates videoscale's SINK
+// caps only and the encoder never sees a caps change at all.
+//
+// CaptureOpts gained one field that was never here: DeviceChannels, the width the
+// device ENUMERATION reports. The matrix has to be written while the pipeline is
+// in NULL, where a native source's pad publishes only a range, so a width from
+// the enumeration is the only thing that can size it before negotiation.
 
 // refuseWrongAudioSource is the WHOLE RULE about which element opens the
 // commentary, applied by both twins before anything is built.
@@ -1243,22 +955,45 @@ type SinkOpts struct {
 	PBKeyLen int
 }
 
-// Pipeline is one media pipeline: slate plus commentary audio, encoded, muxed to
-// MPEG-TS and sent to an SRT listener as a caller.
+// Pipeline is ONE SEND SESSION: two proxysrcs taking the always-live capture
+// layer's picture and commentary across the seam, encoded, muxed to MPEG-TS and
+// sent to an SRT listener as a caller.
+//
+// IT OPENS NOTHING. Its source of media is a proxysrc bound to a CapturePipeline's
+// proxysink, so there is no device in it, no card, no slate, no preview and no
+// meter — every one of those lives in the capture layer, exists before START and
+// survives STOP. That is the whole of R1, and it is why this interface lost four
+// methods when the seam was cut: InputChannels, SetChannelMap, SetCommentaryMute
+// and CommentaryMuted are CapturePipeline's, answered by the pipeline that owns
+// the device, whether or not anything is sending. A caller that used to reach
+// them through the session's pipeline reaches them through the capture set
+// instead, and gets an answer with no session running, which is the point.
 //
 // A Pipeline is single-use. After Stop it cannot be restarted; call New again.
 // All methods are safe for concurrent use.
 type Pipeline interface {
 	// Start builds the pipeline and takes it to PLAYING, but installs NO SINK.
 	// The pipeline runs with the src pad of the leaky srtq queue blocked, which
-	// means capture and encoding are live and correctly paced before the first
-	// connection attempt. The caller must follow Start with ReplaceSink to
-	// actually connect.
+	// means the encoders are live and correctly paced before the first connection
+	// attempt. The caller must follow Start with ReplaceSink to actually connect.
+	//
+	// BEFORE IT PARSES ANYTHING it takes the single-consumer claim on every
+	// proxysink in the capture set this pipeline was minted from and RE-ARMS them,
+	// because gstproxysink.c resets sent_stream_start / sent_caps only on
+	// READY->PAUSED: without the arming every send session after the first
+	// receives no STREAM_START, no CAPS and no SEGMENT, and carries ZERO BYTES
+	// with SRT connected and every lamp green. See seam.go for the measurement.
+	//
+	// AFTER PLAYING it refuses to report success until media has actually reached
+	// the muxer, within liveWatchStartGrace. That is the guard that makes a missed
+	// arming loud instead of green; a healthy seam beats it by two orders of
+	// magnitude (20-60 ms, measured on both rigs).
 	//
 	// Start pins the system clock and reuses one process-lifetime base time, so
-	// that a pipeline rebuilt after a device change does not restart PTS from
-	// zero. It returns an error if called twice or after Stop.
-	Start(opts PipelineOpts) error
+	// that a send pipeline built an hour after the capture it draws from does not
+	// restart PTS from zero. It returns an error if called twice or after Stop, and
+	// an error wrapping ErrSeamBusy if another send pipeline still holds the seam.
+	Start(opts SendOpts) error
 
 	// ReplaceSink installs a fresh srtsink with the given properties, replacing
 	// any sink already present: block the srtq src pad, unlink, set the old sink
@@ -1311,114 +1046,25 @@ type Pipeline interface {
 	// next scheduled IDR.
 	ForceKeyUnit() error
 
-	// InputChannels reports how many channels the capture source's pad ACTUALLY
-	// NEGOTIATED, read from that pad's current caps at the moment of the call.
-	// It is 0 before Start, and 0 whenever nothing has negotiated.
+	// InputChannels, SetChannelMap, SetCommentaryMute and CommentaryMuted USED TO
+	// BE HERE, and they are not gone: they are CapturePipeline's, and every
+	// measurement that argued for them is on that interface now.
 	//
-	// It is the ONLY number a caller may size a channel map against, and it is
-	// deliberately not the same number as the device's advertised max-channels:
-	// a DeckLink card publishes max-channels=16 whatever its element is
-	// configured to produce, and a matrix built against a width the pad did not
-	// negotiate does not degrade the feed, it stops it — measured, "streaming
-	// stopped, reason error (-5)", with the capture chain dead before the next
-	// level message. ChannelMap.MixMatrix takes the count as an argument for
-	// that reason, so that the only way to build a matrix is to have asked.
+	// They moved because they were never questions about a send session. They are
+	// questions about the pipeline that has the device open — how many channels
+	// that device's pad negotiated, which of them reach the feed, and whether the
+	// commentator's microphone is open — and the capture pipeline holds the device
+	// from launch to quit. Answered here they could only ever be answered while
+	// something was sending, which is what made the routing grid unsizeable until
+	// START and the cough button dead until START. Answered on the capture
+	// pipeline they work with no session running, survive STOP, and keep working
+	// across a reconnect that never goes near the audio leg.
 	//
-	// It is also what the mapping UI draws: sixteen faders on a card presenting
-	// sixteen channels, two on a microphone.
-	InputChannels() int
-
-	// SetChannelMap changes the routing WHILE THE PIPELINE IS PLAYING, with no
-	// state change, no renegotiation and no interruption to the feed. The
-	// mapping UI is therefore a real-time control rather than an
-	// apply-and-restart form.
-	//
-	// Measured on the real card on 2026-08-16: the property write took 119 µs,
-	// the pipeline stayed PLAYING with nothing pending, and the change was
-	// audible in the very next level message — a known -9 dBFS tone read
-	// -8.9996 dBFS at unity and -15.0195 dBFS after a live write of 0.5, a
-	// delta of -6.0199 dB against the -6.0206 dB the arithmetic says.
-	//
-	// The map is validated against InputChannels() BEFORE anything is written,
-	// and a map that does not fit is refused with an error wrapping
-	// ErrChannelMap and NOTHING IS SENT TO THE ELEMENT. That order is not
-	// defensive tidiness: audioconvert rejects an out-of-range coefficient
-	// silently, leaving the previous matrix in force, so a rejected write and a
-	// successful one are indistinguishable at the property level and the
-	// application can never learn afterwards which matrix is running. See
-	// ChannelGainLimit for the measurement.
-	//
-	// It returns an error, and does not write, on a pipeline that is not
-	// started, that has been stopped, or whose capture source presents a
-	// POSITIONED stream — the last because there is no matrix in force on such
-	// a pipeline to change, and installing one live would renegotiate the very
-	// caps the feed is running on.
-	SetChannelMap(m ChannelMap) error
-
-	// SetCommentaryMute takes the commentary off the SEND PATH, or puts it back,
-	// WHILE THE PIPELINE IS PLAYING. It is what the cough buttons drive — both
-	// the push-to-mute one, which sets true on press and false on release, and
-	// the latching one, which toggles. Neither mode is a concept this package
-	// has: they are two ways of calling one boolean, and keeping it that way is
-	// what makes the answer to "is the microphone open" a single fact.
-	//
-	// It is a property write on a volume element sitting between the resampler's
-	// capsfilter and the programme meter. No state change, no renegotiation, no
-	// element added to or removed from a running graph, and NOTHING SHARED with
-	// the channel map: the routing and the mute are separate properties on
-	// separate elements and cannot disagree. coughmute.go holds the argument
-	// against the two alternatives — zeroing the mix matrix, and a valve — and
-	// the measurements that settle it.
-	//
-	// MEASURED ON THE SHIPPED PIPELINE with the fitted card on 2026-08-16: the
-	// mute write took 109.792 us and the unmute 101 us, the pipeline was PLAYING
-	// with nothing pending across both, no bus message was posted, and the
-	// programme meter went from -57.0538 dBFS to -100.0000 — the clamped
-	// digital-silence floor — and back, at an unchanged thirty frames a window.
-	//
-	// WHAT THE FAR END SEES IS A CONTINUOUS STREAM THAT HAPPENS TO BE SILENT.
-	// Measured through the shipped encoder chain into mpegtsmux on 2026-08-16,
-	// muted and unmuted: 473 AAC access units either way, the same first PTS,
-	// the same last PTS, and the same largest gap between packets — one AAC
-	// frame, which is the floor. There is no discontinuity to recover from.
-	//
-	// THE PROGRAMME METER TELLS THE TRUTH THROUGHOUT, because the mute is
-	// upstream of it: OnLevels goes on arriving at its own rate and reads
-	// digital silence rather than freezing. A frozen meter and a silent one look
-	// the same on screen for the first second and mean opposite things.
-	//
-	// It returns an error, and writes nothing, on a pipeline that is stopped or
-	// that has not been started. The pre-Start case is deliberately a refusal
-	// rather than a latch — PipelineOpts.MuteCommentary is that route, and one
-	// control with two memories is the failure mode this design exists to avoid.
-	//
-	// It survives a reconnect by construction. internal/sender's reconnect is
-	// RemoveSink, backoff, ReplaceSink; none of the three goes near the audio
-	// leg, and everything upstream of srtq stays in PLAYING for the life of the
-	// process.
-	SetCommentaryMute(mute bool) error
-
-	// CommentaryMuted reports whether the commentary is muted on the send path.
-	//
-	// IT IS AN OBSERVATION, NOT A RECOLLECTION. The value returned is the one
-	// READ BACK OFF THE ELEMENT after the last successful write — the volume
-	// element's mute property is readable, and both Start and SetCommentaryMute
-	// re-read it immediately after setting it, so a write that did not take
-	// cannot leave the application believing it did. That is the property that
-	// disqualified zeroing the mix matrix, which does not marshal back out of
-	// audioconvert at any price.
-	//
-	// It takes no lock and never blocks, which is why it is safe to call from a
-	// UI poll and from a status assembly that runs while a reconnect is in
-	// flight: the reads come off an atomic mirror rather than out of the
-	// GStreamer graph, and ReplaceSink can hold the pipeline lock for seconds.
-	//
-	// Before Start it reports the pipeline's configured PipelineOpts.MuteCommentary
-	// only once Start has applied it; on a pipeline that has never started it is
-	// false, and on a stopped one it is the last state the element confirmed —
-	// which is what a caller rebuilding after a fatal reads and hands to the
-	// replacement's PipelineOpts.MuteCommentary.
-	CommentaryMuted() bool
+	// The one that changed meaning rather than address is the mute. Its old
+	// pre-Start refusal existed so that one control could not have two memories;
+	// with the element live from launch there is only one memory again — the
+	// element's own, read back after every write — so a latch set before START is
+	// simply still set at START. See CapturePipeline.SetCommentaryMute.
 
 	// Errors returns the pipeline's asynchronous error channel, carrying
 	// GST_ELEMENT_ERROR messages from the bus — in practice, srtout losing its
@@ -1429,7 +1075,15 @@ type Pipeline interface {
 	// must drain it: implementations drop rather than block if it is full.
 	Errors() <-chan error
 
-	// Stop takes the pipeline to NULL, releases the capture device and closes
-	// the channel returned by Errors. It is idempotent.
+	// Stop takes the pipeline to NULL, releases the seam and closes the channel
+	// returned by Errors. It is idempotent.
+	//
+	// IT RELEASES NO DEVICE, and that sentence used to say the opposite. The
+	// device belongs to the capture pipelines, which outlive every send session;
+	// Stop here gives back the single-consumer claim on their proxysinks so that
+	// the next START can take it, and touches nothing else. The order matters and
+	// is enforced by the seam itself: the send pipeline reaches NULL first, and only
+	// then is the claim released, because a proxysink whose old consumer is still
+	// alive cannot be re-armed and the next session would carry zero bytes.
 	Stop() error
 }

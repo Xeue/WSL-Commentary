@@ -837,24 +837,36 @@ func (a *App) SetPreviewVisible(visible bool) error {
 	return nil
 }
 
-// startSessionPreview creates the preview surface for the session about to be
-// built and returns the window handle its branch renders into, or 0 for no
+// startCapturePreview creates the preview surface for the capture layer about to
+// be built and returns the window handle its branch renders into, or 0 for no
 // preview at all.
 //
-// It is called from startSession, under sessMu, BEFORE the pipeline exists,
-// because the handle is a build-time option — rule 1 in this section's header.
+// It is called from rebuildCaptureLocked, BEFORE the pipeline exists, because the
+// handle is a build-time option — rule 1 in this section's header.
 // videoLegIsCamera is the pre-flight's verdict rather than the configuration's
 // intention: a seat that asked for a preview but whose video leg resolved to the
 // slate has nothing to preview, and it is the resolved answer that decides.
 //
+// # THE SURFACE'S LIFETIME IS THE CAPTURE'S, NOT A SESSION'S
+//
+// It used to be startSessionPreview, created at START and destroyed at STOP,
+// because the branch it renders into was a branch of the contribution pipeline.
+// The picture capture is now built at launch and held until the application
+// quits, so a desk with the card selected and the preview ticked has its
+// confidence picture BEFORE anything is sent and still has it after STOP —
+// which is the period the operator actually uses it in, setting up.
+//
 // # Every failure here is spared and none of them reaches the caller
 //
-// It returns 0 rather than an error, and startSession has no branch for it,
+// It returns 0 rather than an error, and the capture build has no branch for it,
 // which is rule 3 made structural instead of remembered. The operator is still
 // told — an overlay that will not appear is a control they can see is missing —
-// but through the error event, beside a session that started perfectly.
-func (a *App) startSessionPreview(cfg *config.Config, videoLegIsCamera bool) uintptr {
+// but through the error event, beside a capture that came up perfectly.
+func (a *App) startCapturePreview(cfg *config.Config, videoLegIsCamera bool) uintptr {
 	if !cfg.DeckLinkPreviewEnabled || !videoLegIsCamera {
+		// Nothing to preview on this seat. Any surface left from the last build
+		// goes back rather than sitting opaque over the page.
+		a.stopCapturePreview()
 		return 0
 	}
 
@@ -863,10 +875,10 @@ func (a *App) startSessionPreview(cfg *config.Config, videoLegIsCamera bool) uin
 
 	overlay, err := a.previewOverlayViewLocked()
 	if err != nil {
-		log.Printf("wslcomms: the DeckLink preview could not get a window (%v); starting the "+
-			"session without it — the contribution feed is unaffected", err)
+		log.Printf("wslcomms: the DeckLink preview could not get a window (%v); building the "+
+			"capture without it — the meters, the routing and the feed are unaffected", err)
 		a.emitError(fmt.Errorf(
-			"wslcomms: the preview could not be shown, so the feed is going out without it — "+
+			"wslcomms: the preview could not be shown, so the capture is running without it — "+
 				"nothing about what is being transmitted has changed: %w", err))
 		return 0
 	}
@@ -876,22 +888,24 @@ func (a *App) startSessionPreview(cfg *config.Config, videoLegIsCamera bool) uin
 	return overlay.Handle()
 }
 
-// stopSessionPreview takes the preview surface away at the end of a session.
+// stopCapturePreview takes the preview surface away when the capture that was
+// rendering into it has gone: a device change, a Restart capture, a seat that no
+// longer wants one, or the application quitting.
 //
-// It is called from the sender-state forwarder's exit, which runs after the
-// sender has closed its states channel — the last thing it does when stopping —
-// so the pipeline is already at NULL and nothing is rendering into the surface
-// by the time it is released. That ordering is the one stopPictureForTeardown
-// argues at length for both platforms, and it is not negotiable in either
-// direction.
+// Its callers run AFTER the capture pipeline has reached NULL, and that ordering
+// is the one stopPictureForTeardown argues at length for both platforms: take the
+// surface away first and the video sink is presenting into a handle that no
+// longer names anything. It is not negotiable in either direction.
 //
-// Unlike the picture's overlay, this surface does NOT outlive its session. The
-// picture's is kept because its monitor is rebuilt whenever the configuration
-// changes and a window destroyed and recreated under a running web view is a
-// z-order fight with nothing to gain; the preview's has no such churn — there is
-// exactly one per session — and keeping an idle opaque window over the page
-// between matches would be all cost.
-func (a *App) stopSessionPreview() {
+// Unlike the picture's overlay, this surface does NOT outlive the pipeline that
+// renders into it. The picture's is kept because its monitor is rebuilt whenever
+// the configuration changes and a window destroyed and recreated under a running
+// web view is a z-order fight with nothing to gain; the preview's churn is now a
+// device change, which is rare and deliberate, and keeping an idle opaque window
+// over the page while there is nothing to draw in it would be all cost.
+//
+// It is idempotent.
+func (a *App) stopCapturePreview() {
 	a.prevViewMu.Lock()
 	defer a.prevViewMu.Unlock()
 
@@ -908,15 +922,15 @@ func (a *App) stopSessionPreview() {
 	// calls record and post rather than blocking; see overlay_windows.go's and
 	// overlay_darwin.go's headers.
 	if err := overlay.SetVisible(false); err != nil {
-		log.Printf("wslcomms: hiding the preview surface at the end of the session: %v", err)
+		log.Printf("wslcomms: hiding the preview surface as the capture goes down: %v", err)
 	}
 	if err := overlay.Close(); err != nil {
-		log.Printf("wslcomms: closing the preview surface at the end of the session: %v", err)
+		log.Printf("wslcomms: closing the preview surface as the capture goes down: %v", err)
 	}
 }
 
 // previewOverlayViewLocked creates the preview surface. a.prevViewMu must be
-// held, and the caller must be startSessionPreview — nothing else may bring one
+// held, and the caller must be startCapturePreview — nothing else may bring one
 // into being, for the reason SetPreviewRect gives.
 //
 // The window is created hidden and positioned from whatever rectangle the page
@@ -926,10 +940,11 @@ func (a *App) stopSessionPreview() {
 // surface stays hidden, and the next SetPreviewRect brings it on screen.
 func (a *App) previewOverlayViewLocked() (gst.PictureOverlay, error) {
 	if a.prevOverlay != nil {
-		// A surface left from a previous session. startSession holds sessMu and
-		// the previous session's cleanup ran before it could, so this should not
-		// arise — but reusing it is the answer that cannot leak a window, and
-		// creating a second one over it is the answer that can.
+		// A surface left from the previous capture build. rebuildCaptureLocked
+		// tears the old capture down before it asks for this, so a live surface
+		// here is one whose pipeline has already reached NULL — reusing it is the
+		// answer that cannot leak a window, and creating a second one over it is
+		// the answer that can.
 		return a.prevOverlay, nil
 	}
 	if a.closing.Load() {
@@ -943,7 +958,7 @@ func (a *App) previewOverlayViewLocked() (gst.PictureOverlay, error) {
 	a.prevOverlay = overlay
 
 	if err := overlay.SetRect(a.prevRect); err != nil {
-		// The surface exists and is hidden; it is recorded so stopSessionPreview
+		// The surface exists and is hidden; it is recorded so stopCapturePreview
 		// will close it rather than leaving a window nothing owns.
 		return nil, err
 	}
@@ -957,13 +972,13 @@ func (a *App) previewOverlayViewLocked() (gst.PictureOverlay, error) {
 // preview's own:
 //
 //	the page asked for it       or a preview covers the Settings screen
-//	this session HAS a preview  or a black rectangle covers the controls
+//	this CAPTURE has a preview  or a black rectangle covers the controls
 //	the rectangle has area      or the sink resizes its surface to nothing
 //
 // The picture's equivalent asks whether its monitor is SHOWING. The preview has
 // no state to ask, because it is not a thing that connects and reconnects: it is
-// either in the pipeline that is running or there is no pipeline. prevRunning is
-// that fact, recorded at Start.
+// either in the capture pipeline that is running or there is no such branch.
+// prevRunning is that fact, recorded when the capture is built.
 func (a *App) applyPreviewVisibilityViewLocked() {
 	if a.prevOverlay == nil {
 		return
@@ -1064,13 +1079,13 @@ func (a *App) stopPictureForTeardown() error {
 		problems = append(problems, err)
 	}
 
-	// The preview surface, as a BELT. It normally went with its session, which
-	// teardownOrdered stops several steps before this one — but a sender step
-	// that overran was ABANDONED rather than waited for, and this is the last
+	// The preview surface, as a BELT. It normally goes with the capture layer,
+	// whose step teardownOrdered runs two steps before this one — but a capture
+	// step that overran was ABANDONED rather than waited for, and this is the last
 	// chance to take a window off the operator's screen before the process ends.
 	// It is idempotent and costs one dispatch when there is nothing there, which
 	// is every ordinary quit.
-	a.stopSessionPreview()
+	a.stopCapturePreview()
 
 	// picViewMu, which is where the overlay lives. StopPicture has already
 	// released picMu by now, so this takes nothing while holding anything.

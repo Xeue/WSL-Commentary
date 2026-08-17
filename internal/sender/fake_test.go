@@ -125,10 +125,6 @@ type fakePipeline struct {
 	removeErr  error
 	removeErrN int
 
-	// muted is the cough mute this fake was last told to set. Nothing in the
-	// reconnect machine writes it; see SetCommentaryMute.
-	muted bool
-
 	// sinkResults are handed to successive ReplaceSink calls in order. Once
 	// exhausted, sinkDefault is returned for every further call.
 	sinkResults []error
@@ -172,7 +168,7 @@ type fakePipeline struct {
 	closed bool
 
 	counts   fakeCounts
-	pipeOpts gst.PipelineOpts
+	pipeOpts gst.SendOpts
 	sinkOpts []gst.SinkOpts
 }
 
@@ -187,7 +183,7 @@ func newFakePipeline() *fakePipeline {
 }
 
 // Start records the options and returns the queued start error, if any.
-func (p *fakePipeline) Start(opts gst.PipelineOpts) error {
+func (p *fakePipeline) Start(opts gst.SendOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.counts.starts++
@@ -246,34 +242,14 @@ func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
 	return err
 }
 
-// InputChannels and SetChannelMap are the channel-map half of gst.Pipeline,
-// and they are inert here on purpose. internal/sender reconnects a sink; it has
-// no opinion about which of a capture device's channels reach the feed, and a
-// fake that grew routing state would be modelling a coupling the state machine
-// deliberately does not have. The answers are those of a pipeline with a
-// positioned capture device: no negotiated width, no matrix to change.
-func (p *fakePipeline) InputChannels() int                 { return 0 }
-func (p *fakePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
-
-// The cough mute is inert here for the reason the routing above it is: the
-// reconnect state machine neither reads it nor writes it. It is recorded rather
-// than discarded so that a future test asserting "a reconnect does not touch the
-// mute" has something to assert against — and the recording is what makes the
-// claim checkable at all, since the real answer to that question is structural
-// (nothing in RemoveSink or ReplaceSink goes near the audio leg) rather than
-// something the state machine could get right by accident.
-func (p *fakePipeline) SetCommentaryMute(mute bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.muted = mute
-	return nil
-}
-
-func (p *fakePipeline) CommentaryMuted() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.muted
-}
+// THE ROUTING AND THE COUGH MUTE USED TO BE FAKED HERE and are not gone: they
+// are CapturePipeline's now, on the pipeline that holds the device. Nothing in
+// this package ever read or wrote either — the reconnect machine reconnects a
+// sink and has no opinion about which of a capture device's channels reach the
+// feed — so what the seam removed from this fake is four methods it only had in
+// order to satisfy an interface. The structural claim they existed to make
+// checkable is now true by construction rather than by inertness: there is no
+// audio leg in a send pipeline for RemoveSink or ReplaceSink to go near.
 
 // ForceKeyUnit records the request, runs onForceKeyUnit if one is installed,
 // and then — if a gate is installed — blocks until the test releases it. Both
@@ -520,14 +496,57 @@ var _ clock = (*fakeClock)(nil)
 // shared helpers
 // ---------------------------------------------------------------------------
 
+// stubCaptureSet builds and starts the capture layer a stub send pipeline is
+// minted over: the ordinary seat, a slate picture and a platform microphone, as
+// two independent pipelines.
+//
+// It exists because a send pipeline is MINTED ONLY BY CAPTURE — gst.New refuses
+// an empty set — and because the two things a stub send pipeline models about the
+// seam only mean anything against a real capture set: the single-consumer claim
+// that stops a second session stealing the stream, and the re-arm without which
+// every session after the first carries zero bytes.
+//
+// Both pipelines are stopped through t.Cleanup, AFTER the test has stopped its
+// sender: CapturePipeline.Stop refuses while a send pipeline still holds the
+// seam, and Cleanup runs last-registered-first, so a sender stopped inside the
+// test body is already gone by then.
+func stubCaptureSet(t *testing.T) gst.CaptureSet {
+	t.Helper()
+
+	var set gst.CaptureSet
+	for _, legs := range gst.PlanCapture(gst.CaptureSources{
+		AudioDeviceID: "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
+	}) {
+		c, err := gst.NewCapture(gst.CaptureOpts{
+			Legs:          legs,
+			SlatePath:     `C:\Program Files\WSLComms\slate.png`,
+			AudioDeviceID: "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
+		})
+		if err != nil {
+			t.Fatalf("building the %s capture: %v", legs, err)
+		}
+		t.Cleanup(func() { c.Stop() })
+		if err := c.Start(); err != nil {
+			t.Fatalf("starting the %s capture: %v", legs, err)
+		}
+		if legs.Picture != gst.PictureNone {
+			set.Picture = c
+		}
+		if legs.Commentary != gst.CommentaryNone {
+			set.Commentary = c
+		}
+	}
+	return set
+}
+
 // testOpts is a representative session: the spec's slate and a plausible DVS
 // endpoint GUID, sending to a local listener at the default 120 ms SRT latency.
 func testOpts() Opts {
 	return Opts{
-		Pipeline: gst.PipelineOpts{
-			SlatePath:     `C:\Program Files\WSLComms\slate.png`,
-			AudioDeviceID: "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
-		},
+		// The whole of what a send session can be told. The slate and the capture
+		// endpoint that used to be here are the capture layer's, and a session's
+		// options no longer name a device at all.
+		Pipeline: gst.SendOpts{},
 		Sink: gst.SinkOpts{
 			Host:      "127.0.0.1",
 			Port:      9000,

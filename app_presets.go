@@ -406,7 +406,21 @@ func (a *App) ApplyPreset(id string) (*config.Config, error) {
 			p.Name, strings.Join(ignored, ", ")))
 	}
 
-	// Step 9.
+	// Step 9. THE CAPTURE FOLLOWS THE PRESET. A preset carries no device id and no
+	// slate path — those belong to this PC and Filter keeps them out — but it does
+	// carry videoFormatOverride and the M2L-X coordinates that decide the conform
+	// target, and the conform chain lives in the PICTURE CAPTURE. A capture left
+	// at the previous instance's raster would go on scaling to last venue's
+	// format until somebody restarted the application.
+	//
+	// It is unconditional for the same reason step 8 is: the instance changed, and
+	// step 1 already refused while sending, so this is always off-air work. Its
+	// failure does not fail the apply — the preset IS applied — and the capture
+	// panel names the device fault in its own words.
+	if err := a.rebuildCapture("a preset was applied"); err != nil {
+		log.Printf("wslcomms: rebuilding the capture layer after applying preset %q: %v", p.ID, err)
+	}
+
 	return merged, nil
 }
 

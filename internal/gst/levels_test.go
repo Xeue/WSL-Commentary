@@ -46,8 +46,12 @@ import (
 // handed the frame. TestPipelineDescriptionMetersWhatIsEncoded is the precedent
 // for that shape: assert the indices, not just the substrings.
 func TestLevelMessagesAreAttributedToTheirSourceElement(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+	// THE CAPTURE BUS, because that is where a level element now posts. alevel and
+	// chlevel are upstream of the proxysinks, so the send pipeline's handler has no
+	// level case at all — and a guard that went on reading it would have passed for
+	// ever by no longer being able to see the code it is about.
+	fset, file := parseSource(t, captureCgoSourceFile)
+	body := funcBody(t, fset, file, "cgoCapture", "onBusMessage")
 
 	start := strings.Index(body, "case gogst.MessageElement:")
 	if start < 0 {
@@ -59,7 +63,7 @@ func TestLevelMessagesAreAttributedToTheirSourceElement(t *testing.T) {
 	structure := strings.Index(element, "levelStructureName")
 	source := strings.Index(element, "msg.Source()")
 	kind := strings.Index(element, "levelKindForSource(")
-	deliver := strings.Index(element, "p.onLevels.Load()")
+	deliver := strings.Index(element, "c.onLevels.Load()")
 
 	if structure < 0 {
 		t.Error("the level case no longer matches on levelStructureName; it would read the " +
@@ -104,19 +108,44 @@ func TestLevelMessagesAreAttributedToTheirSourceElement(t *testing.T) {
 // exactly the kind of mistake a parse string built by string concatenation
 // invites.
 func TestEveryLevelElementInThePipelineIsRouted(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+	// BOTH level elements live in the CAPTURE description now: alevel and chlevel
+	// are upstream of the proxysinks, and the send pipeline has no meter at all
+	// (a meter below the seam would read the encoder's input rather than the
+	// microphone). The routing they are checked against is cgoCapture's bus
+	// handler, which is where levelKindForSource is consulted.
+	body := captureDescriptionSource(t)
 
-	const marker = "level name="
+	// BOTH ELEMENTS ARE NAMED FROM CONSTANTS, so the names are read out of the
+	// SOURCE EXPRESSION rather than out of a rendered literal. That is what the
+	// split made necessary and it is a stronger check than the old one: the old
+	// version scanned for the literal text `level name=alevel`, which a build that
+	// named the element from a constant would have satisfied with zero matches and
+	// no failure at all had the `found == 0` guard not existed.
+	const marker = `level name="+`
 	found := 0
 	for i := strings.Index(body, marker); i >= 0; {
 		rest := body[i+len(marker):]
-		name := rest
-		if cut := strings.IndexAny(name, " \"\\"); cut >= 0 {
-			name = name[:cut]
+		ident := rest
+		if cut := strings.IndexAny(ident, " +\n\""); cut >= 0 {
+			ident = ident[:cut]
 		}
 		found++
-		if levelKindForSource(name) == levelKindUnknown {
+
+		// The constant's VALUE, resolved from levels.go, because that is the name
+		// GStreamer will give the element and the name onBusMessage will route on.
+		var name string
+		switch ident {
+		case "levelElementName":
+			name = levelElementName
+		case "channelLevelElementName":
+			name = channelLevelElementName
+		default:
+			t.Errorf("the parse string builds a level element named from %q, which this guard "+
+				"cannot resolve. Every level element must be named from a constant in levels.go, "+
+				"beside levelKindForSource, so that the name that is BUILT and the name that is "+
+				"ROUTED cannot drift", ident)
+		}
+		if name != "" && levelKindForSource(name) == levelKindUnknown {
 			t.Errorf("the parse string builds a level element named %q, which "+
 				"levelKindForSource classifies as unknown: every message it posts would be "+
 				"dropped by onBusMessage and the meter behind it would never move. Add the "+
@@ -128,14 +157,16 @@ func TestEveryLevelElementInThePipelineIsRouted(t *testing.T) {
 		}
 		i = i + len(marker) + next
 	}
-	if found == 0 {
-		t.Fatal("the parse string has no level element at all; the input meters have nothing " +
-			"to measure and the levels event will never fire on a real build")
+	if found != 2 {
+		t.Fatalf("the capture description builds %d level elements, want 2 — the programme meter "+
+			"and the per-channel picker. Zero means the input meters have nothing to measure and "+
+			"the levels event will never fire on a real build", found)
 	}
 	// The programme meter is the on-air one and is not optional.
-	if !strings.Contains(body, marker+levelElementName) {
-		t.Errorf("the parse string no longer names the programme meter %q; onBusMessage routes "+
-			"on that exact name and would drop every frame it posts", levelElementName)
+	if !strings.Contains(body, marker+"levelElementName") {
+		t.Errorf("the parse string no longer names the programme meter from levelElementName "+
+			"(%q); onBusMessage routes on that exact name and would drop every frame it posts",
+			levelElementName)
 	}
 }
 
@@ -465,10 +496,9 @@ func TestChannelLevelIntervalIsSlowerThanTheProgrammeMeter(t *testing.T) {
 			channelLevelIntervalNs)
 	}
 	// The parse string's programme interval is guarded separately by
-	// TestPipelineDescriptionMetersWhatIsEncoded; this only needs them to be
+	// TestTheProgrammeMeterMeasuresWhatCrossesTheSeam; this only needs them to be
 	// talking about the same number.
-	fset, file := parseSource(t, cgoSourceFile)
-	if body := funcBody(t, fset, file, "", "pipelineDescription"); !strings.Contains(body, "interval=50000000") {
+	if body := captureDescriptionSource(t); !strings.Contains(body, "interval=50000000") {
 		t.Error("the programme meter's interval in the parse string is no longer 50 ms; the " +
 			"comparison above is against a number that has moved")
 	}

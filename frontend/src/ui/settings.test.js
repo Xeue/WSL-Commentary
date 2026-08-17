@@ -1107,9 +1107,10 @@ test('Apply and Delete are gated on the sending state, with the reason on the co
   // The handle list is open-ended; what this pins is that setSending is still on
   // it, because app.js drives the gate through it from the same derivation the
   // SENDING lamp uses. adoptVideoLeg joined it for the two video-leg controls,
-  // which a remote seat's stale cache can otherwise use to refuse a save they
-  // are not part of — see settings.js's own comment on it.
-  assert.match(js, /return \{ el, open, setSending, adoptVideoLeg \};/);
+  // and adoptAudioLeg for the microphone picker, because a remote seat's stale
+  // cache of any of those five fields refuses a save it is not part of — see
+  // settings.js's own comments on both.
+  assert.match(js, /return \{ el, open, setSending, adoptVideoLeg, adoptAudioLeg \};/);
   assert.match(
     ui('app.js'),
     /settings\.setSending\(!!currentSenderState && currentSenderState !== backend\.SENDER_STATE\.STOPPED\)/,

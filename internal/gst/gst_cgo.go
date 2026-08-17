@@ -310,9 +310,18 @@ const (
 	nameVideoCapConv  = "vcapconv"  // videoconvert: whatever the card gives us into NV12
 	nameVideoCapDeint = "vcapdeint" // deinterlace: the only thing that handles a 1080i camera
 	nameVideoCapScale = "vcapscale" // videoscale: the camera's raster into the conform target's
-	nameVideoCapRate  = "vcaprate"  // videorate: MANDATORY, see pipelineDescription
+	nameVideoCapRate  = "vcaprate"  // videorate: MANDATORY, see captureDescription
 	nameVideoCapTee   = "vcaptee"   // tee: the broadcast branch, plus an optional preview
-	nameVideoCapQueue = "vcapq"     // the broadcast branch's head queue
+
+	// nameVideoCapQueue IS DELETED. It named the broadcast branch's head queue,
+	// which is now the SEAM's: nameVideoProxyQueue, declared in seam.go with the
+	// leak policy beside it, because "a leaky queue in front of every proxysink"
+	// is one of the three invariants that file exists to hold and the depth is a
+	// judgement rather than a measurement. The old queue was deliberately NOT
+	// leaky — it was the branch that went on air, and dropping its frames to
+	// protect a preview would have been backwards. The new one IS, and that is
+	// the change: it now protects the CAPTURE from a wedged SEND pipeline, which
+	// is a consumer that did not exist when the queue was written.
 )
 
 // nameVideoCaptureClockSink is the fakesink the CLOCK COMPANION feeds: the
@@ -354,7 +363,7 @@ const videoCaptureFactory = "decklinkvideosrc"
 // encoder — and this is not one of them.
 //
 // It never appears in the parse string with a `connection` property. See
-// pipelineDescription: connection PERSISTENTLY RECONFIGURES THE CARD and
+// captureDescription: connection PERSISTENTLY RECONFIGURES THE CARD and
 // overrides Blackmagic Desktop Video Setup, and it has had to be undone by hand
 // twice. If the card is silent the answer is never another connection value.
 const audioCaptureFactory = "decklinkaudiosrc"
@@ -1249,17 +1258,38 @@ func preferenceIndex(name string) int {
 	return len(h264EncoderPreference)
 }
 
-// New creates a Pipeline. Init must have been called first.
+// New mints a send pipeline over a capture set. Init must have been called
+// first.
+//
+// # It takes the capture set rather than being handed one at Start
+//
+// A SEND PIPELINE IS MINTED ONLY BY CAPTURE, so that "a send pipeline with no
+// device behind it" is unconstructible rather than merely unlikely. That is not a
+// stylistic preference: this graph's two sources are proxysrcs, and a proxysrc
+// with no proxysink bound to it does not fail — it reaches PLAYING, SRT connects,
+// every lamp goes green and the switcher receives silence. The type system is the
+// cheapest place to make that state unreachable, and an empty set is refused here,
+// by name, before anything else can happen.
+//
+// It does NOT claim the seam. That happens at Start, with the arming, because the
+// two belong to the same moment; see SendSeam.
 //
 // It starts one goroutine, which does nothing but write bus warnings to the
 // log; Stop ends it. A Pipeline that is created and never stopped therefore
 // leaks that goroutine, which is why the contract in gst.go says Stop is
 // idempotent and must always be called.
-func New() (Pipeline, error) {
+func New(set CaptureSet) (Pipeline, error) {
 	if !inited.Load() {
 		return nil, errors.New("gst: New: Init has not been called")
 	}
+	if len(set.Pipelines()) == 0 {
+		return nil, errors.New("gst: New was given an empty capture set. The send description is " +
+			"invariant — it always has a picture leg and a commentary leg — so a set with neither " +
+			"is a planning error, and a send pipeline built from it would reach PLAYING attached " +
+			"to nothing and carry zero bytes with SRT connected and every lamp green")
+	}
 	p := &cgoPipeline{
+		set:   set,
 		errs:  make(chan error, errorChannelBuffer),
 		warns: make(chan string, warningChannelBuffer),
 	}
@@ -1320,6 +1350,38 @@ type cgoPipeline struct {
 	// is exactly when that message arrives.
 	fatal error
 
+	// set is the capture layer this send pipeline draws from. It is given at
+	// construction and never changes: a Pipeline is single-use, and a send
+	// pipeline that could be re-pointed at a different capture set would be a
+	// device change under a running feed, which is refused everywhere else in this
+	// design for the reason seam.go's third invariant gives.
+	//
+	// THIS PIPELINE NEVER STOPS IT. The capture pipelines are always-live and
+	// outlive every send session; what Start takes and Stop gives back is the
+	// single-consumer CLAIM on their proxysinks, held through seam below.
+	set CaptureSet
+
+	// seam is this session's hold on that capture set: the claim on every
+	// proxysink and the arming that makes the second START carry media. It is
+	// taken by startBuiltLocked BEFORE the parse and released by teardownLocked
+	// AFTER the pipeline has reached NULL, and both ends of that order are
+	// load-bearing — see SendSeam.
+	//
+	// Nil before Start and after a completed teardown. SendSeam's methods are all
+	// nil-safe, so there is one unconditional call at teardown rather than a guard
+	// a later reader can widen without noticing what it was for.
+	seam *SendSeam
+
+	// live is the muxer watchdog: the BUFFER|BUFFER_LIST probes on vq:src, aq:src
+	// and mux:src, and the poller that reads them.
+	//
+	// It is the ONLY detector in this process for a capture pipeline that has died
+	// underneath a running send pipeline. Measured, twice: that failure produces 0
+	// buffers, no EOS, no ERROR and no WARNING on either bus, with this pipeline
+	// still PLAYING and SRT still connected, because proxysink returns
+	// GST_FLOW_OK unconditionally and no back-pressure ever crosses the seam.
+	live *liveWatch
+
 	// pipeline is the GstPipeline built by gst_parse_launch. Held so that it
 	// stays reachable: dropping the Go reference would let the finalizer unref
 	// the last reference to a running pipeline.
@@ -1331,69 +1393,24 @@ type cgoPipeline struct {
 	// bus is the pipeline's bus, held so that Stop can detach the sync handler.
 	bus gogst.Bus
 
-	// aconv is the audioconvert element carrying the channel map, and
-	// aconvSinkPad is the pad whose NEGOTIATED caps size the matrix written to
-	// it. The pad is held rather than looked up per call because
-	// InputChannels() is a UI-facing read that may arrive many times a second
-	// while the mapping panel is open, and a GetByName plus a GetStaticPad per
-	// call would be two cgo round trips to answer a question the pad itself
-	// answers in one.
-	//
-	// Both are nil until Start has parsed the pipeline, and are cleared by
-	// teardownLocked. Everything that touches them holds mu — see
-	// InputChannels for why that is the right lock even though it is the one
-	// held across state changes.
-	aconv        gogst.Element
-	aconvSinkPad gogst.Pad
+	// aconv, aconvSinkPad and matrixWidth ARE NOT HERE ANY MORE. The mix matrix is
+	// a negotiation constraint written to an audioconvert while the pipeline is still
+	// in NULL, so it belongs to the pipeline that opens the device; there is no
+	// audioconvert in this graph at all. See cgoCapture.
 
-	// matrixWidth is the input channel count the mix-matrix currently written to
-	// aconv was built for, and is ZERO WHEN NO MATRIX HAS BEEN WRITTEN — the
-	// ordinary state on a positioned capture source, where audioconvert's own
-	// downmix is doing the work and there is nothing for SetChannelMap to
-	// change without renegotiating the caps the feed is running on. Guarded by
-	// mu.
-	//
-	// The MAP itself is deliberately not kept beside it. There is nothing to
-	// compare it against — mix-matrix is a GST_TYPE_ARRAY and does not marshal
-	// back, so the element cannot be asked what it is running — and a field
-	// nothing reads is a second, unverifiable account of the same fact. The
-	// record of what was written is the log line each write emits, which is
-	// where a field engineer looks anyway.
-	matrixWidth int
+	// The COUGH MUTE is not here either, and its absence is the one worth stating.
+	// It is a volume element between the resampler's capsfilter and the programme
+	// meter, upstream of the proxysink, so a future local foldback tapped off this
+	// side of the seam would NOT be muted by it. Tap upstream of coughmute in the
+	// capture pipeline, or duplicate the mute; do not add a second one here, because
+	// one control with two memories is the failure the read-back discipline exists to
+	// make impossible. See coughmute.go.
 
-	// cough is the volume element the cough mute writes, and muted is the
-	// answer CommentaryMuted gives. coughmute.go carries the argument for the
-	// mechanism; what matters here is why there are two fields rather than one.
-	//
-	// cough is reached only under mu, exactly as aconv is, because writing it is
-	// a cgo property set on an element the teardown may be dropping. muted is an
-	// ATOMIC and is read WITHOUT mu, which is the point of it: "is the
-	// microphone open" is asked by the status assembly and by the UI many times
-	// a second, and mu is held for the whole of ReplaceSink — seconds, during a
-	// reconnect. A mute lamp that stops answering while the socket is down is a
-	// mute lamp nobody can trust at the moment they most need it.
-	//
-	// It is NOT a record of what was requested. Both writers — Start's first
-	// application and SetCommentaryMute afterwards — set the property and then
-	// READ IT BACK OFF THE ELEMENT, and it is the read-back value that is
-	// stored. That is what makes CommentaryMuted an observation, and it is the
-	// property zeroing the mix matrix could never have offered: mix-matrix does
-	// not marshal back out of audioconvert, as matrixWidth's comment says.
-	//
-	// muted deliberately SURVIVES teardownLocked while cough does not. A caller
-	// rebuilding after a latched fatal reads the mute off the pipeline it is
-	// discarding and hands it to the replacement as PipelineOpts.MuteCommentary;
-	// zeroing it at Stop would answer "unmuted" for a session that ended muted
-	// and put the commentator back on air across the rebuild.
-	cough gogst.Element
-	muted atomic.Bool
-
-	// sigWatch is the video signal watchdog, or nil when this pipeline has no
-	// element with a "signal" property to poll — every native capture, and the
-	// slate-only video leg shipping today. The nil is usable: Stop on it does
-	// nothing, so there is one unconditional call at teardown rather than a guard
-	// somebody can widen without noticing what it was for.
-	sigWatch *signalWatch
+	// The VIDEO SIGNAL WATCHDOG is the capture pipeline's, for the same reason: it
+	// polls a decklinkvideosrc's own "signal" property, and there is no decklink
+	// element in this graph. Its readings now start at launch instead of at START,
+	// which is the point of R1 — a cable fault surfaces on the CAMERA lamp when the
+	// application opens, not twenty minutes before kick-off.
 
 	// encoder is the H.264 encoder element, kept for ForceKeyUnit.
 	encoder gogst.Element
@@ -1432,23 +1449,13 @@ type cgoPipeline struct {
 	// Written by ReplaceSink under mu, read by onBusMessage without any lock.
 	route atomic.Pointer[sinkErrRoute]
 
-	// onLevels is PipelineOpts.OnLevels, or nil when the caller wants no
-	// metering. It is an atomic pointer for the same reason route is: the
-	// reader is onBusMessage on a GStreamer streaming thread, which must not
-	// take p.mu, and the writer is Start — which holds p.mu across the state
-	// change that first makes level messages possible, so a plain field would
-	// be a write racing the very messages it enables. It is written once,
-	// before the pipeline is built, and never cleared: busSilenced already
-	// stops delivery at teardown.
-	onLevels atomic.Pointer[func(Levels)]
-
-	// onChannelLevels is PipelineOpts.OnChannelLevels — the per-channel picker
-	// meter's frames, from chlevel rather than alevel. Same type, same atomic,
-	// same reason, and deliberately a SEPARATE field rather than a wider
-	// callback: the two elements measure different points, and the whole of the
-	// routing in onBusMessage exists so that a frame from one can never be
-	// delivered as a frame from the other.
-	onChannelLevels atomic.Pointer[func(Levels)]
+	// BOTH METERS ARE THE CAPTURE PIPELINE'S. alevel and chlevel are upstream of
+	// the proxysinks, so no level message is ever posted on this bus; the callbacks
+	// and the routing between them moved to cgoCapture with the elements. What that
+	// costs is written down in gst.go rather than discovered: OnLevels used to promise
+	// that no meter could move while silence went to air, and between it and the
+	// encoder there is now a leaky queue. The promise holds in normal operation and
+	// NOT during a send-side stall, which is the leak policy the operator chose.
 
 	// busSilenced makes onBusMessage return immediately once the pipeline is
 	// being torn down. It exists because the bus sync handler is NEVER
@@ -1468,8 +1475,9 @@ type cgoPipeline struct {
 // Compile-time assertion that the real implementation satisfies the contract.
 var _ Pipeline = (*cgoPipeline)(nil)
 
-// Start builds the pipeline and takes it to PLAYING with no sink installed.
-func (p *cgoPipeline) Start(opts PipelineOpts) error {
+// Start builds the SEND pipeline over the capture seam and takes it to PLAYING
+// with no sink installed.
+func (p *cgoPipeline) Start(opts SendOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1478,32 +1486,6 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 	}
 	if p.started {
 		return errors.New("gst: pipeline already started")
-	}
-	if opts.SlatePath == "" {
-		return errors.New("gst: PipelineOpts.SlatePath is required")
-	}
-	// WHICH ELEMENT OPENS THE COMMENTARY, decided and refused here,
-	// synchronously, before anything is built.
-	//
-	// It replaces the bare "AudioDeviceID is required" this check used to be,
-	// and the replacement is not a relaxation: exactly one of the two source
-	// fields must be given, so the state that check existed to prevent — a
-	// platform capture element with an empty device, which is the SYSTEM DEFAULT
-	// INPUT and not an error — is still unreachable, and the DeckLink seat that
-	// used to be unexpressible now is.
-	//
-	// refuseWrongAudioSource also carries the RENDER (playback) endpoint refusal
-	// unchanged, and it stays synchronous and up front for the reason it always
-	// was: wasapi2src accepts such an id at construction and fails
-	// ASYNCHRONOUSLY — error 1551 on the bus, after Start has returned success —
-	// and the sender then misreads a local device fault as a network failure and
-	// retries the SRT link forever. The rule and its deliberate asymmetry (only
-	// a POSITIVE render identification refuses; unknown shapes pass) live in
-	// device_id.go, shared with the stub twin so the two cannot drift. NEVER
-	// "fix" it by setting wasapi2src's loopback property instead: that opens the
-	// operator's own monitor mix as the commentary source.
-	if err := refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); err != nil {
-		return err
 	}
 	if opts.VideoBitrateKbps == 0 {
 		opts.VideoBitrateKbps = DefaultVideoBitrateKbps
@@ -1516,438 +1498,123 @@ func (p *cgoPipeline) Start(opts PipelineOpts) error {
 			opts.VideoBitrateKbps, opts.AudioBitrateBps)
 	}
 
-	// THE VIDEO LEG'S SOURCE, decided once, here, and refused here if it cannot
-	// be honoured. Both checks are made BEFORE anything is built, because both
-	// failures are configuration failures and the message a configuration
-	// failure deserves is one that names the value, not a parse error naming an
-	// element.
+	// EVERY OTHER CHECK THIS FUNCTION USED TO MAKE HAS MOVED WITH THE CODE IT
+	// GUARDED, and none of them was deleted. The slate path, the two capture ids,
+	// refuseWrongAudioSource's "exactly one commentary source" rule, the
+	// same-card rule for a DeckLink pair, the conform target's resolution and the
+	// confidence monitor's branch are all questions about a device, and there is
+	// no device in this graph — see NewCapture, which refuses all of them before
+	// anything is opened, at launch, where a fault surfaces on a lamp instead of
+	// twenty minutes before kick-off.
 	//
-	// The id is validated by CONVERTING it, which is the same test
-	// configureDeckLinkSource will make later and is deliberately the same call.
-	// A CoreAudio unique-id or a WASAPI endpoint GUID reaching the element's
-	// persistent-id property would leave it at its own -1 default, which means
-	// "use device-number", which means whichever card the driver enumerated
-	// first — a wrong-card video feed with every lamp green. Refusing early
-	// costs nothing and makes the wrong-kind case a sentence rather than a
-	// picture nobody recognises.
-	if opts.VideoCaptureID != "" {
-		if _, err := parseDeckLinkPersistentID(opts.VideoCaptureID); err != nil {
-			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID names the DeckLink card whose "+
-				"input becomes the video leg, and it must be a DeckLink persistent-id rather "+
-				"than an audio device id: %w", err)
-		}
-		// The bundle contract for this leg alone. Init logged it and did not
-		// refuse, precisely so a seat with no card could still go on air; this
-		// is the seat that does have one, so this is where it becomes an error.
-		// See videoCaptureRequiredElements.
-		if missing := missingFrom(videoCaptureRequiredElements); len(missing) > 0 {
-			return fmt.Errorf("gst: a DeckLink video input is configured but this build's "+
-				"GStreamer cannot build the capture leg: %s. The commentary audio is unaffected; "+
-				"clearing the video input setting will start this seat with the slate",
-				strings.Join(missing, ", "))
-		}
-		log.Printf("gst: Start: the video leg is a LIVE CAPTURE from DeckLink card %s; "+
-			"the slate is not built", opts.VideoCaptureID)
-	}
-
-	// THE COMMENTARY LEG'S SOURCE, refused here on the same terms and before
-	// anything is built. The id itself has already been converted by
-	// refuseWrongAudioSource, so what is left is the two questions that need
-	// more than the string.
-	if opts.AudioCaptureID != "" {
-		// The bundle contract for this seat. Init logged it and did not refuse,
-		// so that a seat with no card could still go on air; this is the seat
-		// that does have one. Unlike the video leg there is nothing to fall back
-		// to — the commentary IS the product — so the message says to change the
-		// input rather than to clear a setting.
-		if missing := missingFrom(audioCaptureRequiredElements); len(missing) > 0 {
-			return fmt.Errorf("gst: the commentary input is a DeckLink card but this build's "+
-				"GStreamer cannot build the capture leg: %s. Choose a microphone in the Commentary "+
-				"input dropdown to start this seat", strings.Join(missing, ", "))
-		}
-		// ONE CARD, and this is the refusal that keeps the clock companion
-		// honest. When the video leg is also a card, THAT decklinkvideosrc is
-		// what clocks this audio — the card is exclusive and a second source
-		// fails — so the two ids naming different cards describes a pipeline
-		// whose audio would be clocked by the WRONG CARD's video. That does not
-		// fail loudly: the audio source would wait for a clock that never starts
-		// for it, and the seat would die in negotiation naming neither card.
-		//
-		// config.json carries ONE decklinkPersistentId for both legs, so the
-		// application cannot produce this; a caller that hand-built it is
-		// describing a two-card rig that would need a THIRD decklink element,
-		// which nothing here has ever run. Refusing by name beats building a
-		// shape nobody has measured.
-		if opts.VideoCaptureID != "" && opts.VideoCaptureID != opts.AudioCaptureID {
-			return fmt.Errorf("gst: PipelineOpts.VideoCaptureID is card %s and "+
-				"PipelineOpts.AudioCaptureID is card %s. A DeckLink drives audio capture off the "+
-				"VIDEO clock, so a commentary leg on one card cannot be clocked by another card's "+
-				"video, and the card is exclusive so a third element is not available to clock it. "+
-				"Both legs must name the same card, or the video leg must be the slate",
-				opts.VideoCaptureID, opts.AudioCaptureID)
-		}
-		if opts.VideoCaptureID != "" {
-			log.Printf("gst: Start: the commentary is captured from DeckLink card %s, clocked by "+
-				"the SAME card's video leg; no clock companion is built", opts.AudioCaptureID)
-		} else {
-			log.Printf("gst: Start: the commentary is captured from DeckLink card %s while the "+
-				"video leg is the slate, so a %s named %s is built to clock it — measured at "+
-				"0.6-2.4%% of one core, and it feeds nothing but a fakesink",
-				opts.AudioCaptureID, videoCaptureFactory, nameVideoCaptureClock)
-		}
-	}
-
-	// The conform target is resolved HERE and nowhere else, so that the string
-	// handed to gst_parse_launch and the string written to the log are the same
-	// decision. resolve never fails — a format that cannot be used falls back
-	// to 1920x1080p50 and says why, because no property of a still slate is
-	// worth refusing to carry commentary for. See FallbackConformTarget.
-	conform, fallbackReason := opts.ConformTo.resolve()
-	if fallbackReason != "" {
-		// A fault, and one worth a whole line: somebody supplied a target and
-		// it was not usable, so the leg is about to be built to a raster nobody
-		// chose. M2L-X only accepts a source in its own configured format.
-		log.Printf("gst: Start: conform target %v is unusable (%s); falling back to %v. "+
-			"If this instance is not configured for %v the video leg will be refused",
-			opts.ConformTo, fallbackReason, conform, conform)
-	} else {
-		log.Printf("gst: Start: conforming the video leg to %v", conform)
-	}
-
-	// The levels callback is published BEFORE anything GStreamer is built. The
-	// level element starts posting the moment the pipeline reaches PLAYING,
-	// which happens further down while p.mu is still held — so onBusMessage,
-	// on a streaming thread that must not take p.mu, may read this field while
-	// Start is still executing. Storing it first, through an atomic, is what
-	// makes that read safe; see the field comment.
-	if opts.OnLevels != nil {
-		cb := opts.OnLevels
-		p.onLevels.Store(&cb)
-	}
-	// The per-channel picker's callback, published here for exactly the same
-	// reason and with one extra consequence. chlevel is the meter the operator
-	// stares at while deciding whether the mapping screen is working at all, so
-	// frames dropped because the callback was stored a moment too late do not
-	// read as a slow start — they read as a dead meter, and the operator goes
-	// looking for the fault somewhere else.
-	if opts.OnChannelLevels != nil {
-		cb := opts.OnChannelLevels
-		p.onChannelLevels.Store(&cb)
-	}
-
+	// The retry-without-preview that used to wrap the build has gone for the same
+	// reason and it is worth naming, because it was load-bearing: a preview sink
+	// that EXISTS and then will not START fails inside the NULL to PLAYING
+	// transition, which is a state change and not a bus error, so the sparing that
+	// protects the confidence monitor everywhere else cannot see it and the only
+	// answer is to build again without it. That answer now lives in the capture
+	// build, where the preview branch is. A send pipeline has no optional branch to
+	// drop, so a second attempt here could only fail the same way twice.
 	encoderName, err := selectH264Encoder()
 	if err != nil {
 		return err
 	}
 	p.encoderName = encoderName
 
-	// THE CONFIDENCE MONITOR, decided here and nowhere else, before anything is
-	// built. preview.go carries the whole argument. Two things about this call
-	// site are load-bearing: the preview is a STRING appended to the parse
-	// description and never an element added to a running graph — set_state(NULL)
-	// on such a branch inside a blocking pad probe took the on-air leg from 50 fps
-	// to 0 PERMANENTLY with the pipeline still reporting PLAYING — and
-	// opts.VideoCaptureID is passed so that a preview can never be rendered
-	// against a tee the slate leg does not build, which would be a
-	// gst_parse_launch failure of this whole pipeline rather than a missing
-	// preview.
-	//
-	// It is resolved ONCE, here, rather than inside the build below, because the
-	// build below may run twice: resolving it there would ask the registry for a
-	// sink a second time and log the branch a second time for a pipeline that is
-	// deliberately not getting one.
-	preview := previewBranchFor(opts.Preview, opts.VideoCaptureID)
-
-	if err := p.startBuiltLocked(opts, conform, encoderName, preview); err != nil {
-		if preview == "" {
-			return err
-		}
-		// THE CONFIDENCE MONITOR IS OPTIONAL AND THE COMMENTARY IS NOT.
-		//
-		// Every OTHER way the preview can fail is spared: a bus error from one of
-		// its elements is classPreview and never reaches the gate or Errors(). A
-		// sink that will not come up at all is the one that is not, because it
-		// fails as a STATE CHANGE and the bus filter is not consulted. Building
-		// once more without the branch can only turn a failure into a success,
-		// and the alternative is a seat that will not go on air because of a
-		// window.
-		//
-		// abort() has already taken the pipeline to NULL and dropped every
-		// element reference, so the second attempt starts where the first did.
-		// p.fatal is the one thing that survives, and that is correct: nothing a
-		// preview element posts can latch it (classPreview never calls markFatal),
-		// so a latched fatal means the first attempt failed for a reason the
-		// second will fail for too — and it will say so, in the same words.
-		//
-		// WHAT IT COSTS when the fault is NOT the preview's: one more NULL to
-		// PLAYING, so a seat that cannot start at all takes up to
-		// pipelineStartTimeout longer to say so. That is paid only by a seat that
-		// has both chosen a camera and ticked the monitor, and only when it is
-		// already failing.
-		log.Printf("gst: Start: the pipeline would not start with the confidence monitor in it "+
-			"(%v); rebuilding WITHOUT it. The commentary is the product and the preview is not", err)
-		return p.startBuiltLocked(opts, conform, encoderName, "")
-	}
-	return nil
+	return p.startBuiltLocked(opts, encoderName)
 }
 
-// startBuiltLocked builds the pipeline, points every element at what it is to
-// open, and takes it to PLAYING. p.mu must be held; Start is its only caller.
+// startBuiltLocked claims and arms the seam, builds the send pipeline, binds both
+// proxysrcs and takes it to PLAYING. p.mu must be held; Start is its only caller.
 //
-// # Why it is a function of its own, and why it may be called twice
+// # It is a function of its own, and it is now called ONCE
 //
-// It is the whole of Start below the option checks, extracted for exactly one
-// reason: a preview sink that EXISTS and then will not START — no GL context, no
-// D3D11 device, a display that has gone away — fails inside the NULL to PLAYING
-// transition. That is a state change and not a bus error, so capturefault.go's
-// classifier never sees it and none of the sparing that protects the preview
-// everywhere else applies. The only answer available at that point is to build
-// the pipeline again without it, which needs the build to be callable twice.
+// It used to be callable twice, for the confidence monitor: a preview sink that
+// would not start failed inside the state change, and the only recovery was to
+// build again without the branch. The preview is upstream of the seam now, so
+// there is no optional element in this graph and nothing to rebuild without. It
+// stays a separate function because the ORDER inside it is the thing under guard
+// and reading it beside Start's option checks is how that guard is written — see
+// startSequence in gst_stub_test.go.
 //
-// It is safe to call twice because every path out of it that is not success goes
-// through abort(), which runs teardownLocked: the pipeline reaches NULL, the
-// capture device and the card are released, every element reference is dropped
-// and matrixWidth goes back to zero. The second call therefore starts from the
-// same state the first one did, with two deliberate exceptions — p.fatal, which
-// is latched and must survive so that a real fault fails the retry too, and the
-// process-lifetime base time, which is sampled once and reused forever.
+// # THE ORDER IS THE WHOLE CORRECTNESS OF THE SEAM
 //
-// THE ORDER OF WHAT IT DOES IS LOAD-BEARING THROUGHOUT and is guarded from Gate
-// A by source-reading tests in gst_stub_test.go, which read this function and
-// Start together as one sequence — see startSequence there. Nothing in here may
-// be reordered on the strength of it reading better.
-func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
-	encoderName, preview string) error {
-	desc := pipelineDescription(encoderName, opts.AudioBitrateBps, conform,
-		opts.VideoCaptureID, opts.AudioCaptureID, preview)
-	log.Printf("gst: gst_parse_launch:\n%s", desc)
-
-	element, err := gogst.ParseLaunch(desc)
-	if err != nil {
-		return fmt.Errorf("gst: gst_parse_launch failed: %w", err)
-	}
-	if element == nil {
-		return errors.New("gst: gst_parse_launch returned nil with no error")
-	}
-	pipeline, ok := element.(gogst.Pipeline)
-	if !ok {
-		return fmt.Errorf("gst: gst_parse_launch returned a %T, not a GstPipeline", element)
-	}
-	p.pipeline = pipeline
-
-	// From here on a failure must tear down what has been built, or the WASAPI
-	// endpoint stays open and the next Start cannot have it.
+//  1. NewSend — claim, then ARM, BEFORE the parse. gstproxysink.c resets
+//     sent_stream_start / sent_caps only on READY->PAUSED, so without the arming
+//     every session after the first receives no STREAM_START, no CAPS and no
+//     SEGMENT: measured 1133076 bytes on cycle 1 and ZERO on cycles 2 and 3, with
+//     SRT connected and the lamp green.
+//  2. parse.
+//  3. Bind — after the arming and BEFORE the pipeline leaves NULL. Binding first
+//     would attach a consumer to a proxysink whose sticky events have not been
+//     reset, which is the whole hazard; binding after PLAYING would attach it to a
+//     pipeline that has already decided it has no upstream.
+//  4. the gate, the probes, the bus handler, the clock and the base time, exactly
+//     as they were — all four are downstream of the seam and never saw a capture
+//     element even when this pipeline had one.
+//  5. attachLiveWatch BEFORE PLAYING (a probe added afterwards misses the buffers
+//     the gate below is looking for), PLAYING, then the liveness gate, then the
+//     poller.
+//
+// Nothing in here may be reordered on the strength of it reading better.
+func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error {
+	// From here on a failure must tear down what has been taken, or the seam stays
+	// claimed and the next START is refused with ErrSeamBusy over a session that
+	// does not exist. teardownLocked releases it, takes the pipeline to NULL and is
+	// safe on a partially built one, which is how every path below unwinds.
 	abort := func(err error) error {
 		p.teardownLocked()
 		return err
 	}
 
-	// THE VIDEO LEG'S SOURCE. Exactly one of the two branches below is built,
-	// decided by the same condition pipelineDescription used, so the element
-	// looked up is always the element the string put there.
+	// THE CLAIM AND THE ARMING, BEFORE THE PARSE. NewSend does both: it refuses
+	// with ErrSeamBusy if either proxysink already has a consumer — a second
+	// proxysrc on a live proxysink SILENTLY STEALS THE STREAM AND KILLS THE FIRST,
+	// measured, A dead at 5.994 s the instant B attached at 6.007 s — and then
+	// runs the READY cycle that restores the sticky events.
 	//
-	// The slate path and the device ids are set with g_object_set rather than
-	// placed in the parse string. gst_parse_launch's quoting rules treat a
-	// backslash as an escape inside double quotes, so a Windows path would be
-	// mangled, and the endpoint GUID's braces and dots are similarly at the
-	// mercy of the parser. Neither value ever reaches the parser.
-	if opts.VideoCaptureID == "" {
-		slate := pipeline.GetByName(nameSlateSrc)
-		if slate == nil {
-			return abort(errors.New("gst: parsed pipeline has no element named " + nameSlateSrc))
-		}
-		if err := setStringProperty(slate, "location", opts.SlatePath); err != nil {
-			return abort(err)
-		}
+	// It is here rather than at STOP because STOP has abnormal paths through which
+	// it could be skipped and START has none, and because at this instant no send
+	// pipeline exists, so it cannot race a reconnect.
+	seam, err := NewSend(p.set)
+	if err != nil {
+		return err
+	}
+	p.seam = seam
 
-		// THE CLOCK COMPANION, on the one configuration that has one: the
-		// picture is a still and the commentary comes off the card. It is
-		// pointed at the card by the SAME configureDeckLinkSource the other two
-		// decklink elements go through, because it must open the SAME CARD as
-		// the audio source — a companion on a different card would clock
-		// nothing and the audio would never preroll.
-		//
-		// It sits inside this branch rather than beside it because the condition
-		// is exactly the condition pipelineDescription used, so the element
-		// looked up is always the element the string put there.
-		if opts.AudioCaptureID != "" {
-			clock := pipeline.GetByName(nameVideoCaptureClock)
-			if clock == nil {
-				return abort(errors.New("gst: parsed pipeline has no element named " +
-					nameVideoCaptureClock + ", so there is nothing to clock the DeckLink " +
-					"commentary capture and it would never produce a buffer"))
-			}
-			if err := configureDeckLinkSource(clock, opts.AudioCaptureID); err != nil {
-				return abort(err)
-			}
-		}
-	} else {
-		vsrc := pipeline.GetByName(nameVideoCaptureSrc)
-		if vsrc == nil {
-			return abort(errors.New("gst: parsed pipeline has no element named " + nameVideoCaptureSrc))
-		}
-		// The SAME function the audio source goes through, on purpose. One saved
-		// persistent-id serves both entries the card publishes, and routing both
-		// kinds of decklink element through one setter is what stops the two
-		// growing different rules about the identical string. Note what is NOT
-		// called anywhere near here: nothing sets `connection`. See
-		// pipelineDescription.
-		if err := configureDeckLinkSource(vsrc, opts.VideoCaptureID); err != nil {
-			return abort(err)
-		}
-	}
+	desc := sendDescription(encoderName, opts.AudioBitrateBps)
+	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
-	// add-borders is set here rather than in the parse string because
-	// gst_parse_launch treats an unknown property as a hard error, and a
-	// commentary position that will not start because a scaler property was
-	// renamed is a worse outcome than a picture scaled at the element's default.
-	// The value pins the behaviour for a source whose aspect ratio is not the
-	// conform target's: letterbox it rather than stretch it. videoscale's own
-	// default is already true, so this is a guard against the default changing,
-	// not a change.
-	//
-	// It applies to WHICHEVER leg was built, and the name is chosen from the
-	// same condition rather than by trying both: a lookup that misses is logged
-	// as a defect below, and a message saying the slate's scaler is missing on a
-	// pipeline that was never asked to build one is a false alarm in the one
-	// file somebody reads when a feed looks wrong. On the capture leg it matters
-	// for a reason the slate never had — a 16:9 camera into a 4:3 switcher
-	// configuration is a real facility, and stretching faces is the kind of
-	// fault nobody reports as a fault.
-	scaleName := nameVideoScale
-	if opts.VideoCaptureID != "" {
-		scaleName = nameVideoCapScale
+	element, err := gogst.ParseLaunch(desc)
+	if err != nil {
+		return abort(fmt.Errorf("gst: gst_parse_launch failed: %w", err))
 	}
-	if vscale := pipeline.GetByName(scaleName); vscale != nil {
-		if hasProperty(vscale, "add-borders") {
-			vscale.SetObjectProperty("add-borders", true)
-		} else {
-			log.Printf("gst: %s has no add-borders property; a picture that is not the conform "+
-				"target's aspect ratio will be stretched", scaleName)
-		}
-	} else {
-		log.Printf("gst: parsed pipeline has no element named %s; a picture that is not exactly "+
-			"%dx%d will fail caps negotiation", scaleName, conform.Width, conform.Height)
+	if element == nil {
+		return abort(errors.New("gst: gst_parse_launch returned nil with no error"))
 	}
+	pipeline, ok := element.(gogst.Pipeline)
+	if !ok {
+		return abort(fmt.Errorf("gst: gst_parse_launch returned a %T, not a GstPipeline", element))
+	}
+	p.pipeline = pipeline
 
-	asrc := pipeline.GetByName(nameAudioSrc)
-	if asrc == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioSrc))
-	}
-	// The id is logged VERBATIM immediately before it is handed to the capture
-	// source, and this line stays wherever the port goes.
-	//
-	// On Windows wasapi2src echoes the requested id verbatim in its
-	// asynchronous error 1551 (proved by probe — no substitution, no default
-	// fallback), so a "Failed to open device {...}" later is matched to what
-	// was actually requested rather than argued about. On macOS the id is a
-	// CoreAudio unique-id that has to be resolved to an integer before
-	// osxaudiosrc will accept it, and this line is what says which id the
-	// resolution was asked to find. In both cases it is the only record of the
-	// value that came out of config.json.
-	if opts.AudioCaptureID != "" {
-		// THE CARD. The same setter the video source and the clock companion go
-		// through, on purpose: the card publishes ONE persistent-id for its audio
-		// and video entries alike, and routing every decklink element through one
-		// function is what stops three of them growing different rules about the
-		// identical saved string. Note what is NOT called anywhere near here:
-		// nothing sets `connection`. See pipelineDescription.
-		if err := configureDeckLinkSource(asrc, opts.AudioCaptureID); err != nil {
-			return abort(err)
-		}
-	} else {
-		log.Printf("gst: Start: %s capture device id: %s", captureSourceFactory, opts.AudioDeviceID)
-		// Everything below the log line about WHICH element gets WHAT is platform
-		// knowledge and lives in deviceprovider_windows.go / deviceprovider_darwin.go:
-		// the two platforms do not even agree on the TYPE of the device property.
-		// See the darwin file — this is the single most important structural
-		// difference in the port.
-		if err := configureCaptureSource(asrc, opts.AudioDeviceID); err != nil {
-			return abort(err)
-		}
-	}
-
-	// The channel map, and it has to happen HERE — after the capture source has
-	// been pointed at a device and BEFORE the pipeline leaves NULL.
-	//
-	// Not earlier, because the source's pad cannot say what it will produce
-	// until it knows which device it is. Not later, because a matrix is not a
-	// gain applied to a running stream, it is a NEGOTIATION CONSTRAINT:
-	// audioconvert cannot map sixteen unpositioned channels to stereo without
-	// one, so a pipeline that reaches PLAYING first never reaches it at all.
-	// Measured — decklinkaudiosrc channels=16 into this chain with no matrix
-	// dies 0.069 s after PLAYING with "streaming stopped, reason
-	// not-negotiated (-4)", and written without the resampler in between it
-	// does not even parse.
-	p.aconv = pipeline.GetByName(nameAudioConv)
-	if p.aconv == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameAudioConv))
-	}
-	p.aconvSinkPad = p.aconv.GetStaticPad("sink")
-	if p.aconvSinkPad == nil {
-		return abort(errors.New("gst: " + nameAudioConv + " has no sink pad"))
-	}
-	if err := p.applyStartChannelMapLocked(asrc, opts.ChannelMap); err != nil {
+	// THE SEAM ITSELF: vproxsrc and aproxsrc are handed the proxysink POINTERS.
+	// They cannot be named in the parse string — measured, `proxysrc proxysink=ps`
+	// fails with `could not set property "proxysink" in element "proxysrc" to
+	// "ps"`, because the property is object-typed — so this is the only place the
+	// two halves of the graph are joined, and a Bind that silently did nothing
+	// would leave this pipeline attached to NOTHING, which at the pipeline level is
+	// indistinguishable from a healthy one right up to the moment the switcher
+	// hears silence.
+	if err := p.seam.Bind(pipeline); err != nil {
 		return abort(err)
 	}
-
-	// THE COUGH MUTE, resolved and applied while the pipeline is STILL IN NULL.
-	//
-	// The order matters in one direction only, and it is this one: a pipeline
-	// asked to start muted must be muted before it can produce a buffer. Doing
-	// it after PLAYING would put however many milliseconds of live commentary on
-	// air, which for the one case this option exists for — rebuilding a session
-	// that was muted when it died — is the exact failure it is meant to prevent.
-	//
-	// A missing element ABORTS, and that is a deliberate departure from the way
-	// armChannelMeterLocked survives a missing chlevel. A meter that does not
-	// move is a diagnosis problem; a cough button that does nothing is a
-	// commentator who believes they are off air and is not. There is no safe way
-	// to carry a feed whose mute control is absent, so the pipeline refuses to
-	// start and says which element it could not find.
-	p.cough = pipeline.GetByName(nameCoughMute)
-	if p.cough == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameCoughMute +
-			", so there is no cough mute on this feed and the buttons that drive it would do " +
-			"nothing while reporting success"))
-	}
-	if err := p.applyCoughMuteLocked(opts.MuteCommentary); err != nil {
-		return abort(err)
-	}
-
-	// ARM THE PICKER METER, and only now, because the condition is what
-	// applyStartChannelMapLocked just decided. chlevel is built with
-	// post-messages=false (see pipelineDescription) so that a seat with a
-	// positioned capture source — every microphone, every Dante endpoint, the
-	// whole of the on-air Windows path — posts not one per-channel frame for the
-	// length of a match. A matrix having been written is exactly the statement
-	// "this source presents channels nobody has positioned", which is the only
-	// case in which sixteen bars mean anything that the two on the programme
-	// meter do not already say.
-	//
-	// A nil callback disarms it just as firmly: frames posted for a consumer that
-	// does not exist are cost with no reader, and the element's own property is a
-	// cheaper way to not have them than a nil check on a streaming thread.
-	p.armChannelMeterLocked(pipeline, p.matrixWidth > 0 && opts.OnChannelLevels != nil)
 
 	p.encoder = pipeline.GetByName(nameVideoEncod)
 	if p.encoder == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameVideoEncod))
+		return abort(errNoElement(nameVideoEncod, "there is nothing to encode the picture with"))
 	}
 	applyEncoderProperties(p.encoder, encoderName, opts.VideoBitrateKbps)
-
-	// The preview sink's surface, and the properties that could not safely go in
-	// the parse string. It MUST happen before the pipeline leaves NULL: a
-	// GstVideoOverlay with no window handle makes its OWN top-level window, with
-	// a title bar and a close button, over the commentator's screen.
-	//
-	// It does nothing at all when there is no preview branch. Every error it can
-	// return means the parsed graph is not the one this package just asked for,
-	// so it aborts — and the rebuild in Start is what stops that costing the
-	// commentary anything.
-	if err := attachPreview(pipeline, opts.Preview, preview); err != nil {
-		return abort(err)
-	}
 
 	p.srtq = pipeline.GetByName(nameSRTQueue)
 	if p.srtq == nil {
@@ -2010,7 +1677,11 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	p.busSilenced.Store(false)
 	p.bus.SetSyncHandler(p.onBusMessage)
 
-	// Specification section 6.1, in exactly this order. Every line matters.
+	// Specification section 6.1, in exactly this order. Every line matters, and
+	// gstproxysrc.c:51-67 states the same three as a requirement of the element
+	// itself: a proxysrc emits the PRODUCER'S running time, not a rebased zero, so
+	// a send pipeline whose clock or base time disagreed with the capture it draws
+	// from would be timestamping an hour-old stream against its own fresh zero.
 	p.clock = gogst.SystemClockObtain()
 	if p.clock == nil {
 		return abort(errors.New("gst: gst_system_clock_obtain returned nil"))
@@ -2033,158 +1704,153 @@ func (p *cgoPipeline) startBuiltLocked(opts PipelineOpts, conform ConformTarget,
 	base := savedBase
 	savedBaseMu.Unlock()
 
-	// The same value on every rebuild, forever.
+	// The same value on every rebuild, forever. It is the SAME value the capture
+	// pipelines were given, sampled once for the process, which is what makes a
+	// send pipeline built an hour into a capture start its output at zero rather
+	// than an hour in — measured either way, mpegtsmux normalised TS first PTS to
+	// 0.000000 on every cycle at every join offset, so this is belt-and-braces
+	// rather than the thing correctness rests on.
 	pipeline.SetBaseTime(base)
 
 	// Do NOT set start-time-selection=first on mpegtsmux. That reproduces the
 	// measured bug: audio DTS jumping backwards by exactly the previous run's
 	// uptime, 1,523 non-monotonic errors downstream, every indicator green.
 
-	stopWatchdog := stateChangeWatchdog("pipeline NULL to PLAYING (opening the capture endpoint " +
+	// THE MUXER WATCHDOG'S PROBES, ATTACHED BEFORE PLAYING AND NOT AFTER. The
+	// poller is started further down, once there is a PLAYING moment to measure
+	// silence from; the probes have to be in place first or the buffers the
+	// liveness gate is waiting for cross the pads unseen and a healthy seam is
+	// refused. livewatch.go carries the argument and the numbers.
+	p.live, err = attachLiveWatch(pipeline)
+	if err != nil {
+		return abort(err)
+	}
+
+	stopWatchdog := stateChangeWatchdog("send pipeline NULL to PLAYING (binding the capture seam " +
 		"and initialising the encoders)")
 	ret := pipeline.BlockSetState(gogst.StatePlaying, gogst.ClockTime(pipelineStartTimeout))
 	stopWatchdog()
 	if !stateChangeOK(ret) {
 		err := fmt.Errorf("gst: pipeline would not go to PLAYING (%s)", ret)
 
-		// THE THREE RUNGS BELOW EXIST SO THAT A CARD FAILURE IS NAMED HERE,
-		// rather than reaching the operator as "not-negotiated (-4)" twenty
-		// seconds after START with a commentator waiting.
-		//
-		// MEASURED: DeckLink contention produces "Internal data stream error /
-		// not-negotiated (-4)" in about 100 microseconds, and it names neither
-		// the device nor the cause. At the GStreamer level that message is
-		// identical for a card another application is holding, a card that has
-		// been unplugged and a card with nothing on its input — three problems
-		// with three completely different fixes. capturefault.go tells them
-		// apart from the card's own evidence, and this is the path that was not
-		// yet using it.
-		// A bus error arrived during the transition and onBusMessage has ALREADY
-		// diagnosed it — classAudioCapture goes through captureFatalError, and
-		// on a DeckLink seat a video-element error is upgraded to that class
-		// because the commentary is clocked by it. So the named sentence already
-		// exists. %v and not %w deliberately: this is a Start failure the caller
-		// handles by not starting, and putting ErrPipelineFatal at the head of
-		// it would tell internal/sender it had a running pipeline whose chain
+		// A bus error arrived during the transition and onBusMessage has already
+		// latched it. %v and not %w deliberately: this is a Start failure the
+		// caller handles by not starting, and putting ErrPipelineFatal at the head
+		// of it would tell internal/sender it had a running pipeline whose chain
 		// had died.
-		fatal := p.fatalError()
-		busErr := p.drainStartupError()
-		switch {
-		case fatal != nil:
+		//
+		// THE THREE CARD RUNGS THAT USED TO BE HERE ARE NOT LOST. Contention,
+		// an unplugged card and a card with nothing on its input all produce the
+		// same generic "not-negotiated (-4)" in about 100 microseconds, and
+		// capturefault.go tells them apart from the card's own evidence — on the
+		// pipeline that HAS the card. There is no decklink element in this graph to
+		// interrogate, and asking one that is not here would have reported "no
+		// signal" for a broken encoder.
+		if fatal := p.fatalError(); fatal != nil {
 			err = fmt.Errorf("%w: %v", err, fatal)
-		case busErr != nil:
+		} else if busErr := p.drainStartupError(); busErr != nil {
 			// Kept exactly as it was: a Start that loses an asynchronous error
 			// entirely is worse than one that reports it undiagnosed.
 			err = fmt.Errorf("%w: %v", err, busErr)
-		case opts.AudioCaptureID != "" || opts.VideoCaptureID != "":
-			// The state change failed with nothing on the bus at all, and a card
-			// is in this graph. The evidence is still there to be read — the
-			// card's own signal property above all — so the diagnosis runs here
-			// too. It degrades to naming the three things to check, in order,
-			// which is what an operator can act on and "(failure)" is not.
-			err = fmt.Errorf("%w: %v", err, captureFatalError(asrc, nameAudioSrc, err))
 		}
 		return abort(err)
 	}
+	playingAt := time.Now()
 
-	// BlockSetState reporting success is NOT proof the capture chain is
-	// healthy. wasapi2src opens its endpoint on its own thread and posts
-	// failure asynchronously — error 1551 for a device it cannot open — so
-	// NULL→PLAYING can return success while onBusMessage has already latched a
-	// pipeline-fatal error. Without this re-check Start reports a running
-	// pipeline whose capture chain is dead, and the caller connects a sink
-	// that will never carry media. ReplaceSink double-checks fatal before
-	// promising success for exactly the same reason; this mirrors it.
-	//
-	// osxaudiosrc opens its device inside the state change rather than on its
-	// own thread, so on macOS the failure is more likely to come back through
-	// BlockSetState above. The re-check costs nothing and covers both.
+	// BlockSetState reporting success is NOT proof the chain is healthy: an
+	// element can post failure asynchronously while the state change returns
+	// success. ReplaceSink double-checks fatal before promising success for
+	// exactly the same reason; this mirrors it.
 	if err := p.fatalError(); err != nil {
 		return abort(err)
 	}
 
-	// CONFIRM THE MATRIX AGAINST WHAT THE PAD REALLY NEGOTIATED.
+	// THE LIVENESS GATE, and it is the reason a missed arming is loud instead of
+	// green. Everything above this line can succeed over a seam carrying nothing:
+	// proxysink returns GST_FLOW_OK unconditionally, so an unarmed or unbound
+	// consumer reaches PLAYING, SRT connects and the switcher receives silence.
+	// This is the one check that asks whether media actually arrived.
 	//
-	// The width the matrix was built for came from a caps QUERY, made before
-	// the pipeline left NULL and therefore before negotiation had happened. The
-	// number below comes from the pad's CURRENT CAPS, which is negotiation's
-	// own answer. They are the same number on every device measured, and the
-	// point of asking twice is that a disagreement is otherwise undiagnosable:
-	// a matrix of the wrong width does not produce a degraded feed, it produces
-	// "streaming stopped, reason error (-5)" out of the capture source, which
-	// reads as a broken card rather than as a bad matrix.
-	//
-	// A ZERO here is NOT a failure and must not be treated as one. The capture
-	// source is live; BlockSetState returns NO_PREROLL as soon as the state
-	// change completes, which can be before the first CAPS event has travelled
-	// downstream, so "the pad has not settled yet" is an ordinary race and not
-	// a fault. It is logged and nothing more; InputChannels() re-reads the pad
-	// on every call and will have the answer by the time any UI asks.
-	if p.matrixWidth > 0 {
-		switch got := p.negotiatedInputChannelsLocked(); {
-		case got == 0:
-			log.Printf("gst: Start: the %s matrix was written for %d input channels; the pad has "+
-				"not published its negotiated caps yet, so the width is confirmed on the first "+
-				"InputChannels call rather than here", nameAudioConv, p.matrixWidth)
-		case got != p.matrixWidth:
-			return abort(fmt.Errorf("gst: the %s mix-matrix was built for %d input channels and "+
-				"%s:sink negotiated %d. A matrix of the wrong width does not attenuate or misroute, "+
-				"it stops the capture chain with a flow error naming the source rather than the "+
-				"matrix, so this is refused here while it can still be read as what it is",
-				nameAudioConv, p.matrixWidth, nameAudioConv, got))
-		default:
-			log.Printf("gst: Start: %s:sink negotiated %d input channels, matching the matrix",
-				nameAudioConv, got)
-		}
+	// It holds p.mu for as long as it waits, which is by construction the only
+	// lock discipline available — Start holds it across the state change above and
+	// the caller is required to keep Start off the message loop for that reason
+	// alone. A healthy seam beats the budget by two orders of magnitude: measured
+	// 20-60 ms to the first buffer against a 2 s grace, on both rigs.
+	if err := p.awaitFirstMediaLocked(); err != nil {
+		return abort(err)
 	}
 
-	// THE VIDEO SIGNAL WATCHDOG, and it is the last thing Start does before
-	// returning nil so that no abort() path above can leak its goroutine.
-	//
-	// signalwatch.go has the measurements. The short version is that a DeckLink
-	// which loses its input keeps emitting black frames at full rate forever — no
-	// error, no EOS, the muxer never starves — so every other indicator in this
-	// application goes on saying the feed is healthy, and the bus warning that
-	// would say otherwise is edge-triggered and routed to logWarnings. Polling
-	// the element's own "signal" property is the only reading that tracks it.
-	//
-	// ONE PROPERTY READ DECIDES WHETHER TO WATCH AT ALL, and that read doubles as
-	// the debouncer's seed. triUnknown — no element with a signal property, which
-	// is every native capture and the slate-only video leg shipping today — means
-	// no goroutine, no ticker and nothing paid for the life of the pipeline.
-	//
-	// BOTH NAMES NOW EXIST IN pipelineDescription, which is what makes this
-	// live: vcapsrc when the video leg is the card, and vcapclock when the
-	// picture is the slate and the element is there only to clock a DeckLink
-	// COMMENTARY. On a seat with neither — every native microphone with a slate,
-	// which is the whole of the on-air Windows path — both lookups return nil,
-	// signalWatchWanted is never even asked, and this costs one nil check.
-	//
-	// The clock companion case is the one where this watchdog earns the most.
-	// There the card's lock is not a property of the PICTURE at all: a DeckLink
-	// drives audio capture off the video clock, so losing signal means losing the
-	// COMMENTARY, silently, with the muxer still fed and the sender still
-	// CONNECTED. Watching vcapclock is the only reading in this process that can
-	// say so, and it is why videoCaptureElement looks for it by name.
-	if vsrc := videoCaptureElement(pipeline); vsrc != nil {
-		probe := boolPropertyTriState(vsrc, propSignal)
-		if signalWatchWanted(opts.OnSignal, probe) {
-			watched := nameVideoCaptureSrc
-			if opts.VideoCaptureID == "" {
-				watched = nameVideoCaptureClock
-			}
-			p.sigWatch = startSignalWatch(probe,
-				func() triState { return boolPropertyTriState(vsrc, propSignal) },
-				opts.OnSignal)
-			log.Printf("gst: Start: watching %s for input lock every %v; the card's own signal "+
-				"property is the only thing in this process that can tell", watched,
-				signalPollInterval)
-		}
-	}
+	// And only now the poller, which watches for the feed going quiet LATER.
+	// Starting it before the gate would have both mechanisms measuring the same
+	// silence at once, and the poller's verdict — which latches fatal and calls
+	// back into this object — would be racing a Start that is still deciding
+	// whether there was ever a feed at all.
+	p.live.run(playingAt, p.onFeedWentSilent)
 
 	p.started = true
-	log.Printf("gst: pipeline PLAYING with no sink; base time %d ns, encoder %s", uint64(base), encoderName)
+	log.Printf("gst: send pipeline PLAYING with no sink; base time %d ns, encoder %s, seam %v",
+		uint64(base), encoderName, captureSetSeamNames(p.set))
 	return nil
+}
+
+// awaitFirstMediaLocked waits until every watched pad has seen a buffer, or
+// liveWatchStartGrace has passed, and returns the verdict. p.mu is held.
+//
+// It polls rather than signalling from the probe because the probe is on a
+// GStreamer streaming thread on the on-air path, and the whole of livewatch_cgo.go
+// is arranged so that thread does two stores and returns. A condition variable
+// there would put a Go scheduler wake-up inside the muxer's push.
+func (p *cgoPipeline) awaitFirstMediaLocked() error {
+	deadline := time.Now().Add(liveWatchStartGrace)
+	for {
+		verdict := liveWatchStartVerdict(p.live.samples(), liveWatchStartGrace)
+		if verdict == nil {
+			return nil
+		}
+		// A LATCHED FAULT ENDS THE WAIT AT ONCE, AND IT IS THE BETTER MESSAGE.
+		// The commonest cause of no media is an unarmed VIDEO seam, and that also
+		// posts "negotiation problem" naming venc at about +16 ms, which
+		// classifyBusError already treats as fatal — two orders of magnitude
+		// quicker than this budget, and it names the element rather than the pad.
+		// Waiting the full grace to report "nothing reached vq:src" over an error
+		// that already said why would be a slower start and a worse sentence.
+		if err := p.fatalError(); err != nil {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return verdict
+		}
+		time.Sleep(liveWatchStartPoll)
+	}
+}
+
+// onFeedWentSilent is the muxer watchdog's verdict handler. It runs on the
+// poller's own goroutine, which is an ordinary Go goroutine and not a streaming
+// thread, so it may log.
+//
+// It latches the fault and closes the gate, then puts the error on Errors().
+// Errors() rather than a channel of its own is deliberate and is the least bad of
+// the two available answers: internal/sender reads any error arriving while
+// CONNECTED as the peer going away, so it will spend one DRAINING/BACKOFF cycle
+// before its next ReplaceSink returns the latched fatal and it stops with the
+// reason. That costs about seven seconds of amber over a feed that is ALREADY
+// dead. The alternative — latching quietly — is a green SENDING lamp over silence
+// for the rest of the match, which is the exact failure this watchdog exists for.
+func (p *cgoPipeline) onFeedWentSilent(err error) {
+	log.Printf("gst: %v", err)
+	p.markFatal(err)
+	p.gateClosed.Store(true)
+	p.deliver(err)
+}
+
+// captureSetSeamNames renders the proxysinks a send pipeline is bound to, for the
+// one log line that says which capture the feed is coming from.
+func captureSetSeamNames(set CaptureSet) []string {
+	var names []string
+	for _, c := range set.Pipelines() {
+		names = append(names, c.ProxySinks()...)
+	}
+	return names
 }
 
 // videoCaptureElement finds the element the signal watchdog polls: the video
@@ -2202,145 +1868,6 @@ func videoCaptureElement(pipeline gogst.Pipeline) gogst.Element {
 	if el := pipeline.GetByName(nameVideoCaptureClock); el != nil {
 		return el
 	}
-	return nil
-}
-
-// armChannelMeterLocked turns the per-channel picker meter's messages on or off
-// on a pipeline that may already be PLAYING. p.mu is held.
-//
-// post-messages is a plain gboolean on the level element and is LIVE-SETTABLE:
-// measured on a PLAYING pipeline at 61 us, stopping that element's messages dead
-// — 0 in two seconds — while the other level element in the same pipeline
-// carried on at its own rate, undisturbed, with the pipeline still in PLAYING
-// and nothing renegotiated. That is what makes arming a decision this function
-// can take at Start and a later work package can take when a drawer opens,
-// rather than a decision baked into the parse string until the next restart.
-//
-// A missing element is LOGGED AND SURVIVED. The name is a literal in
-// pipelineDescription and a const here, and a source guard keeps them in step,
-// so a nil is not something a shipped build can produce — but the failure it
-// would cause is a meter that never moves with nothing anywhere saying why, and
-// that is exactly the failure worth one log line rather than a refusal to carry
-// commentary.
-func (p *cgoPipeline) armChannelMeterLocked(pipeline gogst.Pipeline, on bool) {
-	el := pipeline.GetByName(channelLevelElementName)
-	if el == nil {
-		log.Printf("gst: the pipeline has no element named %s, so the per-channel meters cannot be "+
-			"armed and the mapping screen's bars will never move", channelLevelElementName)
-		return
-	}
-	// The same hasProperty discipline applyEncoderProperties and the videoscale
-	// add-borders write keep, and for the same reason: a property write against
-	// an element that does not have it is a GLib CRITICAL on stderr, where no
-	// shipped build is looking, rather than an error anybody can act on.
-	if !hasProperty(el, propPostMessages) {
-		log.Printf("gst: %s has no %s property, so the per-channel meters cannot be armed or "+
-			"silenced", channelLevelElementName, propPostMessages)
-		return
-	}
-	el.SetObjectProperty(propPostMessages, on)
-	log.Printf("gst: per-channel metering %s (%s %s=%t)",
-		map[bool]string{true: "ON", false: "off"}[on],
-		channelLevelElementName, propPostMessages, on)
-}
-
-// applyStartChannelMapLocked decides whether this capture source needs a mix
-// matrix at all and, if it does, writes the first one. p.mu is held and the
-// pipeline is still in NULL.
-//
-// # The discriminator: can the source give this pipeline a stereo pair by itself?
-//
-// The question is asked of the SOURCE'S OWN PAD, by intersecting its caps with
-// the two-channel caps the rest of the audio leg needs. If the intersection is
-// non-empty the source can produce the pair unaided — which is every native
-// microphone, every Dante endpoint and the whole of the on-air Windows path —
-// and NOTHING IS WRITTEN. That silence is the most important property of this
-// function: a build with no capture card behaves exactly as it did before this
-// file's mechanism existed, byte for byte, because no property is set.
-//
-// If the intersection is empty the source cannot, and the only reason a capture
-// source cannot produce stereo is that its channels are UNPOSITIONED — sixteen
-// of them, channel-mask=0x0, which is what a DeckLink card presents and what
-// audioconvert has nothing to derive a downmix from.
-//
-// It is phrased as "what does this pipeline need, and can the source give it"
-// rather than as "is the channel mask zero" deliberately. The mask is the
-// CAUSE, but a mask test asks a question about a bitmask type this build's
-// bindings do not marshal, and answers it for a condition that could equally
-// arise another way. Intersecting caps is GStreamer's own way of asking whether
-// two ends can agree, it needs no new type support, and it stays correct for
-// any future source whose problem is not the mask.
-//
-// Measured on the port machine on 2026-08-16, every source this application can
-// meet, with the pipeline still in NULL:
-//
-//	source                        stereo unaided   fixed width
-//	decklinkaudiosrc channels=16       no               16
-//	decklinkaudiosrc channels=8        no                8
-//	decklinkaudiosrc channels=2        YES               2
-//	osxaudiosrc                        YES        (a range)
-//	audiotestsrc                       YES        (a range)
-//
-// The two columns say the whole design: exactly the sources that need a matrix
-// are refused a stereo pair, and exactly those publish a fixed width to size it
-// against. A source that can do stereo never reaches the width question at all,
-// which is why "a range" in the last column is not a problem to solve.
-//
-// # Why the width can be read before negotiation has happened
-//
-// The count comes from a caps QUERY on the source's own pad, and decklinkaudiosrc
-// answers it from its channels property without opening anything. That is not
-// the same as trusting the property: the pad is asked, the pad's answer is what
-// is used, and the number is CONFIRMED against gst_pad_get_current_caps once the
-// pipeline is PLAYING — see the end of Start, where a disagreement is a hard
-// failure. Asking earlier is unavoidable, because the matrix is a negotiation
-// constraint and negotiation is the thing it has to happen before.
-//
-// The one setting this cannot resolve is channels=max, which publishes a CHOICE
-// in NULL (2, or 8-or-16) and only fixes itself once the card has been opened.
-// fixedChannelCount refuses it by name rather than guessing, and the refusal
-// says to set the property explicitly. That is the right answer for this
-// application anyway: sixteen has to be the steady state, because the channels
-// property is not live-settable and reaching pairs 3/4 and up any other way
-// costs a pipeline restart.
-func (p *cgoPipeline) applyStartChannelMapLocked(asrc gogst.Element, m ChannelMap) error {
-	srcPad := asrc.GetStaticPad("src")
-	if srcPad == nil {
-		return errors.New("gst: " + nameAudioSrc + " has no src pad, so the channel layout it will " +
-			"produce cannot be read")
-	}
-
-	stereo := gogst.CapsFromString("audio/x-raw,channels=" + strconv.Itoa(ChannelMapOutputs))
-	if stereo == nil {
-		return errors.New("gst: gst_caps_from_string for the stereo probe caps returned nil")
-	}
-	// The source is named from its own FACTORY rather than from
-	// captureSourceFactory, and that is not pedantry: the whole point of this
-	// branch is that the capture source may be a decklink element rather than
-	// the platform's own, and a log line that says "osxaudiosrc presents
-	// sixteen channels" about a Blackmagic card sends the reader to the wrong
-	// half of the system.
-	factory := elementFactoryNameOf(asrc)
-
-	if direct := srcPad.QueryCaps(stereo); direct != nil && !direct.IsEmpty() {
-		log.Printf("gst: Start: %s can deliver the %d-channel pair this pipeline needs on its own; "+
-			"no %s is written and audioconvert maps the layout as it always has",
-			factory, ChannelMapOutputs, propMixMatrix)
-		return nil
-	}
-
-	width, err := fixedChannelCount(srcPad.QueryCaps(nil))
-	if err != nil {
-		return fmt.Errorf("gst: %s cannot produce %d channels and %w. Without a channel count there "+
-			"is no matrix to build, and without a matrix audioconvert has no way to map an "+
-			"unpositioned stream to stereo",
-			factory, ChannelMapOutputs, err)
-	}
-	if err := p.writeChannelMapLocked(m, width); err != nil {
-		return err
-	}
-	log.Printf("gst: Start: %s presents %d channels it will not position; %s set to route %s",
-		factory, width, propMixMatrix, m)
 	return nil
 }
 
@@ -2407,223 +1934,6 @@ func fixedChannelCount(caps *gogst.Caps) (int, error) {
 	return width, nil
 }
 
-// writeChannelMapLocked validates a map against a width and writes the matrix.
-// p.mu is held.
-//
-// VALIDATION HAPPENS FIRST AND NOTHING IS WRITTEN IF IT FAILS, because the
-// element's own rejection is invisible: an out-of-range coefficient makes
-// GObject log a CRITICAL to stderr and LEAVE THE PREVIOUS MATRIX IN FORCE, and
-// there is nothing readable afterwards that says which of the two is running.
-// ChannelGainLimit carries the measurement. Everything this function could get
-// wrong is therefore decided in channelmap.go, at Gate A, under -race.
-//
-// gst_util_set_object_arg rather than a typed setter: mix-matrix is a
-// GST_TYPE_ARRAY, which neither go-gst nor go-glib v0.0.2 binds, so the
-// property's own gst_value_deserialize is the only way in. mixMatrixArg renders
-// the string it parses. This is the same mechanism applyEncoderProperties uses
-// and for the same reason.
-func (p *cgoPipeline) writeChannelMapLocked(m ChannelMap, width int) error {
-	matrix, err := m.MixMatrix(width)
-	if err != nil {
-		return err
-	}
-	if !hasProperty(p.aconv, propMixMatrix) {
-		return fmt.Errorf("gst: this build's audioconvert has no %s property, so an unpositioned "+
-			"capture device cannot be mapped to stereo at all (GStreamer has had it since 1.16)",
-			propMixMatrix)
-	}
-	gogst.UtilSetObjectArg(p.aconv, propMixMatrix, mixMatrixArg(matrix))
-	p.matrixWidth = width
-	return nil
-}
-
-// negotiatedInputChannelsLocked reads the channel count from aconv's sink pad's
-// CURRENT caps — negotiation's own answer, not a query about what might happen.
-// It returns 0 when nothing has negotiated. p.mu is held.
-func (p *cgoPipeline) negotiatedInputChannelsLocked() int {
-	if p.aconvSinkPad == nil {
-		return 0
-	}
-	caps := p.aconvSinkPad.GetCurrentCaps()
-	if caps == nil || caps.GetSize() == 0 {
-		return 0
-	}
-	s := caps.GetStructure(0)
-	if s == nil {
-		return 0
-	}
-	n, ok := s.GetInt("channels")
-	if !ok || n <= 0 {
-		return 0
-	}
-	return int(n)
-}
-
-// InputChannels reports how many channels the capture pad has negotiated.
-//
-// It takes p.mu, which is the lock held across state changes and therefore for
-// seconds at a time during Start and ReplaceSink. That is deliberate rather
-// than an oversight: this method reads two fields that Start writes and
-// teardownLocked clears, and a caller who arrives during a state change has
-// nothing to be told anyway — there is no negotiated width until Start has
-// finished, and a Stop in progress is about to make the answer 0. Blocking
-// until the truth exists is better than answering from a cache that Start is
-// halfway through invalidating.
-func (p *cgoPipeline) InputChannels() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.stopped {
-		return 0
-	}
-	return p.negotiatedInputChannelsLocked()
-}
-
-// SetChannelMap rewrites the routing on a running pipeline.
-//
-// It is sized against the pad's NEGOTIATED count read at this moment, never
-// against the count Start used and never against anything the caller supplies.
-// That is the whole discipline: the caller cannot pass a width, so the caller
-// cannot pass a wrong one.
-//
-// The pipeline never changes state and the feed is never interrupted. Measured
-// on the real card on 2026-08-16: 119 us for the write, PLAYING throughout with
-// nothing pending, and the change visible in the next level message — a known
-// -9 dBFS tone read -8.9996 dBFS at unity, -15.0195 dBFS after a live write of
-// 0.5, and -90.3 dBFS after a live rewrite that routed two silent channels
-// instead. Routing and gain alike take effect immediately.
-func (p *cgoPipeline) SetChannelMap(m ChannelMap) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.stopped {
-		return errors.New("gst: pipeline is stopped")
-	}
-	if !p.started || p.aconv == nil {
-		return errors.New("gst: pipeline has not been started")
-	}
-	if p.matrixWidth == 0 {
-		// No matrix was written at Start, which means the capture source
-		// produces a positioned stream that audioconvert already maps. There is
-		// nothing to change, and writing a matrix now would pin a channel count
-		// on a pad that has negotiated without one — a renegotiation on a live
-		// feed, to achieve a routing the device has no channels to route.
-		return fmt.Errorf("%w: the capture device presents a positioned stream, which audioconvert "+
-			"maps to stereo on its own; there is no channel map on this pipeline to change. A "+
-			"channel map applies to a device that presents unpositioned channels, such as a "+
-			"DeckLink card's sixteen", ErrChannelMap)
-	}
-
-	width := p.negotiatedInputChannelsLocked()
-	if width == 0 {
-		return fmt.Errorf("%w: %s:sink has not published negotiated caps, so there is no width to "+
-			"size a matrix against. A matrix of the wrong width stops the capture chain",
-			ErrChannelMap, nameAudioConv)
-	}
-	if err := p.writeChannelMapLocked(m, width); err != nil {
-		return err
-	}
-	log.Printf("gst: channel map set live on %d input channels: %s", width, m)
-	return nil
-}
-
-// SetCommentaryMute takes the commentary off the send path, or puts it back, on
-// a pipeline that is already PLAYING.
-//
-// It is a single gboolean write on a volume element that has been in the graph
-// since gst_parse_launch ran, followed by a read of the same property. Nothing
-// changes state, nothing renegotiates, nothing is added to or removed from the
-// running graph, and the far end receives a continuous stream that is silent
-// rather than an interrupted one — coughmute.go has the packet-level
-// measurement that settles that, and the two rejected alternatives.
-//
-// # Why it refuses instead of latching before Start
-//
-// PipelineOpts.MuteCommentary is the pre-Start route and this is the live one,
-// and there are two rather than one for a reason that is the whole of the design:
-// a control with two memories is a control whose two memories can disagree. If
-// this method latched an intent, a caller could set the mute here, then pass a
-// different MuteCommentary to Start, and which one won would be a property of
-// the order of two lines in this file rather than of anything anyone can see.
-// That is exactly the charge coughmute.go lays against zeroing the mix matrix,
-// and it would be incoherent to convict that mechanism of it and then build it.
-func (p *cgoPipeline) SetCommentaryMute(mute bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.stopped {
-		return errors.New("gst: pipeline is stopped")
-	}
-	if !p.started || p.cough == nil {
-		return errors.New("gst: pipeline has not been started, so there is no element to mute; " +
-			"a pipeline that must begin muted is started with PipelineOpts.MuteCommentary, which " +
-			"is applied before it can produce a buffer")
-	}
-	if err := p.applyCoughMuteLocked(mute); err != nil {
-		return err
-	}
-	log.Printf("gst: commentary %s on the send path", map[bool]string{
-		true:  "MUTED",
-		false: "unmuted",
-	}[mute])
-	return nil
-}
-
-// CommentaryMuted reports what the element said, not what anybody asked for.
-//
-// It takes NO LOCK. p.mu is held for the whole of ReplaceSink, which on a
-// reconnect is seconds; a caller assembling a status line, or a UI polling the
-// mute lamp, must not be able to block behind a socket. The atomic it reads is
-// written only by applyCoughMuteLocked, and only from the value read back off
-// the element, so a lock-free read here still cannot report a write that did
-// not happen.
-func (p *cgoPipeline) CommentaryMuted() bool {
-	return p.muted.Load()
-}
-
-// applyCoughMuteLocked writes the mute and then reads it back, storing what the
-// ELEMENT said in the atomic that CommentaryMuted answers from. p.mu is held.
-//
-// It has two callers — startBuiltLocked with the pipeline still in NULL, and
-// SetCommentaryMute with it PLAYING — and it is deliberately identical for both.
-// The property write is the same write at either state: volume's mute is a plain
-// gboolean, live-settable, and there is no preroll or negotiation consequence to
-// setting it early or late.
-//
-// # The read-back is the whole function
-//
-// Setting a property in GObject is a void call. Every other guarantee this
-// package makes about the audio path is checkable — the level element posts, the
-// pad publishes caps, the sink returns a handshake result — but a mute that
-// silently did not take looks exactly like a mute that did, and the operator's
-// only evidence would be that the far end heard them cough. So the value is read
-// straight back out of the element and compared, and a disagreement is an ERROR
-// rather than a log line: at Start it refuses the pipeline, and live it leaves
-// the caller's control showing the state that is actually in force.
-//
-// hasProperty first, for the reason applyEncoderProperties and
-// armChannelMeterLocked keep it: a write against a property an element does not
-// have is a GLib CRITICAL on stderr, where no shipped build is looking, and the
-// setter returns as if it had worked.
-func (p *cgoPipeline) applyCoughMuteLocked(mute bool) error {
-	if !hasProperty(p.cough, propMute) {
-		return fmt.Errorf("gst: %s has no %s property, so the commentary cannot be muted on the "+
-			"send path", nameCoughMute, propMute)
-	}
-	p.cough.SetObjectProperty(propMute, mute)
-
-	got, ok := p.cough.ObjectProperty(propMute).(bool)
-	if !ok {
-		return fmt.Errorf("gst: %s.%s did not read back as a boolean, so there is no way to say "+
-			"whether the commentary is muted", nameCoughMute, propMute)
-	}
-	if got != mute {
-		return fmt.Errorf("gst: %s.%s was set to %t and read back as %t; the mute did not take and "+
-			"the application must not report that it did", nameCoughMute, propMute, mute, got)
-	}
-	p.muted.Store(got)
-	return nil
-}
-
 // drainStartupError takes one error off the asynchronous channel, so that a
 // failure during Start can be reported by Start rather than left for a consumer
 // that may never read it. It never blocks.
@@ -2641,628 +1951,49 @@ func (p *cgoPipeline) drainStartupError() error {
 	}
 }
 
-// pipelineDescription renders specification section 5 as a gst_parse_launch
-// string.
+// pipelineDescription IS DELETED, and this is where it was.
 //
-// Two things are deliberately not in it. The srtsink is absent because Start
-// installs no sink — the first ReplaceSink installs the first one, which is
-// what lets the chain stay in PLAYING for the life of the process. The slate
-// path and the audio device id are absent because they are user-supplied
-// strings and the parser's escaping rules are not something to trust a Windows
-// path or a GUID to; they are set with g_object_set afterwards.
+// It rendered ONE pipeline carrying capture AND send: the slate or the card, the
+// conform chain, the commentary source, the mix matrix, the cough mute, both
+// meters, both encoders, mpegtsmux and the leaky srtq, in one string built at
+// START and destroyed at STOP. The seam split it in two — captureDescription and
+// sendDescription, both in capturedesc_cgo.go — and it was kept unreferenced for
+// one phase so that the source-reading guards over it went on running while
+// app.go was re-pointed at the capture layer. That phase is over.
 //
-// encoderName is the H.264 factory resolved at runtime. audioBitrateBps is the
-// AAC encoder's bitrate property, in bits per second — the same unit on
-// mfaacenc and on atenc, which is the one piece of luck in this port. conform
-// is the ALREADY-RESOLVED raster and rate the video leg is conformed to: Start
-// resolves it and logs what it resolved, so this function never sees a zero or
-// a nonsense one and does not check. videoCapture is non-empty when the video
-// leg is a LIVE CAPTURE rather than the slate, and audioCapture when the
-// COMMENTARY comes off a card rather than off the platform's own audio stack.
-// Neither VALUE is used here — both persistent-ids are set with g_object_set for
-// the same reason the slate path and the device id are — only whether each is
-// empty, and, for the clock companion, whether they are empty TOGETHER.
+// EVERY MEASUREMENT IT CARRIED HAS A HOME, and this list is here so the next
+// reader can find one rather than conclude it was lost:
 //
-// # Exactly two element names in it are per-platform
+//   - the imagefreeze reordering (2.85 s -> 0.04 s CPU per 500 frames, byte-
+//     identical output, and why the capsfilter has to split): captureDescription's
+//     PictureSlate branch.
+//   - the live capture leg element by element — mode=auto, `connection` never
+//     set, drop-no-signal-frames, videorate against the card's 720x486 NTSC
+//     placeholder first buffer, tee allow-not-linked: captureDescription's
+//     PictureCard branch, which also answers the "proxysrc measured and rejected"
+//     note that used to sit beside the tee.
+//   - the clock companion (decklinkaudiosrc cannot preroll without a
+//     decklinkvideosrc in the same pipeline; 0 level messages against 160):
+//     CaptureLegs.NeedsClockCompanion and captureDescription's last chain.
+//   - the absent channel and rate capsfilters on the commentary source, and why
+//     forcing either is worse than not: captureDescription's commentary chain.
+//   - chlevel's placement and its cost (four paired runs, difference smaller than
+//     the run-to-run noise), the cough mute's position and the 473-access-unit
+//     muted/unmuted comparison: the same chain.
+//   - mpegtsmux alignment=7, pcr-interval=3600, srtq leaky=downstream and
+//     config-interval=-1: sendDescription.
+//   - the end-to-end proof against the live M2L-X on 2026-08-16 — 525i59.94 in,
+//     1920x1080p50 bt709 out, 45 s on cam4 "COMMS" with error_packet_count and
+//     discontinuous_packet_count both 0, cross-checked against 25,301,792 bytes
+//     captured off the wire: CONTRACT.md, which is where a claim about what the
+//     switcher accepted belongs.
 //
-// captureSourceFactory (wasapi2src / osxaudiosrc) and aacEncoderFactory
-// (mfaacenc / atenc), both from elements_windows.go and elements_darwin.go.
-// EVERYTHING ELSE — the caps chain, the level element and its 50 ms interval,
-// mpegtsmux alignment=7 pcr-interval=3600, both queues, the leaky srtq — is
-// byte-identical on both platforms, and that is a deliberate and load-bearing
-// property, not an accident of the port. The whole reason internal/sender and
-// the timestamp discipline in this file can be trusted on macOS is that the
-// graph they reason about is the same graph. A future change that makes any
-// other part of this string conditional is a change to that promise and needs
-// to be argued for on its own terms.
-//
-// # The string is no longer a constant, and here is that argument
-//
-// The two video capsfilters are rendered from conform rather than written out.
-// That is a real change to the promise above and it is made deliberately,
-// because the promise it was protecting is not the one the sentence literally
-// says. What internal/sender and the timestamp discipline rely on is that the
-// graph is the SAME GRAPH ON BOTH PLATFORMS — same elements, same order, same
-// pad topology, same liveness — not that it is the same text on every run.
-//
-// That property survives intact, for a specific structural reason: the
-// conditional is chosen IDENTICALLY on both platforms, from the same
-// ConformTarget, by the same code in gst.go, which carries no build tag and no
-// runtime.GOOS. Windows and macOS given the same PipelineOpts produce the same
-// bytes here. The per-platform seam therefore stays exactly where it was —
-// captureSourceFactory and aacEncoderFactory in elements_*.go, and nowhere
-// else — and TestPlatformElementContractIsPinned still checks both ports from
-// whichever host Gate A runs on.
-//
-// What it is NOT is a licence for the next conditional. Anything that varies
-// the ELEMENTS, their ORDER or their LIVENESS by platform, by device or by
-// configuration breaks the property this comment is actually about, and a
-// reader who cites this paragraph as precedent for one has cited the wrong
-// half of it.
-//
-// The alternative was to keep the constant and refuse to start on a switcher
-// configured for anything but 1080p50. That is not tidier, it is a commentary
-// position that cannot go on air; see FallbackConformTarget.
-//
-// # The second conditional: which SOURCE the video leg has
-//
-// This one varies the elements and it is exactly the thing the paragraph above
-// says needs arguing for on its own terms. Here is the argument.
-//
-// What must not vary is the format everything BELOW the encoder sees. It does
-// not: the two legs meet at one capsfilter carrying the same ConformTarget, and
-// from " ! " + encoderName onwards the string is written ONCE, in one place,
-// for both. h264parse, the byte-stream capsfilter, vq, mpegtsmux, srtq and
-// every reconnect rule in internal/sender are handed an identical graph
-// whichever leg is above them, and that is checked rather than asserted —
-// TestBothVideoLegsMeetAtTheSameEncoder reads this function and fails if the
-// encoder line is ever written twice.
-//
-// What varies above it is a SOURCE, and a source is the one thing in this graph
-// the application has always been allowed to choose: the audio leg has been
-// pointed at a different device on every seat since the first build, and
-// nothing downstream has ever known or cared. A camera instead of a PNG is the
-// same kind of choice made in the other leg, and the conform chain is what
-// makes it the same kind of choice — a 1080i50 camera, a 720p59.94 camera and
-// the card's own start-up placeholder all leave the leg as one raster and rate.
-//
-// The alternative was a second Pipeline implementation, or a slate leg that
-// switches source live. Both were rejected on the same measurement:
-// set_state(NULL) inside a blocking pad probe took the on-air leg from 50 fps
-// to 0 PERMANENTLY, with the pipeline still reporting PLAYING and no error
-// anywhere. The source is therefore decided at Start, from configuration, and
-// never afterwards.
-//
-// # The third conditional: which SOURCE the AUDIO leg has, and its companion
-//
-// This is the second axis and it needs its own argument, because it does two
-// things the video axis did not: it varies the element on the leg that IS the
-// product, and it adds a CHAIN that feeds no output at all.
-//
-// THE SOURCE SWAP IS THE SAME KIND OF CHOICE the paragraphs above license, and
-// it is the older of the two: the audio leg has been pointed at a different
-// device on every seat since the first build, and nothing downstream has ever
-// known or cared. What must not vary is the format everything below the mix
-// matrix sees, and it does not — audioresample, the S16LE/48000/2ch capsfilter,
-// alevel, the AAC encoder, aacparse and the aq queue are written ONCE, below the
-// branch, for both sources. A DeckLink presents sixteen unpositioned channels
-// instead of a positioned pair, and the NAMED audioconvert is what turns that
-// into the same two; channelmap.go holds the model and applyStartChannelMapLocked
-// decides, from the pad rather than from configuration, whether a matrix is
-// needed at all. On a microphone seat nothing is written and the leg is byte for
-// byte what ships today.
-//
-// THE CLOCK COMPANION IS THE PART THAT IS GENUINELY NEW, and it exists because
-// of one measured fact: decklinkaudiosrc CANNOT PREROLL without a
-// decklinkvideosrc in the SAME pipeline. The card drives audio capture off the
-// video clock, and with no video element the audio branch produced ZERO buffers
-// — 0 level messages against 160. It is not a defensive addition; without it the
-// feature does not start.
-//
-// So there are four shapes, and the choice between them is made HERE, from the
-// two ids and nothing else:
-//
-//	video    audio      decklinkvideosrc built            why
-//	slate    native     none                              today's pipeline, byte for byte
-//	card     native     vcapsrc, feeding the encoder      the video leg that landed already
-//	card     card       vcapsrc ONLY — it serves both     the card is EXCLUSIVE. Two sources
-//	                                                      in one process fail 3/3 and two
-//	                                                      processes fail 3/3, so a second one
-//	                                                      is impossible, not merely wasteful
-//	slate    card       vcapclock, feeding fakesink       the only way to clock the audio when
-//	                                                      the picture is a still
-//
-// THE SLATE-PLUS-CARD SHAPE IS THE ONE THAT COULD DO HARM, so what it costs was
-// measured rather than reasoned about: the companion source straight into
-// fakesink is 0.6-2.4 % of one core, and it is a chain of its own with no pad
-// linked to anything the slate leg touches. sync=false async=false is what keeps
-// it out of the way of everything else — it never participates in the pipeline's
-// preroll latching and never paces itself against the clock, so a card with no
-// signal cannot delay or stall a state change the slate leg is also making.
-//
-// THE ALTERNATIVE WAS decklinkaudiosrc ALONE, and it is not a trade-off that was
-// balanced — it does not work. The next alternative was a second process holding
-// the card for the clock, which the exclusivity measurement rules out. There is
-// no third.
-//
-// # What the capture leg is, element by element, and what breaks without each
-//
-// Every line below was measured on the fitted UltraStudio 4K Mini on
-// 2026-08-16. None of it is defensive habit.
-//
-//	mode=auto             ONLY. A pinned mode that disagrees with the input does
-//	                      not fail — measured, mode=pal against a real 1080p25
-//	                      input produced 50 clean PAL buffers with nothing but a
-//	                      warning. Green lamp, real bitrate, black picture.
-//	connection            IS NEVER SET, not here and not anywhere in this
-//	                      package. It is not a per-pipeline selection: it
-//	                      PERSISTENTLY RECONFIGURES THE CARD and overrides what
-//	                      the operator set in Blackmagic Desktop Video Setup, and
-//	                      it has had to be undone by hand twice. The card's input
-//	                      is chosen in Desktop Video Setup and leaving the
-//	                      property alone is what makes that work. If a capture is
-//	                      black or silent the answer is NEVER another connection
-//	                      value.
-//	drop-no-signal-frames Left at its default of false, and stated so that the
-//	                      default changing is a visible edit rather than a silent
-//	                      one. False means the card keeps emitting black
-//	                      GAP-flagged frames at full rate FOREVER on signal loss
-//	                      — no error, no EOS, the muxer never starves. That is
-//	                      why the feed's continuity is not at risk, and it is
-//	                      also why nothing in this pipeline can tell you the
-//	                      signal has gone: the only thing that can is the card's
-//	                      own signal property, which is what signalwatch.go
-//	                      polls.
-//	videoconvert          The card negotiates UYVY or v210 depending on the
-//	                      input; the encoder wants NV12.
-//	deinterlace           The only thing in this chain that handles a 1080i50
-//	                      camera, which is still what a good deal of outside
-//	                      broadcast kit produces. It passes progressive through
-//	                      at essentially zero cost, so it is not a trade — it is
-//	                      free insurance against the one input format that would
-//	                      otherwise reach the encoder as interlaced frames the
-//	                      switcher will not take.
-//	videoscale            The camera's raster need not be the switcher's.
-//	videorate             MANDATORY, and the least obvious element here.
-//	                      decklinkvideosrc emits a 720x486 NTSC PLACEHOLDER as
-//	                      its FIRST BUFFER on every start, with GAP set and
-//	                      signal=false, and the real caps arrive about 170 ms
-//	                      later. A fixed capsfilter with no videorate in front of
-//	                      it dies 0.088 s after PLAYING with not-negotiated (-4),
-//	                      3 runs out of 3. It also absorbs a camera whose rate is
-//	                      not the switcher's.
-//	tee allow-not-linked  The broadcast branch is linked below; the preview
-//	                      branch is optional and arrives as this function's
-//	                      `preview` argument, rendered by previewBranchFor and
-//	                      empty on every seat that has not asked for one. Without
-//	                      allow-not-linked=true a tee with an unlinked src pad
-//	                      returns NOT_LINKED upstream and stops the leg — which is
-//	                      to say the DEFAULT configuration is the one that needs
-//	                      the property, not the preview. A SECOND
-//	                      decklinkvideosrc IS NOT AN OPTION — the card is
-//	                      exclusive, two sources in one process fail 3/3 and two
-//	                      processes fail 3/3 — so sharing this one through a tee
-//	                      is the only shape a preview can have.
-//	queue vcapq           The branch head queue. Bounded by TIME only, one
-//	                      second, exactly as vq below is: a plain queue's default
-//	                      10 MB bound is about three frames of 1080p NV12, which
-//	                      would make the bound depend on the raster. It is NOT
-//	                      leaky — this is the branch that goes on air, and
-//	                      dropping its frames to protect a preview would be
-//	                      backwards. The PREVIEW branch's head queue is the one
-//	                      that must be leaky=downstream, because tee pushes
-//	                      serially on the upstream thread and a preview that
-//	                      merely renders slowly was measured dragging this
-//	                      branch from 50 fps to 20.8.
-//
-// proxysrc was measured as an alternative to the tee and REJECTED: its internal
-// queue is leaky=0, so a wedged consumer stalls the producer from 50 fps to 0 in
-// under two seconds, and the producer's death is silent across it. A tee INSIDE
-// the contribution pipeline crosses no boundary CONTRACT.md draws.
-//
-// # The capture leg was proven end to end against a live M2L-X, 2026-08-16
-//
-// Not against a loopback and not against a receiver written to be agreeable:
-// against the live instance matchH, through this package's own Pipeline, with
-// the card locked to a real 525i59.94 input — 720x486, interlaced,
-// bottom-field-first, bt601, pixel aspect 10:11, 29.97 fps, which is the worst
-// input the conform chain can be handed.
-//
-// 45 seconds of it were ingested by cam4 "COMMS", and switcher_status reported,
-// on two independent reads twelve seconds apart:
-//
-//	stream_state              "streaming"
-//	video format              h264, width 1920, height 1080, scan_type "P",
-//	                          sample_format "420", bit_depth 8, YCbCr
-//	audio format              aac, 2 channels, 48000
-//	bitrate                   10463.0 then 10454.0 kbit/s (asked for 10000)
-//	error_packet_count        0
-//	discontinuous_packet_count 0
-//
-// A local listener-first srtsink run immediately before it captured the same
-// stream to disk and settles what was actually on the wire rather than what a
-// switcher said about it: 25,301,792 bytes in 19.75 s, PID 0x41 carrying
-// 10,041 kbit/s of video (98.0 % of packets) and PID 0x42 179 kbit/s of audio,
-// decoding as H.264 High profile level 4.2, 1920x1080, NV12, progressive,
-// bt709, pixel aspect 1/1 — which is conform.captureCaps() field for field.
-//
-// The conform chain is what that proves. A 720x486 interlaced 29.97 fps
-// standard-definition input left this leg as 1920x1080p50 square-pixel bt709
-// progressive, continuously, for 45 seconds, with not one discontinuous packet
-// at the far end.
-//
-// The full send path was proven end to end over real SRT on macOS on
-// 2026-08-14, receiver first: 16.2 s of media reached a listener-first
-// srtsrc, the received transport stream carried PID 0x41 video (91.2 %) and
-// PID 0x42 audio (7.4 %), gst-discoverer reported "H.264 (High Profile)
-// 1920x1080", and the audio decoded to 48 kHz stereo with real room tone on it
-// (peak -36.0 dBFS, RMS -59.2 dBFS) rather than the digital silence a
-// mis-negotiated AAC path produces.
-func pipelineDescription(encoderName string, audioBitrateBps int, conform ConformTarget,
-	videoCapture, audioCapture, preview string) string {
-	// alignment=7 gives 7 x 188 = 1316-byte buffers, exactly one SRT payload,
-	// so nothing fragments. pcr-interval=3600 is the specification's value.
-	// leaky=downstream means output produced during an outage is dropped rather
-	// than back-pressuring the live capture, so the encoder never stalls and
-	// the timestamps never bunch.
-	//
-	// imagefreeze is-live=true is mandatory: without it the slate branch is not
-	// a live source and will not pace correctly.
-	//
-	// config-interval=-1 puts SPS/PPS in front of every IDR so M2L-X can
-	// re-lock mid-stream.
-	//
-	// videoscale is present so that the slate PNG does not have to be exactly
-	// the conform target's size. assets/slate.png is 1920x1080 today and
-	// CONTRACT.md says so, but the artwork is replaced every season by someone
-	// who will not read this file, and without videoscale a 1920x1200 export
-	// fails caps negotiation at Start with no diagnostic that names the size.
-	// The videoconvertscale plugin is already required for videoconvert, so the
-	// element costs nothing and does nothing at all when the slate already
-	// matches. Since the conform target became an option that property matters
-	// MORE, not less: a switcher configured for 720p is now a size the same
-	// 1920x1080 artwork has to reach.
-	//
-	// VIDEOCONVERT AND VIDEOSCALE SIT BEFORE IMAGEFREEZE, and that is the whole
-	// optimisation.
-	//
-	// They used to sit after it, which meant converting and scaling the SAME
-	// STILL PICTURE fifty times a second for the length of the match. Moving
-	// them above imagefreeze does the work ONCE, on the single frame pngdec
-	// produces, and imagefreeze then repeats the finished NV12 buffer.
-	//
-	// Measured on macOS arm64, GStreamer 1.26.10, 2026-08-15, 500 frames at
-	// 50 fps into fakesink, both orders, both slate sizes:
-	//
-	//	order                     1920x1080 slate   1920x1200 slate
-	//	imagefreeze first (old)      2.85 s CPU        3.02 s CPU
-	//	videoscale first (new)       0.04 s CPU        0.05 s CPU
-	//
-	// and the rendered NV12 buffers are BYTE-IDENTICAL between the two orders
-	// for both slates (md5 of the first three frames, checked per size). It is
-	// a pure reordering: nothing is dropped and nothing is approximated.
-	//
-	// The 1920x1200 property the paragraph above is about SURVIVES the reorder,
-	// and survives it for the obvious reason — videoscale is still in the leg,
-	// still upstream of the encoder, and now scales the odd-sized export to the
-	// conform target BEFORE the freeze rather than after it. The 1920x1200 case
-	// is in the measurement above precisely so that this is checked rather than
-	// asserted: it started, and it produced the same bytes.
-	//
-	// The capsfilter has to SPLIT to allow the reorder, and the split is the
-	// only subtle part. Everything about one picture — format, size, PAR,
-	// colorimetry, interlace-mode — is pinned upstream of imagefreeze, where
-	// videoscale can act on it. The frame RATE is pinned downstream, because
-	// the rate is the one thing imagefreeze itself decides: it takes a single
-	// buffer whose upstream framerate is 0/1 and repeats it at whatever rate
-	// its src pad negotiates. Pinning framerate=50/1 upstream instead asks
-	// pngdec for a frame rate it does not have, and the leg fails to
-	// negotiate.
-	//
-	// There is deliberately NO capsfilter between the capture source and
-	// audioconvert. One used to sit there pinning rate=48000,channels=2,
-	// upstream of the resampler that exists to produce exactly that — where it
-	// could not help, only refuse. wasapi2src in shared mode can only ever
-	// produce its endpoint's mix format, and Dante Virtual Soundcard is
-	// commonly configured at 44.1 or 96 kHz, so on a DVS endpoint that is not
-	// at 48 k the caps filter fails negotiation at Start, twenty minutes before
-	// kick-off, with an error naming neither the sample rate nor the device.
-	//
-	// macOS makes the same point louder rather than differently: measured on
-	// this machine, the built-in microphone offers 48 kHz but the NDI Audio
-	// device offers 44100 ONLY, and osxaudiosrc is likewise bound to whatever
-	// the CoreAudio device is configured for. audioconvert and audioresample
-	// convert whatever the endpoint gives us; the capsfilter that actually
-	// matters is the one below them, pinning what enters the AAC encoder.
-
-	// THE SLATE LEG, unchanged, and it is what a caller that configures nothing
-	// gets. It ends at a capsfilter carrying the conform target, which is the
-	// point the capture leg below also ends at and the reason the encoder line
-	// is written once for both.
-	videoLeg := "" +
-		"filesrc name=" + nameSlateSrc +
-		" ! pngdec" +
-		" ! videoconvert" +
-		" ! videoscale name=" + nameVideoScale +
-		" ! " + conform.spatialCaps() +
-		" ! imagefreeze is-live=true" +
-		" ! " + conform.temporalCaps()
-
-	// THE LIVE CAPTURE LEG, which replaces it whole. The long comment above has
-	// the measurement behind every element and every property; the two that are
-	// easiest to lose in a later tidy-up are that videorate is what survives the
-	// card's NTSC placeholder first buffer, and that connection is NEVER set.
-	//
-	// The persistent-id is absent from this string deliberately, exactly as the
-	// slate path and the audio device id are: it is set with g_object_set in
-	// Start, through the same configureDeckLinkSource the audio source uses, so
-	// one saved string reaches both kinds of decklink element by one route.
-	if videoCapture != "" {
-		videoLeg = "" +
-			videoCaptureFactory + " name=" + nameVideoCaptureSrc +
-			" mode=auto drop-no-signal-frames=false" +
-			" ! videoconvert name=" + nameVideoCapConv +
-			" ! deinterlace name=" + nameVideoCapDeint +
-			" ! videoscale name=" + nameVideoCapScale +
-			" ! videorate name=" + nameVideoCapRate +
-			" ! " + conform.captureCaps() +
-			" ! tee name=" + nameVideoCapTee + " allow-not-linked=true\n" +
-
-			nameVideoCapTee + ". ! queue name=" + nameVideoCapQueue +
-			" max-size-time=1000000000 max-size-bytes=0 max-size-buffers=0"
-	}
-
-	// THE COMMENTARY CAPTURE SOURCE. Exactly one element, and everything below
-	// it in the return statement is written once for both.
-	//
-	// The persistent-id is absent for the same reason it is absent from the
-	// video leg and the audio device id: Start sets it with g_object_set,
-	// through the same configureDeckLinkSource, so one saved string reaches
-	// every decklink element by one route and never through the parser's
-	// quoting rules.
-	//
-	// channels is the ONE property set here, and deckLinkAudioChannels says why
-	// it is 16 and why 2 — which would negotiate a positioned pair and need no
-	// matrix at all — is the wrong answer. `connection` is NOT set. It never is.
-	audioSource := captureSourceFactory + " name=" + nameAudioSrc
-	if audioCapture != "" {
-		audioSource = audioCaptureFactory + " name=" + nameAudioSrc +
-			" channels=" + strconv.Itoa(deckLinkAudioChannels)
-	}
-
-	// THE CLOCK COMPANION, and it is built ONLY when the commentary comes off the
-	// card AND the picture does not.
-	//
-	// When the picture DOES, the videoLeg above already put a decklinkvideosrc in
-	// this pipeline and that one is the clock: the card is exclusive, so a second
-	// source is not an option to weigh, it is a pipeline that fails. The
-	// condition below is therefore an AND of both ids and not a test of the audio
-	// one alone, and getting that wrong is not a wasted element — it is a seat
-	// with a camera and a card microphone that will not start at all.
-	//
-	// It is its own chain, linked to nothing, and it carries a leading newline
-	// the way the preview branch does so that the return below does not have to
-	// know whether it is there.
-	clockLeg := ""
-	if audioCapture != "" && videoCapture == "" {
-		clockLeg = "\n" + videoCaptureFactory + " name=" + nameVideoCaptureClock +
-			// mode=auto and drop-no-signal-frames=false for the reasons the video
-			// leg gives — and the second one matters MORE here, because this
-			// element's whole job is to keep producing a clock. A card that
-			// dropped its no-signal frames would stop the commentary rather than
-			// merely blank a picture nobody is watching.
-			" mode=auto drop-no-signal-frames=false" +
-			// sync=false async=false: this sink must not participate in preroll
-			// latching and must not pace against the clock. It exists so the CARD
-			// runs, not so anything downstream of it does, and every frame it is
-			// handed is thrown away.
-			" ! fakesink name=" + nameVideoCaptureClockSink + " sync=false async=false"
-	}
-
-	return "" +
-		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
-		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
-
-		videoLeg +
-		" ! " + encoderName + " name=" + nameVideoEncod +
-		" ! video/x-h264,profile=high" +
-		" ! h264parse config-interval=-1" +
-		" ! video/x-h264,stream-format=byte-stream,alignment=au" +
-		" ! queue name=vq max-size-time=1000000000 ! " + nameMux + ".\n" +
-
-		// The level element sits AFTER audioconvert/audioresample and their
-		// capsfilter, IMMEDIATELY BEFORE the encoder, and that placement is the
-		// point: it measures the exact S16LE 48 kHz stereo signal that enters
-		// the AAC encoder, so the input meters show what is ACTUALLY being
-		// encoded and sent — wrong device, dead Dante endpoint, muted desk send
-		// and all. Measuring upstream of the resample (or worse, in the
-		// browser) would keep a meter moving while the on-air signal was
-		// silence, which is a reassurance the operator must never be given.
-		// interval=50000000 is 50 ms in nanoseconds — twenty element messages a
-		// second, which the app throttles rather than trusts — and
-		// post-messages defaults to true so it is not set here. The element
-		// passes buffers through untouched; it adds measurement, not latency.
-		//
-		// alevel is a literal rather than an entry in the element-name const
-		// block, deliberately: those consts exist because GetByName is called
-		// with them, and nothing ever looks the level element up — its output
-		// arrives as bus messages matched on the STRUCTURE name. The literal
-		// is also what lets the Gate A source guard
-		// (TestPipelineDescriptionMetersWhatIsEncoded) assert the exact text.
-		//
-		// The two factory names below are consts rather than literals for one
-		// reason and it is not brevity: it makes the Gate A guard able to check
-		// BOTH ports at once — it asserts the order of the elements here and
-		// the exact value of each const in elements_windows.go and
-		// elements_darwin.go, so neither port can be silently repointed at a
-		// different encoder.
-		//
-		// audioSource is one of those two consts or audioCaptureFactory,
-		// resolved above; the element NAME is nameAudioSrc either way, because
-		// capturefault.go classifies the commentary capture by that name and a
-		// second name would return a DeckLink audio failure to the nameless
-		// fatal default.
-		audioSource +
-		// The PER-CHANNEL PICKER meter, and everything about where it sits is
-		// deliberate. It is UPSTREAM of the audioconvert below, so it measures
-		// the capture device's OWN channels — all sixteen of a DeckLink card's
-		// unpositioned ones — before any routing decision has been applied to
-		// them. alevel, further down, cannot answer this question at any price:
-		// it sits after the capsfilter that pins channels=2, so by construction
-		// it measures the post-mix stereo and can never say which of the
-		// sixteen inputs the commentator is on. That is the whole reason the
-		// mapping UI is usable — the operator asks the commentator to talk and
-		// watches which bar moves.
-		//
-		// The name is a LITERAL and must stay one. levels.go's
-		// channelLevelElementName holds the same string and onBusMessage routes
-		// on it; TestEveryLevelElementInThePipelineIsRouted reads this literal
-		// out of the source and fails BY NAME if levelKindForSource does not
-		// know it, because a level element the handler does not recognise posts
-		// frames that are silently dropped — a meter that never moves with
-		// nothing in the log to say why.
-		//
-		// post-messages=false IS THE STEADY STATE, and it is what keeps a seat
-		// with no capture card exactly as it was. Every native microphone and
-		// every Dante endpoint presents a POSITIONED stereo pair, for which
-		// this meter would report the same two numbers alevel already reports —
-		// a duplicate of the programme meter, ten times a second, over the
-		// webview bridge, for the whole of a ninety-minute match. So the
-		// element is built silent and armed only when there is something worth
-		// metering: applyStartChannelMapLocked writes a matrix exactly when the
-		// source is unpositioned, and arms this element in the same breath.
-		// MEASURED live on a PLAYING pipeline — setting post-messages took
-		// 61 us, stopped that element's messages dead (0 in two seconds) and
-		// left the OTHER level element in the same pipeline posting at its own
-		// rate, undisturbed, with the pipeline still in PLAYING.
-		//
-		// It stays in the graph on a native seat rather than being built
-		// conditionally, because whether the source is positioned is not
-		// knowable until the element exists and its pad can be asked — which is
-		// after gst_parse_launch has run.
-		//
-		// WHAT THAT COSTS THE ON-AIR PATH WAS MEASURED, because adding an
-		// element to the audio chain every shipping seat runs is not something
-		// to reason about from first principles. Four paired runs of the real
-		// stereo chain (audiotestsrc, 2 channels, through audioconvert,
-		// audioresample, the 2-channel capsfilter and alevel into a synced
-		// fakesink), 32 seconds of audio each, on the port machine 2026-08-16:
-		//
-		//	without chlevel   user 0.11, 0.11, 0.10, 0.18 s
-		//	with chlevel      user 0.12, 0.12, 0.12, 0.10 s
-		//
-		// The difference is smaller than the run-to-run noise — one run WITHOUT
-		// the element was the most expensive of the eight. A SILENT level
-		// element is nearly free, which is not what the posting measurements in
-		// levels.go would have led you to expect: those bracket an element that
-		// is analysing and posting, and post-messages=false takes that work out
-		// rather than merely dropping the message at the end of it. So the
-		// ability to arm this meter live, on a pipeline already carrying
-		// commentary, is bought for no measurable cost on the path that never
-		// uses it.
-		//
-		// The tidier end state is still to build this element only on the
-		// DeckLink capture leg, which becomes possible the day that leg exists:
-		// it is one condition in this string, decided by the same thing that
-		// decides which capture source to build.
-		// AN audioconvert ABOVE chlevel, AND IT IS NOT COSMETIC. level's sink
-		// template accepts five formats — S8, S16LE, S32LE, F32LE, F64LE — and
-		// interleaved only. audioconvert's accepts thirty, plus non-interleaved.
-		// Putting chlevel directly on the capture source therefore NARROWS what
-		// a capture device is allowed to negotiate, on every seat, including the
-		// on-air Windows build where nothing here can be compiled or run.
-		//
-		// Measured on this machine, the failure it prevents:
-		//
-		//	audiotestsrc ! audio/x-raw,format=S24_32LE,... ! chlevel ! ...
-		//	  WARNING: erroneous pipeline: could not link audiotestsrc0 to
-		//	  chlevel, chlevel can't handle caps audio/x-raw,
-		//	  format=(string)S24_32LE, rate=(int)48000, channels=(int)2
-		//
-		// osxaudiosrc negotiates S16LE either way, so darwin never sees it —
-		// which is precisely why it would have shipped. wasapi2src takes its
-		// caps from the device's WASAPI mix format and gst-plugins-bad's wasapi2
-		// does emit S24_32LE for some devices, so the seat this breaks is a
-		// Windows one, on hardware nobody here owns, on the platform that is
-		// broadcasting.
-		//
-		// This converter costs one element and restores the old tolerance
-		// exactly. It does NOT flatten the channel layout: measured, chlevel's
-		// sink still sees channels=16 channel-mask=0x0 through it, so the meter
-		// still reports every one of a DeckLink's unpositioned channels. The
-		// mix-matrix conversion is still the NAMED audioconvert below; this one
-		// only makes the format legal.
-		" ! audioconvert" +
-		" ! level name=chlevel interval=" + strconv.Itoa(channelLevelIntervalNs) +
-		" post-messages=false" +
-		// audioconvert IS NAMED, and the name is the routing engine's handle on
-		// it. Its mix-matrix property is where a DeckLink card's sixteen
-		// UNPOSITIONED channels are turned into the stereo pair pinned below,
-		// and it is live-settable while the pipeline is PLAYING — measured at
-		// 119 us with no renegotiation, which is what lets the mapping UI be a
-		// real-time control rather than an apply-and-restart form. Start writes
-		// the matrix before the first buffer; SetChannelMap rewrites it
-		// afterwards. channelmap.go holds the model and every measurement.
-		//
-		// Nothing else about this element changes, and on a POSITIONED source —
-		// every microphone, every Dante endpoint, the whole of the on-air
-		// Windows path — no matrix is written at all and the element behaves
-		// exactly as it did before it had a name.
-		" ! audioconvert name=" + nameAudioConv + " ! audioresample" +
-		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
-		// THE COUGH MUTE, and its position between the capsfilter above and the
-		// programme meter below is the whole of what makes it honest.
-		//
-		// It is a `volume` element whose `mute` property is written live. It
-		// changes nothing about negotiation: its sink template accepts S16LE
-		// interleaved, which is exactly what the capsfilter above has just
-		// pinned, so it is a passthrough in the literal sense and the caps
-		// either side of it are the same caps. mute=false is written here so
-		// that the parse string states the shipped default rather than relying
-		// on the element's; Start overwrites it from PipelineOpts.MuteCommentary
-		// before the pipeline leaves NULL.
-		//
-		// ABOVE alevel, NOT BELOW IT. The long note on alevel below says it
-		// measures the exact signal entering the encoder so that no meter can
-		// keep moving while silence goes to air. A mute placed below that meter
-		// would rebuild that exact failure by hand — the commentator coughs, the
-		// mute engages, and the programme meter bounces on to a voice nobody is
-		// receiving. Above it, the meter reads digital silence and goes on
-		// posting at its own rate: measured, 89 level messages either way, rms
-		// -12.006563271339424 unmuted and -699.99999984363217 muted.
-		//
-		// BELOW chlevel, which is the other half of the same decision. The
-		// per-channel picker measures the capture device's own channels before
-		// any routing or muting has been applied, so the operator can still see
-		// which of a card's sixteen inputs the commentator is on while they are
-		// coughing. That question's answer does not change because they are off
-		// air for two seconds.
-		//
-		// WHAT IT COSTS THE FAR END IS NOTHING, and that was measured rather
-		// than assumed. Through this exact encoder chain into mpegtsmux, muted
-		// and unmuted: 473 AAC access units both times, identical first and last
-		// PTS, identical largest inter-packet gap of 21.344 ms — one AAC frame.
-		// The stream is continuous and silent, not interrupted. coughmute.go
-		// carries the same measurement for the valve, which produces zero bytes.
-		" ! volume name=" + nameCoughMute + " " + propMute + "=false" +
-		" ! level name=alevel interval=50000000" +
-		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +
-		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
-		" ! queue name=aq max-size-time=1000000000 ! " + nameMux + "." +
-
-		// THE CLOCK COMPANION, appended whole or not at all, for exactly the
-		// reason the preview below is: the empty string is the ordinary answer
-		// and leaves this description character for character the one that ships
-		// today. It is a chain of its own and links to nothing above it.
-		clockLeg +
-
-		// THE CONFIDENCE MONITOR, appended whole or not at all. previewBranchFor
-		// has already decided; the empty string is the ordinary answer and leaves
-		// this description character for character the one that ships today. It
-		// carries its own leading newline, so nothing here has to know whether
-		// there is a branch.
-		preview
-}
+// The one thing it said that is NO LONGER TRUE is the sentence promising that the
+// graph is byte-identical on both platforms apart from two factory names. It
+// still is, on each side of the seam, and TestPlatformElementContractIsPinned
+// still checks both ports from whichever host Gate A runs on — but there are now
+// two graphs with two lifetimes, and the property is stated per description
+// rather than over one string.
 
 // applyEncoderProperties sets the platform's encoder settings on whichever
 // H.264 encoder was chosen, skipping any property that encoder does not have.
@@ -3273,7 +2004,7 @@ func pipelineDescription(encoderName string, audioBitrateBps int, conform Confor
 // which settings did not apply is better than refusing to send commentary.
 //
 // bitrate is deliberately handled here rather than in h264EncoderProps, because
-// it is the one setting that comes from PipelineOpts. Its UNIT is kilobits per
+// it is the one setting that comes from SendOpts. Its UNIT is kilobits per
 // second on mfh264enc and on vtenc_h264 alike — checked on both, because a
 // factor-of-1000 disagreement here is a 2 kbit/s or a 2 Gbit/s feed, and
 // neither fails loudly.
@@ -3296,7 +2027,7 @@ func applyEncoderProperties(enc gogst.Element, factoryName string, bitrateKbps i
 
 	// bitrate is in KILOBITS per second on mfh264enc ("Bitrate in kbit/sec")
 	// and on vtenc_h264 ("Target video bitrate in kbps"), which is the unit
-	// DefaultVideoBitrateKbps and PipelineOpts.VideoBitrateKbps use. Measured
+	// DefaultVideoBitrateKbps and SendOpts.VideoBitrateKbps use. Measured
 	// on macOS: bitrate=2000 produced a 2.05 Mbit/s video PID.
 	set("bitrate", strconv.Itoa(bitrateKbps))
 	for _, prop := range h264EncoderProps {
@@ -3501,63 +2232,33 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 
 		// CLASSIFY BEFORE CLOSING THE GATE, AND CLASSIFY FROM THE NAME ALONE.
 		//
-		// Something has to run before the store, because a VIDEO CAPTURE failure
-		// must NOT close the gate: the gate is what stops media reaching the
-		// sink, and the whole point of sparing a video fault is that the
-		// commentary keeps flowing through it. Closing it would starve the SRT
-		// peer and defeat the sparing entirely, so this genuinely cannot be
-		// folded into the switch below — it has to move ahead of the store.
+		// classifySendBusError is THREE STRING COMPARISONS on a string already in
+		// hand: no allocation, no cgo, no GObject lock. That is what lets it run
+		// ahead of the store on the ON-AIR path, where an srtout-N error arrives on
+		// every peer loss and the buffer carrying GST_FLOW_ERROR into srtq is racing
+		// us. That race is not hypothetical: BUILD-NOTES.md section 8.6 is the 21 ms
+		// window in which losing it took the whole capture chain down and the
+		// commentary off air.
 		//
-		// A CONFIDENCE MONITOR failure must leave the gate open for the same
-		// reason and a stronger one: the gate is between the mux and the sink,
-		// and the preview hangs off a tee far upstream of both. Nothing it can do
-		// reaches the feed, so closing the gate over one would starve the SRT peer
-		// to no purpose whatever.
-		//
-		// WHAT RUNS THERE IS THE PART THAT COSTS NOTHING, and the split is not
-		// cosmetic. classifyBusError with the zero captureLegs is three string
-		// comparisons on a string already in hand: no allocation, no cgo, no
-		// GObject lock. captureLegsFor is the opposite of all three — it crosses
-		// into C for the element's name, walks up to the parent bin and runs
-		// gst_bin_get_by_name over the whole graph — and running it here would
-		// put a bin traversal in front of the store on the ON-AIR path, where an
-		// srtout-N error arrives on every peer loss and the buffer carrying
-		// GST_FLOW_ERROR into srtq is racing us. That race is not hypothetical:
-		// BUILD-NOTES.md section 8.6 is the 21 ms window in which losing it took
-		// the whole capture chain down and the commentary off air.
-		//
-		// The zero value is exactly right as a first answer. classifyBusError
-		// consults legs in ONE branch — the video-capture prefix — so for every
-		// other source the two stages are provably the same decision, and for
-		// that one branch the refinement happens below, after the gate is
-		// settled. See capturefault.go.
-		class := classifyBusError(source, captureLegs{})
+		// THIS BUS NO LONGER CARRIES ANY CAPTURE ELEMENT, and that is why there is
+		// one stage here where there used to be two. The capture legs, the slate,
+		// the preview branch, both level elements and both DeckLink sources live in
+		// a CapturePipeline with a bus of its own; this graph is two proxysrcs, two
+		// encoders, the muxer and the sink. So the classVideoCapture sparing, the
+		// classPreview sparing and the AudioClockedByVideo upgrade — which needed
+		// captureLegsFor's parent-bin walk, the one cgo call that had to be kept off
+		// the fast path — describe elements that cannot post here. Keeping them
+		// would be worse than dead: capturefault.go's video and audio proxy prefixes
+		// are "vprox" and "aprox", which match THIS graph's vproxsrc and aproxsrc as
+		// well as the capture side's tails, so a vproxsrc error would have been
+		// spared with the gate left open and an aproxsrc error handed to a DeckLink
+		// diagnosis of a graph containing no card.
+		class := classifySendBusError(source)
 
-		if class != classVideoCapture && class != classPreview {
-			// Close the gate before building the error value. Everything after
-			// this point is allocation, and the buffer that is about to carry
-			// GST_FLOW_ERROR into the queue is racing us.
-			p.gateClosed.Store(true)
-		}
-
-		// STAGE TWO, and it is deliberately below the store rather than above
-		// it. THE CASE THAT LOOKS LIKE AN EXCEPTION: when the commentary audio
-		// comes off the same DeckLink as the video, the card drives audio
-		// capture off the video clock, so an error from a video element is an
-		// audio fault wearing a video element's name and must go fatal. Asking
-		// that question is what costs the bin traversal, so it is asked only on
-		// the one path that can be affected by the answer — never on the sink
-		// path, which is the one that is on air.
-		//
-		// The gate is closed HERE when the answer upgrades the class, because
-		// the first stage deliberately left it open. Closing it a few
-		// microseconds late costs nothing on this path: the fault is at the
-		// card, upstream of the mux, and there is no failing sink pushing a
-		// GST_FLOW_ERROR buffer at srtq to lose a race against.
-		if class == classVideoCapture && captureLegsFor(msg.Source()).AudioClockedByVideo {
-			class = classAudioCapture
-			p.gateClosed.Store(true)
-		}
+		// Close the gate before building the error value. Everything after this
+		// point is allocation, and the buffer that is about to carry
+		// GST_FLOW_ERROR into the queue is racing us.
+		p.gateClosed.Store(true)
 
 		err := fmt.Errorf("gst: %s: %v (%s)", source, gerr, debug)
 
@@ -3578,44 +2279,10 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 			// replacing the sink can repair it, so it goes to internal/sender
 			// on Errors() and the connection ladder handles it.
 
-		case classVideoCapture:
-			// RECOVERABLE. The pipeline stays PLAYING, mpegtsmux keeps
-			// aggregating audio, the sender keeps its socket.
-			//
-			// It must NOT reach Errors(): internal/sender treats ANY error
-			// arriving while CONNECTED as the peer going away, and would spend a
-			// whole DRAINING/BACKOFF cycle — seven seconds off air — on a fault
-			// that never touched the feed.
-			p.deliverWarning("gst: the video capture failed and the commentary is unaffected: " +
-				err.Error())
-			return gogst.BusDrop
-
-		case classPreview:
-			// The operator's confidence monitor. SPARED, and unlike
-			// classVideoCapture there is no second stage that can upgrade it: the
-			// preview is downstream of a leaky tee branch and feeds a window, so
-			// nothing it does can reach the feed. This is a log line and nothing
-			// more.
-			//
-			// It must NOT reach Errors(): internal/sender treats any error arriving
-			// while CONNECTED as the peer going away and would spend a whole
-			// DRAINING/BACKOFF cycle — seven seconds off air — over a monitor.
-			p.deliverWarning("gst: the confidence monitor failed and the commentary and the feed " +
-				"are unaffected: " + err.Error())
-			return gogst.BusDrop
-
-		case classAudioCapture:
-			// Fatal, because the commentary IS the product and there is nothing
-			// to degrade to — but NAMED. At this level "device busy", "device
-			// missing" and "no signal" are the same generic stream error and
-			// have three different fixes; capturefault_cgo.go reads the card's
-			// own evidence to tell them apart.
-			p.markFatal(captureFatalError(msg.Source(), source, err))
-
 		default:
-			// Not the sink and not a capture leg: replacing the sink cannot
-			// repair this, so mark it and let ReplaceSink refuse rather than
-			// report a connection that carries no media.
+			// Not the sink: replacing the sink cannot repair this, so mark it and
+			// let ReplaceSink refuse rather than report a connection that carries
+			// no media.
 			//
 			// The wrap puts ErrPipelineFatal — whose text is "gst:
 			// pipeline-fatal", so the rendered message is unchanged and
@@ -3623,7 +2290,7 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 			// the head of the chain, which is what lets internal/sender use
 			// errors.Is to stop retrying a failure no reconnect can fix.
 			p.markFatal(fmt.Errorf("%w: %w "+
-				"(the capture or mux chain has failed; recover with Stop, New, Start)",
+				"(the encode or mux chain has failed; recover with Stop, New, Start)",
 				ErrPipelineFatal, err))
 		}
 		p.deliver(err)
@@ -3647,89 +2314,19 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		p.deliverWarning(fmt.Sprintf("gst: warning: %s: %v (%s)", source, gerr, debug))
 
 	case gogst.MessageElement:
-		// A level element's measurement reports. Everything here runs on the
-		// posting streaming thread, so the whole path is: two cheap rejections,
-		// name the source, convert, hand to a callback that the contract in
-		// gst.go requires not to block. No locks, no logging.
+		// NOTHING. THE METERS ARE UPSTREAM OF THE SEAM and this handler used to route
+		// them, so the absence is written down rather than left as a missing case.
 		//
-		// TWO TESTS, IN THIS ORDER, AND THE ORDER IS THE POINT.
+		// alevel and chlevel sit in the capture pipeline, above the proxysinks, so no
+		// level message is ever posted on THIS bus; cgoCapture.onBusMessage carries the
+		// routing, the two-tier match on structure name then source element, and the
+		// measurement that made the second tier necessary — 39 level messages a second,
+		// every one of them named "level", which without attribution would have fed the
+		// programme meter a sixteen-entry frame and a two-entry frame alternately.
 		//
-		// The STRUCTURE name comes first because it is nearly free — a string
-		// compare against a name the message already carries — and because it
-		// is what rejects the element messages this handler is not interested
-		// in at all. Other elements in this pipeline are free to post their
-		// own and several do.
-		//
-		// The SOURCE ELEMENT comes second, and it used not to be tested at all.
-		// That was the defect: every level element in the process posts a
-		// structure named "level", so matching the structure alone means
-		// matching EVERY level element there will ever be. With one element it
-		// was merely sloppy. This tier makes a second one possible — chlevel on
-		// the capture device's own sixteen unpositioned channels for the
-		// picker, alevel on the mixed-down stereo that is actually encoded —
-		// and then it is a silent cross-wire. MEASURED with both in one
-		// pipeline: 39 level messages a second, every one of them matching the
-		// structure name, so OnLevels would have been fed a sixteen-entry frame
-		// and a two-entry frame alternately, twenty times a second each. The
-		// programme meter would not have failed; it would have flickered
-		// between two different signals at two different widths, and a meter
-		// that reads as live while showing the wrong signal is the one failure
-		// this application refuses to ship. msg.Source() separated them
-		// perfectly in that measurement — 39 attributed, 0 unattributed.
-		//
-		// Naming the source costs a cgo call, a GObject lock and a string, so
-		// it is deliberately BELOW the structure test: it is paid only for
-		// messages that really are level reports, at most a few tens a second,
-		// and never for the element messages of anything else.
-		s := msg.GetStructure()
-		if s == nil || s.GetName() != levelStructureName {
-			break
-		}
-		source := ""
-		if src := msg.Source(); src != nil {
-			source = src.GetName()
-		}
-		switch levelKindForSource(source) {
-		case levelKindProgramme:
-			// alevel: the stereo that is being encoded and sent. Unchanged,
-			// and it is the on-air path, so the callback load stays where it
-			// was — after the match, so that a session with no metering does
-			// no work per message beyond the two rejections above.
-			f := p.onLevels.Load()
-			if f == nil || *f == nil {
-				break
-			}
-			if levels, ok := levelsFromStructure(s); ok {
-				(*f)(levels)
-			}
-
-		case levelKindChannels:
-			// chlevel: the capture device's own channels, upstream of the mix
-			// down to the encoder's two. It is what the mapping UI meters, and
-			// it is the only measurement in this pipeline that can say WHICH
-			// input the commentator is on — alevel sits after the capsfilter
-			// that pins channels=2 and by construction cannot.
-			//
-			// The three lines are deliberately identical to the programme
-			// case's, and the callbacks are two fields rather than one so that
-			// this frame cannot reach OnLevels however the code above it is
-			// later rearranged. A sixteen-entry frame delivered to the
-			// programme meter is not a crash; it is a meter that reads as live
-			// while showing a signal that is not going to air.
-			f := p.onChannelLevels.Load()
-			if f == nil || *f == nil {
-				break
-			}
-			if levels, ok := levelsFromStructure(s); ok {
-				(*f)(levels)
-			}
-
-		default:
-			// A level message this pipeline did not ask for. Dropped. An
-			// unattributable level frame is precisely the cross-wire the
-			// source test exists to prevent, and a meter fed from an unknown
-			// element is worse than a meter that does not move.
-		}
+		// Do not re-add a level element here. A meter measuring what has crossed the
+		// seam would read the encoder's input rather than the microphone, which on a
+		// send-side stall is exactly the reassurance nobody should be given.
 	}
 
 	return gogst.BusDrop
@@ -4663,8 +3260,14 @@ func (p *cgoPipeline) Errors() <-chan error {
 	return p.errs
 }
 
-// Stop takes the pipeline to NULL, releases the capture device and closes the
-// channel returned by Errors. It is idempotent.
+// Stop takes the pipeline to NULL, releases the seam and closes the channel
+// returned by Errors. It is idempotent.
+//
+// IT DOES NOT STOP THE CAPTURE. The capture pipelines are always-live and outlive
+// every send session; what is given back here is the single-consumer claim on
+// their proxysinks. The signal watchdog that used to be stopped on this line went
+// with the decklink element it polls — see teardownLocked for the order the seam
+// release has to keep.
 func (p *cgoPipeline) Stop() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -4675,18 +3278,6 @@ func (p *cgoPipeline) Stop() error {
 	p.stopped = true
 	p.gateClosed.Store(true)
 	p.route.Store(nil)
-
-	// Stop the signal watchdog BEFORE the pipeline goes to NULL. Its reader
-	// closure holds the capture element, and a property read against a disposed
-	// element is a read on freed memory. Stop JOINS, so no report can arrive after
-	// this line — a lamp coming back on for a pipeline that no longer exists is
-	// the direction this project never lets a status display be wrong in.
-	//
-	// Joining under p.mu is safe: the watchdog goroutine never takes p.mu, and its
-	// emit path is the application's, which the interface contract requires not to
-	// block. Nil-safe, so there is no guard here.
-	p.sigWatch.Stop()
-	p.sigWatch = nil
 
 	err := p.teardownLocked()
 
@@ -4765,11 +3356,21 @@ func (p *cgoPipeline) teardownLocked() error {
 		p.sinkEventProbeID = 0
 	}
 
+	// THE MUXER WATCHDOG GOES BEFORE THE STATE CHANGE, and Stop joins its poller
+	// before removing the probes. Both halves matter and in this order: the poller
+	// reads the pads, the probes write them, and a teardown that removed the probes
+	// first would leave the poller reading a counter nothing can update while the
+	// pipeline it is about to indict is already on its way to NULL. Nil-safe, and
+	// it joins only a poller that was actually started — every failure between
+	// attachLiveWatch and PLAYING reaches here with no goroutine to wait for.
+	p.live.Stop()
+	p.live = nil
+
 	var err error
 	if p.pipeline != nil {
 		// The whole pipeline goes to NULL in one call; there is no need to take
 		// the sink down separately, and doing so would only add a way to fail.
-		stopWatchdog := stateChangeWatchdog("pipeline to NULL (releasing the WASAPI endpoint)")
+		stopWatchdog := stateChangeWatchdog("send pipeline to NULL (releasing the capture seam)")
 		ret := p.pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(pipelineStartTimeout))
 		stopWatchdog()
 		if !stateChangeOK(ret) {
@@ -4784,26 +3385,22 @@ func (p *cgoPipeline) teardownLocked() error {
 	p.srtq = nil
 	p.srtqSrcPad = nil
 	p.srtqSinkPad = nil
-	p.aconv = nil
-	p.aconvSinkPad = nil
-	// The cough mute's ELEMENT goes, and its STATE deliberately stays. Dropping
-	// the reference is the same hygiene as every line above it; leaving
-	// p.muted alone is a decision. A caller rebuilding a session that died
-	// muted — the latched-fatal path, which is the only thing that ever
-	// discards a Pipeline mid-match — reads CommentaryMuted off this corpse and
-	// hands it to the replacement as PipelineOpts.MuteCommentary. Zeroing it
-	// here would answer "unmuted" for a session that ended muted, and put the
-	// commentator back on air across the rebuild without anyone touching a
-	// button.
-	p.cough = nil
-	// matrixWidth goes back to zero with the pad it described. Leaving it set
-	// would make SetChannelMap on a torn-down pipeline get as far as reading a
-	// nil pad rather than being refused by the started/stopped guards above it,
-	// which is a longer path to the same answer through more nil checks.
-	p.matrixWidth = 0
 	p.bus = nil
 	p.clock = nil
 	p.pipeline = nil
+
+	// THE SEAM IS RELEASED LAST, AFTER THE PIPELINE HAS REACHED NULL, and that is
+	// not tidiness. gst_proxy_src_dispose clears only the src's weak reference on
+	// the sink; the SINK's reference on the old src survives until the old src is
+	// finalised, which Go may not do promptly. If the claim were given back while
+	// this pipeline were still PAUSED or PLAYING, the next session's arming could
+	// not repair it — gst_proxy_sink_sink_chain would re-store the sticky events on
+	// the old proxysrc's still-active pad, sent_stream_start and sent_caps would go
+	// TRUE before the new proxysrc bound, and the new session would carry ZERO
+	// BYTES with SRT connected and every lamp green. SendSeam.Stop names the
+	// violation in the log if anyone ever reverses these lines.
+	p.seam.Stop()
+	p.seam = nil
 
 	return err
 }

@@ -973,13 +973,22 @@ export function mountApp(root) {
     // and above all do not showHome() on a page that may be mid-edit.
     if (payload.origin === ownClientId()) return;
     applyRemoteConfig(payload.config);
-    // AND THE SETTINGS FORM'S TWO VIDEO-LEG BOXES, which are the only controls
-    // on that screen whose staleness can refuse a save they are not part of:
-    // App.SaveConfig refuses a REMOTE save whose videoSource or
-    // decklinkPreviewEnabled differ from the live ones, and that form is a page
-    // cache refreshed only by open(). Narrow on purpose — it is not populate(),
+    // AND THE SETTINGS FORM'S CAPTURE CONTROLS, which are the controls on that
+    // screen whose staleness can refuse a save they are not part of:
+    // App.SaveConfig refuses a REMOTE save whose videoSource,
+    // decklinkPreviewEnabled, audioSourceKind, audioDeviceId or
+    // decklinkPersistentId differ from the live ones, and that form is a page
+    // cache refreshed only by open(). Narrow on purpose — neither is populate(),
     // which would redraw the whole form under somebody mid-edit.
+    //
+    // The audio half arrived with the widening of refuseRemoteCaptureChange:
+    // without that guard a remote whole-document save could take the desk's
+    // microphone, and on a card seat close and reopen the exclusive DeckLink,
+    // from another building. With it, the picker is the one control that writes
+    // all three of those fields — so it needs the same adoption the video leg
+    // has always had.
     settings.adoptVideoLeg(payload.config);
+    settings.adoptAudioLeg(payload.config);
     // Another seat's save may have applied a different instance — the Settings
     // screen or a remote client can change the active preset — so refresh the
     // header indicator from the authority rather than trusting the config event

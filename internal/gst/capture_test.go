@@ -242,10 +242,11 @@ func TestTheDeviceKeyStampsTheWidthWithItsDevice(t *testing.T) {
 // count armings. It is not the stub twin: it exists so that NewSend can be tested
 // in BOTH builds against a set whose behaviour the test controls.
 type seamTestCapture struct {
-	claims  seamClaims
-	armings int
-	armErr  error
-	health  error
+	claims        seamClaims
+	armings       int
+	armErr        error
+	health        error
+	pictureHealth error
 }
 
 func newSeamTestCapture(legs CaptureLegs) *seamTestCapture {
@@ -262,6 +263,7 @@ func (c *seamTestCapture) ProxySinks() []string           { return c.claims.name
 func (c *seamTestCapture) ClaimForSend() error            { return c.claims.claimAll() }
 func (c *seamTestCapture) ReleaseFromSend()               { c.claims.releaseAll() }
 func (c *seamTestCapture) Health() error                  { return c.health }
+func (c *seamTestCapture) PictureHealth() error           { return c.pictureHealth }
 func (c *seamTestCapture) InputChannels() int             { return 0 }
 func (c *seamTestCapture) SetChannelMap(ChannelMap) error { return nil }
 func (c *seamTestCapture) SetCommentaryMute(bool) error   { return nil }

@@ -270,24 +270,65 @@ func TestConformFormatIgnoresAnUnparseableOverride(t *testing.T) {
 	}
 }
 
-func TestSenderOptsCarriesTheConformTarget(t *testing.T) {
-	// The seam between the decision and the pipeline. senderOpts reads the
-	// atomic Start wrote, because its own signature has callers in the test
-	// suite this change is not entitled to move.
+// TestCaptureOptsCarriesTheConformTarget follows the conform target to where it
+// is now applied: the CAPTURE pipeline.
+//
+// That placement is the single most consequential decision in the seam. With the
+// conform chain above the proxysink, the caps crossing to the encoder are pinned
+// for the life of the process, so the card changing raster — a 720x486 NTSC
+// placeholder before it locks, the real input after, back again when the cable is
+// pulled — renegotiates videoscale's SINK caps only and the encoder never sees a
+// caps change at all.
+// # REWRITTEN: the target is HANDED IN, and it is the RESOLVED one
+//
+// This test used to call captureOpts with no conform argument and assert that
+// the ZERO ConformTarget came out when nothing had been derived. Both halves went
+// with the fix to the first-START rebuild.
+//
+// captureOpts no longer reads a.conformTo at all: the value is read ONCE per
+// rebuild, by rebuildCaptureLocked, and handed to both the build and the record,
+// so that startSession's drift check compares two values that came from one place
+// rather than two reads of an atomic with a device open between them.
+//
+// And the zero is gone because conformNow RESOLVES it. internal/gst reads a zero
+// ConformTo as "nothing is known" and turns it into FallbackConformTarget, so the
+// zero and the fallback describe the same capsfilter and only one of them can be
+// compared against anything: recording the unresolved zero is what made the first
+// START of every day tear the always-live capture down and build it again.
+func TestCaptureOptsCarriesTheConformTargetItIsGiven(t *testing.T) {
 	a, _ := newTestApp(t)
 	silencePump(a)
 
-	// Nothing stored: the zero ConformTo, which internal/gst documents as
-	// "nothing is known". This is what every other senderOpts test sees, and it
-	// is what keeps them asserting the pipeline the shipped build produces.
-	if got := a.senderOpts(validConfig(), "").Pipeline.ConformTo; got != (gst.ConformTarget{}) {
-		t.Fatalf("ConformTo = %v with nothing derived, want the zero value", got)
+	want := gst.ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
+	if got := a.captureOpts(validConfig(), capturePlan{}, 0, want, false).ConformTo; got != want {
+		t.Fatalf("ConformTo = %v, want %v — captureOpts must pass its argument through", got, want)
+	}
+}
+
+// TestConformNowResolvesTheUnknownTarget is the other half, and it is the one
+// that stops a healthy capture being rebuilt at the worst moment.
+//
+// a.conformTo is written in exactly ONE place — App.Start — so at domReady, when
+// the always-live capture is built, it is nil. The picture leg is therefore built
+// to internal/gst's fallback; if this side records the zero instead, the first
+// START compares zero against whatever the switcher answers and rebuilds even
+// when the two describe the same raster. On a card seat that closes and reopens
+// the exclusive DeckLink, blanks the preview and drops the meters at the exact
+// moment the operator pressed START.
+func TestConformNowResolvesTheUnknownTarget(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+
+	if got := a.conformNow(); got != gst.FallbackConformTarget() {
+		t.Fatalf("conformNow with nothing derived = %v, want the fallback %v — the picture leg "+
+			"is built to the fallback, so recording anything else makes the first START rebuild "+
+			"a capture that is already correct", got, gst.FallbackConformTarget())
 	}
 
 	want := gst.ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
 	a.conformTo.Store(&want)
-	if got := a.senderOpts(validConfig(), "").Pipeline.ConformTo; got != want {
-		t.Fatalf("ConformTo = %v, want %v", got, want)
+	if got := a.conformNow(); got != want {
+		t.Fatalf("conformNow = %v, want %v", got, want)
 	}
 }
 

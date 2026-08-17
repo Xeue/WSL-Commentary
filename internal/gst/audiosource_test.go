@@ -132,8 +132,12 @@ func TestRefuseWrongAudioSourceConvertsTheCardID(t *testing.T) {
 }
 
 // TestStubStartsADeckLinkCommentarySeat is the DeckLink seat end to end through
-// the stub: no platform endpoint anywhere, sixteen channels negotiated, a matrix
-// written and the per-channel picker meter armed.
+// the capture stub: no platform endpoint anywhere, sixteen channels negotiated,
+// a matrix written and the per-channel picker meter armed.
+//
+// IT DRIVES THE CAPTURE PIPELINE AND NOT A SEND PIPELINE, and that is the whole
+// change: everything it asserts is true with nothing sending, which is what the
+// routing screen now depends on.
 //
 // The width assertion is the one worth reading twice. decklinkaudiosrc is built
 // with channels=16 and has no configuration in which it presents a positioned
@@ -141,82 +145,52 @@ func TestRefuseWrongAudioSourceConvertsTheCardID(t *testing.T) {
 // shape the shipped build cannot produce — and the sixteen-bar picker is the
 // control an operator uses to find which channel the commentator is on.
 func TestStubStartsADeckLinkCommentarySeat(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{
-		SlatePath:       "slate.png",
+	c, err := NewStubCapture(CaptureOpts{
+		Legs:            CaptureLegs{Commentary: CommentaryCard},
 		AudioCaptureID:  "2747401380",
 		OnChannelLevels: func(Levels) {},
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatalf("NewCapture refused a DeckLink commentary seat: %v", err)
+	}
+	defer c.Stop()
+	if err := c.Start(); err != nil {
 		t.Fatalf("Start refused a DeckLink commentary seat: %v", err)
 	}
-	if got := p.StartedWith().AudioDeviceID; got != "" {
-		t.Errorf("AudioDeviceID = %q on a DeckLink seat; no platform capture element is built and "+
-			"an empty id on one is the SYSTEM DEFAULT INPUT", got)
-	}
-	if got := p.InputChannels(); got != deckLinkAudioChannels {
+	if got := c.InputChannels(); got != deckLinkAudioChannels {
 		t.Errorf("InputChannels() = %d, want %d: a DeckLink commentary seat presents all sixteen "+
 			"embedded channels and the routing grid is sized from this number", got,
 			deckLinkAudioChannels)
 	}
-	if _, written := p.ChannelMap(); !written {
-		t.Error("no mix matrix was written for an unpositioned sixteen-channel source. The matrix " +
-			"is a NEGOTIATION CONSTRAINT and not a gain: audioconvert cannot fold unpositioned " +
-			"channels to stereo without one and the leg dies with not-negotiated (-4)")
-	}
-	if err := p.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if got := c.MatrixWidth(); got != deckLinkAudioChannels {
+		t.Errorf("the matrix in force is %d wide, want %d. The matrix is a NEGOTIATION CONSTRAINT "+
+			"and not a gain: audioconvert cannot fold unpositioned channels to stereo without one "+
+			"and the leg dies with not-negotiated (-4)", got, deckLinkAudioChannels)
 	}
 }
 
 // TestStubRefusesTwoDifferentCards pins the one-card rule, which is what keeps
 // the clock companion honest.
 //
-// A DeckLink drives audio capture off the VIDEO clock. When the video leg is
+// A DeckLink drives audio capture off the VIDEO clock. When the picture leg is
 // also a card, THAT decklinkvideosrc is the clock — the card is exclusive, so a
 // second source in the same process fails 3/3 — and two ids naming different
 // cards therefore describes a commentary leg clocked by the wrong card's video.
 // The real build discovers that as a seat that will not preroll, naming neither
 // card; here it is a sentence, before any hardware is involved.
 func TestStubRefusesTwoDifferentCards(t *testing.T) {
-	p := NewStubPipeline()
-	err := p.Start(PipelineOpts{
-		SlatePath:      "slate.png",
+	_, err := NewStubCapture(CaptureOpts{
+		Legs:           CaptureLegs{Picture: PictureCard, Commentary: CommentaryCard},
 		VideoCaptureID: "2747401380",
 		AudioCaptureID: "1234567890",
 	})
 	if err == nil {
-		t.Fatal("Start accepted a commentary leg on one card and a picture on another")
+		t.Fatal("NewCapture accepted a commentary leg on one card and a picture on another")
 	}
 	for _, want := range []string{"2747401380", "1234567890"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not name card %s: %v", want, err)
 		}
-	}
-	if p.State() != StubStateStopped {
-		t.Errorf("state after the refusal = %q, want %q", p.State(), StubStateStopped)
-	}
-}
-
-// TestStubStartsBothLegsOnOneCard is the combination the fitted rig runs: the
-// picture and the commentary off the same card, which needs ONE decklinkvideosrc
-// and gets one.
-func TestStubStartsBothLegsOnOneCard(t *testing.T) {
-	const card = "2747401380"
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{
-		SlatePath:      "slate.png",
-		VideoCaptureID: card,
-		AudioCaptureID: card,
-	}); err != nil {
-		t.Fatalf("Start refused a seat with both legs on one card: %v", err)
-	}
-	got := p.StartedWith()
-	if got.VideoCaptureID != card || got.AudioCaptureID != card {
-		t.Errorf("started with video %q audio %q, want both %q",
-			got.VideoCaptureID, got.AudioCaptureID, card)
-	}
-	if err := p.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
 	}
 }
 
@@ -224,11 +198,15 @@ func TestStubStartsBothLegsOnOneCard(t *testing.T) {
 // because it is the thing a reader of this feature needs and the thing two
 // separately correct halves can still get wrong between them.
 //
-// The elements each shape builds are asserted in the cgo twin
-// (decklinkaudio_cgo_test.go, which renders pipelineDescription for real). What
-// is asserted HERE is that every one of the four is a seat Start accepts, and
-// that the two ids arrive at the pipeline unswapped — which is the failure a
-// pair of same-typed strings invites and the reason capturePlan is a struct.
+// What is asserted HERE is that every one of the four is a seat the capture
+// layer accepts, that the fusion rule plans the right NUMBER of pipelines for
+// each, and that the two ids arrive unswapped — which is the failure a pair of
+// same-typed strings invites and the reason capturePlan is a struct.
+//
+// The PIPELINE COUNT is the column that did not exist before the seam and is now
+// the load-bearing one: at most one pipeline may ever contain decklink elements,
+// because the card is exclusive and decklinkaudiosrc cannot preroll without a
+// decklinkvideosrc in the SAME pipeline.
 func TestTheFourCaptureCombinationsAreExpressible(t *testing.T) {
 	const (
 		endpoint = "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}"
@@ -239,85 +217,138 @@ func TestTheFourCaptureCombinationsAreExpressible(t *testing.T) {
 		name          string
 		device, video string
 		audio         string
+		pipelines     int
 	}{
-		{name: "slate picture, microphone commentary — the seat that ships today", device: endpoint},
-		{name: "card picture, microphone commentary", device: endpoint, video: card},
-		{name: "card picture, card commentary — one source serves both", video: card, audio: card},
-		{name: "slate picture, card commentary — the clock companion case", audio: card},
+		{name: "slate picture, microphone commentary — the seat that ships today",
+			device: endpoint, pipelines: 2},
+		{name: "card picture, microphone commentary",
+			device: endpoint, video: card, pipelines: 2},
+		{name: "card picture, card commentary — one source serves both",
+			video: card, audio: card, pipelines: 1},
+		{name: "slate picture, card commentary — the clock companion case",
+			audio: card, pipelines: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := NewStubPipeline()
-			if err := p.Start(PipelineOpts{
-				SlatePath:      "slate.png",
-				AudioDeviceID:  tc.device,
+			plan := PlanCapture(CaptureSources{
 				VideoCaptureID: tc.video,
 				AudioCaptureID: tc.audio,
-			}); err != nil {
-				t.Fatalf("Start refused a combination the application can configure: %v", err)
+				AudioDeviceID:  tc.device,
+			})
+			if len(plan) != tc.pipelines {
+				t.Fatalf("PlanCapture returned %d pipelines, want %d: %v", len(plan),
+					tc.pipelines, plan)
 			}
-			got := p.StartedWith()
-			if got.AudioDeviceID != tc.device {
-				t.Errorf("AudioDeviceID = %q, want %q", got.AudioDeviceID, tc.device)
-			}
-			if got.VideoCaptureID != tc.video {
-				t.Errorf("VideoCaptureID = %q, want %q", got.VideoCaptureID, tc.video)
-			}
-			if got.AudioCaptureID != tc.audio {
-				t.Errorf("AudioCaptureID = %q, want %q", got.AudioCaptureID, tc.audio)
-			}
-			if err := p.Stop(); err != nil {
-				t.Fatalf("Stop: %v", err)
+			for _, legs := range plan {
+				c, err := NewStubCapture(CaptureOpts{
+					Legs:           legs,
+					SlatePath:      "slate.png",
+					AudioDeviceID:  tc.device,
+					VideoCaptureID: tc.video,
+					AudioCaptureID: tc.audio,
+				})
+				if err != nil {
+					t.Fatalf("the %s pipeline of a combination the application can configure was "+
+						"refused: %v", legs, err)
+				}
+				defer c.Stop()
+				if err := c.Start(); err != nil {
+					t.Fatalf("starting the %s pipeline: %v", legs, err)
+				}
+				if got := c.Legs(); got != legs {
+					t.Errorf("the pipeline reports legs %v, want %v", got, legs)
+				}
 			}
 		})
 	}
 }
 
-// TestPipelineDescriptionBuildsTheCommentarySourceConditionally is the Gate A
+// TestCaptureDescriptionBuildsTheCommentarySourceConditionally is the Gate A
 // source guard over the half of the feature Gate A cannot run.
 //
 // The behavioural version is decklinkaudio_cgo_test.go, which renders the real
-// string. This one exists because gst_cgo.go does not compile at Gate A and the
-// on-air Windows build is checked from whichever host Gate A runs on: a change
-// that repointed the commentary at a decklink element unconditionally would
-// otherwise reach a Windows commentary position before anything noticed.
-func TestPipelineDescriptionBuildsTheCommentarySourceConditionally(t *testing.T) {
-	body := pipelineDescriptionSource(t)
+// strings. This one exists because capturedesc_cgo.go does not compile at Gate A
+// and the on-air Windows build is checked from whichever host Gate A runs on: a
+// change that repointed the commentary at a decklink element unconditionally
+// would otherwise reach a Windows commentary position before anything noticed.
+//
+// REWRITTEN FROM pipelineDescription, which is deleted. Two of the assertions
+// moved rather than changed: the source choice is now made on the LEG-SET
+// (CommentaryCard) rather than on an id string, because PlanCapture resolves the
+// id to a leg once and carries it; and the clock companion's AND of both ids is
+// now CaptureLegs.NeedsClockCompanion, which is untagged and therefore checked
+// BEHAVIOURALLY here instead of as text — a strictly better guard.
+func TestCaptureDescriptionBuildsTheCommentarySourceConditionally(t *testing.T) {
+	body := captureDescriptionSource(t)
 
-	if !strings.Contains(body, `audioCapture != ""`) {
-		t.Error("pipelineDescription no longer chooses the commentary source on whether a card id " +
-			"was supplied. An empty PipelineOpts.AudioCaptureID must mean the PLATFORM capture " +
-			"source, byte for byte, on every seat that has configured nothing")
+	if !strings.Contains(body, "CommentaryCard") {
+		t.Error("captureDescription no longer chooses the commentary source on the leg it was " +
+			"handed. CommentaryNative must mean the PLATFORM capture source, byte for byte, on " +
+			"every seat that has configured no card")
 	}
 	if !strings.Contains(body, "audioCaptureFactory") {
-		t.Error("pipelineDescription never mentions audioCaptureFactory, so there is no DeckLink " +
+		t.Error("captureDescription never mentions audioCaptureFactory, so there is no DeckLink " +
 			"commentary source in the graph at all — which is the state this work package existed " +
 			"to end")
 	}
+	if !strings.Contains(body, "captureSourceFactory") {
+		t.Error("captureDescription never mentions captureSourceFactory, so a seat with a " +
+			"microphone has no source at all")
+	}
 
-	// THE CLOCK COMPANION'S CONDITION IS AN AND OF BOTH IDS. Getting it wrong is
-	// not a wasted element: with the video leg already on the card, a second
+	// THE CLOCK COMPANION'S CONDITION IS AN AND OF BOTH LEGS. Getting it wrong is
+	// not a wasted element: with the picture already on the card, a second
 	// decklinkvideosrc is a pipeline that FAILS — two sources in one process fail
 	// 3/3 — so a seat with a camera and a card microphone would not start at all.
-	if !strings.Contains(body, `audioCapture != "" && videoCapture == ""`) {
-		t.Error("the clock companion is not conditioned on the commentary being a card AND the " +
-			"picture not being one. The card is EXCLUSIVE: when the video leg is also the card, " +
-			"vcapsrc IS the clock and a second decklinkvideosrc fails the whole pipeline")
+	// NeedsClockCompanion is untagged, so this is the behaviour rather than the
+	// text of the condition.
+	for _, tc := range []struct {
+		legs CaptureLegs
+		want bool
+		why  string
+	}{
+		{CaptureLegs{Picture: PictureSlate, Commentary: CommentaryCard}, true,
+			"a card microphone on a slate seat has nothing else to clock it: measured, 0 buffers " +
+				"and 0 level messages against 160"},
+		{CaptureLegs{Picture: PictureCard, Commentary: CommentaryCard}, false,
+			"the picture leg's vcapsrc IS the clock, and the card is EXCLUSIVE — a second " +
+				"decklinkvideosrc fails the whole pipeline"},
+		{CaptureLegs{Picture: PictureSlate, Commentary: CommentaryNative}, false,
+			"a platform microphone needs no card clock at all"},
+		{CaptureLegs{Picture: PictureCard, Commentary: CommentaryNone}, false,
+			"a picture-only leg-set has no audio to clock"},
+	} {
+		if got := tc.legs.NeedsClockCompanion(); got != tc.want {
+			t.Errorf("NeedsClockCompanion(%+v) = %v, want %v — %s", tc.legs, got, tc.want, tc.why)
+		}
+	}
+	if !strings.Contains(body, "NeedsClockCompanion()") {
+		t.Error("captureDescription no longer asks NeedsClockCompanion, so the rule above is " +
+			"checked against a function nothing renders from")
 	}
 
 	// The audio chain below the source is written ONCE, for both sources, which
-	// is what lets internal/sender and the timestamp discipline reason about one
-	// graph however the commentary arrives.
+	// is what lets the send pipeline reason about one graph however the
+	// commentary arrives.
+	//
+	// THE LOWER BOUND MOVED WITH THE SEAM: aacparse and the ADTS capsfilter are
+	// the send pipeline's now, so the shared chain runs from the first
+	// audioconvert to the audio proxy tail. It is the same claim over the same
+	// elements minus the two that changed pipeline.
 	for _, tail := range []string{
 		"audioconvert name=",
-		"audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved",
-		"level name=alevel interval=50000000",
-		"aacparse ! audio/mpeg,mpegversion=4,stream-format=adts",
+		"seamAudioCaps",
+		"level name=\"+levelElementName",
+		"audioProxyTail()",
 	} {
 		if n := strings.Count(body, tail); n != 1 {
-			t.Errorf("%q appears %d times in pipelineDescription, want exactly 1: everything "+
+			t.Errorf("%q appears %d times in captureDescription, want exactly 1: everything "+
 				"below the mix matrix is shared by both commentary sources and a second copy is "+
 				"a second graph that only stays equal by hand", tail, n)
 		}
+	}
+	if send := sendDescriptionSource(t); !strings.Contains(send, "aacparse ! audio/mpeg,mpegversion=4,stream-format=adts") {
+		t.Error("sendDescription no longer parses the AAC into ADTS; mpegtsmux takes ADTS and " +
+			"the two elements moved to the send pipeline together")
 	}
 }
 
@@ -337,8 +368,8 @@ func TestTheClockCompanionsSinkCarriesTheCapturePrefix(t *testing.T) {
 			"would treat its failures as pipeline-fatal and take the commentary off air over a "+
 			"fakesink", name, videoCaptureNamePrefix)
 	}
-	if !strings.Contains(pipelineDescriptionSource(t), "nameVideoCaptureClockSink") {
-		t.Error("pipelineDescription does not name the clock companion's sink, so GStreamer gives " +
+	if !strings.Contains(captureDescriptionSource(t), "nameVideoCaptureClockSink") {
+		t.Error("captureDescription does not name the clock companion's sink, so GStreamer gives " +
 			"it one of its own (\"fakesink0\") and the prefix rule above protects nothing")
 	}
 }

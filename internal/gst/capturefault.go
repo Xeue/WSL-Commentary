@@ -252,6 +252,43 @@ func classifyBusError(source string, legs captureLegs) busErrorClass {
 	}
 }
 
+// classifySendBusError is the SEND pipeline's classifier, and it is a separate
+// function rather than a call into classifyBusError with a zero captureLegs.
+//
+// # Why the send bus gets its own two-way decision
+//
+// The send graph is two proxysrcs, two encoders, aacparse/h264parse, two queues,
+// mpegtsmux, srtq and an srtsink installed by ReplaceSink. It contains NO capture
+// element at all: the slate, both DeckLink sources, the conform chain, the
+// preview branch, the mix matrix and both level elements live in a
+// CapturePipeline with a bus of its own. So classVideoCapture, classPreview and
+// classAudioCapture cannot describe anything that can post here, and the sparing
+// they carry — leave the gate open, deliver as a warning, never reach Errors() —
+// would be applied to elements that are on the air path.
+//
+// THAT IS NOT MERELY DEAD, IT IS WRONG IN A SILENT DIRECTION. classifyBusError's
+// proxy prefixes are "vprox" and "aprox", chosen for the CAPTURE tails vproxq /
+// vproxsink and aproxq / aproxsink. This graph's two sources are named vproxsrc
+// and aproxsrc, which match the same prefixes: an error posted under either name
+// would have been classified as a capture fault on a bus where no capture exists
+// — the video one spared with the gate left OPEN and no fatal latched, the audio
+// one handed to captureFatalError, which would go looking for a DeckLink's signal
+// property in a graph containing no card. seam_test.go checks those prefixes
+// against vprev and vcap; nobody checked them against the two names seam.go
+// declares six lines above.
+//
+// It is latent rather than live today — measured: `strings -a libgstproxy.dylib`
+// contains no GST_ELEMENT_ERROR format strings at all, so proxysrc posts no
+// element errors under its own name, and errors from its internal children
+// arrive named "queue0"/"internal_src" and fall to the fatal default — but it is
+// in the one function that decides whether the commentary goes off air.
+func classifySendBusError(source string) busErrorClass {
+	if source == captureSinkQueueName || strings.HasPrefix(source, captureSinkNamePrefix) {
+		return classSinkSourced
+	}
+	return classFatal
+}
+
 // captureFault names WHICH of the three device failures happened. They are
 // indistinguishable at the GStreamer level and have three different fixes.
 type captureFault int
@@ -448,6 +485,23 @@ func diagnoseCaptureFault(ev captureEvidence) captureFault {
 // They are deliberately long. The audience is one person, at a commentary
 // position, with the match starting, and the cost of a sentence they do not
 // need is nothing against the cost of a fix they cannot find.
+//
+// # The recovery control is "Restart capture", and it used to be "press START"
+//
+// Four of these sentences said "press START again", and that instruction became
+// FALSE the day the capture layer stopped being built at START. The card and the
+// microphone are opened at domReady and held until the application quits
+// (PLAN.md 0-BIS A1); START mints a send pipeline over a capture set it did not
+// open, and its own refusal says so. So a press of START after reconnecting a
+// cable would reopen nothing, and the operator would be sent round the loop that
+// cannot work while the one control that CAN — RestartCapture, on the capture
+// panel — went unnamed.
+//
+// faultDeviceBusy additionally asserted that contention "is a problem at START
+// and never mid-match". Both halves of that are now wrong: the card is claimed at
+// LAUNCH, so contention is a problem at launch; and the incumbent-survives fact
+// it rests on is still true and now matters MORE, because the window in which
+// something else could take the card is the one before this application starts.
 func captureFaultMessage(fault captureFault, ev captureEvidence) string {
 	device := ev.DeviceName
 	if device == "" {
@@ -473,12 +527,12 @@ func captureFaultMessage(fault captureFault, ev captureEvidence) string {
 		if ev.DeckLink {
 			b.WriteString("A DeckLink on Thunderbolt that has been unplugged, or a Desktop Video " +
 				"driver that has restarted, does exactly this. Reconnect the card, wait for " +
-				"Desktop Video Setup to see it, and press START again.")
+				"Desktop Video Setup to see it, and press Restart capture.")
 		} else {
 			b.WriteString("Dante Virtual Soundcard and NDI endpoints are created and destroyed as " +
 				"their sources come and go, and a USB interface that has been unplugged does the " +
-				"same. Reconnect it, choose it again in the Commentary input dropdown, and press " +
-				"START again.")
+				"same. Reconnect it and choose it again in the Commentary input dropdown, which " +
+				"reopens the device on its own; if it was already selected, press Restart capture.")
 		}
 
 	case faultDeviceBusy:
@@ -487,13 +541,14 @@ func captureFaultMessage(fault captureFault, ev captureEvidence) string {
 			b.WriteString("A DeckLink card is EXCLUSIVE — Blackmagic Desktop Video Setup, Media " +
 				"Express, Premiere, OBS or a previous copy of this application is enough, and the " +
 				"card reports only a negotiation failure without naming who has it. Close the other " +
-				"application and press START again. Note that nothing can take the card from us " +
-				"once we hold it: a second opener fails and the incumbent survives, so this is a " +
-				"problem at START and never mid-match.")
+				"application and press Restart capture. Note that nothing can take the card from us " +
+				"once we hold it: a second opener fails and the incumbent survives. This application " +
+				"claims the card when it LAUNCHES and holds it until it quits, so contention is a " +
+				"problem at launch and never mid-match.")
 		} else {
 			b.WriteString("Close whatever else has the device open — another copy of this " +
 				"application, a conferencing client, or a DAW holding it exclusively — and press " +
-				"START again.")
+				"Restart capture.")
 		}
 
 	case faultNoSignal:

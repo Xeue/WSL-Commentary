@@ -121,15 +121,34 @@
 // remoteAllowlist enforces: a host-only classification on a method is what
 // TestRemoteHostOnlySet pins, and deleting them would leave the two most
 // dangerous fields on this surface reachable only through SaveConfig, whose
-// host-only-ness is a runtime argument in refuseRemoteVideoLegChange rather than
+// host-only-ness is a runtime argument in refuseRemoteCaptureChange rather than
 // a table entry. If a future page wants to write either field on change instead
 // of on Save, these are what it calls and nothing else has to move.
 //
 // HOST-ONLY IS NOT SELF-ENFORCING HERE, and the gap is closed rather than
 // noted: SaveConfig is remotely reachable and is a whole-document write, so
-// refuseRemoteVideoLegChange refuses a remote save that would change either of
-// the two configuration fields. Without it the classification would be a
-// decoration.
+// refuseRemoteCaptureChange refuses a remote save that would change any of the
+// five configuration fields the capture layer is built from. Without it the
+// classification would be a decoration.
+//
+// and the three added for the ALWAYS-LIVE CAPTURE LAYER, which is the thing that
+// holds the card and the microphone open from launch to quit:
+//
+//	SelectCommentaryInput(kind,id,pid)  error                   caller: WP-R2
+//	RestartCapture()                    error                   caller: WP-R2
+//	GetCaptureState()                   capturePayload          caller: WP-R2
+//
+// The first two are HOST-ONLY, and for the two reasons the video leg's setters
+// are: SelectCommentaryInput decides which microphone a broadcast switcher hears
+// this position on, and RestartCapture blanks a native window on the screen of
+// whoever is sitting at this machine. GetCaptureState is a read and is reachable,
+// because a remote seat that could see a dead meter and not the sentence
+// explaining it would report a fault this application had already diagnosed.
+//
+// SelectCommentaryInput DOES NOT SAVE. It re-points the live capture and nothing
+// else; the Settings screen's Save is still what makes a choice stick. That is
+// what lets an operator audition microphones before kick-off without rewriting
+// config.json, and it is the frontend's stated contract (backend.js).
 //
 // and the three added for the COUGH MUTE and for telling the page the truth
 // about the preview. These are the newest, and two of the three are unlike
@@ -238,15 +257,32 @@
 //
 // # Events emitted Go to JS
 //
+// The list is remoteEventNames()'s, which is what the hello frame advertises,
+// and TestRemoteEventNamesCoversEveryEvent reflects over the Event* constants in
+// both directions. It reads the CONSTANTS and not this comment, so this list is
+// kept complete by hand — it was six short before the capture layer landed.
+//
 //	"status"              an m2lx.Status
 //	"sender"              a sender.State
 //	"return"              a gst.ReturnState
+//	"picture"             a gst.PictureState — the confidence monitor's own window
 //	"error"               a string
 //	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
 //	"levels"              a levelsPayload {peak:[...], rms:[...]} — the input meters
 //	"channelLevels"       a levelsPayload, one entry per CAPTURE channel — the picker
 //	"channelMap"          a channelMapPayload {deviceKey, inputChannels, map, isDefault}
 //	"signal"              a signalPayload {state, flaps} — the video capture's input lock
+//	"config"              a configEvent {config, origin} — another seat saved
+//	"remote"              a remotePayload — which seats are connected
+//	"mute"                a mutePayload {muted, by, available, reason, seq}
+//	"preview"             a previewStatePayload — why there is or is not a preview
+//	"capture"             a capturePayload {picture, commentary, reason, audioDeviceName}
+//
+// "capture" is the always-live capture layer's state, one word per leg, and it
+// is the only one of these that fires BEFORE a session and goes on firing after
+// one. It is emitted from every build and teardown path and from each capture's
+// fault drain, so a device that dies at run time repaints the panel rather than
+// leaving it reading "live" for the rest of the day.
 //
 // The "error" event carries first-run configuration problems, gst.Init failures,
 // sign-in failures, and — rate-limited, because the sender retries forever — the
@@ -379,14 +415,35 @@
 // A process that will not exit is a support call, so a wedged pipeline loses the
 // race rather than the window.
 //
-// # Five locks, in this order
+// # The lock order
 //
+// (It was five when this heading was written; the list below is the authority,
+// and every addition since has been named in it rather than counted in the
+// heading.)
+//
+//	sessMu -> capMu     (a rebuild must not race a Start; see capMu's field comment)
 //	sessMu -> cfgMu     (Start reads the config while holding the session lock)
-//	ctlMu               (never held with either of the others)
+//	capMu  -> cfgMu     (a capture build reads the config it is built from)
+//	ctlMu               (never held with any of the others)
 //	senderMu            (leaf; never held while any other lock is taken)
+//	capStateMu          (leaf; never held while any other lock is taken)
 //	mixMu               (leaf; never held while any other lock is taken)
 //	retMu -> cfgMu      (StartReturn reads the config while holding it)
 //	retStateMu          (leaf; never held while any other lock is taken)
+//
+// capMu is the ALWAYS-LIVE CAPTURE LAYER's lock and it is nested UNDER sessMu,
+// in that direction and no other. A capture rebuild takes sessMu first, finds no
+// session, and only then takes capMu — because a rebuild that raced a Start
+// would replace the very set the send pipeline was being minted over. Nothing
+// may take sessMu while holding capMu; that is the cycle, and forwardSenderStates
+// records what a lock-order mistake in this file looks like (ten minutes).
+//
+// capStateMu is split off capMu for exactly the reason senderMu is split off
+// sessMu, and the consequence is sharper here: capMu is held ACROSS A DEVICE
+// OPEN — up to a second on a card that is slow to lock — and GetCaptureState is
+// read from a page's startup path and replayed from domReady on the Wails main
+// thread. One lock over both would freeze the window for the length of an open,
+// over the very panel that is trying to say "opening".
 //
 // retMu is a SIXTH and it is deliberately disjoint from sessMu rather than
 // nested under it. The two guard two independent media sessions that share no
@@ -402,8 +459,11 @@
 // flight. senderMu is split off sessMu for exactly this reason and it is worth
 // two locks in both places.
 //
-// No goroutine started here takes any of the five, so the WaitGroup joins
+// No goroutine started here takes sessMu or capMu, so the WaitGroup joins
 // performed under ctlMu and sessMu cannot deadlock against their own workers.
+// The capture layer's fault and warning drains are on rootWG and take neither;
+// the teardown's capture step closes their channels two steps before rootWG is
+// joined, which is what makes that join finite.
 //
 // mixMu is a leaf by construction rather than by luck: every mixer method needs
 // the m2lx client or the configuration, and reads both — under ctlMu and cfgMu
@@ -587,6 +647,22 @@ const (
 	// with no way to ask draws an empty black panel instead, which reads as a
 	// fault in a machine that is working perfectly.
 	EventPreview = "preview"
+
+	// EventCapture carries a capturePayload: what each leg of the ALWAYS-LIVE
+	// capture layer is doing — off, opening, live or failed — why not when it is
+	// failed, and which commentary device actually opened.
+	//
+	// IT IS THE ONLY THING ON THE PAGE THAT KNOWS WHETHER THE HARDWARE WAS TAKEN.
+	// That question used to be answered by START failing, twenty minutes before
+	// kick-off with a commentator waiting; the card and the microphone are now
+	// opened at launch, so it is answered while there is still time to fix it. A
+	// device that will not open is a STATE with a reason and not an error: the
+	// application must still come up, and on the picture leg it still sends,
+	// because that leg falls back to the slate.
+	//
+	// It is mirrored by EVENT_CAPTURE and CAPTURE_STATE in
+	// frontend/src/ui/backend.js, which copied Go's own lower-case spelling.
+	EventCapture = "capture"
 )
 
 const (
@@ -670,14 +746,33 @@ const (
 	// The remote listener adds one more second (remoteStopBudget, in
 	// app_remote.go): closing a TLS http.Server and its session goroutines is
 	// prompt — no cgo, no device, only sockets and goroutines selecting on a
-	// cancelled context — so a second is generous, and it takes the total to
-	// twenty-five. Unlike the media stops it cannot wedge, so it is a term in the
-	// sum rather than a wait expected to be cut off.
-	shutdownTimeout = 25 * time.Second
+	// cancelled context — so a second is generous. Unlike the media stops it
+	// cannot wedge, so it is a term in the sum rather than a wait expected to be
+	// cut off.
+	//
+	// The ALWAYS-LIVE CAPTURE adds the last four (captureStopBudget), and it is
+	// what takes this from twenty-five to twenty-nine. Its step runs AFTER the
+	// sender's and never before it, because the send pipeline is the proxysrc
+	// consumer and CapturePipeline.Stop refuses with ErrSeamBusy while that
+	// consumer still holds the seam.
+	shutdownTimeout = 29 * time.Second
 
 	// senderStopBudget bounds step 2, a.Stop. Fifteen seconds is the sender's own
 	// bounded worst case; see above.
 	senderStopBudget = 15 * time.Second
+
+	// captureStopBudget bounds the capture step: every distinct pipeline in the
+	// set taken to NULL. It is FOUR seconds, on the same arithmetic
+	// pictureStopBudget uses: internal/gst bounds one element's shutdown at
+	// elementShutdownTimeout, and a fused card seat is one pipeline while the
+	// worst ordinary seat is two.
+	//
+	// It is the one step in this teardown that releases a device NOTHING ELSE ON
+	// THE MACHINE CAN OPEN while we hold it (PLAN.md 0-BIS A1: the DeckLink is
+	// held from launch to quit), so it is given a real budget rather than a
+	// formality — and if it overruns anyway the process exit releases the card,
+	// which is what makes abandoning it safe.
+	captureStopBudget = 4 * time.Second
 
 	// returnStopBudget bounds step 3, a.StopReturn. Two seconds is the ordinary
 	// case with room to spare; a Play in flight is expected to be cut off and is
@@ -866,9 +961,21 @@ type App struct {
 
 	// rootCtx is the root of the app's one context tree; rootCancel ends it.
 	// rootWG holds every goroutine whose lifetime is the whole process.
+	//
+	// rootJoinMu / rootJoined are the ADD-AFTER-WAIT guard, and they are a leaf
+	// lock taken for two field accesses and nothing else. sync.WaitGroup panics
+	// with "Add called concurrently with Wait" if a counter that has reached zero
+	// is incremented while a Wait is in flight, and the capture layer can reach
+	// rootWG.Add after teardownOrdered has walked past its own capture step: that
+	// step takes capMu, so it queues behind an in-flight rebuild, and it is
+	// ABANDONED at captureStopBudget while the rebuild is still opening a device.
+	// The rebuild then completes and adopts. rootGo is the only permitted Add on
+	// that path; teardownOrdered latches rootJoined immediately before it waits.
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 	rootWG     sync.WaitGroup
+	rootJoinMu sync.Mutex
+	rootJoined bool
 
 	// events decouples both event producers from the renderer.
 	events *eventPump
@@ -968,6 +1075,71 @@ type App struct {
 	sessMu  sync.Mutex
 	session *session
 
+	// capMu guards capSet, capKey and capSel: the ALWAYS-LIVE CAPTURE LAYER,
+	// which is a different lifetime from a.session and is the whole of R1.
+	//
+	// # The lock order is sessMu -> capMu, in that direction only
+	//
+	// A rebuild must not race a Start, because a Start mints its send pipeline
+	// over whatever set is here and a rebuild replaces it — so rebuildCapture
+	// takes sessMu first, finds no session, and only then takes capMu. The one
+	// path that starts with sessMu already held is startSession itself, which
+	// calls rebuildCaptureLocked directly. NOTHING may take sessMu while holding
+	// capMu: that is the cycle, and forwardSenderStates' ten-minute hang is what
+	// it looks like when this file gets a lock order wrong.
+	//
+	// capMu is HELD ACROSS DEVICE OPENS — up to a second on a card that is slow
+	// to lock — which is why the published capture STATE lives under its own leaf
+	// lock below rather than under this one. GetCaptureState is called from a
+	// page's startup path and must answer "opening" WHILE the open is happening.
+	capMu sync.Mutex
+
+	// capSet is the capture layer: one pipeline on most seats, the SAME object in
+	// both fields on a fused card seat, and the zero value when nothing is open.
+	// It is built at domReady and rebuilt on a device, preview or conform change;
+	// a session neither creates it nor destroys it.
+	capSet gst.CaptureSet
+
+	// capKey is the ChannelMaps key of the device capSet.Commentary actually
+	// opened, in config.AudioDeviceKeyFor's spelling. It is recorded from the
+	// configuration the pipeline was BUILT from, so that a saved routing that has
+	// since been re-pointed cannot make this side describe a device the pad is
+	// not on. Empty when there is no commentary capture.
+	capKey string
+
+	// capConform is the conform target capSet's picture leg was BUILT with.
+	//
+	// It exists so that START can notice a target that has moved. The conform
+	// chain lives in the capture pipeline — which is what pins the caps crossing
+	// the proxy for the life of the process, so the card changing raster never
+	// reaches the encoder — and the price of that placement is that a new target
+	// is a new pipeline. Comparing this against a.conformTo is how a preset
+	// applied, or a switcher reconfigured, gets a picture at the right raster
+	// instead of one silently built for last month's venue.
+	capConform gst.ConformTarget
+
+	// capSel is the LIVE commentary selection, or nil when the saved
+	// configuration is the answer.
+	//
+	// SelectCommentaryInput deliberately does not save (frontend/src/ui/backend.js
+	// states that as its contract): an operator auditioning microphones twenty
+	// minutes before kick-off must be able to hear each one without rewriting
+	// config.json, and the Settings screen's Save is still what makes a choice
+	// stick. So the selection lives here, it wins over the document for as long as
+	// the application is running, and captureConfig is the one place the two are
+	// merged.
+	capSel *commentarySelection
+
+	// capStateMu guards capState, the last capture state published on
+	// EventCapture. It is a LEAF lock — nothing is taken while it is held, and
+	// the only thing done under it is one assignment — and it is a different lock
+	// from capMu for the reason senderMu is a different lock from sessMu: capMu
+	// is held across a device open, and GetCaptureState is read from a page's
+	// startup path and from domReady, where blocking for the length of an open
+	// would freeze the window over the very state it is trying to draw.
+	capStateMu sync.Mutex
+	capState   capturePayload
+
 	// senderMu guards lastSender, the most recent sender.State forwarded to the
 	// frontend. It is a leaf lock: nothing is taken while it is held.
 	//
@@ -996,6 +1168,28 @@ type App struct {
 	// streaming thread; see signalForwarder) and read by domReady.
 	sigMu      sync.Mutex
 	lastSignal gst.SignalReport
+
+	// THE ROUTING takes TWO locks, exactly as the cough mute does, and for the
+	// same reason on both.
+	//
+	//	chanApplyMu  →  chanMu
+	//
+	// chanApplyMu SERIALISES THE WRITE and is held from the call into internal/gst
+	// through the cache update and the republish. Without it the write and the
+	// record are two steps that two seats can interleave: internal/gst serialises
+	// the property writes under its own lock, so B's matrix is what audioconvert is
+	// running, but a desk goroutine descheduled between its write and its cache
+	// update takes chanMu LAST, records A and emits channelMap{A} — after which
+	// both screens and every domReady replay show A while B is on air. That is the
+	// commentator's channel assignment reported as something other than what is
+	// being sent, with nothing on screen to say so, and it is the failure
+	// setCommentaryMuteFrom's own comment names for the mute. Both controls are on
+	// the remote allowlist and both are now reachable off air as well as on.
+	//
+	// It is held across a call into internal/gst, which takes a lock that package
+	// holds across state changes, which is exactly why the state a page READS must
+	// not be behind it.
+	chanApplyMu sync.Mutex
 
 	// chanMu guards lastChannelMap, the capture routing CURRENTLY IN FORCE on
 	// the running pipeline. Another leaf lock, held for one assignment.
@@ -1211,12 +1405,16 @@ type App struct {
 	prevRect        gst.PictureRect
 	prevWantVisible bool
 
-	// prevRunning records whether THIS session's pipeline actually has a preview
+	// prevRunning records whether THE PICTURE CAPTURE actually has a preview
 	// branch in it — the configuration asked for one AND an overlay was created
 	// for it. It is the preview's equivalent of "the monitor is SHOWING" in
 	// applyPictureVisibilityViewLocked: without it, a page that asked to see the
 	// preview would be shown an empty opaque rectangle over its own controls on
 	// every seat that is sending a slate.
+	//
+	// IT NO LONGER MEANS "A SESSION IS UP". The picture capture is built at
+	// domReady and held until the application quits, so this is true from launch
+	// on a card seat that asked for a preview and stays true across a STOP.
 	prevRunning bool
 
 	// THE COUGH MUTE takes TWO locks, and the split is the same one the picture
@@ -1406,6 +1604,20 @@ type session struct {
 	snd  sender.Sender
 	pipe gst.Pipeline
 	wg   sync.WaitGroup
+
+	// cap is the capture layer this session's send pipeline was minted over: the
+	// pipelines that hold the device, meter it, route it and mute it.
+	//
+	// THE SESSION DOES NOT OWN IT. Ownership is App.capSet, under capMu, built at
+	// domReady and rebuilt on a device, preview or conform change; this is a
+	// RECORD of which set this session bound to, so that the state forwarder can
+	// reconcile the mute against the same pipeline for the whole of the session
+	// without taking a lock (see forwardSenderStates for why that matters).
+	//
+	// It is therefore never stopped from here. A session ending releases the seam
+	// and leaves the devices open, which is the whole of R1: the meters, the
+	// picture, the routing width, the signal lamp and the mute all survive STOP.
+	cap gst.CaptureSet
 }
 
 // NewApp creates the bound application object.
@@ -1593,9 +1805,82 @@ func (a *App) domReady(ctx context.Context) {
 	a.events.send(EventMute, a.GetCommentaryMute())
 
 	// And the preview panel, so a page that has just loaded draws the sentence
-	// about why there is no picture rather than an empty black rectangle while
-	// it waits for a session that may be an hour away.
+	// about why there is no picture rather than an empty black rectangle.
 	a.publishPreview()
+
+	// The capture layer's state, replayed for the reason the signal lamp's is: it
+	// changes only when a device does, so a page that reloaded at half-time would
+	// otherwise have nothing at all to say about what is open. It reads
+	// capStateMu, a leaf that is never held across a device open — which is what
+	// makes it safe on this, the Wails main thread.
+	a.events.send(EventCapture, a.GetCaptureState())
+
+	// ---------------------------------------------------------------------
+	// AND THE CAPTURE LAYER IS BUILT, HERE, FOR THE FIRST TIME.
+	// ---------------------------------------------------------------------
+	//
+	// domReady is the earliest point at which this can be done, and there are two
+	// separate reasons, either of which alone would fix the moment here.
+	//
+	// NewOverlaySurface needs the application window to exist, and before this
+	// callback it does not: it answers ErrNoHostWindow, and the seat that asked
+	// for a confidence preview would come up without one for the whole session.
+	//
+	// And the three events the build publishes — capture, channelMap, mute — go to
+	// a page that is now LISTENING. Firing them from startup would put all three
+	// before a single subscription existed, and the signal lamp has no getter to
+	// read itself back with.
+	//
+	// IT RUNS ON A GOROUTINE AND NOT ON THIS THREAD. This callback is the Wails
+	// MAIN THREAD; a card that is slow to lock takes the best part of a second to
+	// open, and doing it inline would freeze the window at launch over exactly the
+	// panel that is trying to say "opening". The surface creation inside it
+	// dispatches to the main queue, which is running by now, so a background
+	// goroutine is also the only place it can be done without dispatching to
+	// ourselves.
+	//
+	// It is on rootWG so that teardown joins it, and it re-checks closing itself:
+	// a window closed inside the first second must not leave a device open behind
+	// a shutdown that has already walked past the capture step.
+	if !a.rootGo(1) {
+		return
+	}
+	go func() {
+		defer a.rootWG.Done()
+
+		// THE CONFORM TARGET IS RESOLVED BEFORE THE CAPTURE IS BUILT, and this is
+		// the line that makes "pressing START is identical" true.
+		//
+		// The conform chain lives in the CAPTURE pipeline, which is what pins the
+		// caps crossing the proxy for the life of the process (PLAN.md 3.6). So the
+		// raster is decided when the capture is built, and if that decision is left
+		// until START then the first START of every day finds a picture built to the
+		// wrong target and rebuilds it — closing and reopening the exclusive
+		// DeckLink, blanking the preview and dropping the meters at the exact moment
+		// the operator pressed the button, with no capture at all if the card does
+		// not come back.
+		//
+		// It runs HERE, outside sessMu, because conformFormat takes ctlMu and can
+		// spend conformFetchTimeout (three seconds) on a REST call, and this file's
+		// lock order says ctlMu is never held with sessMu — which the rebuild below
+		// holds throughout. Three seconds on a background goroutine at launch costs
+		// nothing: the window is already up and the capture panel is already saying
+		// "opening".
+		//
+		// It does not make START's read redundant. Start re-reads on every press,
+		// and captureForSessionLocked rebuilds if the answer has genuinely MOVED —
+		// which is the case this cannot cover, because a preset applied or a
+		// switcher reconfigured mid-afternoon changes it.
+		a.conformTo.Store(a.conformFormat(a.snapshotConfig()))
+
+		if err := a.rebuildCapture("launch"); err != nil {
+			// Already published on the capture event, with this same sentence, and
+			// already logged. NOT emitted as an error banner as well: a machine with
+			// no card in it would open with a red banner over a screen that is
+			// working, and the capture panel is where this belongs.
+			log.Printf("wslcomms: the capture layer did not come up at launch: %v", err)
+		}
+	}()
 }
 
 // secondInstanceLaunched is the Wails OnSecondInstanceLaunch callback. It runs
@@ -1732,8 +2017,23 @@ func (a *App) teardownOrdered() int {
 		return nil
 	})
 
-	// The return monitor after the sender, never before it. Both release a
-	// audio endpoint and an SRT socket, and if the whole sequence overruns the
+	// THE CAPTURE LAYER, IMMEDIATELY AFTER THE SENDER AND NEVER BEFORE IT.
+	//
+	// The send pipeline is the proxysrc consumer, and CapturePipeline.Stop
+	// refuses with ErrSeamBusy while that consumer still holds the seam — because
+	// taking a device to NULL underneath a bound proxysrc is measured SILENT in
+	// every direction: 0 buffers, no EOS, no ERROR and no WARNING on either bus,
+	// with the send pipeline still PLAYING and SRT still connected. So the sender
+	// goes first and this waits for it, exactly as the ordering inside a normal
+	// STOP does.
+	//
+	// It is this high in the order — above the return monitor and the picture —
+	// because it holds the DeckLink, which nothing else on this machine can open
+	// while we have it, and because it is what stops the meters and the preview.
+	step("the capture", captureStopBudget, a.stopCaptureForTeardown)
+
+	// The return monitor after the capture, never before the sender. Both release
+	// a audio endpoint and an SRT socket, and if the whole sequence overruns the
 	// process exits regardless — so the one that must already have finished is
 	// the contribution path.
 	step("the return monitor", returnStopBudget, func() error {
@@ -1768,11 +2068,36 @@ func (a *App) teardownOrdered() int {
 	})
 
 	step("the background goroutines", rootJoinBudget, func() error {
+		// LATCH BEFORE WAITING. From here on rootGo refuses, so nothing can
+		// increment a counter this goroutine is about to sit on — which is a panic
+		// ("sync: WaitGroup misuse: Add called concurrently with Wait") on the way
+		// out rather than the controlled hardExit, and is reachable because the
+		// capture step above is ABANDONED at its budget while a slow device open
+		// still has capMu.
+		a.rootJoinMu.Lock()
+		a.rootJoined = true
+		a.rootJoinMu.Unlock()
+
 		a.rootWG.Wait()
 		return nil
 	})
 
 	return abandoned
+}
+
+// rootGo reserves n slots on rootWG, or reports that the join has already
+// started and the caller must not add to it. See the rootJoinMu field.
+//
+// The caller that is refused owns whatever it was about to hand to those
+// goroutines and must dispose of it itself: there is nobody left to join them.
+func (a *App) rootGo(n int) bool {
+	a.rootJoinMu.Lock()
+	defer a.rootJoinMu.Unlock()
+	if a.rootJoined {
+		return false
+	}
+	a.rootWG.Add(n)
+	return true
 }
 
 // teardownStep runs one step of the ordered shutdown under its own bound and
@@ -1927,7 +2252,7 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 		return errors.New("wslcomms: SaveConfig: no configuration supplied")
 	}
 	if originClientID != localClientID {
-		if err := a.refuseRemoteVideoLegChange(c); err != nil {
+		if err := a.refuseRemoteCaptureChange(c); err != nil {
 			return err
 		}
 	}
@@ -1951,6 +2276,56 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 
 	a.events.send(EventConfig, configEvent{Config: &saved, Origin: originClientID})
 
+	// THE CAPTURE FOLLOWS THE DOCUMENT, when the document says something new about
+	// it. A save that moves the commentary input, the video source, the preview
+	// switch or the slate is a save that describes a different pipeline, and the
+	// pipeline is live: leaving it alone would mean the Settings screen and the
+	// meters described two different pieces of hardware until the next launch.
+	if captureConfigChanged(previous, &saved) {
+		// THE LIVE SELECTION IS DROPPED BY A SAVE, and only by one. SelectCommentaryInput
+		// deliberately does not write config.json, so an audition and the document
+		// can disagree; a Save is the operator committing, and the document becomes
+		// the answer again. Clearing it here rather than leaving it to win silently
+		// is what stops "I saved the Focusrite and it is still on the built-in mic".
+		//
+		// IT IS CLEARED ONLY IF THE REBUILD ACTUALLY HAPPENS, and that ordering is
+		// the whole of it. rebuildCapture refuses outright while a feed is running,
+		// having done nothing — so clearing first left the running capture on the
+		// audition device with capSel saying there was no live selection and the
+		// document naming a third one. The banner below is true either way, but the
+		// NEXT rebuild would then have silently moved the commentary to the
+		// document's device rather than back to the audition the operator is
+		// listening to.
+		a.capMu.Lock()
+		sel := a.capSel
+		a.capSel = nil
+		a.capMu.Unlock()
+
+		if err := a.rebuildCapture("the configuration was saved"); err != nil {
+			if errors.Is(err, errCaptureChangeWhileSending) {
+				a.capMu.Lock()
+				a.capSel = sel
+				a.capMu.Unlock()
+			}
+			// NOT returned. The configuration IS saved — that succeeded, and telling
+			// the operator otherwise would have them press Save again over a file
+			// that is already correct.
+			log.Printf("wslcomms: the saved configuration could not be applied to the capture "+
+				"layer: %v", err)
+			if errors.Is(err, errCaptureChangeWhileSending) {
+				// THIS ONE GETS A BANNER, and the others do not. A device failure is
+				// already on screen in the capture panel's own words; this is a
+				// DIVERGENCE — the file now says one microphone and the feed is
+				// carrying another — and nothing else on the page would ever show it.
+				// The Settings screen disables these controls while sending, so
+				// reaching here at all means something went round them.
+				a.emitError(fmt.Errorf(
+					"wslcomms: the configuration was saved, but the capture is still on the "+
+						"device it was already using because a feed is running: %w", err))
+			}
+		}
+	}
+
 	// The preview panel's explanation is derived from decklinkPreviewEnabled and
 	// videoSource, so a save can change what it should be saying without changing
 	// anything about a session. Republished here rather than left to the page to
@@ -1958,6 +2333,30 @@ func (a *App) saveConfigFrom(originClientID string, c *config.Config) error {
 	// republishes its grid.
 	a.publishPreview()
 	return nil
+}
+
+// captureConfigChanged reports whether two configurations describe DIFFERENT
+// capture pipelines.
+//
+// It is a whitelist rather than a whole-struct comparison, and deliberately: an
+// srtPort or a statusKey must not blank a commentator's picture, and a
+// reflection-based "did anything change" would do exactly that on every save.
+// Every field here appears because captureOpts or preflightCapture reads it.
+//
+// ChannelMaps is NOT on this list. The routing is written live to a running
+// pipeline by SetChannelMap, in about 119 microseconds, with nothing rebuilt —
+// so a save that only records that routing must not take the card down and back
+// up to achieve what has already happened.
+func captureConfigChanged(prev, next *config.Config) bool {
+	if prev == nil || next == nil {
+		return true
+	}
+	return prev.EffectiveVideoSource() != next.EffectiveVideoSource() ||
+		prev.DeckLinkPreviewEnabled != next.DeckLinkPreviewEnabled ||
+		prev.EffectiveAudioSourceKind() != next.EffectiveAudioSourceKind() ||
+		prev.AudioDeviceID != next.AudioDeviceID ||
+		prev.DeckLinkPersistentID != next.DeckLinkPersistentID ||
+		prev.SlatePath != next.SlatePath
 }
 
 // carryForwardUIOnlyFields copies fields that NO SCREEN WRITES YET out of the
@@ -2000,8 +2399,9 @@ type configEvent struct {
 	Origin string         `json:"origin"`
 }
 
-// refuseRemoteVideoLegChange is what makes SetVideoSource and
-// SetDeckLinkPreviewEnabled being HOST-ONLY mean something.
+// refuseRemoteCaptureChange is what makes SetVideoSource,
+// SetDeckLinkPreviewEnabled and SelectCommentaryInput being HOST-ONLY mean
+// something.
 //
 // # Why a host-only method is not by itself a guarantee
 //
@@ -2013,7 +2413,18 @@ type configEvent struct {
 // entitled to call, and the host-only classification would be a decoration.
 // This is the enforcement; the classification is the declaration.
 //
-// # It refuses the whole save rather than dropping the two fields
+// # It guards the COMMENTARY leg too, and that is new
+//
+// It used to guard videoSource and decklinkPreviewEnabled alone, because those
+// were the only two fields a session did not re-read. The capture layer is now
+// live from launch and a save re-points it (saveConfigFrom), so a remote
+// whole-document SaveConfig carrying a different audioSourceKind, audioDeviceId
+// or decklinkPersistentId would take the desk's microphone away from the person
+// sitting at it — and on a card seat it would take the EXCLUSIVE DeckLink away
+// and reopen it, blanking the operator's picture, from another building. Those
+// three fields are therefore on this list beside the two that were always here.
+//
+// # It refuses the whole save rather than dropping the fields
 //
 // Silently keeping the live values and writing everything else would be the
 // gentler behaviour and it is the wrong one: the remote page would show the
@@ -2027,9 +2438,28 @@ type configEvent struct {
 // with the video leg restated exactly as the page was told it — passes through
 // untouched. A remote seat's cache is refreshed by the "config" event on every
 // save, so a difference is an intention rather than staleness.
-func (a *App) refuseRemoteVideoLegChange(c *config.Config) error {
+func (a *App) refuseRemoteCaptureChange(c *config.Config) error {
 	live := a.snapshotConfig()
 
+	if c.EffectiveAudioSourceKind() != live.EffectiveAudioSourceKind() {
+		return fmt.Errorf(
+			"wslcomms: refused: audioSourceKind is %q here and this save would make it %q, and "+
+				"which microphone this position is heard on cannot be changed from a remote seat. "+
+				"Ask the operator at the desk to change it there",
+			live.EffectiveAudioSourceKind(), c.EffectiveAudioSourceKind())
+	}
+	if c.AudioDeviceID != live.AudioDeviceID {
+		return fmt.Errorf(
+			"wslcomms: refused: audioDeviceId names the commentary microphone this position is " +
+				"captured from, and it cannot be changed from a remote seat. Ask the operator at the " +
+				"desk to change it there")
+	}
+	if c.DeckLinkPersistentID != live.DeckLinkPersistentID {
+		return fmt.Errorf(
+			"wslcomms: refused: decklinkPersistentId names the capture card this position holds " +
+				"open, and changing it from a remote seat would close and reopen the card on the " +
+				"operator's desk. Ask the operator at the desk to change it there")
+	}
 	if c.EffectiveVideoSource() != live.EffectiveVideoSource() {
 		return fmt.Errorf(
 			"wslcomms: refused: videoSource is %q here and this save would make it %q, and what "+
@@ -2053,15 +2483,15 @@ func (a *App) refuseRemoteVideoLegChange(c *config.Config) error {
 // both would say neither.
 var (
 	errVideoSourceWhileSending = errors.New(
-		"wslcomms: cannot change the video source while sending: the video leg is built at START " +
-			"and there is no way to swap it under a running feed — set_state(NULL) inside a blocking " +
-			"pad probe was measured to take the leg from 50 fps to 0 permanently with the pipeline " +
-			"still reporting PLAYING. Press STOP, change it, then START")
+		"wslcomms: cannot change the video source while sending: changing it rebuilds the picture " +
+			"capture, and there is no way to swap the leg under a running feed — set_state(NULL) " +
+			"inside a blocking pad probe was measured to take the leg from 50 fps to 0 permanently " +
+			"with the pipeline still reporting PLAYING. Press STOP, change it, then START")
 
 	errPreviewChangeWhileSending = errors.New(
-		"wslcomms: cannot turn the preview on or off while sending: it is a branch of the " +
-			"contribution pipeline and is built with it at START, so it can be neither attached nor " +
-			"detached live. Press STOP, change it, then START")
+		"wslcomms: cannot turn the preview on or off while sending: it is a tee branch of the " +
+			"picture capture and is built with it, so it can be neither attached nor detached live. " +
+			"Press STOP, change it, then START")
 )
 
 // SetVideoSource chooses WHAT THE VIDEO LEG CARRIES: config.VideoSourceSlate,
@@ -2078,7 +2508,7 @@ var (
 // decide that this position is now showing its camera.
 //
 // The classification alone does not achieve that, because SaveConfig writes the
-// same field and is reachable — refuseRemoteVideoLegChange is what closes it.
+// same field and is reachable — refuseRemoteCaptureChange is what closes it.
 // Having a method of its own is still the right shape: it is where the value is
 // checked before anything is written, and it is the row in remoteAllowlist that
 // STATES the rule the other check enforces.
@@ -2122,6 +2552,10 @@ func (a *App) SetVideoSource(source string) error {
 		return errVideoSourceWhileSending
 	}
 
+	// saveConfigFrom is what rebuilds the picture capture: it compares the saved
+	// document against the live one (captureConfigChanged) and re-points the
+	// pipeline when the video leg has moved. There is deliberately no second
+	// rebuild here — two callers of one rebuild is how the two orders drift.
 	cfg := a.snapshotConfig()
 	cfg.VideoSource = s
 	return a.saveConfigFrom(localClientID, cfg)
@@ -2153,6 +2587,9 @@ func (a *App) SetDeckLinkPreviewEnabled(enabled bool) error {
 		return errPreviewChangeWhileSending
 	}
 
+	// Rebuilt through saveConfigFrom, exactly as SetVideoSource is: the preview is
+	// a TEE BRANCH of the picture capture and is built with it, so turning it on
+	// or off is a new pipeline. That is a blank picture for a moment, off air.
 	cfg := a.snapshotConfig()
 	cfg.DeckLinkPreviewEnabled = enabled
 	return a.saveConfigFrom(localClientID, cfg)
@@ -2258,133 +2695,84 @@ func (a *App) startSession() error {
 		return fmt.Errorf("wslcomms: cannot start, the configuration is incomplete: %w", err)
 	}
 
-	// Every hardware question this session's two legs raise, answered before a
-	// single element is built: which video source, which audio subsystem, which
-	// card, and whether the machine actually has it. It returns the DeckLink
-	// persistent-id each leg is to open — empty for the slate, and empty for a
-	// commentary input that is an ordinary microphone.
-	plan, err := a.preflightCapture(cfg)
-	if err != nil {
-		return err
-	}
-
 	passphrase, err := a.srtPassphrase(cfg)
 	if err != nil {
 		return err
 	}
 
-	// The operator's confidence monitor, if they have asked for one and the video
-	// leg is a camera. It is built HERE, before the pipeline, because the preview
-	// is a branch of that pipeline and its handle is a build-time option: there is
-	// no attaching one to a running graph. Its failures are SPARED — a preview
-	// that cannot get a window leaves plan.VideoCaptureID untouched and the feed goes
-	// out without it — which is the whole rule for this path.
-	previewHandle := a.startSessionPreview(cfg, plan.VideoCaptureID != "")
-
-	pipe, err := gst.New()
+	// THE CAPTURE LAYER IS ALREADY UP, AND START NO LONGER BUILDS IT. It was
+	// built at domReady and it outlives this session; all START does is check
+	// that it is the RIGHT one and then mint a send pipeline over it.
+	//
+	// Two things can make it wrong, and both are answered off air, before
+	// anything is claimed:
+	//
+	//   - THERE IS NONE. The device would not open at launch, or the operator has
+	//     never had one. Pressing START is a retry, so one is attempted here and
+	//     the refusal — if it comes — is the SAME SENTENCE the capture panel is
+	//     already showing rather than a second description of one fault.
+	//   - THE CONFORM TARGET HAS MOVED. Start has just re-read it from the
+	//     switcher (see Start), and the conform chain lives in the CAPTURE
+	//     pipeline, so a target that differs from the one the capture was built
+	//     with means rebuilding the picture. That is a blank preview for a moment,
+	//     off air, which is the price of the caps crossing the proxy never
+	//     changing while a feed is running.
+	capSet, err := a.captureForSessionLocked()
 	if err != nil {
-		// The preview surface exists by now and nothing will ever render into it,
-		// so it goes back. Ordinarily it is released by the sender-state
-		// forwarder's exit, and this Start never reaches the point where that
-		// forwarder is launched — so without this, a Start that failed here would
-		// leave an opaque native window over the page with no session behind it
-		// and nothing that would ever take it away. The same applies at the
-		// snd.Start failure below. Both are idempotent.
-		a.stopSessionPreview()
+		return err
+	}
+
+	// gst.New refuses an empty set, which is what makes "a send pipeline with no
+	// device behind it" unconstructible rather than merely unlikely: the send
+	// description has no device in it at all — its two sources are proxysrcs bound
+	// to the proxysinks these capture pipelines own.
+	pipe, err := gst.New(capSet)
+	if err != nil {
+		// THE CAPTURE IS NOT STOPPED HERE, and that is the change R1 makes to
+		// every failure path in this function. It is not this session's to stop:
+		// the meters, the preview and the routing grid are still live and still
+		// correct, and a failed START must leave the operator exactly as it found
+		// them. gst.New either claimed the seam or it did not; it releases its own
+		// claim on the way out.
 		return fmt.Errorf("wslcomms: creating the media pipeline: %w", err)
 	}
 
 	snd := a.newSender(pipe)
 	opts := a.senderOpts(cfg, passphrase)
 
-	// The options the PRE-FLIGHT decided rather than the configuration, and the
-	// reason they are set here instead of inside senderOpts: two are card ids
-	// resolved against what this machine is actually offering, the third a native
-	// window handle. None is a function of the configuration alone, and
-	// senderOpts is deliberately a pure reading of it — see its comment.
-	//
-	// THE PAIRING WITH senderOpts' AudioDeviceID IS THE WHOLE SAFETY PROPERTY OF
-	// THIS FEATURE and the two lines have to be read together: senderOpts sets
-	// AudioDeviceID only for a NATIVE seat, and this sets AudioCaptureID only for
-	// a card one, so exactly one of them is ever non-empty and internal/gst's
-	// refuseWrongAudioSource refuses the pipeline if that is ever untrue. An
-	// empty device id on osxaudiosrc or wasapi2src is not an error — it is the
-	// SYSTEM DEFAULT INPUT — so "a DeckLink seat that reached the platform
-	// element" is the failure both halves exist to make unreachable.
-	opts.Pipeline.VideoCaptureID = plan.VideoCaptureID
-	opts.Pipeline.AudioCaptureID = plan.AudioCaptureID
-	opts.Pipeline.Preview = gst.PreviewOpts{
-		// Enabled is the operator's request AND the pre-flight's verdict, ANDed
-		// here rather than left to internal/gst, so that a seat which asked for a
-		// preview while sending the slate is simply not asking for one. Passing
-		// the request through with no handle would have the pipeline log that the
-		// monitor is switched on and has no surface, which is a true sentence
-		// about a machine that has nothing to preview and would send the operator
-		// looking for a window fault that is not there.
-		Enabled:      cfg.DeckLinkPreviewEnabled && plan.VideoCaptureID != "",
-		WindowHandle: previewHandle,
-	}
-
-	// THE MUTE IS FALSE HERE, EXPLICITLY, AND IT MUST STAY THAT WAY.
-	//
-	// internal/gst offers PipelineOpts.MuteCommentary so a caller can rebuild a
-	// pipeline after a fatal and have the replacement born muted rather than
-	// muted a moment after its first buffer. That is the right facility and this
-	// is the wrong caller for it: nothing in this application continues a session
-	// across a rebuild. A capture chain that dies stops the sender, the forwarder
-	// exits, forgetMute runs, and the operator presses START again — which is a
-	// NEW session, begun by somebody who is about to speak.
-	//
-	// So the only thing carrying a mute in here could ever do is put a position
-	// on air silent because of a key pressed before the last failure. It is
-	// written out rather than left to the zero value precisely so that the next
-	// reader who finds MuteCommentary and thinks "we should carry the mute
-	// across" finds this paragraph first. Coming on air muted because of a stale
-	// flag is as bad as coughing on air.
-	opts.Pipeline.MuteCommentary = false
-
 	if err := snd.Start(opts); err != nil {
 		// sender.Start leaves the pipeline it was given untouched on failure,
 		// and a gst.Pipeline is single-use, so this one is stopped here rather
 		// than leaked: Stop is what closes its Errors channel and releases the
-		// capture device.
+		// seam back to the capture pipelines.
 		if stopErr := pipe.Stop(); stopErr != nil {
 			log.Printf("wslcomms: stopping the pipeline after a failed start: %v", stopErr)
 		}
-		// After the pipeline, never before it: the branch that was rendering into
-		// the surface has to be at NULL first. See stopSessionPreview.
-		a.stopSessionPreview()
 		return err
 	}
 
-	sess := &session{snd: snd, pipe: pipe}
+	sess := &session{snd: snd, pipe: pipe, cap: capSet}
 
-	// The routing that is now in force, recorded before anything can change it.
-	// It is taken from the options the pipeline was ACTUALLY started with rather
-	// than re-derived from the config, so there is one derivation and no way for
-	// the cache and the pipeline to disagree about what was written.
-	a.chanMu.Lock()
-	a.lastChannelMap = opts.Pipeline.ChannelMap
-	a.chanMu.Unlock()
-
-	// And the width, which exists only now: the pad negotiates as the pipeline
-	// goes to PLAYING, so this is the first moment there is a real number to
-	// size a routing grid against. A Settings screen left open across a START
-	// therefore sizes itself without being reopened.
+	// THE CAPTURE'S FAULTS ARE NOT DRAINED HERE ANY MORE, and the deletion is the
+	// change rather than an omission. The two goroutines that read Faults() and
+	// Warnings() now belong to the CAPTURE and live on rootWG (adoptCaptureLocked),
+	// because a capture fault is a fault whether or not anybody is sending — which
+	// is the entire point of a device that is open an hour before START. Leaving
+	// them here would have meant a card going missing at line-up reaching nobody.
 	//
-	// STAMPED WITH THE DEVICE THIS cfg NAMES, from the same call senderOpts used
-	// to choose which saved routing to start with. One derivation, one config
-	// value, so the width and the routing on screen cannot end up describing two
-	// different pieces of hardware.
-	a.publishChannelMap(pipe, cfg.AudioDeviceKey())
-
-	// THE MUTE IS PUT INTO ITS DEFINED STATE — off — and published. This is the
-	// line that stops a position coming on air muted because of something
-	// pressed before the last Stop, and it is deliberately here rather than in
-	// Stop alone: a session that ended by dying takes no orderly path out, and
-	// the only moment that is guaranteed to happen before anybody is heard is
-	// this one.
-	a.armMuteForSession(pipe)
+	// THE ROUTING AND THE WIDTH ARE NOT PUBLISHED HERE EITHER. They were published
+	// at START because START was the first moment a pad had negotiated; the pad
+	// negotiated an hour ago, the grid has been sized and live since, and
+	// republishing now would be this side re-announcing a measurement it did not
+	// make. A Settings screen left open across a START sees nothing change,
+	// correctly: nothing about the routing did.
+	//
+	// AND THE MUTE IS NOT CLEARED. That is the operator's ruling (PLAN.md 0-BIS
+	// A2) and it reverses what this line used to do. The argument for clearing is
+	// answered where it stands, beside SetCommentaryMute: the fear was of a
+	// control that LIES, and it is met by VISIBILITY — a muted commentator has a
+	// flat programme meter AND a mute banner, before and after START — rather than
+	// by a session boundary that silently discards what the operator pressed.
 
 	// The lock-free record of "a session is running", raised here and lowered in
 	// the forwarder's exit — the one place that covers the self-stop path as well
@@ -2392,8 +2780,8 @@ func (a *App) startSession() error {
 	// would not do.
 	a.sessionUp.Store(true)
 
-	// And the preview panel is told what it now is. The page has been drawing a
-	// sentence about why there is no picture; this is the moment there is one.
+	// And the preview panel is told what it now is — the SENDING half of it. The
+	// picture itself has been on screen since launch.
 	a.publishPreview()
 
 	// The forwarder is started only after sender.Start has succeeded. On failure
@@ -2405,62 +2793,24 @@ func (a *App) startSession() error {
 	sess.wg.Add(1)
 	go func() {
 		defer sess.wg.Done()
-		a.forwardSenderStates(pipe, snd.States())
-		// The session is over — the sender closed its states channel, on the
-		// operator-Stop path and the self-stop path alike — so the meters get
-		// one final all-silence frame. Without it they freeze at the last
-		// level the pipeline reported, and a frozen meter reads as a live one.
-		// It is sent from here, before wg.Done runs, so that by the time
-		// App.Stop returns (it waits on sess.wg) the zero-frame is already
-		// queued behind the StateStopped that preceded it. It bypasses the
-		// levels throttle deliberately: the throttle drops frames on the
-		// assumption another is 50 ms behind, and this is the frame after
-		// which nothing follows.
-		a.events.send(EventLevels, silentLevelsPayload())
-		// The per-channel picker gets its own zero-frame, AT ITS OWN WIDTH, and
-		// only if it ever ran. Swap rather than Load, so the width belongs to the
-		// session that recorded it and a later session starts from nothing. A
-		// zero here is a session in which no per-channel frame was ever forwarded
-		// — every positioned capture source, which is every microphone — and
-		// sending a silent frame then would lay out strips for a meter that never
-		// existed.
-		if n := int(a.chanLevelWidth.Swap(0)); n > 0 {
-			a.events.send(EventChannelLevels, silentLevelsPayloadFor(n))
-		}
-		// The routing grid goes back to "no pad, nothing negotiated". Its
-		// crosspoints are controls over a capture pad, and the pad is gone.
-		a.forgetChannelMap()
-		// And the signal lamp goes back to "cannot tell", for the same reason
-		// and with a sharper consequence. The watchdog dies with the pipeline,
-		// so whatever it last said — OK or LOST — would stand forever: a green
-		// signal lamp beside a grey SENDING lamp, describing a capture element
-		// that no longer exists. UNKNOWN is the truth once there is nothing left
-		// to poll. It clears the replay cache too, so a page loaded after the
-		// session ends does not resurrect it.
-		a.forgetSignal()
-		// And the preview surface goes, because the pipeline that was rendering
-		// into it has gone. This runs HERE rather than in App.Stop so that it
-		// covers the self-stop path too — a capture chain that died takes its
-		// preview with it — and it runs AFTER the sender closed its states
-		// channel, which it does as the last act of stopping the pipeline. That
-		// ordering is the same one stopPictureForTeardown insists on and it is
-		// insisted on for the same reason: take the surface away first and the
-		// video sink is presenting into a handle that no longer names anything.
-		a.stopSessionPreview()
-		// Lowered BEFORE the two publishes below, so neither of them describes a
-		// session that has ended as though it were still running.
+		a.forwardSenderStates(capSet.Commentary, snd.States())
+		// SIX SUBSYSTEM SHUTDOWNS USED TO LIVE HERE, AND THE LIST IS NOW EMPTY.
+		//
+		// stopCaptureSet, the silent levels frame, the per-channel zero frame,
+		// forgetChannelMap, forgetSignal and forgetMute have all moved to
+		// teardownCaptureLocked, and stopSessionPreview has moved to the capture's
+		// own preview lifetime. THE METERS, THE PICTURE, THE ROUTING WIDTH, THE
+		// SIGNAL LAMP AND THE MUTE ALL SURVIVE STOP: that is the whole point of the
+		// seam, and it is a visible change rather than a refactor. A commentator
+		// who presses STOP at half-time keeps everything they were watching.
+		//
+		// What is left is the two facts that really did end with the session.
+		//
+		// Lowered BEFORE the publish below, so it does not describe a session that
+		// has ended as though it were still running.
 		a.sessionUp.Store(false)
-		// And the panel that was drawing it is told, so it goes back to the
-		// sentence about pressing START rather than to a black rectangle.
+		// And the panel that draws the SENDING half is told.
 		a.publishPreview()
-		// And the cough mute goes back to "nothing to mute", for the reason
-		// forgetChannelMap and forgetSignal go back to theirs, with the sharpest
-		// consequence of the three: a latched cough button left drawn over a
-		// session that has gone is a control the operator cannot release,
-		// because there is nothing left for it to act on. This runs on the
-		// self-stop path as well as the operator-Stop one, which is the whole
-		// reason it is here and not in App.Stop.
-		a.forgetMute()
 	}()
 	a.session = sess
 
@@ -2760,9 +3110,10 @@ func (a *App) preflightAudioDevice(id string) error {
 		// over from Windows, in which case the saved id really is a Windows
 		// playback endpoint and saying so is the fastest route to the fix.
 		return fmt.Errorf(
-			"wslcomms: cannot start: the saved commentary input %s is a Windows PLAYBACK endpoint, "+
+			"wslcomms: cannot open the commentary capture: the selected input %s is a Windows PLAYBACK endpoint, "+
 				"not a microphone — capture endpoints begin %s and this one begins %s. Choose a device "+
-				"from the Commentary input dropdown on the main screen and press START again.",
+				"from the Commentary input dropdown on the main screen; the capture re-points as "+
+				"soon as you do.",
 			id, gst.CaptureEndpointPrefix, gst.RenderEndpointPrefix)
 	}
 
@@ -2783,10 +3134,11 @@ func (a *App) preflightAudioDevice(id string) error {
 		}
 	}
 	return fmt.Errorf(
-		"wslcomms: cannot start: the saved commentary input %s is not present on this machine — "+
+		"wslcomms: cannot open the commentary capture: the selected input %s is not present on this machine — "+
 			"%d inputs were found and none of them is that one. Dante Virtual Soundcard and NDI "+
 			"endpoints are created and destroyed as their sources come and go. Choose a device from "+
-			"the Commentary input dropdown on the main screen and press START again. (If this id was "+
+			"the Commentary input dropdown on the main screen; the capture re-points as soon as you "+
+			"do. (If this id was "+
 			"typed into the Settings screen's Commentary input device ID box, it belongs to another "+
 			"machine.)",
 		id, len(devices))
@@ -2991,7 +3343,7 @@ func (a *App) resolveDeckLinkCard(cfg *config.Config, seat deckLinkSeat) (string
 			// slate to a switcher the operator believes is receiving their camera,
 			// or put the laptop microphone on air in place of the commentator's.
 			return "", fmt.Errorf(
-				"wslcomms: cannot start: %s — but decklinkPersistentId is empty and this machine's "+
+				"wslcomms: cannot open the capture: %s — but decklinkPersistentId is empty and this machine's "+
 					"capture devices could not be listed, so there is nothing to say WHICH card. Set "+
 					"decklinkPersistentId on the Settings screen, or %s",
 				seat.because(), seat.instead())
@@ -3019,7 +3371,7 @@ func (a *App) resolveDeckLinkCard(cfg *config.Config, seat deckLinkSeat) (string
 			}
 		}
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: %s, and decklinkPersistentId is %s, which is not a Blackmagic "+
+			"wslcomms: cannot open the capture: %s, and decklinkPersistentId is %s, which is not a Blackmagic "+
 				"card on this machine — %s. A persistent-id is minted by the card and survives a "+
 				"reboot, so an id that no longer resolves means a different card, or none. Choose "+
 				"the card on the Settings screen, clear decklinkPersistentId if this machine has "+
@@ -3038,14 +3390,14 @@ func (a *App) resolveDeckLinkCard(cfg *config.Config, seat deckLinkSeat) (string
 		return cards[0].ID, nil
 	case 0:
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: %s, but there is no Blackmagic capture card on this machine — "+
+			"wslcomms: cannot open the capture: %s, but there is no Blackmagic capture card on this machine — "+
 				"%d capture devices were found and none of them is one. Without the Desktop Video "+
 				"driver installed the card is not offered at all, even when it is plugged in. On "+
 				"the Settings screen, %s",
 			seat.because(), len(devices), seat.instead())
 	default:
 		return "", fmt.Errorf(
-			"wslcomms: cannot start: %s, and decklinkPersistentId is empty, which means \"the card "+
+			"wslcomms: cannot open the capture: %s, and decklinkPersistentId is empty, which means \"the card "+
 				"this machine has\" — but this machine has %d: %s. The card is EXCLUSIVE, so guessing "+
 				"would take a card another application may be holding and would use whichever one "+
 				"the driver happened to enumerate first. Name the one you want in "+
@@ -3560,6 +3912,1124 @@ func (a *App) readSwitcherFormat() *ConformTargetView {
 	return conformTargetView(t, conformSourceSwitcher, t.String())
 }
 
+// ---------------------------------------------------------------------------
+// THE ALWAYS-LIVE CAPTURE LAYER
+// ---------------------------------------------------------------------------
+//
+// The capture pipelines are built at domReady and live until the device they
+// open changes or the application quits. NOTHING here belongs to a session:
+// a.session comes and goes above it, and every one of the five things the
+// operator watches — the input meters, the confidence preview, the routing
+// width, the signal lamp and the cough mute — is a property of THIS layer and
+// therefore exists before START and survives STOP.
+//
+// # Why it is owned here rather than by the session
+//
+// Because of what a session could not do. A routing grid cannot be sized until
+// a pad has negotiated, a meter cannot move until a device is open, and a
+// commentator cannot be heard before going on air unless something is capturing
+// them. All three used to wait for START, which meant START was the moment a
+// device problem was DISCOVERED — twenty minutes late, with a commentator
+// waiting. The card is now opened at launch, so the fault is on screen while
+// there is still time to fix it (PLAN.md 0-BIS A1).
+//
+// # The three rules a later reader must not undo
+//
+//  1. A DEVICE CHANGE WHILE SENDING IS REFUSED. It is a safety property and not
+//     a preference: a new proxysink orphans the running send pipeline's proxysrc
+//     and the feed goes SILENTLY dead — measured, consumer A stopped at 5.994 s
+//     the instant consumer B attached at 6.007 s, with every lamp still green.
+//  2. THE CAPTURE IS STOPPED AFTER THE SEND PIPELINE, NEVER BEFORE IT.
+//     CapturePipeline.Stop refuses with ErrSeamBusy while a send pipeline still
+//     holds the seam, because taking a device to NULL underneath a bound
+//     proxysrc is silent in every direction.
+//  3. A REBUILD IS OFF-AIR WORK AND MUST NEVER TAKE THE APPLICATION DOWN. Every
+//     failure below is a STATE on the "capture" event with a reason, not an
+//     error that stops the window coming up.
+
+// The four states each leg of the capture can be in, mirrored exactly by
+// CAPTURE_STATE in frontend/src/ui/backend.js. They are lower case because they
+// are Go's spelling first and the frontend copied it.
+//
+// OPENING IS NOT A TRANSIENT WORTH SKIPPING. A card held by another application
+// fails in about 100 microseconds, but one that is merely slow to lock can sit
+// in this state for a second or more, and a screen that drew "failed" over it
+// would have an operator pulling cables at a pipeline that was about to come up.
+const (
+	captureStateOff     = "off"
+	captureStateOpening = "opening"
+	captureStateLive    = "live"
+	captureStateFailed  = "failed"
+)
+
+// capturePayload is the "capture" event's wire shape and GetCaptureState's
+// return: what each leg is doing, why not when it is failed, and WHICH DEVICE
+// the commentary leg actually opened.
+//
+// AudioDeviceName is not the same question as the form's selection and that is
+// why it is here. The Settings screen shows what has been CHOSEN; this shows
+// what OPENED, and the two differ for the whole of the window between selecting
+// a microphone and the capture renegotiating — and permanently, if the chosen
+// one is not present.
+//
+// Reason is non-empty exactly when a leg is failed, so a screen never has an
+// "off" to explain and nothing to explain it with.
+type capturePayload struct {
+	Picture         string `json:"picture"`
+	Commentary      string `json:"commentary"`
+	Reason          string `json:"reason"`
+	AudioDeviceName string `json:"audioDeviceName"`
+}
+
+// commentarySelection is one live choice of commentary input, in the three
+// fields config.json spells it with. It is the frontend's
+// deriveAudioInputEffects in Go: exactly one of the two ids applies, and which
+// one is decided by the kind rather than by which happens to be non-empty.
+type commentarySelection struct {
+	kind         string
+	deviceID     string
+	persistentID string
+}
+
+// captureConfig is the configuration THE CAPTURE LAYER IS BUILT FROM: the saved
+// document with the live commentary selection applied over it.
+//
+// It returns a config.Config rather than three fields because everything
+// downstream — preflightCapture, AudioDeviceKey, CurrentChannelMap,
+// UsesDeckLinkAudio, nativeAudioDeviceID — is already written against the
+// document, and re-deriving any of them from a pair of override fields would be
+// a second spelling of a rule that must have exactly one.
+//
+// A DECKLINK selection writes decklinkPersistentId and a NATIVE one does not,
+// which is the one asymmetry worth reading twice: that field names the CARD and
+// the picture leg shares it, so overwriting it for a native microphone would
+// re-point the camera as a side effect of choosing a microphone.
+func (a *App) captureConfig(sel *commentarySelection) *config.Config {
+	cfg := a.snapshotConfig()
+	if sel == nil {
+		return cfg
+	}
+	cfg.AudioSourceKind = sel.kind
+	if sel.kind == config.AudioSourceDeckLink {
+		// AN EMPTY PERSISTENT-ID DOES NOT OVERWRITE ONE THE DOCUMENT HAS.
+		// decklinkPersistentId is documented as MEANINGFUL when empty — "the card
+		// this machine has" — so a selection that carries none is not asking for a
+		// different card; it is not naming one. Writing the emptiness through
+		// would, on a two-card machine, take the PICTURE leg off the card the
+		// document names as a side effect of choosing a microphone, and the
+		// pre-flight would then refuse the whole seat for a field the operator
+		// never touched.
+		if sel.persistentID != "" {
+			cfg.DeckLinkPersistentID = sel.persistentID
+		}
+	} else {
+		cfg.AudioDeviceID = sel.deviceID
+	}
+	return cfg
+}
+
+// errCaptureChangeWhileSending is the refusal that keeps rule 1 above true. It
+// is a sibling of errVideoSourceWhileSending rather than the same sentinel,
+// because the two send the operator to different controls and a message that
+// had to be right about both would say neither.
+var errCaptureChangeWhileSending = errors.New(
+	"wslcomms: the commentary input cannot be changed while sending. Re-pointing capture under a " +
+		"running send pipeline builds a new proxysink and orphans the proxysrc the feed is drawing " +
+		"from — measured: the first consumer stopped dead the instant the second attached, with SRT " +
+		"still connected and every lamp still green. Press STOP, change it, then START")
+
+// rebuildCapture tears the capture layer down and builds it again from the
+// current configuration. It is THE one function used for launch, for a device
+// change, for a preview toggle and for a conform change, so that four callers
+// cannot drift into four slightly different orders.
+//
+// why is a short phrase for the log — "launch", "the commentary input changed" —
+// because "which of the four rebuilt this" is the first question anybody asks of
+// a field log in which the picture blanked.
+//
+// It takes sessMu FIRST and capMu second (see the capMu field comment for the
+// order and for what breaking it costs), and it holds sessMu for the whole
+// rebuild so that a Start cannot slip in and mint a send pipeline over a set
+// that is about to be replaced.
+func (a *App) rebuildCapture(why string) error {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+
+	if a.closing.Load() {
+		return errShuttingDown
+	}
+	if a.session != nil {
+		return errCaptureChangeWhileSending
+	}
+	return a.rebuildCaptureLocked(why)
+}
+
+// rebuildCaptureLocked is rebuildCapture's body. a.sessMu must be held and there
+// must be no session; startSession is the other caller, and it has both.
+//
+// EVERY FAILURE IN HERE IS A STATE AND NOT AN ERROR RETURN, with one exception:
+// the return value exists so that START can refuse with the same sentence the
+// screen is already showing, rather than inventing a second description of one
+// fault. A caller that is merely rebuilding may ignore it — the operator has
+// been told on the "capture" event either way.
+func (a *App) rebuildCaptureLocked(why string) error {
+	a.capMu.Lock()
+	defer a.capMu.Unlock()
+
+	// GSTREAMER MAY NOT EXIST. Every other entry point into internal/gst asks
+	// this — startSession, ListInputDevices — and the always-live rebuild is the
+	// one that reaches it FIRST, at domReady, on a machine where Init failed.
+	// NewCapture now refuses in that state too, but a refusal that names the
+	// bundle is what the operator can act on, and it is the same sentence
+	// main.go's launch banner carries.
+	if a.gstInitErr != nil {
+		return a.captureFailedLocked(a.captureConfig(a.capSel),
+			captureStateFailed, captureStateFailed, a.gstInitErr)
+	}
+
+	// THE TWO VALUES THE REBUILD MUST SAMPLE BEFORE IT DESTROYS ANYTHING.
+	//
+	// The conform target is read ONCE and handed to both the build and the
+	// record, so that startSession's drift check compares two values that came
+	// from one place; see captureOpts. It is RESOLVED here — a nil atomic means
+	// "nothing could be read", which internal/gst would turn into its own
+	// fallback anyway, and recording the unresolved zero is what made the FIRST
+	// START of every day tear the capture down and build it again.
+	//
+	// The cough mute is read before teardownCaptureLocked's forgetMute clears it,
+	// which is the only order in which PLAN.md 0-BIS A2's "a latch set before
+	// START is still set at START" can actually hold.
+	conform := a.conformNow()
+	muted := a.mutedNow()
+
+	// DOWN FIRST, ALWAYS. The card is exclusive and a native endpoint may be
+	// too, so building the replacement before releasing the incumbent is the
+	// contention failure ("not-negotiated (-4)" in about 100 microseconds, naming
+	// neither the device nor the cause) on the seat that matters most.
+	//
+	// A REFUSAL HERE IS NOT A REBUILD THAT HAPPENED ANYWAY. CapturePipeline.Stop
+	// refuses while a send pipeline still holds the seam, and a capture that
+	// refused to stop is still running, still holding the exclusive card and
+	// still owning the two goroutines draining its fault channels.
+	if err := a.teardownCaptureLocked(); err != nil {
+		// NOT captureFailedLocked, and the difference is the preview surface. That
+		// path releases it, which is right when nothing is rendering into it and
+		// WRONG here: the capture refused to stop, so it is still PLAYING and still
+		// presenting into that handle, and taking the surface away leaves a video
+		// sink drawing into something that no longer names anything. The legs are
+		// reported LIVE because they are.
+		a.publishCapture(capturePayload{
+			Picture:         captureStateLive,
+			Commentary:      captureStateLive,
+			Reason:          err.Error(),
+			AudioDeviceName: a.audioDeviceDisplayName(a.captureConfig(a.capSel)),
+		})
+		return err
+	}
+
+	cfg := a.captureConfig(a.capSel)
+	a.publishCapture(capturePayload{
+		Picture:    captureStateOpening,
+		Commentary: captureStateOpening,
+		// The device name is known from the CONFIGURATION before anything is
+		// opened, and saying it now is the point: the sentence an operator needs
+		// while a card is slow to lock is "opening the UltraStudio", not "opening".
+		AudioDeviceName: a.audioDeviceDisplayName(cfg),
+	})
+	log.Printf("wslcomms: building the capture layer (%s): video=%q audio=%q preview=%v",
+		why, cfg.EffectiveVideoSource(), cfg.AudioDeviceKey(), cfg.DeckLinkPreviewEnabled)
+
+	// The pre-flight, exactly as START used to run it: which card, and does this
+	// machine actually have it. Its refusals name the FIELD to go and fix, which
+	// is the whole reason it exists — and now they arrive at launch instead of
+	// twenty minutes before kick-off.
+	plan, err := a.preflightCapture(cfg)
+	if err != nil {
+		return a.captureFailedLocked(cfg, captureStateFailed, captureStateFailed, err)
+	}
+
+	// The confidence monitor's surface, BEFORE the pipeline, because the handle
+	// is a build-time option — there is no attaching one to a running graph. Its
+	// failures are spared: a preview that cannot get a window leaves the capture
+	// untouched and the meters running.
+	previewHandle := a.startCapturePreview(cfg, plan.VideoCaptureID != "")
+
+	set, err := a.buildCaptureSet(cfg, plan, previewHandle, conform, muted)
+	if err == nil {
+		return a.captureUpLocked(cfg, set, conform)
+	}
+
+	// THE SLATE FALLBACK, AND WHY IT IS NOT OFFERED ON A FUSED SEAT.
+	//
+	// A card that will not open must not stop the application coming up
+	// (PLAN.md 0-BIS A1's first mitigation), so a picture leg that failed is
+	// rebuilt as the slate and the operator is told which of the two they are
+	// looking at. On a seat whose COMMENTARY is also on the card there is
+	// nothing to fall back to — dropping the card would take the microphone with
+	// it — so that seat stays down, says why, and RestartCapture is the retry.
+	if plan.VideoCaptureID == "" || plan.AudioCaptureID != "" {
+		return a.captureFailedLocked(cfg, captureStateFailed, captureStateFailed, err)
+	}
+
+	log.Printf("wslcomms: the picture leg's card would not open (%v); falling back to the slate so "+
+		"the position can still be used, and reporting the card fault on the capture event", err)
+	slate := plan
+	slate.VideoCaptureID = ""
+	// The preview surface goes with the card: there is nothing to render into it.
+	a.stopCapturePreview()
+
+	fallbackSet, fallbackErr := a.buildCaptureSet(cfg, slate, 0, conform, muted)
+	if fallbackErr != nil {
+		// Both the card and the slate. This is a broken build or a broken
+		// GStreamer, not a cable, so the FIRST error is the one reported: it is
+		// the one about the hardware the operator configured.
+		log.Printf("wslcomms: the slate fallback also failed (%v)", fallbackErr)
+		return a.captureFailedLocked(cfg, captureStateFailed, captureStateFailed, err)
+	}
+
+	a.capSet, a.capKey = fallbackSet, cfg.AudioDeviceKey()
+	a.adoptCaptureLocked(cfg, fallbackSet, conform)
+	// PICTURE IS "failed" EVEN THOUGH A PICTURE IS BEING CAPTURED, and that is
+	// the honest answer rather than a pedantic one: the operator asked for their
+	// camera and is not getting it. The reason says what IS going out, so nobody
+	// reads this as "no video".
+	a.publishCapture(capturePayload{
+		Picture:    captureStateFailed,
+		Commentary: captureStateLive,
+		Reason: fmt.Sprintf("the capture card could not be opened, so the still slate is being "+
+			"captured instead and the feed can still go out: %v. Fix the card or the cable and press "+
+			"Restart capture", err),
+		AudioDeviceName: a.audioDeviceDisplayName(cfg),
+	})
+	return nil
+}
+
+// captureUpLocked records a set that built and started, and publishes everything
+// that hangs off it. a.capMu must be held.
+func (a *App) captureUpLocked(cfg *config.Config, set gst.CaptureSet,
+	conform gst.ConformTarget) error {
+
+	a.capSet, a.capKey = set, cfg.AudioDeviceKey()
+	a.adoptCaptureLocked(cfg, set, conform)
+	a.publishCapture(capturePayload{
+		Picture:         captureStateLive,
+		Commentary:      captureStateLive,
+		AudioDeviceName: a.audioDeviceDisplayName(cfg),
+	})
+	return nil
+}
+
+// captureFailedLocked publishes a failed capture and returns the error, so that
+// a caller which needs to refuse — START — refuses with the SAME sentence the
+// screen is showing. a.capMu must be held.
+func (a *App) captureFailedLocked(cfg *config.Config, picture, commentary string, err error) error {
+	// The surface is released rather than left over a page with nothing rendering
+	// into it. It is idempotent.
+	a.stopCapturePreview()
+	a.publishCapture(capturePayload{
+		Picture:         picture,
+		Commentary:      commentary,
+		Reason:          err.Error(),
+		AudioDeviceName: a.audioDeviceDisplayName(cfg),
+	})
+	return err
+}
+
+// adoptCaptureLocked wires a freshly started set into everything above it: the
+// fault drains, the routing cache and the cough mute's record. a.capMu must be
+// held.
+//
+// # The mute is READ OFF THE ELEMENT rather than assumed
+//
+// PLAN.md 0-BIS A2 reversed the old rule and a latch now survives; but this is a
+// pipeline that has just been built, so the value it reports is the one
+// CaptureOpts.MuteCommentary asked for, read back. Publishing what was READ is
+// what stops this side ever believing a microphone is open when it is not — the
+// same discipline applyCoughMuteLocked keeps one layer down.
+func (a *App) adoptCaptureLocked(cfg *config.Config, set gst.CaptureSet,
+	conform gst.ConformTarget) {
+
+	// The target the picture leg was actually built to, HANDED IN rather than
+	// re-read, so that startSession's drift check compares two values that came
+	// from one place. See captureOpts for the failure a second read produced.
+	a.capConform = conform
+
+	// The routing the capture was built with, recorded before anything can change
+	// it, from the SAME expression the pipeline was built from rather than
+	// re-derived. The WIDTH is deliberately left at zero: it belongs to
+	// OnInputChannels, which fires when the pad negotiates — measured 7 ms after
+	// Start returned on the real card — and a synchronous read here would publish
+	// a zero that nothing would ever correct if the callback had already fired.
+	a.chanMu.Lock()
+	a.lastChannelMap = gstChannelMap(cfg.CurrentChannelMap())
+	a.lastInputChannels = 0
+	a.lastDeviceKey = ""
+	a.chanMu.Unlock()
+
+	// THE CAPTURE'S OWN FAULTS, FORWARDED, because nothing else can name them.
+	//
+	// A capture fault does NOT travel on the send pipeline's Errors() and must
+	// not: internal/sender reads any error arriving while CONNECTED as the peer
+	// going away, and would spend a whole DRAINING/BACKOFF cycle — seven seconds
+	// off air — on a fault that is not the network's.
+	//
+	// WHAT IS LOST WITHOUT THIS IS THE DIAGNOSIS AND NOT THE DETECTION. A capture
+	// that dies under a running send pipeline is caught within two seconds by the
+	// muxer watchdog, which latches ErrPipelineFatal and stops the sender — but
+	// its message says "nothing reached vq:src", where capturefault.go has already
+	// read the card's own evidence and can say whether the card is busy, gone, or
+	// simply has nothing on its input.
+	//
+	// # AND EVERY FAULT REPAINTS THE CAPTURE PANEL
+	//
+	// publishCapture is otherwise called only from a build or a teardown path, so
+	// before this the panel went on reading "live" over a capture that had died
+	// hours earlier — and for a PICTURE-leg death there was no banner either,
+	// because internal/gst delivered it as a warning that this side drained and
+	// discarded. A page reloaded at half-time read the same stale record through
+	// GetCaptureState and drew a healthy microphone over a dead one.
+	//
+	// WHICH LEG IS ASKED OF THE PIPELINE rather than inferred from the error text:
+	// Health() is the commentary-or-whole-pipeline latch and PictureHealth() is
+	// the picture leg's, and a fused seat holds ONE object in both fields of the
+	// set, so the flags are computed from the set and captured per goroutine.
+	//
+	// They are on rootWG, not on a session's WaitGroup: they outlive every
+	// session, and they end when the capture's Stop closes its channels — which
+	// the teardown's capture step does before rootWG is joined.
+	for _, c := range set.Pipelines() {
+		isPicture, isCommentary := set.Picture == c, set.Commentary == c
+		if !a.rootGo(2) {
+			// Shutdown has already begun and rootWG.Wait is in flight or imminent.
+			// Adding to it now is "sync: WaitGroup misuse: Add called concurrently
+			// with Wait" — a panic on the way out instead of the controlled
+			// hardExit. The pipeline is stopped instead, which closes the channels
+			// nobody is now draining.
+			log.Printf("wslcomms: the capture layer came up during shutdown; stopping the %s "+
+				"capture again rather than adopting it", c.Legs())
+			if err := c.Stop(); err != nil {
+				log.Printf("wslcomms: stopping the %s capture during shutdown: %v", c.Legs(), err)
+			}
+			continue
+		}
+		go func(c gst.CapturePipeline) {
+			defer a.rootWG.Done()
+			for err := range c.Faults() {
+				a.emitError(fmt.Errorf("wslcomms: the %s capture has failed: %w", c.Legs(), err))
+				a.publishCaptureFault(isPicture && c.PictureHealth() != nil,
+					isCommentary && c.Health() != nil, err)
+			}
+		}(c)
+		go func(c gst.CapturePipeline) {
+			defer a.rootWG.Done()
+			// The SPARED classes — every confidence-monitor failure, and the
+			// GStreamer WARNING messages that are not failures at all. internal/gst
+			// has ALREADY WRITTEN EACH ONE TO THE FIELD LOG on its way here, so this
+			// drain is not a discard: it is what stops a sixteen-deep buffer filling
+			// and dropping the lines that would have followed.
+			for range c.Warnings() {
+			}
+		}(c)
+	}
+
+	a.publishMuteForCapture(set.Commentary)
+	a.publishPreview()
+}
+
+// teardownCaptureLocked takes the current set to NULL and publishes the end of
+// everything that hung off it. a.capMu must be held. It is idempotent and is a
+// no-op when nothing is open.
+//
+// THE SIX PUBLISHES BELOW USED TO LIVE IN THE SESSION FORWARDER'S EXIT, and
+// moving them is the operator-visible half of R1: the meters, the routing grid,
+// the signal lamp and the mute now end when the DEVICE goes, which is a device
+// change, a restart or the application quitting — and no longer when a session
+// does. A STOP leaves all four exactly where they were.
+// # A REFUSED Stop KEEPS THE SET, and that is not a nicety
+//
+// CapturePipeline.Stop refuses with ErrSeamBusy while a send pipeline still holds
+// the seam, and a capture that refused to stop IS STILL RUNNING: it still holds
+// the exclusive DeckLink, still holds its seam claim, and still owns the two
+// goroutines adoptCaptureLocked parked on its fault channels — which Stop is the
+// only thing that ends. Clearing a.capSet regardless dropped the last reference
+// to all of that, so nothing could ever stop it and rootWG.Wait() was then
+// GUARANTEED to be abandoned, because the goroutines it joins range over channels
+// nothing would ever close.
+//
+// The reachable path is not exotic: teardownOrdered abandons the sender step when
+// App.Stop overruns senderStopBudget (sender.Stop cannot shorten an srtsink state
+// change internal/gst bounds at ten seconds), and the capture step then runs with
+// the seam still claimed. The refusal exists precisely so that ordering cannot be
+// got wrong; discarding it threw the enforcement away.
+func (a *App) teardownCaptureLocked() error {
+	if len(a.capSet.Pipelines()) == 0 {
+		return nil
+	}
+
+	if err := stopCaptureSet(a.capSet); err != nil {
+		log.Printf("wslcomms: the capture layer would not stop, so it is KEPT rather than "+
+			"forgotten — it still holds its device: %v", err)
+		return err
+	}
+	a.capSet, a.capKey, a.capConform = gst.CaptureSet{}, "", gst.ConformTarget{}
+
+	// The meters get one final all-silence frame. Without it they freeze at the
+	// last level the pipeline reported, and a frozen meter reads as a live one.
+	// It bypasses the levels throttle deliberately: the throttle drops frames on
+	// the assumption another is 50 ms behind, and this is the frame after which
+	// nothing follows.
+	a.events.send(EventLevels, silentLevelsPayload())
+	// The per-channel picker gets its own zero-frame, AT ITS OWN WIDTH, and only
+	// if it ever ran. Swap rather than Load, so the width belongs to the capture
+	// that recorded it. Under the wire contract a changed array length means "lay
+	// yourself out again", so a two-channel zero-frame sent to a sixteen-strip
+	// meter would make fourteen channels VANISH rather than fall silent.
+	if n := int(a.chanLevelWidth.Swap(0)); n > 0 {
+		a.events.send(EventChannelLevels, silentLevelsPayloadFor(n))
+	}
+	// The routing grid goes back to "no pad, nothing negotiated". Its crosspoints
+	// are controls over a capture pad, and the pad is gone.
+	a.forgetChannelMap()
+	// The signal lamp goes back to "cannot tell". The watchdog dies with the
+	// pipeline, so whatever it last said would stand forever — a green signal
+	// lamp over a capture element that no longer exists.
+	a.forgetSignal()
+	// And the cough mute goes back to "nothing to mute", which is the sharpest of
+	// the four: a latched cough button left drawn over a capture that has gone is
+	// a control the operator cannot release.
+	//
+	// A REBUILD CARRIES THE LATCH ACROSS THIS ANYWAY (PLAN.md 0-BIS A2): the value
+	// is sampled at the top of rebuildCaptureLocked, before this runs, and handed
+	// to the new pipeline as CaptureOpts.MuteCommentary. What clearing it here
+	// buys is the gap — for the length of a device open there is nothing to mute
+	// and the panel says so — and the honesty of publishMuteForCapture, which
+	// re-publishes the value it READS BACK off the new element rather than the one
+	// it asked for.
+	a.forgetMute()
+	return nil
+}
+
+// captureForSessionLocked is START's view of the capture layer: the set the send
+// pipeline is about to be minted over, rebuilt first if it is missing or if it
+// was built to a conform target that has since moved.
+//
+// a.sessMu must be held and there must be no session — startSession is the only
+// caller, and it has both.
+//
+// # Why START rebuilds at all, when the capture is supposed to be always-live
+//
+// Two reasons, and both are off-air work done before anything is claimed.
+//
+// THERE MAY BE NONE. A card held by another application, a microphone unplugged
+// since the last launch, a capture that failed at domReady: the panel has been
+// saying so, and pressing START is the operator asking again. Refusing without
+// trying would make RestartCapture a step people had to know about.
+//
+// THE CONFORM TARGET MAY HAVE MOVED. Start re-reads it from the switcher on
+// every press, and the conform chain is in the CAPTURE pipeline (which is what
+// keeps the caps crossing the proxy fixed for the life of the process). A target
+// that differs from the one this capture was built with means the picture is
+// being conformed to the wrong raster, and the only way to change it is a new
+// pipeline. The preview blanks for a moment, off air.
+func (a *App) captureForSessionLocked() (gst.CaptureSet, error) {
+	a.capMu.Lock()
+	set, built := a.capSet, a.capConform
+	a.capMu.Unlock()
+
+	// THE COMPARISON IS BETWEEN TWO RESOLVED TARGETS, and "we could not read one"
+	// is NOT a third value that differs from both.
+	//
+	// Both halves of that are corrections. capConform used to be recorded as the
+	// unresolved zero whenever a.conformTo was nil — which it always is at
+	// domReady, because Start is its only writer — so the FIRST START of the day
+	// compared the zero against a resolved target and rebuilt the capture on every
+	// seat whose switcher answered at all. On a card seat that closed and reopened
+	// the exclusive DeckLink, blanked the preview, dropped the meters and released
+	// the cough latch at the exact moment the operator pressed START, and if the
+	// card did not come back START refused and left the seat with no capture where
+	// a working one had been a second earlier — the direct opposite of PLAN.md
+	// section 12's promise.
+	//
+	// And a nil pointer here means conformFormat could not read ANYTHING this
+	// press: a three-second REST timeout to the M2L-X is enough. Treating that as
+	// a new answer would take the card down over a network blip and rebuild the
+	// picture to the 1080p50 fallback, which is the one raster the switcher had
+	// already been observed not to be configured for. The absence of an answer
+	// cannot contradict the answer we have.
+	want := a.conformTo.Load()
+
+	switch {
+	case len(set.Pipelines()) == 0:
+		if err := a.rebuildCaptureLocked("START found no capture open"); err != nil {
+			// The SAME sentence the capture panel is showing. A second description
+			// of one fault is one description too many, and this one arrives on a
+			// button press where the operator is already looking.
+			return gst.CaptureSet{}, err
+		}
+	case want == nil:
+		log.Printf("wslcomms: the switcher did not say what it is configured for this press; the "+
+			"capture stays as it is, built to %v", built)
+		return set, nil
+	case *want != built:
+		log.Printf("wslcomms: the conform target has changed from %v to %v since the capture was "+
+			"built; rebuilding the picture before starting", built, *want)
+		if err := a.rebuildCaptureLocked("the conform target changed"); err != nil {
+			return gst.CaptureSet{}, err
+		}
+	default:
+		return set, nil
+	}
+
+	a.capMu.Lock()
+	set = a.capSet
+	a.capMu.Unlock()
+	if len(set.Pipelines()) == 0 {
+		// A rebuild that reported success and produced nothing is a defect rather
+		// than a device fault, and it must not reach gst.New — which would refuse
+		// an empty set, correctly, with a message about the seam that named none
+		// of this.
+		return gst.CaptureSet{}, errors.New(
+			"wslcomms: cannot start: the capture layer is not open and rebuilding it produced " +
+				"nothing. Press Restart capture, and if that does not help, restart the application")
+	}
+	return set, nil
+}
+
+// conformNow is the conform target the next capture will be built to: the
+// RESOLVED value, never the zero one.
+//
+// internal/gst reads a zero ConformTo as "nothing is known" and resolves it to
+// FallbackConformTarget, so the zero and the fallback describe the same
+// capsfilter and only one of them can be compared against anything. Resolving
+// here is what lets a.capConform record what the picture leg is ACTUALLY
+// conformed to rather than what this side happened to know when it asked.
+func (a *App) conformNow() gst.ConformTarget {
+	if f := a.conformTo.Load(); f != nil {
+		return *f
+	}
+	return gst.FallbackConformTarget()
+}
+
+// stopCaptureForTeardown is the capture's step of the ordered shutdown. It runs
+// AFTER the sender's, never before it; see the step's comment and rule 2 in this
+// section's header.
+func (a *App) stopCaptureForTeardown() error {
+	a.capMu.Lock()
+	err := a.teardownCaptureLocked()
+	a.capMu.Unlock()
+	if err != nil {
+		// The capture is still running and still holds its device, which is a
+		// shutdown that will have to be finished by hardExit. teardownStep's budget
+		// is what bounds this; saying so here is what makes the exit code
+		// explicable in a field log.
+		log.Printf("wslcomms: the capture layer could not be released during shutdown: %v", err)
+		return err
+	}
+
+	// The confidence monitor's surface, after the pipeline that was rendering
+	// into it has reached NULL and never before: take the surface away first and
+	// the video sink is presenting into a handle that no longer names anything.
+	// The same ordering stopPictureForTeardown argues at length, for the same
+	// reason on both platforms.
+	a.stopCapturePreview()
+
+	a.publishCapture(capturePayload{Picture: captureStateOff, Commentary: captureStateOff})
+	return nil
+}
+
+// buildCaptureSet builds and starts the capture layer and returns the set a send
+// pipeline can be minted over.
+//
+// # Why the whole plan is applied here rather than one pipeline at a time
+//
+// PlanCapture is THE FUSION RULE and it decides how many pipelines there are:
+// one when both legs are on the card, two otherwise. That is not an optimisation.
+// decklinkaudiosrc cannot preroll without a decklinkvideosrc in the SAME
+// pipeline, and the card is EXCLUSIVE — two decklink sources fail 3/3 in one
+// process and 3/3 across two — so AT MOST ONE PIPELINE MAY EVER CONTAIN DECKLINK
+// ELEMENTS. A caller that built the two legs independently would produce the
+// contention failure ("Internal data stream error / not-negotiated (-4)" in about
+// 100 microseconds, naming neither the device nor the cause) on the seat that
+// matters most.
+//
+// They are built and started IN THE ORDER PlanCapture RETURNS THEM and torn down
+// in reverse, for the same reason.
+//
+// # THE PAIRING WITH nativeAudioDeviceID IS THE WHOLE SAFETY PROPERTY HERE
+//
+// AudioDeviceID is set only for a NATIVE seat and AudioCaptureID only for a card
+// one, so exactly one of them is ever non-empty and internal/gst's
+// refuseWrongAudioSource refuses the capture if that is ever untrue. An empty
+// device id on osxaudiosrc or wasapi2src is not an error — it is the SYSTEM
+// DEFAULT INPUT — so "a DeckLink seat that reached the platform element" is the
+// state both halves exist to make unreachable, not merely unlikely.
+func (a *App) buildCaptureSet(cfg *config.Config, plan capturePlan,
+	previewHandle uintptr, conform gst.ConformTarget, muted bool) (gst.CaptureSet, error) {
+
+	base := a.captureOpts(cfg, plan, previewHandle, conform, muted)
+
+	var set gst.CaptureSet
+	var built []gst.CapturePipeline
+	fail := func(err error) (gst.CaptureSet, error) {
+		for i := len(built) - 1; i >= 0; i-- {
+			if stopErr := built[i].Stop(); stopErr != nil {
+				log.Printf("wslcomms: stopping a capture pipeline after a failed build: %v", stopErr)
+			}
+		}
+		return gst.CaptureSet{}, err
+	}
+
+	for _, legs := range gst.PlanCapture(gst.CaptureSources{
+		VideoCaptureID: base.VideoCaptureID,
+		AudioCaptureID: base.AudioCaptureID,
+		AudioDeviceID:  base.AudioDeviceID,
+		Preview:        base.Preview.Enabled,
+	}) {
+		opts := base
+		opts.Legs = legs
+
+		cap, err := gst.NewCapture(opts)
+		if err != nil {
+			return fail(fmt.Errorf("wslcomms: building the %s capture: %w", legs, err))
+		}
+		built = append(built, cap)
+		if err := cap.Start(); err != nil {
+			return fail(fmt.Errorf("wslcomms: starting the %s capture: %w", legs, err))
+		}
+
+		// The SAME OBJECT lands in both fields on a fused seat, which is what
+		// CaptureSet.Pipelines collapses when it claims and arms — claiming a fused
+		// pipeline twice would refuse the seat its own consumer with ErrSeamBusy.
+		if legs.Picture != gst.PictureNone {
+			set.Picture = cap
+		}
+		if legs.Commentary != gst.CommentaryNone {
+			set.Commentary = cap
+		}
+	}
+	return set, nil
+}
+
+// stopCaptureSet takes every distinct pipeline in a set to NULL, in the reverse
+// of the order they were built.
+//
+// It goes through Pipelines() rather than over the two fields because a fused
+// seat holds the SAME OBJECT in both, and stopping it twice is a second teardown
+// of a pipeline already at NULL.
+//
+// IT MUST RUN AFTER THE SEND PIPELINE HAS STOPPED. CapturePipeline.Stop refuses
+// with ErrSeamBusy while a send pipeline still holds the seam, because taking a
+// device to NULL underneath a bound proxysrc is measured silent in every
+// direction: 0 buffers, no EOS, no ERROR and no WARNING on either bus, with the
+// send pipeline still PLAYING and SRT still connected.
+// It returns the FIRST refusal rather than swallowing them, because the one
+// refusal it can produce — ErrSeamBusy — means the pipeline is still running and
+// still holds its device, which is a fact the caller must not discard. See
+// teardownCaptureLocked. Every pipeline is still attempted: a set whose first
+// entry refuses may still have a second that can be released.
+func stopCaptureSet(set gst.CaptureSet) error {
+	var first error
+	pipes := set.Pipelines()
+	for i := len(pipes) - 1; i >= 0; i-- {
+		if err := pipes[i].Stop(); err != nil {
+			log.Printf("wslcomms: stopping the %s capture: %v", pipes[i].Legs(), err)
+			if first == nil {
+				first = fmt.Errorf("wslcomms: the %s capture would not stop: %w", pipes[i].Legs(), err)
+			}
+		}
+	}
+	return first
+}
+
+// audioDeviceDisplayName is the NAME of the commentary device this configuration
+// selects, for the "capture" event's audioDeviceName.
+//
+// It is an enumeration and opens nothing — the same walk ListInputDevices
+// answers from — and every way of not knowing falls back to the id, because a
+// panel that says "opening decklink:2747401380" is still more use than one that
+// says "opening".
+func (a *App) audioDeviceDisplayName(cfg *config.Config) string {
+	kind, id := gst.KindNative, cfg.AudioDeviceID
+	if cfg.UsesDeckLinkAudio() {
+		kind, id = gst.KindDeckLink, cfg.DeckLinkPersistentID
+	}
+
+	devices, err := a.ListInputDevices()
+	if err == nil {
+		for _, d := range devices {
+			if gst.NormaliseDeviceKind(d.Kind) == kind && strings.EqualFold(d.ID, id) {
+				return d.Name
+			}
+		}
+	}
+	if id == "" {
+		// The documented normal cases: "decklink:" is the only card in this
+		// machine and "native:" is the system default input. Neither has a name
+		// to look up, and both are worth saying out loud.
+		if kind == gst.KindDeckLink {
+			return "the capture card in this machine"
+		}
+		return "the system default input"
+	}
+	return cfg.AudioDeviceKey()
+}
+
+// publishCapture records the capture state and emits it on the "capture" event.
+//
+// It takes capStateMu ONLY — never capMu — which is what makes GetCaptureState
+// answer "opening" while capMu is held across a device open.
+func (a *App) publishCapture(p capturePayload) {
+	a.capStateMu.Lock()
+	a.capState = p
+	a.capStateMu.Unlock()
+
+	a.events.send(EventCapture, p)
+}
+
+// publishCaptureFault repaints the capture panel when a pipeline dies AT RUN
+// TIME, naming the leg or legs that went with it and leaving the other one alone.
+//
+// It is a READ-MODIFY-WRITE of the recorded state rather than a whole payload,
+// which is the only correct shape here: on a split seat the picture and the
+// commentary are different pipelines with different lifetimes, so a picture death
+// must not overwrite what this side knows about a microphone that is still open.
+// The device name is carried forward for the same reason — it was resolved from
+// the configuration at build time and a fault does not change it.
+//
+// Neither flag set is possible: a fault classified as neither leg has already
+// been latched as a whole-pipeline death by internal/gst, so Health() answers and
+// isCommentary decides. It is still guarded, because a payload with a reason and
+// no state change is a banner with nothing on screen to explain it.
+func (a *App) publishCaptureFault(picture, commentary bool, err error) {
+	if !picture && !commentary {
+		return
+	}
+
+	a.capStateMu.Lock()
+	p := a.capState
+	if picture {
+		p.Picture = captureStateFailed
+	}
+	if commentary {
+		p.Commentary = captureStateFailed
+	}
+	p.Reason = err.Error()
+	a.capState = p
+	a.capStateMu.Unlock()
+
+	a.events.send(EventCapture, p)
+}
+
+// GetCaptureState reports what each capture leg is doing right now.
+//
+// It reads THIS SIDE'S record rather than the pipelines, for the reason
+// GetCommentaryMute does: it is called on a page's startup path and replayed
+// from domReady on the Wails main thread, and capMu is held across a device
+// open. A read that could block for the length of an open is a window that
+// freezes over the very state it is trying to draw.
+//
+// It cannot fail, so it returns no error: every way of not knowing is a state
+// with a reason in it.
+func (a *App) GetCaptureState() capturePayload {
+	a.capStateMu.Lock()
+	defer a.capStateMu.Unlock()
+
+	// The ZERO VALUE is a machine on which domReady has not yet built anything —
+	// a page that loaded inside the first fraction of a second, and every test
+	// that never asked for a capture. It is rendered as OFF rather than as two
+	// empty strings, because an empty state is a value no screen has a case for
+	// and would draw as nothing at all. This is signalPayloadFrom's rule for
+	// SignalUnknown, applied to the same problem.
+	p := a.capState
+	if p.Picture == "" {
+		p.Picture = captureStateOff
+	}
+	if p.Commentary == "" {
+		p.Commentary = captureStateOff
+	}
+	return p
+}
+
+// SelectCommentaryInput re-points the commentary capture at a device, LIVE, with
+// no session and without saving.
+//
+// The three arguments are config.json's three fields in config's own order, and
+// the one that does not apply is IGNORED rather than having to be omitted: a
+// caller must not have to know which of the two id fields its kind uses, because
+// that is exactly the knowledge the single dropdown exists to remove.
+//
+// # It does not save, and that is the contract rather than an omission
+//
+// An operator auditioning microphones twenty minutes before kick-off must be able
+// to hear each one without rewriting config.json; the Settings screen's Save is
+// what makes a choice stick, and this is what makes it audible. The selection
+// lives on the App (capSel) and wins over the document until something saves.
+//
+// # It is refused while sending, and that is a safety property
+//
+// A new proxysink orphans the running send pipeline's proxysrc and the feed goes
+// silently dead. See errCaptureChangeWhileSending.
+//
+// It is HOST-ONLY. It decides which microphone this position is heard on, which
+// is a decision about what a broadcast switcher receives, and it is the same
+// classification SetVideoSource carries for the picture.
+func (a *App) SelectCommentaryInput(kind, deviceId, persistentId string) error {
+	k := strings.TrimSpace(kind)
+	switch k {
+	case config.AudioSourceNative, config.AudioSourceDeckLink:
+	case "":
+		// Empty is the DEFAULT rather than an error, exactly as
+		// EffectiveAudioSourceKind reads it, so a caller that has never chosen a
+		// kind selects a platform endpoint rather than failing.
+		k = config.DefaultAudioSourceKind
+	default:
+		return fmt.Errorf("wslcomms: audioSourceKind must be %q or %q, got %q",
+			config.AudioSourceNative, config.AudioSourceDeckLink, kind)
+	}
+
+	sel := &commentarySelection{
+		kind:         k,
+		deviceID:     strings.TrimSpace(deviceId),
+		persistentID: strings.TrimSpace(persistentId),
+	}
+
+	a.sessMu.Lock()
+	if a.closing.Load() {
+		a.sessMu.Unlock()
+		return errShuttingDown
+	}
+	if a.session != nil {
+		a.sessMu.Unlock()
+		return errCaptureChangeWhileSending
+	}
+	// Recorded under capMu, which rebuildCaptureLocked then reads: the selection
+	// and the rebuild it causes are one step, so nothing can observe a selection
+	// that no pipeline has been built for.
+	a.capMu.Lock()
+	a.capSel = sel
+	a.capMu.Unlock()
+	err := a.rebuildCaptureLocked("the commentary input changed")
+	a.sessMu.Unlock()
+	return err
+}
+
+// RestartCapture tears the capture pipelines down and builds them again.
+//
+// This is the ONLY recovery from a capture fault, because the card is held from
+// launch to quit and there is deliberately no Acquire/Release control (PLAN.md
+// 0-BIS A1). It is what an operator reaches for after plugging the SDI cable back
+// in, after quitting whatever else took the card, or after connecting the
+// microphone they had forgotten.
+//
+// It is a REBUILD and not a repair: the picture blanks and the meters fall for as
+// long as it takes. Off air that costs nothing; while sending it is a device
+// change by another name and is refused for the same reason.
+//
+// It is HOST-ONLY for the reason SelectCommentaryInput is, plus one of its own:
+// it blanks an opaque native window on the screen of whoever is sitting at this
+// machine.
+func (a *App) RestartCapture() error {
+	return a.rebuildCapture("the operator asked for a restart")
+}
+
+// currentCapture returns the capture set, or the zero set when nothing is open.
+//
+// IT IS A DIFFERENT QUESTION FROM currentSend AND THE SPLIT IS THE POINT. The
+// routing width, the channel map, the meters, the signal lamp and the cough mute
+// are properties of the pipeline that HAS THE DEVICE OPEN, not of a send
+// session; asking the send pipeline for them is what made the routing grid
+// unsizeable until START and the cough button dead until START.
+//
+// capMu is held only to read the two pointers and is released before the caller
+// touches either, which is the same discipline currentSend keeps and for the
+// same reason: internal/gst takes its own lock across state changes, so calling
+// into it under capMu would couple a UI read to a rebuild.
+func (a *App) currentCapture() gst.CaptureSet {
+	a.capMu.Lock()
+	defer a.capMu.Unlock()
+	return a.capSet
+}
+
+// currentCommentary returns the capture pipeline that owns the commentary device
+// — the one that meters it, routes it and mutes it — and the key of the device
+// it actually opened, or nil and "" when there is none.
+//
+// The KEY is returned with the pipeline rather than re-derived by the caller,
+// because it is recorded from the configuration the pipeline was BUILT from: a
+// selection made since does not reach a running capture, so a key derived from
+// the current configuration would name a device the pad is not on — which is
+// precisely the mismatch the stamp exists to make visible.
+func (a *App) currentCommentary() (gst.CapturePipeline, string) {
+	a.capMu.Lock()
+	defer a.capMu.Unlock()
+	return a.capSet.Commentary, a.capKey
+}
+
+// captureOpts is the CAPTURE half of what used to be one options struct: every
+// field that names a device, a slate, a raster, a routing, a meter or a mute.
+//
+// It is a PURE READING OF THE CONFIGURATION plus the pre-flight's two card ids
+// and the preview's window handle, which are the three things the document alone
+// cannot answer: which card this machine actually has, and which native surface
+// the confidence monitor is to present into.
+//
+// # conform is passed IN rather than read here
+//
+// It is the RESOLVED target — never a zero that internal/gst would turn into its
+// own fallback — and it is read ONCE per rebuild, by rebuildCaptureLocked, so
+// that the value the picture leg is built to and the value recorded as
+// a.capConform are the same value by construction rather than by two reads of an
+// atomic with a device open between them.
+//
+// That is not a tidy-up. a.conformTo is written by Start, which runs BEFORE it
+// takes sessMu; a START landing during an in-flight rebuild used to make the
+// build read the old pointer and the record read the new one, after which
+// startSession's drift check compared the new target against itself, found no
+// drift, and put a feed on air conformed to a raster the capsfilter does not
+// carry. The caps crossing the proxy are pinned for the life of the process
+// (PLAN.md 3.6), so nothing downstream could ever have corrected it.
+//
+// conformFormat itself is still never called from here: it takes ctlMu and can
+// spend conformFetchTimeout on a REST call, and this file's lock order says ctlMu
+// is never held with sessMu, which a capture build holds throughout.
+func (a *App) captureOpts(cfg *config.Config, plan capturePlan,
+	previewHandle uintptr, conform gst.ConformTarget, muted bool) gst.CaptureOpts {
+
+	return gst.CaptureOpts{
+		SlatePath: a.slatePath(cfg),
+
+		// THE PLATFORM ENDPOINT, AND ONLY ON A SEAT THAT OPENS ONE. It is cleared
+		// for a DeckLink commentary seat rather than passed through; see
+		// nativeAudioDeviceID, and buildCaptureSet for the other half of the
+		// pairing.
+		AudioDeviceID: nativeAudioDeviceID(cfg),
+
+		// The two card ids the PRE-FLIGHT resolved against what this machine is
+		// actually offering, rather than what the document remembers.
+		AudioCaptureID: plan.AudioCaptureID,
+		VideoCaptureID: plan.VideoCaptureID,
+
+		ConformTo: conform,
+
+		Preview: gst.PreviewOpts{
+			// Enabled is the operator's request AND the pre-flight's verdict,
+			// ANDed here rather than left to internal/gst, so that a seat which
+			// asked for a preview while sending the slate is simply not asking for
+			// one. Passing the request through with no handle would have the
+			// pipeline log that the monitor is switched on and has no surface,
+			// which is a true sentence about a machine that has nothing to preview
+			// and would send the operator looking for a window fault that is not
+			// there.
+			Enabled:      cfg.DeckLinkPreviewEnabled && plan.VideoCaptureID != "",
+			WindowHandle: previewHandle,
+		},
+
+		// THE WIDTH THE ENUMERATION REPORTS, which is what SIZES THE MATRIX — and
+		// the matrix has to be written while the pipeline is still in NULL, where
+		// a native source's pad publishes only a range. Zero means "not known" and
+		// internal/gst asks the pad instead; it is never a guess.
+		DeviceChannels: a.deviceChannels(cfg),
+
+		// The input meters. The capture pipeline's level elements measure what is
+		// actually crossing the seam and call this on a streaming thread
+		// (gst.CaptureOpts.OnLevels: MUST NOT BLOCK) — the forwarder is a throttle
+		// in front of the non-blocking event pump, so it cannot.
+		OnLevels: a.levelsForwarder(nil),
+
+		// The per-channel picker meter, from the OTHER level element: the capture
+		// device's own channels, upstream of the routing. It is a separate callback
+		// because it is a separate measurement, and the separation is what stops a
+		// sixteen-entry frame ever being drawn on the meter that is supposed to
+		// show what is going to air.
+		OnChannelLevels: a.channelLevelsForwarder(),
+
+		// The signal lamp. Unlike OnLevels this is not called on a streaming
+		// thread — internal/gst's watchdog polls from a goroutine of its own — so
+		// the forwarder may take sigMu for the one assignment it makes.
+		OnSignal: a.signalForwarder(),
+
+		// THE NEGOTIATED WIDTH, STAMPED WITH THE DEVICE, and the ONLY thing this
+		// application may size a routing grid from. InputChannels() reads 0 for
+		// about 7 ms after Start returns — measured on the card: Start completed at
+		// +108 ms and aconv:sink published its negotiated caps at +115 ms — so a
+		// synchronous read after Start is a zero this side would have no reason to
+		// ask about again.
+		OnInputChannels: a.inputChannelsForwarder(),
+
+		// The routing the capture starts with — THE ONE SAVED FOR THE DEVICE THIS
+		// SEAT IS CAPTURING FROM, and no other. config.ChannelMaps holds one per
+		// device, keyed by capture kind and device id, so a card's sixteen-wide
+		// routing cannot reach a two-channel microphone that happened to be
+		// selected when somebody last pressed Save. Nothing here picks the key:
+		// CurrentChannelMap reads the same three fields that decide which capture
+		// element gets built.
+		//
+		// The zero value is not silence: it means nobody has chosen for this
+		// device, and internal/gst resolves it at the negotiated width to the first
+		// two input channels — bit-for-bit what this application sent before the
+		// routing screen existed.
+		ChannelMap: gstChannelMap(cfg.CurrentChannelMap()),
+
+		// THE COUGH MUTE IS CARRIED ACROSS THE REBUILD, AND THE ARGUMENT AGAINST
+		// IT IS ANSWERED RATHER THAN DELETED.
+		//
+		// This field used to be written false unconditionally, so that nothing
+		// carried a cough mute across a pipeline rebuild: a position coming on air
+		// silent because of a key pressed before the last failure is as bad as one
+		// that coughs on air. The operator has ruled the other way (PLAN.md 0-BIS
+		// A2), and the argument that was made at length beside SetCommentaryMute is
+		// answered where it stands rather than removed.
+		//
+		// The short form: the fear was of a control that LIES, and it is met by
+		// VISIBILITY rather than by unavailability. The mute sits UPSTREAM of
+		// alevel, so a muted commentator has a flat programme meter AND a mute
+		// banner, before and after START — and the write-then-read-back discipline
+		// is untouched, so nothing here can believe a mute it did not achieve.
+		//
+		// A DEVICE CHANGE IS NOT A SESSION BOUNDARY, which is what makes carrying
+		// it the safe answer here too: the operator who muted is the operator
+		// selecting the microphone, seconds apart, watching a flat meter.
+		//
+		// IT IS PASSED IN RATHER THAN READ HERE, and that is what makes the
+		// paragraph above true rather than merely intended. rebuildCaptureLocked's
+		// first act is teardownCaptureLocked, which calls forgetMute, which sets
+		// a.muted false — so a read taken at this point could only ever return
+		// false, and every word above described behaviour the code did not have.
+		// Measured before the fix: latch the mute, call RestartCapture, and
+		// mutedNow goes true -> false with the rebuilt pipeline reporting muted
+		// false. The latch is now sampled at the TOP of the rebuild, before
+		// anything is forgotten.
+		MuteCommentary: muted,
+	}
+}
+
+// deviceChannels is the commentary device's advertised width, from the
+// enumeration and never from the source kind.
+//
+// A DeckLink commentary answers zero deliberately: the width is the constant 16
+// stated on decklinkaudiosrc by the description itself, so there is nothing here
+// to discover and internal/gst says so in CaptureOpts.DeviceChannels. Every other
+// seat gets structure 0's channel count — the 1 of a built-in microphone, the 16
+// of an UltraStudio seen through CoreAudio, the 8 of a Focusrite — which is what
+// makes the routing panel a property of the DEVICE rather than of the card.
+func (a *App) deviceChannels(cfg *config.Config) int {
+	if cfg.UsesDeckLinkAudio() {
+		return 0
+	}
+	devices, err := a.ListInputDevices()
+	if err != nil {
+		// Not knowing is not a failure: internal/gst asks the pad instead, and
+		// writes no matrix at all rather than one sized from a guess.
+		return 0
+	}
+	for _, d := range devices {
+		if gst.NormaliseDeviceKind(d.Kind) == gst.KindNative && strings.EqualFold(d.ID, cfg.AudioDeviceID) {
+			return d.Channels
+		}
+	}
+	return 0
+}
+
 // senderOpts builds the options for one session from a configuration snapshot
 // and the passphrase already read from the credential store.
 //
@@ -3587,41 +5057,8 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 	srtHost := cfg.EffectiveSRTHost()
 	reporter := newConnectErrorReporter(a.emitError, srtHost, cfg.SRTPort, time.Now)
 
-	// The conform format Start derived, or the zero VideoFormat when it derived
-	// none — which internal/gst documents as "nothing is known" and resolves to
-	// its own 1920x1080p50. A nil here is therefore not a missing value to
-	// guard against; it is the third of the three answers conformFormat can
-	// give, and it is the one every test that calls senderOpts directly
-	// receives, so those tests keep asserting exactly the pipeline the shipped
-	// build produces today.
-	var conformTo gst.ConformTarget
-	if f := a.conformTo.Load(); f != nil {
-		conformTo = *f
-	}
-
 	return sender.Opts{
-		Pipeline: gst.PipelineOpts{
-			SlatePath: a.slatePath(cfg),
-
-			// THE PLATFORM ENDPOINT, AND ONLY ON A SEAT THAT OPENS ONE.
-			//
-			// It is cleared for a DeckLink commentary seat rather than passed
-			// through, and that clearing is half of the safety property this
-			// whole area is built around; startSession's AudioCaptureID line is
-			// the other half. A saved audioDeviceId sitting beside
-			// audioSourceKind "decklink" is two answers to one question — an
-			// ordinary state in a hand-edited config.json, and one the single
-			// picker cannot produce — and internal/gst refuses a PipelineOpts
-			// carrying both, by name, before anything is built.
-			//
-			// It is still a PURE READING of the configuration, which is what
-			// keeps this function what its comment says it is: which subsystem
-			// captures the commentary is a field in the document, and no
-			// hardware is consulted to decide it. Only WHICH CARD needs an
-			// enumeration, and that is the pre-flight's answer, not this one's.
-			AudioDeviceID: nativeAudioDeviceID(cfg),
-
-			ConformTo: conformTo,
+		Pipeline: gst.SendOpts{
 			// The AUDIO bitrate is left at zero so that internal/gst applies
 			// its own documented constant of 128000 bps (specification section
 			// 5); the codec is likewise not exposed to the user. The VIDEO
@@ -3631,38 +5068,6 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// unset field, so a configuration nobody has touched still encodes
 			// exactly what the on-air build encodes.
 			VideoBitrateKbps: cfg.EffectiveVideoBitrateKbps(),
-
-			// The input meters. The pipeline's level element measures what is
-			// actually encoded and sent and calls this on a streaming thread
-			// (gst.PipelineOpts.OnLevels: MUST NOT BLOCK) — the forwarder is a
-			// throttle in front of the non-blocking event pump, so it cannot.
-			OnLevels: a.levelsForwarder(nil),
-
-			// The per-channel picker meter, from the OTHER level element: the
-			// capture device's own channels, upstream of the routing. It is a
-			// separate callback because it is a separate measurement, and the
-			// separation is what stops a sixteen-entry frame ever being drawn on
-			// the meter that is supposed to show what is going to air.
-			OnChannelLevels: a.channelLevelsForwarder(),
-
-			// The signal lamp. Unlike OnLevels this is not called on a streaming
-			// thread — internal/gst's watchdog polls from a goroutine of its own —
-			// so the forwarder may take sigMu for the one assignment it makes.
-			OnSignal: a.signalForwarder(),
-
-			// The routing the capture starts with — THE ONE SAVED FOR THE DEVICE
-			// THIS SEAT IS CAPTURING FROM, and no other. config.ChannelMaps holds
-			// one per device, keyed by capture kind and device id, so a card's
-			// sixteen-wide routing cannot reach a two-channel microphone that
-			// happened to be selected when somebody last pressed Save. Nothing here
-			// picks the key: CurrentChannelMap reads the same three fields that
-			// decide which capture element gets built.
-			//
-			// The zero value is not silence: it means nobody has chosen for this
-			// device, and internal/gst resolves it at the negotiated width to the
-			// first two input channels — bit-for-bit what this application sent
-			// before the routing screen existed.
-			ChannelMap: gstChannelMap(cfg.CurrentChannelMap()),
 		},
 		Sink: gst.SinkOpts{
 			Host:       srtHost,
@@ -4451,14 +5856,19 @@ func gstChannelMap(saved []config.ChannelContribution) gst.ChannelMap {
 	return m
 }
 
-// currentPipeline returns the running session's pipeline, or nil when no session
-// is running.
+// currentSend returns the running session's SEND pipeline, or nil when no
+// session is running.
+//
+// It replaces currentPipeline, and the rename is the point rather than a tidy-up:
+// "the pipeline" stopped being one thing the moment the capture layer became
+// always-live, and a reader who was allowed to keep saying "the pipeline" would
+// eventually ask this one for a channel map. Its twin is currentCapture.
 //
 // sessMu is held only to read the pointer and is released before the caller
 // touches the pipeline, which is the same discipline GetConformTarget keeps and
 // for the same reason: internal/gst takes its own lock across state changes, so
 // calling into it under sessMu would couple a UI read to a reconnect.
-func (a *App) currentPipeline() gst.Pipeline {
+func (a *App) currentSend() gst.Pipeline {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 	if a.session == nil {
@@ -4484,17 +5894,25 @@ func (a *App) currentPipeline() gst.Pipeline {
 // and there is no honest answer to give while the pipeline is being rebuilt
 // anyway. domReady, which DOES run on the main thread, replays the cache instead.
 //
-// No session is not an error. Zero channels draws no grid and the screen says
-// why, which is the truth on every machine that has not pressed START.
+// NO CAPTURE IS NOT AN ERROR. Zero channels draws no grid and the screen says
+// why, which is the truth on a machine whose microphone will not open — and no
+// longer the truth on every machine that has not pressed START, because the pad
+// negotiates at launch now.
 func (a *App) GetChannelMap() (channelMapPayload, error) {
+	// THE KEY COMES FROM THE PIPELINE THAT IS OPEN and never from the current
+	// configuration: a selection made since does not reach a running capture, and
+	// a key re-derived here would name the newly chosen device while the width
+	// still described the one actually capturing — which is precisely the
+	// mismatch the stamp exists to make visible.
+	cap, key := a.currentCommentary()
 	width := 0
-	if pipe := a.currentPipeline(); pipe != nil {
-		width = pipe.InputChannels()
+	if cap != nil {
+		width = cap.InputChannels()
 	}
 
 	a.chanMu.Lock()
-	a.lastInputChannels = width
-	m, key := a.lastChannelMap, a.lastDeviceKey
+	a.lastInputChannels, a.lastDeviceKey = width, key
+	m := a.lastChannelMap
 	a.chanMu.Unlock()
 
 	return channelMapPayloadFrom(key, width, m), nil
@@ -4518,13 +5936,36 @@ func (a *App) GetChannelMap() (channelMapPayload, error) {
 // leaving the previous matrix in force with nothing readable afterwards to say
 // which one is running. A caller that swallowed this would leave the grid showing
 // a routing that is not the one on air.
+//
+// # IT NO LONGER REFUSES BECAUSE NOTHING IS SENDING
+//
+// The old refusal said "nothing is sending, so there is no capture pad to route.
+// Press START once", and it was true of a build in which the pad came into
+// existence at START. It is now false in both halves: the pad negotiates at
+// launch, and pressing START would change nothing about whether this call can be
+// served. It is deleted here and the copy quoting it is deleted in
+// frontend/src/ui/channelmap.js, together, because a refusal that survives in
+// one language is a refusal the next reader restores in the other.
+//
+// What CAN still be missing is a capture — a card held by another application, a
+// microphone that is not plugged in — and that is a different sentence pointing
+// at a different control.
 func (a *App) SetChannelMap(m gst.ChannelMap) error {
-	pipe := a.currentPipeline()
-	if pipe == nil {
-		return errors.New("wslcomms: nothing is sending, so there is no capture pad to route. " +
-			"Press START once; the routing can then be changed live, while the feed is running")
+	cap, key := a.currentCommentary()
+	if cap == nil {
+		return errors.New("wslcomms: there is no commentary capture open, so there is no pad to " +
+			"route. Choose a commentary input, or press Restart capture if the device should " +
+			"already be there — the capture panel says what went wrong")
 	}
-	if err := pipe.SetChannelMap(m); err != nil {
+
+	// THE WRITE, THE RECORD AND THE REPUBLISH ARE ONE STEP. See chanApplyMu: two
+	// seats routing at once can otherwise leave both screens showing the matrix
+	// that is NOT in force. setCommentaryMuteFrom holds muteApplyMu across exactly
+	// the same three things, for exactly the same failure.
+	a.chanApplyMu.Lock()
+	defer a.chanApplyMu.Unlock()
+
+	if err := cap.SetChannelMap(m); err != nil {
 		return err
 	}
 
@@ -4532,7 +5973,7 @@ func (a *App) SetChannelMap(m gst.ChannelMap) error {
 	// what is IN FORCE, and a refused write left the previous matrix in force.
 	a.chanMu.Lock()
 	a.lastChannelMap = m
-	width, key := a.lastInputChannels, a.lastDeviceKey
+	width := a.lastInputChannels
 	a.chanMu.Unlock()
 
 	// Republished so that a SECOND SEAT follows the change. A remote operator's
@@ -4543,30 +5984,50 @@ func (a *App) SetChannelMap(m gst.ChannelMap) error {
 	return nil
 }
 
-// publishChannelMap emits the current routing state and refreshes the cache the
-// domReady replay reads. It is called once when a session starts, which is when
-// the capture pad negotiates and therefore the first moment the width is real.
+// inputChannelsForwarder returns the OnInputChannels callback: the ONE thing in
+// this application allowed to size a routing grid.
 //
-// The DEVICE KEY comes from the caller, which is the only place that holds the
-// configuration this pipeline was built from — see the lastDeviceKey field for
-// why it is recorded here and not re-read later.
-func (a *App) publishChannelMap(pipe gst.Pipeline, deviceKey string) {
-	width := 0
-	if pipe != nil {
-		width = pipe.InputChannels()
+// # It is a callback and not a read, and that is a measurement
+//
+// InputChannels() READS ZERO FOR ABOUT 7 ms AFTER Start RETURNS. Measured on the
+// fitted card: Start completed at +108 ms and aconv:sink published its negotiated
+// caps at +115 ms. That is the shipped contract of a live source — it returns
+// NO_PREROLL as soon as its state change completes, which can be before the first
+// CAPS event has travelled downstream — and not a defect. So the capture build
+// takes the width from HERE and never from a synchronous read it would have no
+// reason to repeat.
+//
+// # It is called on a GStreamer streaming thread, so nothing here may block
+//
+// chanMu is a leaf held for two assignments and never across a call into
+// internal/gst, and events.send discards rather than blocking. That is the same
+// budget levelsForwarder works to, arrived at the same way.
+//
+// # The device stamp travels with the width, always
+//
+// Without it there is a window between selecting a Focusrite and the capture
+// renegotiating in which the grid still holds the previous device's sixteen, and
+// a crosspoint pressed in that window writes a 2x16 matrix onto a two-channel pad
+// — the measured "streaming stopped, reason error (-5)", which reads as a broken
+// device rather than as a bad matrix.
+func (a *App) inputChannelsForwarder() func(string, int) {
+	return func(deviceKey string, width int) {
+		a.chanMu.Lock()
+		a.lastInputChannels = width
+		a.lastDeviceKey = deviceKey
+		m := a.lastChannelMap
+		a.chanMu.Unlock()
+
+		a.events.send(EventChannelMap, channelMapPayloadFrom(deviceKey, width, m))
 	}
-
-	a.chanMu.Lock()
-	a.lastInputChannels = width
-	a.lastDeviceKey = deviceKey
-	m := a.lastChannelMap
-	a.chanMu.Unlock()
-
-	a.events.send(EventChannelMap, channelMapPayloadFrom(deviceKey, width, m))
 }
 
-// forgetChannelMap publishes the end-of-session state — no negotiated channels,
+// forgetChannelMap publishes the end-of-CAPTURE state — no negotiated channels,
 // no map in force — and clears the cache with it.
+//
+// IT IS NO LONGER CALLED AT THE END OF A SESSION. The routing grid is a control
+// over a capture pad, and the pad now outlives every session; the moments this
+// runs are a device change, a Restart capture and the application quitting.
 //
 // Both halves matter, exactly as they do in forgetSignal. Without the EVENT a
 // routing grid stays drawn at sixteen channels for a pipeline that no longer
@@ -4662,8 +6123,9 @@ func (a *App) signalForwarder() func(gst.SignalReport) {
 	}
 }
 
-// forgetSignal publishes the UNKNOWN frame that ends a session and clears the
-// replay cache with it.
+// forgetSignal publishes the UNKNOWN frame that ends a CAPTURE and clears the
+// replay cache with it. Like forgetChannelMap, it no longer runs at the end of a
+// session: the watchdog belongs to the pipeline that has the card open.
 //
 // Both halves matter and they fail differently. Without the EVENT, the lamp
 // keeps whatever it last showed for a pipeline that has been torn down — a green
@@ -4690,16 +6152,21 @@ func (a *App) forgetSignal() {
 //
 // # It is HANDED the pipeline, and that is a deadlock fix rather than a style
 //
-// THIS GOROUTINE MAY NEVER TAKE sessMu. App.Stop holds sessMu for its whole
-// duration, INCLUDING the join of this very goroutine (sess.wg.Wait), so a
-// transition being forwarded while a Stop is in flight would park here on a
-// lock the Stop will not release until this goroutine has exited. That is not a
-// hypothetical: reconcileMute was written to look the pipeline up through
-// currentPipeline, and the app suite hung for ten minutes on the first Stop that
-// raced a transition. The pipeline is therefore passed in from startSession —
-// the same reason publishChannelMap takes one rather than asking — and
+// THIS GOROUTINE MAY NEVER TAKE sessMu, AND MAY NEVER TAKE capMu EITHER. App.Stop
+// holds sessMu for its whole duration, INCLUDING the join of this very goroutine
+// (sess.wg.Wait), so a transition being forwarded while a Stop is in flight would
+// park here on a lock the Stop will not release until this goroutine has exited.
+// That is not a hypothetical: reconcileMute was written to look the pipeline up
+// through the session, and the app suite hung for ten minutes on the first Stop
+// that raced a transition. capMu joins the ban for the second half of the same
+// reason — the lock order is sessMu then capMu, and a rebuild holds sessMu across
+// a device open, so reaching for capMu from here would queue behind exactly the
+// Stop that is waiting for this goroutine.
+//
+// What is passed in is the CAPTURE pipeline — the one that owns the cough mute
+// element — resolved once at START and held for the life of the session, and
 // reconcileMute reads gst's atomic mirror, which takes no lock at all.
-func (a *App) forwardSenderStates(pipe gst.Pipeline, states <-chan sender.State) {
+func (a *App) forwardSenderStates(cap gst.CapturePipeline, states <-chan sender.State) {
 	for state := range states {
 		a.senderMu.Lock()
 		a.lastSender = state
@@ -4713,7 +6180,7 @@ func (a *App) forwardSenderStates(pipe gst.Pipeline, states <-chan sender.State)
 		// CommentaryMuted reads an atomic mirror, takes no lock and never blocks,
 		// which is what makes it safe from a goroutine that App.Stop is holding
 		// sessMu to join. A state that still agrees publishes no event at all.
-		a.reconcileMute(pipe)
+		a.reconcileMute(cap)
 	}
 }
 
@@ -4827,16 +6294,29 @@ type mutePayload struct {
 	Seq       float64 `json:"seq"`
 }
 
-// muteUnavailableNoSession is the one reason a mute cannot happen, in the
-// operator's words rather than the program's.
+// muteUnavailableNoCapture is the one remaining reason a mute cannot happen, in
+// the operator's words rather than the program's.
 //
-// It is the SAME TEXT errMuteNoSession carries, because the operator can meet
+// It replaces muteUnavailableNoSession and errMuteNoSession, both of which are
+// DELETED. Those said "nothing is being sent yet, so there is nothing to mute…
+// it becomes live when you press START", which was true of a build in which the
+// volume element came into existence at START. The element now exists from
+// launch, so the sentence would be a disabled control explaining itself with a
+// fact that is no longer one — and the operator's ruling (PLAN.md 0-BIS A2) is
+// that a mute latched before START is CARRIED INTO the session rather than
+// refused.
+//
+// What is left is the honest case: there is no commentary capture at all, so
+// there is no element to write to. That points at a device and at Restart
+// capture, not at START.
+//
+// It is the SAME TEXT errMuteNoCapture carries, because the operator can meet
 // either — the sentence on a disabled button and the sentence in a failed call —
 // and two descriptions of one fact are one description too many.
-const muteUnavailableNoSession = "nothing is being sent yet, so there is nothing to mute. " +
-	"The cough control acts on the commentary going out; it becomes live when you press START."
+const muteUnavailableNoCapture = "the commentary capture is not open, so there is nothing to mute. " +
+	"Choose a commentary input, or press Restart capture if the microphone should already be there."
 
-var errMuteNoSession = errors.New("wslcomms: " + muteUnavailableNoSession)
+var errMuteNoCapture = errors.New("wslcomms: " + muteUnavailableNoCapture)
 
 // SetCommentaryMute mutes or unmutes the commentary on the running feed.
 //
@@ -4858,12 +6338,36 @@ var errMuteNoSession = errors.New("wslcomms: " + muteUnavailableNoSession)
 // It returns the state IN FORCE rather than nothing, so a caller never has to
 // infer the result of its own call from an event that may or may not arrive.
 //
-// It refuses when nothing is sending. That is deliberate and it is the other
-// half of "Start must leave the mute in a defined state": a mute accepted before
-// START would have to be either forgotten (a control that lies) or carried into
-// the session (a commentator who comes on air muted because of something pressed
-// twenty minutes earlier). Neither is acceptable, so there is no third state to
-// hold.
+// # IT NO LONGER REFUSES BECAUSE NOTHING IS SENDING, AND THE ARGUMENT THAT SAID
+// IT SHOULD IS ANSWERED HERE RATHER THAN DELETED
+//
+// This is what stood in this comment, and it is worth reading before the answer:
+//
+//	"It refuses when nothing is sending. That is deliberate and it is the other
+//	 half of 'Start must leave the mute in a defined state': a mute accepted
+//	 before START would have to be either forgotten (a control that lies) or
+//	 carried into the session (a commentator who comes on air muted because of
+//	 something pressed twenty minutes earlier). Neither is acceptable, so there
+//	 is no third state to hold."
+//
+// The dilemma was real and the reasoning was sound about the build it was
+// written for. What changed is not the argument but the premise: always-live
+// capture creates that third state whether or not we want it, because the volume
+// element exists from launch. The operator was asked and ruled CARRY IT (PLAN.md
+// 0-BIS A2), and the fear the refusal answered is met a different way.
+//
+// THE FEAR WAS OF A CONTROL THAT LIES, AND IT IS MET BY VISIBILITY RATHER THAN
+// BY UNAVAILABILITY. The mute sits UPSTREAM of alevel, so a muted commentator has
+// a flat programme meter AND a mute banner — before START and after it, in the
+// same two places, showing the same two things. The commentator who comes on air
+// muted because of something pressed twenty minutes earlier is looking at a dead
+// meter for those twenty minutes, which is the state this application is best at
+// making obvious. And the write-then-read-back discipline is untouched: this side
+// still publishes what the element REPORTS and never what it was asked for, so
+// the control cannot lie in the direction that costs a match.
+//
+// What it refuses now is a mute with no capture to write to — a different fact,
+// pointing at a different control. See muteUnavailableNoCapture.
 func (a *App) SetCommentaryMute(muted bool, seq float64) (mutePayload, error) {
 	return a.setCommentaryMuteFrom(muteSeatDesk, "", muted, seq)
 }
@@ -4875,11 +6379,12 @@ func (a *App) SetCommentaryMute(muted bool, seq float64) (mutePayload, error) {
 // is not a permission — a remote seat may mute, and remoteAllowlist argues why —
 // it is what the desk is shown, so that a red badge is never unaccountable.
 func (a *App) setCommentaryMuteFrom(seat, addr string, muted bool, seq float64) (mutePayload, error) {
-	// The pipeline is resolved BEFORE either lock is taken, because that goes
-	// through sessMu and the order in this file is sessMu → muteApplyMu → muteMu.
-	pipe := a.currentPipeline()
-	if pipe == nil {
-		return a.muteSnapshot(), errMuteNoSession
+	// The capture pipeline — the one that OWNS the cough mute element — is
+	// resolved BEFORE either lock is taken, because that goes through sessMu and
+	// the order in this file is sessMu → muteApplyMu → muteMu.
+	cap, _ := a.currentCommentary()
+	if cap == nil {
+		return a.muteSnapshot(), errMuteNoCapture
 	}
 
 	// Stamped on arrival if the caller offered nothing, on the same millisecond
@@ -4903,7 +6408,7 @@ func (a *App) setCommentaryMuteFrom(seat, addr string, muted bool, seq float64) 
 		return a.muteSnapshot(), nil
 	}
 
-	if err := pipe.SetCommentaryMute(muted); err != nil {
+	if err := cap.SetCommentaryMute(muted); err != nil {
 		// Nothing is recorded and nothing is published: the mute in force is
 		// whatever it was, and this side must not claim otherwise. The caller gets
 		// the unchanged state alongside the error.
@@ -4914,7 +6419,7 @@ func (a *App) setCommentaryMuteFrom(seat, addr string, muted bool, seq float64) 
 	// property after every successful write, so this is what is actually in
 	// force; recording the value we ASKED for would be the one way this side
 	// could end up confidently wrong about whether a microphone is open.
-	inForce := pipe.CommentaryMuted()
+	inForce := cap.CommentaryMuted()
 
 	a.muteMu.Lock()
 	a.muted = inForce
@@ -4979,7 +6484,7 @@ func (a *App) muteSnapshot() mutePayload {
 func (a *App) muteStateLocked() mutePayload {
 	reason := a.muteReason
 	if !a.muteAvailable && reason == "" {
-		reason = muteUnavailableNoSession
+		reason = muteUnavailableNoCapture
 	}
 	if a.muteAvailable {
 		reason = ""
@@ -4994,35 +6499,52 @@ func (a *App) muteStateLocked() mutePayload {
 	}
 }
 
-// armMuteForSession puts the mute into its DEFINED START STATE: off, owned by
-// nobody, with the ordering high-water mark reset so the first press of the new
-// session cannot be dropped as stale against the last press of the old one.
+// mutedNow is the cough mute's CURRENT state, for CaptureOpts.MuteCommentary.
 //
-// It is called from startSession under sessMu, after the pipeline is running.
+// It takes muteMu only — a leaf that is never held across a call into
+// internal/gst — because the pipeline it would otherwise ask is the one being
+// replaced. This is the line that carries a latch across a device change: an
+// operator who muted to cough and then picked a different microphone gets the
+// microphone they picked, still muted, rather than a commentator restored to air
+// by a dropdown.
+func (a *App) mutedNow() bool {
+	a.muteMu.Lock()
+	defer a.muteMu.Unlock()
+	return a.muted
+}
+
+// publishMuteForCapture records and publishes the mute a freshly built capture
+// is actually in, and marks the control available.
 //
-// It WRITES the unmuted state rather than assuming it. A fresh pipeline is
-// unmuted by construction, so the write is expected to be a no-op — and a no-op
-// is precisely what makes it safe to do, against the case where it is not: this
-// is the one line that stops "coming on air muted because of a stale flag",
-// which is the failure it exists for. Its failure is logged and spared, on the
-// same principle the preview's failures are: a mute that could not be cleared
-// must not take a working feed off air, and the reconciliation that follows
-// every sender transition will publish the truth either way.
-func (a *App) armMuteForSession(pipe gst.Pipeline) {
-	if err := pipe.SetCommentaryMute(false); err != nil {
-		log.Printf("wslcomms: could not clear the cough mute at the start of the session (%v); "+
-			"the feed is unaffected, and the state published below is the one read back off the "+
-			"element rather than the one asked for", err)
+// It replaces armMuteForSession, which used to run at START and WRITE the
+// unmuted state. Two things changed and both come from PLAN.md 0-BIS A2. The
+// mute is no longer cleared at a session boundary — a latch set before START is
+// still set at START — and the moment that matters is no longer START but the
+// build of the pipeline that owns the element.
+//
+// IT WRITES NOTHING AND READS EVERYTHING. CaptureOpts.MuteCommentary already
+// asked for the state this pipeline was to be built in (mutedNow), so the only
+// question left is what the element actually reports, and that is the one
+// question in this product that must never be answered from memory. If the two
+// disagree, THIS publishes the element's answer: a commentator who is inaudible
+// under a control that says they are not muted is the failure the read-back
+// discipline exists to prevent, and it is worse than a startling banner.
+//
+// The ordering high-water mark is reset with it, so the first press against a
+// new pipeline cannot be dropped as stale against the last press against the old
+// one.
+func (a *App) publishMuteForCapture(cap gst.CapturePipeline) {
+	if cap == nil {
+		// No commentary leg, so there is no element and no control. forgetMute has
+		// already published exactly that during the teardown above.
+		return
 	}
 
-	// READ BACK, and published as read. If the write above failed, or failed to
-	// take, this publishes MUTED — which is a startling thing to see on a fresh
-	// session and is exactly right: the alternative is a commentator who is on
-	// air and inaudible under a control that says they are not muted.
-	inForce := pipe.CommentaryMuted()
+	inForce := cap.CommentaryMuted()
 	if inForce {
-		log.Printf("wslcomms: the session started with the commentary MUTED, which is not what " +
-			"START asks for; the cough control is published as muted so the desk can clear it")
+		log.Printf("wslcomms: the commentary capture came up MUTED, which is a cough latch carried " +
+			"across the rebuild rather than a fault; the control is published as muted so the desk " +
+			"can see it and release it")
 	}
 
 	a.muteMu.Lock()
@@ -5038,16 +6560,22 @@ func (a *App) armMuteForSession(pipe gst.Pipeline) {
 	a.events.send(EventMute, out)
 }
 
-// forgetMute publishes the end-of-session state — nothing to mute, nobody
+// forgetMute publishes the end-of-CAPTURE state — nothing to mute, nobody
 // holding it — and clears the record with it.
 //
+// IT NO LONGER RUNS AT THE END OF A SESSION. A STOP leaves the cough control
+// exactly where it was, because the element it acts on is still there; what
+// takes the control away is the DEVICE going, which is a device change, a
+// Restart capture or the application quitting.
+//
 // Both halves matter, exactly as they do in forgetChannelMap and forgetSignal.
-// Without the EVENT a latched cough button stays red over a session that has
+// Without the EVENT a latched cough button stays red over a capture that has
 // gone, and the operator has a control that will not release because there is
-// nothing left for it to act on. Without the RECORD CLEAR the next Start would
-// begin with this side believing the commentator is muted, which armMuteForSession
-// would correct — but a page loaded in between would be told the old answer, and
-// an answer that is wrong and freshly delivered is worse than one that is absent.
+// nothing left for it to act on. Without the RECORD CLEAR the next build would
+// begin with this side believing the commentator is muted, which
+// publishMuteForCapture would correct — but a page loaded in between would be
+// told the old answer, and an answer that is wrong and freshly delivered is worse
+// than one that is absent.
 func (a *App) forgetMute() {
 	a.muteMu.Lock()
 	a.muted = false
@@ -5055,7 +6583,7 @@ func (a *App) forgetMute() {
 	a.muteSeq = 0
 	a.muteSeqAt = time.Time{}
 	a.muteAvailable = false
-	a.muteReason = muteUnavailableNoSession
+	a.muteReason = muteUnavailableNoCapture
 	out := a.muteStateLocked()
 	a.muteMu.Unlock()
 
@@ -5070,21 +6598,21 @@ func (a *App) forgetMute() {
 // reconnect, or anything internal/gst does to recover leaves a mute either
 // carried or cleared, and this side has no way to know which without asking.
 //
-// THE PIPELINE IS AN ARGUMENT AND MUST STAY ONE. Looking it up through
-// currentPipeline would take sessMu on a goroutine App.Stop joins while holding
+// THE CAPTURE PIPELINE IS AN ARGUMENT AND MUST STAY ONE. Looking it up through
+// currentCommentary would take sessMu on a goroutine App.Stop joins while holding
 // it — a deadlock that hung the app suite for ten minutes the first time this
 // was written that way. See forwardSenderStates.
 //
 // It corrects the RECORD as well as publishing, so a subsequent read agrees with
 // the event rather than repeating the stale answer.
-func (a *App) reconcileMute(pipe gst.Pipeline) {
-	if pipe == nil {
+func (a *App) reconcileMute(cap gst.CapturePipeline) {
+	if cap == nil {
 		return
 	}
 	// Free: internal/gst reads this off an atomic mirror, takes no lock and never
 	// blocks, so it is safe even while a ReplaceSink is holding the pipeline lock
 	// and safe from a goroutine that a Stop holding sessMu is waiting on.
-	actual := pipe.CommentaryMuted()
+	actual := cap.CommentaryMuted()
 
 	a.muteMu.Lock()
 	if a.muted == actual {
@@ -5186,13 +6714,25 @@ func (a *App) releaseMuteHeldByGoneSeat(connected map[string]bool) {
 // it is this application calling Start when a capture device is configured and
 // not calling ReplaceSink until the operator says go.
 //
-// THAT SPLIT IS NOT WIRED HERE YET. App.Start still does both halves in one
-// press, through internal/sender, so today the preview does appear at START and
-// not before — and BeforeStart says FALSE because it reports what this build
-// does, not what the media layer could support. It is a field rather than a
-// constant in the frontend precisely so that the day the split is made, the page
-// follows without being rewritten. What it must never become is a claim that the
-// thing is impossible, because it is not.
+// THAT SPLIT IS NOW WIRED, AND THE PARAGRAPH THAT SAID IT WAS NOT IS ANSWERED
+// RATHER THAN DELETED, because it is the reasoning that produced the field and
+// the next reader will look for it. It said:
+//
+//	"THAT SPLIT IS NOT WIRED HERE YET. App.Start still does both halves in one
+//	 press, through internal/sender, so today the preview does appear at START
+//	 and not before — and BeforeStart says FALSE because it reports what this
+//	 build does, not what the media layer could support. It is a field rather
+//	 than a constant in the frontend precisely so that the day the split is
+//	 made, the page follows without being rewritten."
+//
+// That day arrived. The capture layer is built at domReady and held until the
+// application quits (PLAN.md 0-BIS A1); START mints a SEND pipeline over it and
+// opens no device at all. So the preview exists before START, survives STOP, and
+// BeforeStart is TRUE — which was one line to change, exactly as the field was
+// designed for, and the page followed without being rewritten.
+//
+// What the paragraph got right is worth keeping: the field must never become a
+// claim that the thing is impossible, because it never was.
 //
 // Reason is non-empty exactly when Running is false, and is written for the
 // operator rather than for a log. It says what happens and when, and it
@@ -5210,9 +6750,11 @@ type previewStatePayload struct {
 	// distinguish "not yet" from "not for this configuration".
 	Sending bool `json:"sending"`
 
-	// BeforeStart is whether a preview can exist WITHOUT a session. It is false,
-	// and it is a field rather than a constant in the frontend so that the day
-	// internal/gst can do it safely, the page follows without being rewritten.
+	// BeforeStart is whether a preview can exist WITHOUT a session. IT IS NOW
+	// TRUE, and this field existing is why the page follows without being
+	// rewritten: it was written as a field rather than as a constant in the
+	// frontend precisely so that the day the split was made, one line here would
+	// carry it. That day is R1's always-live capture.
 	BeforeStart bool `json:"beforeStart"`
 
 	// Reason is why the preview is not running, in a sentence. Empty when it is.
@@ -5224,18 +6766,22 @@ type previewStatePayload struct {
 // read, and a control whose explanation changed depending on how it was asked
 // would be worse than one with no explanation.
 const (
-	previewReasonOff = "the confidence preview is switched off. Turn it on in Settings, before you " +
-		"press START — it is built into the pipeline at START and cannot be attached to a running feed."
+	previewReasonOff = "the confidence preview is switched off. Turn it on in Settings — it is a " +
+		"branch of the picture capture and is built with it, so it cannot be attached to a feed " +
+		"that is already running."
 
 	previewReasonSlate = "this position is sending the slate, so there is nothing to preview. " +
 		"The preview shows what the capture card is seeing; select the camera as the video source " +
 		"to use it."
 
-	previewReasonNotSending = "your own picture appears when you press START. The programme return " +
-		"above is not waiting for anything — it is live already and owes nothing to START, so you " +
-		"can watch and hear the match before you go on air."
-
-	previewReasonNoSurface = "the preview could not get a window on this screen, so the session is " +
+	// previewReasonNotSending IS DELETED, and its absence is the change rather
+	// than an oversight. It said "your own picture appears when you press START",
+	// which was true of a preview that was a branch of the contribution pipeline.
+	// The picture capture is built at domReady and held until the application
+	// quits, so the picture appears at LAUNCH and survives STOP; a sentence
+	// telling the operator to press START to see it would now be the application
+	// asking for something it does not need.
+	previewReasonNoSurface = "the preview could not get a window on this screen, so the capture is " +
 		"running without it. Nothing about what is being transmitted has changed."
 )
 
@@ -5268,13 +6814,12 @@ func (a *App) GetPreviewState() previewStatePayload {
 		Running: running,
 		Enabled: cfg.DeckLinkPreviewEnabled,
 		Sending: sending,
-		// FALSE, and it is a fact about THIS BUILD rather than about the card.
-		// internal/gst/preview.go measured that the preview renders perfectly
-		// with the pipeline started and no sink installed; what is missing is
-		// this application splitting Start into "bring the capture up" and "go on
-		// air". Until that split exists this is false, and the day it does, this
-		// is where it becomes true — one line, and the page follows.
-		BeforeStart: false,
+		// TRUE, and it is a fact about THIS BUILD rather than about the card.
+		// internal/gst/preview.go measured that the preview renders perfectly with
+		// the pipeline started and no sink installed; what was missing was this
+		// application splitting "bring the capture up" from "go on air". The
+		// capture layer is that split, and it is built at domReady.
+		BeforeStart: true,
 	}
 	switch {
 	case running:
@@ -5282,12 +6827,13 @@ func (a *App) GetPreviewState() previewStatePayload {
 		out.Reason = previewReasonOff
 	case cfg.EffectiveVideoSource() != config.VideoSourceDeckLink:
 		out.Reason = previewReasonSlate
-	case !sending:
-		out.Reason = previewReasonNotSending
 	default:
-		// Enabled, on the camera, sending — and no surface. The one remaining
-		// case is a window that could not be created, whose failure startSession
-		// spares deliberately so the feed goes out without it.
+		// Enabled, on the camera — and no surface. THE "not sending yet" CASE IS
+		// GONE from this switch, because it is no longer a reason: the picture
+		// capture is up whether or not anything is being transmitted. What is left
+		// is a window that could not be created, whose failure the capture build
+		// spares deliberately so that the meters, the routing and the feed are
+		// unaffected by it.
 		out.Reason = previewReasonNoSurface
 	}
 	return out

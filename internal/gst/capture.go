@@ -514,8 +514,8 @@ type CapturePipeline interface {
 	// they most need it.
 	CommentaryMuted() bool
 
-	// Health is nil while this capture is carrying media and the latched fault
-	// once it has died.
+	// Health is nil while this capture's COMMENTARY leg is carrying media and the
+	// latched fault once the pipeline has died.
 	//
 	// It exists because a latched death does NOT stop the object working: every
 	// method still answers, ClaimForSend still succeeds, and on a dead device the
@@ -524,6 +524,23 @@ type CapturePipeline interface {
 	// must ask this before it builds a send pipeline; Faults() cannot answer it,
 	// being a channel the application has already drained.
 	Health() error
+
+	// PictureHealth is nil while this capture's PICTURE leg is carrying media and
+	// the latched, NAMED fault once it has died.
+	//
+	// IT IS A SECOND QUESTION AND NOT A REFINEMENT OF THE FIRST, because the two
+	// deaths have different repairs. A picture death leaves the commentary being
+	// captured, metered, routed and muted, so this pipeline is not "down" and must
+	// not be reported as such — but nothing downstream of the muxer can tell the
+	// difference, because mpegtsmux emits nothing at all while one of its two
+	// inputs is silent. ArmForSend therefore refuses on either, and this is what
+	// lets the CAPTURE PANEL say which of the two the operator is looking at.
+	//
+	// Before it existed a picture-leg death reached deliverWarning and stopped
+	// there: nothing on screen changed, Health() answered nil, START reached
+	// PLAYING and the operator was refused two seconds later by the muxer
+	// watchdog's "nothing reached vq:src" — the pad, not the cause.
+	PictureHealth() error
 
 	// Faults carries this capture pipeline's fatal errors. It is NOT the send
 	// pipeline's Errors(): internal/sender reads any error arriving while

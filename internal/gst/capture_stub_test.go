@@ -622,17 +622,59 @@ func TestACaptureFaultIsRoutedByTheClassifierTheRigUses(t *testing.T) {
 		}
 	})
 
-	t.Run("a picture failure on a split seat is not fatal", func(t *testing.T) {
+	// REWRITTEN, AND THE OLD ASSERTION IS QUOTED BECAUSE IT LOOKED RIGHT. It was
+	// `Health() == nil` and `len(Warnings()) == 1`, i.e. "a picture death on a
+	// split seat is invisible except in the log" — which is what shipped, and what
+	// made a dead card produce nothing on the capture event, nothing on the error
+	// event, a frozen preview, a Health() of nil that let ArmForSend succeed, and a
+	// START refused two seconds later by a message about a pad.
+	//
+	// The commentary half of that claim survives untouched and is still asserted:
+	// this is not a death of the pipeline and Health() must stay nil.
+	t.Run("a picture failure on a split seat is the picture's alone", func(t *testing.T) {
 		c := startedStubCapture(t, CaptureOpts{
 			Legs:           CaptureLegs{Picture: PictureCard},
 			VideoCaptureID: card,
 		})
 		c.InjectBusError(nameVideoCaptureSrc, errors.New("Internal data stream error"))
+
 		if err := c.Health(); err != nil {
-			t.Errorf("a picture failure on a seat whose commentary is elsewhere latched: %v", err)
+			t.Errorf("a picture failure on a seat whose commentary is elsewhere latched as a "+
+				"whole-pipeline death: %v", err)
 		}
-		if len(c.Warnings()) != 1 {
-			t.Error("the picture failure delivered no warning")
+		if err := c.PictureHealth(); err == nil {
+			t.Fatal("a picture failure latched nothing PictureHealth can report, so the capture " +
+				"panel goes on reading live over a dead card and START is refused two seconds " +
+				"later by a message about a pad")
+		}
+		if len(c.Faults()) != 1 {
+			t.Errorf("the picture failure put %d errors on Faults(), want 1. A warning is drained "+
+				"and discarded by the application, which is why this used to change nothing on "+
+				"screen", len(c.Faults()))
+		}
+		if !errors.Is(c.PictureHealth(), ErrPipelineFatal) {
+			t.Error("the latched picture fault does not wrap ErrPipelineFatal, so nothing " +
+				"downstream can classify it")
+		}
+	})
+
+	t.Run("a dead picture leg refuses the arming", func(t *testing.T) {
+		// mpegtsmux emits nothing at all while one of its two inputs is silent —
+		// measured, vq:src 0, aq:src 187 at full rate, mux:src 0 — so a send over a
+		// dead picture is as complete a stop as one over a dead microphone. The
+		// refusal has to come HERE, with the named cause, and not from the liveness
+		// gate two seconds later with the name of a pad.
+		c := startedStubCapture(t, CaptureOpts{
+			Legs:           CaptureLegs{Picture: PictureCard},
+			VideoCaptureID: card,
+		})
+		if err := c.ArmForSend(); err != nil {
+			t.Fatalf("a healthy capture refused the arming: %v", err)
+		}
+		c.InjectBusError(nameVideoCaptureSrc, errors.New("Internal data stream error"))
+		if err := c.ArmForSend(); err == nil {
+			t.Fatal("ArmForSend succeeded over a dead picture leg, so START reaches PLAYING and " +
+				"the operator is refused by the muxer watchdog rather than by the card fault")
 		}
 	})
 

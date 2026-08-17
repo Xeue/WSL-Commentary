@@ -983,3 +983,177 @@ func describeControlSignature(t *testing.T, control, healthy seamCycle) {
 			len(control.busErrors), control.busErrors, nameVideoEncod)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The shipped code, over the shipped seam
+// ---------------------------------------------------------------------------
+
+// TestLiveShippedSendPipelineCarriesMediaOverTheSeam is the proof that closes
+// this work package, and it is deliberately the CHEAPEST live proof that can
+// close it: no card, no network, no M2L-X and no sink.
+//
+// # What it exercises that nothing else does
+//
+// TestLiveProxySeamRearmsEverySendSession above proves the MECHANISM against
+// hand-built pipelines: the READY cycle, the object-valued property write, the
+// byte counts. This proves the SHIPPED CODE — gst.NewCapture, gst.New,
+// Pipeline.Start, Pipeline.Stop — actually performs it, in the right order, with
+// the real descriptions, three sessions in a row. Those are different claims, and
+// the second one is the one that goes on air.
+//
+// # Why no sink is needed to prove it
+//
+// Start installs none, by contract: srtq's src pad is gated and nothing leaves
+// the process until ReplaceSink. Everything the seam can get wrong is UPSTREAM of
+// that gate — the arming, the binding, the caps crossing the proxy — and the
+// liveness gate inside Start is what reads it: it refuses unless media has
+// actually reached vq:src, aq:src and mux:src within liveWatchStartGrace. So a
+// Start that returns nil IS the assertion, and this test's job is to make it
+// three times and then say what the muxer saw.
+//
+// # The falsification control, and how to run it
+//
+// A test that cannot be made to fail has proved nothing, so this one's control
+// has been run and its result is recorded here rather than described.
+//
+// THE CONTROL IS A SOURCE EDIT, NOT AN ENVIRONMENT VARIABLE, and the distinction
+// matters because this doc comment used to claim the opposite. The hand-built rig
+// above reads WSLCOMMS_LIVE_SKIP_PROXY_ARMING because the rig does its own
+// arming; the SHIPPED path does not, and must not — an environment variable that
+// can silently disarm the seam on an operator's machine is precisely the
+// permanent-false-green this whole mechanism exists against. Setting that
+// variable while running THIS test therefore changes nothing, which was measured:
+// all three cycles passed and the log showed every one of them armed anyway.
+//
+// To run the control, make gst.NewSend skip its ArmForSend loop (sendseam.go) in
+// a scratch copy of the tree and run this test. Measured on 2026-08-17, macOS
+// arm64, slate + built-in microphone:
+//
+//	cycle 1  passes unchanged
+//	cycle 2  FAILS in 25.2 ms with
+//	         "pipeline-fatal: venc: negotiation problem ... encoder not initialized"
+//
+// which is awaitFirstMediaLocked's early-fatal exit rather than the 2 s liveness
+// gate: an unarmed VIDEO seam complains through the encoder at about 16 ms with a
+// better sentence than the gate could give. An audio-only missed arming has no
+// such shortcut and falls to the gate, which names aq:src and mux:src — which is
+// why livewatch.go probes three pads and not one.
+//
+// # What it opens
+//
+// The platform's own capture endpoint and the slate PNG. It NEVER opens a
+// Continuity device — the operator's phone is in another room and opening it
+// chimes out of the phone — and it never touches the card, so it can run beside
+// anything that has one.
+func TestLiveShippedSendPipelineCarriesMediaOverTheSeam(t *testing.T) {
+	liveInitDarwin(t)
+
+	slate, err := filepath.Abs(env("WSLCOMMS_LIVE_SLATE", defaultSlatePath))
+	if err != nil {
+		t.Fatalf("resolving the slate: %v", err)
+	}
+	if _, err := os.Stat(slate); err != nil {
+		t.Skipf("no slate at %s: %v", slate, err)
+	}
+
+	devID := liveNativeInputID(t)
+
+	// THE CAPTURE LAYER, ONCE, FOR ALL THREE SESSIONS. That is the whole point of
+	// the seam and it is what makes cycles 2 and 3 the interesting ones: the
+	// proxysinks below never make another READY->PAUSED transition of their own, so
+	// without the arming at each START they would carry no STREAM_START, no CAPS
+	// and no SEGMENT to the second consumer, and the feed would be silent with
+	// every indicator green.
+	set := liveNativeCapture(t, slate, devID)
+
+	fmt.Fprintf(os.Stderr, "\n>>>> THE SHIPPED SEND PIPELINE OVER THE SHIPPED SEAM\n")
+	fmt.Fprintf(os.Stderr, "  capture: slate %s + %s\n", filepath.Base(slate), devID)
+
+	for cycle := 1; cycle <= 3; cycle++ {
+		pipe, err := New(set)
+		if err != nil {
+			t.Fatalf("cycle %d: New: %v", cycle, err)
+		}
+		cp, ok := pipe.(*cgoPipeline)
+		if !ok {
+			t.Fatalf("cycle %d: New returned a %T, not a *cgoPipeline", cycle, pipe)
+		}
+		go func() {
+			for range pipe.Errors() {
+			}
+		}()
+
+		t0 := time.Now()
+		startErr := pipe.Start(SendOpts{})
+		startedIn := time.Since(t0)
+		if startErr != nil {
+			_ = pipe.Stop()
+			t.Fatalf("cycle %d: Start: %v (after %v). THIS IS THE ZERO-BYTE SESSION: the "+
+				"liveness gate refused because nothing reached the muxer, which on the shipped "+
+				"code means the seam was not armed, not bound, or bound to a proxysink that had "+
+				"already been consumed", cycle, startErr, startedIn)
+		}
+
+		// Let it run long enough that the counts are a rate rather than a preroll.
+		time.Sleep(1500 * time.Millisecond)
+		samples := cp.live.samples()
+
+		var readings []string
+		for _, s := range samples {
+			readings = append(readings, fmt.Sprintf("%s:src %d", s.Pad, s.Buffers))
+			if s.Buffers == 0 {
+				t.Errorf("cycle %d: %s:src carried nothing 1.5 s after PLAYING; the liveness gate "+
+					"passed and the feed then went quiet", cycle, s.Pad)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  cycle %d  start %-10v  %s\n",
+			cycle, startedIn.Round(time.Millisecond), strings.Join(readings, "  "))
+
+		if err := pipe.Stop(); err != nil {
+			t.Errorf("cycle %d: Stop: %v", cycle, err)
+		}
+	}
+
+	// AND THE CAPTURE IS STILL ALIVE, which is R1 in one assertion: three send
+	// sessions have come and gone underneath it and the device is still open.
+	for _, c := range set.Pipelines() {
+		if err := c.Health(); err != nil {
+			t.Errorf("the %s capture did not survive three send sessions: %v", c.Legs(), err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  the capture layer outlived all three sessions\n")
+}
+
+// liveNativeInputID picks a platform capture endpoint to open, and SKIPS EVERY
+// CONTINUITY DEVICE.
+//
+// Enumerating is harmless; OPENING is not. "Sam's iPhone Microphone" is in a
+// different room from the laptop and the commentary mic, and opening it plays the
+// Continuity connection chime out of the phone at the phone's volume. That
+// happened on 2026-08-16 and the rule it produced is absolute: never open one.
+// See continuityDeviceNames in channelwidth_live_test.go.
+func liveNativeInputID(t *testing.T) string {
+	t.Helper()
+
+	if id := os.Getenv("WSLCOMMS_LIVE_AUDIO_DEVICE"); id != "" {
+		return id
+	}
+	devices, err := ListInputDevices()
+	if err != nil {
+		t.Fatalf("ListInputDevices: %v", err)
+	}
+	for _, d := range devices {
+		if NormaliseDeviceKind(d.Kind) != KindNative {
+			continue
+		}
+		if isContinuityDevice(d.Name) {
+			t.Logf("NOT OPENING %q: it is a Continuity device, it is in a different room, and "+
+				"opening it chimes out of somebody's phone", d.Name)
+			continue
+		}
+		t.Logf("native commentary input: %q (%s)", d.Name, d.ID)
+		return d.ID
+	}
+	t.Skip("this machine offers no native capture endpoint that is safe to open")
+	return ""
+}

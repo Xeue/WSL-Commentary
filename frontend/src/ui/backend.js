@@ -657,7 +657,9 @@ function installFakeConsoleHandle() {
     //
     // setChannelCount(8) is the other: a pad that negotiates fewer channels than
     // the saved map was written against is what the dropped-routing warning
-    // exists for, and 0 is the "press START once" state.
+    // exists for, and 0 is the "this input has not negotiated" state — which is
+    // a device that is opening or one that failed, and no longer anything START
+    // could fix.
     setSignal: (state, flaps) => {
       fakeSignal = { state: String(state || SIGNAL_STATE.UNKNOWN), flaps: Number(flaps) || 0 };
       fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
@@ -3023,7 +3025,8 @@ export const CAPTURE_UNAVAILABLE = Object.freeze({
 });
 
 /**
- * captureAvailable reports whether this build has always-live capture at all.
+ * captureAvailable reports whether this build can RE-POINT capture: whether the
+ * two mutating controls are here.
  *
  * ALL THREE, all-or-nothing, by channelMapAvailable's argument and one sharper
  * than it. SelectCommentaryInput without GetCaptureState re-points the
@@ -3032,6 +3035,14 @@ export const CAPTURE_UNAVAILABLE = Object.freeze({
  * meter that never moves again is the only evidence anything went wrong.
  * RestartCapture without the other two is a recovery control for a subsystem
  * this build cannot describe.
+ *
+ * IT ANSWERS FALSE ON EVERY REMOTE SEAT, and that is correct rather than a
+ * limitation. SelectCommentaryInput and RestartCapture are host-only, so
+ * internal/remote's shim prunes them and hasBinding reads them back as
+ * undefined; a remote seat genuinely cannot re-point capture, and a control that
+ * offered to would fail at the dispatcher. What must NOT be gated on it is
+ * getCaptureState — the read is on the open side of the allowlist precisely so a
+ * remote producer can see the sentence explaining a dead meter. See there.
  *
  * It is the BUILD's answer, not the machine's. "There is no card in this
  * machine" is a different fact, it arrives on the "capture" event's reason, and
@@ -3318,11 +3329,33 @@ export async function restartCapture() {
  * there would replace the explanation with a stack trace. Every way of not
  * knowing answers CAPTURE_UNAVAILABLE, which says so.
  *
+ * ============ IT IS NOT GATED ON captureAvailable(), AND THAT IS THE POINT ===
+ *
+ * It used to be, and the gate made this method unreachable from EVERY REMOTE
+ * SEAT — which is the seat it exists for. captureAvailable() is all-or-nothing
+ * over three method names, and two of them (SelectCommentaryInput,
+ * RestartCapture) are deliberately HOST-ONLY: internal/remote's shim replaces
+ * window.go.main.App with the hello methods alone, so a pruned method reads back
+ * as undefined and hasBinding answers false for it. The probe therefore returned
+ * false on a remote seat and this short-circuited to CAPTURE_UNAVAILABLE without
+ * ever calling the one method the dispatcher would happily have served.
+ *
+ * The paragraph of argument that put GetCaptureState on the OPEN side of
+ * app_remote.go's allowlist is what that defeated: "a remote producer who could
+ * see a dead meter and not the sentence explaining it would report a fault this
+ * application had already diagnosed". There is no event replay on connect, so
+ * this read is a remote seat's ONLY chance to learn a launch-time capture
+ * failure — a producer joining after the card failed saw nothing at all.
+ *
+ * getPictureState, four of whose five methods are likewise host-only, has always
+ * called straight through for the same reason. The catch below is what covers an
+ * older build that genuinely has no binding: callGoBound rejects and this
+ * answers CAPTURE_UNAVAILABLE, which is what the gate was for.
+ *
  * @returns {Promise<{picture: string, commentary: string, reason: string, audioDeviceName: string}>}
  */
 export async function getCaptureState() {
   if (hasWails()) {
-    if (!captureAvailable()) return CAPTURE_UNAVAILABLE;
     try {
       const got = await callGoBound(CAPTURE_METHODS.state);
       return got && typeof got === 'object' ? got : CAPTURE_UNAVAILABLE;

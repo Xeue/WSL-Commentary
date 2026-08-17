@@ -163,7 +163,27 @@ type cgoCapture struct {
 	// instead of coming up without a confidence monitor.
 	errMu sync.RWMutex
 	fatal error
-	errs  chan error
+
+	// pictureFatal latches a PICTURE-LEG death on a pipeline whose commentary is
+	// still running. It is a second field rather than a second use of fatal
+	// because the two have different consequences and only one of them is
+	// recoverable in place: the commentary goes on being captured, metered and
+	// muted, and RestartCapture is the repair.
+	//
+	// IT EXISTS BECAUSE A PICTURE DEATH USED TO BE INVISIBLE. classVideoCapture
+	// reached deliverWarning and nothing else: Health() answered nil, ArmForSend's
+	// latched-fault refusal did not fire, START reached PLAYING over a dead card
+	// and the operator was refused two seconds later by the muxer's "nothing
+	// reached vq:src" — the pad, not the cause — while capturefault.go's named
+	// diagnosis of that exact fault had already been produced and thrown away one
+	// layer down.
+	//
+	// It is CLEARED by teardownLocked for the reason fatal is: buildLocked's
+	// abort() runs teardownLocked and Start may build a second time without the
+	// preview.
+	pictureFatal error
+
+	errs chan error
 
 	// warns is what deliverWarning writes from the streaming thread, and warnsOut
 	// is what Warnings() hands the application. THEY ARE TWO CHANNELS AND NOT ONE,
@@ -200,6 +220,21 @@ var _ CapturePipeline = (*cgoCapture)(nil)
 // the width publisher) and Stop is the only thing that closes them. Stop on a
 // pipeline that was never started is cheap and does not fail.
 func NewCapture(opts CaptureOpts) (CapturePipeline, error) {
+	// THE SAME GUARD New, ListInputDevices, the picture monitor and the return
+	// monitor all open with, and it is not a formality here.
+	//
+	// `inited` false does not only mean "a required element is missing". Several
+	// of doInit's failure paths return BEFORE gst_init is ever called — a plugin
+	// directory that cannot be read, a Setenv that will not take, a registry path
+	// that cannot be created — so on a bundle whose Contents/Resources/gstreamer-1.0
+	// is missing, this is reached with GStreamer never initialised at all, and
+	// gst_parse_launch against that is undefined behaviour rather than an error
+	// return. The window used to come up with main.go's named banner and START
+	// refused by name; the always-live layer builds at domReady instead, which is
+	// what made this the FIRST thing to touch GStreamer on such a machine.
+	if !inited.Load() {
+		return nil, errors.New("gst: NewCapture: Init has not been called")
+	}
 	if err := opts.Legs.Valid(); err != nil {
 		return nil, err
 	}
@@ -221,7 +256,7 @@ func NewCapture(opts CaptureOpts) (CapturePipeline, error) {
 		}
 	}
 	if opts.Legs.Commentary != CommentaryNone {
-		// The same rule PipelineOpts carries, and it is the dangerous half: an
+		// THE ONE-SOURCE RULE, and it is the dangerous half that matters: an
 		// EMPTY device on osxaudiosrc or wasapi2src is not an error, it is THE
 		// SYSTEM DEFAULT INPUT, which is how a match goes on air off the
 		// laptop's built-in microphone with every lamp green.
@@ -726,7 +761,10 @@ func (c *cgoCapture) seamSinks() (video, audio gogst.Element, err error) {
 		return nil, nil, errors.New("gst: this capture pipeline has not been started, so its " +
 			"proxysinks would push nothing at a send pipeline that reached PLAYING regardless")
 	}
-	if err := c.fatalError(); err != nil {
+	// EITHER LEG'S LATCHED DEATH REFUSES. A dead picture is as complete a stop as
+	// a dead commentary is: mpegtsmux emits nothing at all while one of its two
+	// inputs is silent, so the feed carries zero bytes either way.
+	if err := c.anyFatalError(); err != nil {
 		return nil, nil, fmt.Errorf("gst: this capture pipeline has already failed, so binding a "+
 			"send pipeline to it would produce a connected feed carrying zero bytes: %w", err)
 	}
@@ -747,6 +785,10 @@ func (c *cgoCapture) ReleaseFromSend() { c.claims.releaseAll() }
 // the 2 s liveness gate between the operator and a green lamp over silence.
 func (c *cgoCapture) Health() error { return c.fatalError() }
 
+// PictureHealth is nil while this pipeline's PICTURE leg is carrying media and
+// the latched, NAMED fault once it has died. See the pictureFatal field.
+func (c *cgoCapture) PictureHealth() error { return c.pictureFatalError() }
+
 // ArmForSend runs the READY cycle over every proxysink this pipeline owns.
 //
 // It takes mu because it touches elements a teardown may be dropping, and it
@@ -763,13 +805,19 @@ func (c *cgoCapture) ArmForSend() error {
 	if !c.started {
 		return errors.New("gst: capture pipeline has not been started, so its seam cannot be armed")
 	}
-	// A LATCHED FAULT REFUSES THE ARMING, and this is the only place the send
-	// side's build can be stopped by it. On a dead device the IDLE probe fires
-	// immediately — the pad is idle BECAUSE it is dead — so the arming reports
+	// A LATCHED FAULT IN EITHER LEG REFUSES THE ARMING, and this is the only place
+	// the send side's build can be stopped by it. On a dead device the IDLE probe
+	// fires immediately — the pad is idle BECAUSE it is dead — so the arming reports
 	// success over a proxysink with nothing behind it, and PLAN.md step 6's
 	// liveness gate is left as the backstop for a MISSED arming rather than for an
 	// arming that succeeded over a corpse.
-	if err := c.fatalError(); err != nil {
+	//
+	// The PICTURE leg counts here even though it is recoverable in place, because
+	// this is the send side asking: mpegtsmux emits nothing at all while one of its
+	// two inputs is silent, so a START over a dead picture reaches PLAYING and is
+	// refused two seconds later by a message about a pad rather than by the named
+	// card fault this pipeline already holds.
+	if err := c.anyFatalError(); err != nil {
 		return fmt.Errorf("gst: this capture pipeline has already failed, so arming its seam would "+
 			"report success over a device that is producing nothing: %w", err)
 	}
@@ -1044,12 +1092,44 @@ func (c *cgoCapture) watchNegotiatedWidthLocked() error {
 // publishWidths hands negotiated widths to the application on its OWN goroutine.
 // See cgoCapture.widths for why the hop exists. It ends when Stop closes the
 // channel.
+//
+// # A WIDTH QUEUED BEFORE Stop IS DRAINED AND NOT DELIVERED
+//
+// Closing a buffered channel does NOT discard what is already in it: a range
+// yields every buffered value before it ends. So a width the CAPS probe queued
+// while this goroutine was descheduled would be delivered after the capture that
+// measured it had been stopped and replaced — stamped with the OLD device key,
+// because the stamp is taken in the probe.
+//
+// That is not a stale number that the next one corrects. The application's
+// forwarder writes the last width and device key it is given and emits
+// channelMap with them, and the frontend gates the routing panel on the key
+// matching the SELECTED device, so the panel hides. It then stays hidden: the
+// replacement's publishedWidth de-duplication means its probe will never publish
+// that width again, and only reopening the routing screen (which reads the pad
+// directly) repairs it.
+//
+// The guard is a read of errsClosed rather than a second channel, because
+// closeFaultChannels sets it under errMu immediately before the close: anything
+// still queued at that point belongs to a pipeline the application has already
+// been told is gone.
 func (c *cgoCapture) publishWidths() {
 	for w := range c.widths {
+		if c.faultChannelsClosed() {
+			continue
+		}
 		if cb := c.onInputChannels.Load(); cb != nil {
 			(*cb)(w.deviceKey, w.channels)
 		}
 	}
+}
+
+// faultChannelsClosed reports that Stop has closed this object's channels, which
+// is also the moment after which nothing it measured is still true.
+func (c *cgoCapture) faultChannelsClosed() bool {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+	return c.errsClosed
 }
 
 // InputChannels reports the pad's negotiated width, or 0 on a pipeline with no
@@ -1204,21 +1284,37 @@ func (c *cgoCapture) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSync
 				"picture are unaffected: " + err.Error())
 
 		case classVideoCapture:
-			// The picture is down. RECOVERABLE for this pipeline — the CAMERA lamp
-			// carries it, the commentary capture is a different pipeline and goes
-			// on metering, and the operator can rebuild this one with
-			// RestartCapture.
+			// The picture is down. RECOVERABLE for this pipeline — the commentary
+			// capture goes on metering, muting and routing, and RestartCapture is
+			// the repair — so it is latched in its OWN field and never in fatal,
+			// which would take a fused seat's microphone off the air for a queue.
+			//
+			// IT IS DELIVERED ON Faults() AND NO LONGER ONLY ON Warnings(), and that
+			// is the correction rather than a widening. A warning is drained and
+			// discarded by the application; nothing on screen changed, Health()
+			// answered nil, ArmForSend's latched-fault refusal did not fire, START
+			// reached PLAYING over a dead card and the refusal that finally came was
+			// the muxer watchdog's "nothing reached vq:src" two seconds later — the
+			// pad, not the cause — with capturefault.go's named diagnosis of that
+			// exact fault produced and discarded one layer down.
 			//
 			// IT IS NOT "the commentary is unaffected" WHILE A SESSION IS UP, and
 			// this message must not say so. mpegtsmux emits nothing at all while
 			// one of its two inputs is silent — measured, vq:src 0, aq:src 187 at
 			// full rate, mux:src 0 — so a dead picture takes the WHOLE transport
-			// stream down. The send side's 2 s muxer watchdog is the detector for
-			// that; this message is the one the operator reads first, and a
-			// reassurance here would contradict the fault they are about to see.
-			c.deliverWarning("gst: the picture capture failed; the commentary capture is a " +
-				"separate pipeline and is still running, but if a send session is up the muxer " +
-				"stops entirely until this is rebuilt: " + err.Error())
+			// stream down. The send side's 2 s muxer watchdog is still the detector
+			// while a feed is up; this is what names the cause.
+			//
+			// captureFatalError, and not a sentence of its own: at the GStreamer
+			// level a card that is busy, a card that has been unplugged and a card
+			// with nothing on its input are one generic stream error with three
+			// different fixes, and that diagnosis is exactly what was being computed
+			// and thrown away.
+			c.markPictureFatal(fmt.Errorf("%w. The commentary capture is unaffected and is "+
+				"still running, but while a send session is up the muxer stops entirely until "+
+				"the picture is rebuilt",
+				captureFatalError(msg.Source(), source, err)))
+			c.deliver(c.pictureFatalError())
 
 		case classAudioCapture:
 			// Fatal for THIS capture, and NAMED. At the GStreamer level "device
@@ -1287,6 +1383,39 @@ func (c *cgoCapture) fatalError() error {
 	c.errMu.RLock()
 	defer c.errMu.RUnlock()
 	return c.fatal
+}
+
+// markPictureFatal latches a picture-leg death. First one wins, as markFatal
+// does: the first fault is the diagnosis and the tenth is what it knocked over.
+func (c *cgoCapture) markPictureFatal(err error) {
+	c.errMu.Lock()
+	if c.pictureFatal == nil {
+		c.pictureFatal = err
+	}
+	c.errMu.Unlock()
+}
+
+func (c *cgoCapture) pictureFatalError() error {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+	return c.pictureFatal
+}
+
+// anyFatalError is the question the SEND side asks: is there ANY latched death
+// in this pipeline, of either leg.
+//
+// Both answers stop a send, and for the same measured reason: mpegtsmux emits
+// nothing at all while one of its two inputs is silent — vq:src 0, aq:src 187 at
+// full rate, mux:src 0 — so a dead picture takes the whole transport stream down
+// exactly as a dead commentary does. What differs is the REPAIR, which is why
+// the two are latched separately and only this one merges them.
+func (c *cgoCapture) anyFatalError() error {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+	if c.fatal != nil {
+		return c.fatal
+	}
+	return c.pictureFatal
 }
 
 // deliver puts an error on Faults() without ever blocking a streaming thread. A
@@ -1475,10 +1604,11 @@ func (c *cgoCapture) teardownLocked() error {
 	// re-sized.
 	c.publishedWidth.Store(0)
 
-	// The latched fault belongs to the pipeline that died, not to this object. See
-	// the doc above and the field's own comment.
+	// The latched faults belong to the pipeline that died, not to this object. See
+	// the doc above and the two fields' own comments.
 	c.errMu.Lock()
 	c.fatal = nil
+	c.pictureFatal = nil
 	c.errMu.Unlock()
 	return err
 }

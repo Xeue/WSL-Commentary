@@ -112,7 +112,7 @@ func TestPreviewBranchIsTheMeasuredShape(t *testing.T) {
 	// a continuation of it.
 	if !strings.HasPrefix(branch, "\n"+namePreviewTee+".") {
 		t.Errorf("the preview branch does not begin on a new line with %q. Appended to the end of "+
-			"pipelineDescription's string it would be read as a continuation of the audio chain:\n%s",
+			"captureDescription's string it would be read as a continuation of the audio chain:\n%s",
 			namePreviewTee+".", branch)
 	}
 }
@@ -406,7 +406,7 @@ func TestPreviewTeeMatchesThePipeline(t *testing.T) {
 // is conditional on purpose.
 //
 // The preview branch is rendered by this package and appended to
-// pipelineDescription's string by gst_cgo.go, and the bus filter that has to
+// captureDescription's string, and the bus filter that has to
 // spare it is capturefault.go's. Those are three files with three owners, and
 // the failure of the middle one to be wired to the third is silent: the preview
 // works, looks right, and takes the commentary off air the first time its sink

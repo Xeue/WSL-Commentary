@@ -1,20 +1,25 @@
 //go:build cgo && !gststub
 
-// decklinkaudio_cgo_test.go renders the REAL pipeline description for all four
+// decklinkaudio_cgo_test.go renders the REAL capture descriptions for all four
 // capture combinations and asserts what each one builds.
 //
 // Owner: WP-3a, with internal/gst.
 //
-// # Why this is not another source guard
+// # It is about the PLAN, which is what capturedesc_cgo_test.go is not
 //
-// Because it does not have to be. gst_stub_test.go reads pipelineDescription as
-// TEXT, which is the only thing available at Gate A where gst_cgo.go does not
-// compile, and those guards stay — they are what protects the on-air Windows
-// build from a host that has no GStreamer. But on a machine that CAN compile
-// this package, the honest test is to call the function and look at the string
-// it returns, and everything below does exactly that. Neither needs a card, a
-// registry or a pipeline: pipelineDescription is a pure function of its
-// arguments.
+// capturedesc_cgo_test.go renders the seven leg-sets and compares each against a
+// golden string. This file asks the question one level up: given the two capture
+// IDS an operator can configure, WHICH leg-sets get built, and how many DeckLink
+// elements exist across the whole set. That is PlanCapture's fusion rule, and it
+// is the difference between a seat that starts and a seat that does not — the
+// card is EXCLUSIVE, so "exactly one decklinkvideosrc in the process, or none"
+// is a hardware constraint and not a tidiness rule.
+//
+// REWRITTEN FROM pipelineDescription, which is deleted. Every assertion below is
+// the one it made; what changed is that a configuration now renders a SET of
+// descriptions rather than one string, so the counting is done across the set.
+// The set is what the process actually builds, so counting across it is the more
+// honest form of the same question.
 //
 // # The property that matters most is the NEGATIVE one
 //
@@ -32,17 +37,47 @@ import (
 	"testing"
 )
 
-// theFourCombinations renders pipelineDescription for each shape the two capture
-// ids can express, with everything else held constant.
+// theFourCombinations renders THE WHOLE CAPTURE LAYER for each shape the two
+// capture ids can express, with everything else held constant.
+//
+// It goes through PlanCapture rather than naming leg-sets, so the fusion rule is
+// exercised rather than restated: the card+card row is ONE description because
+// the plan fuses it, and the counting tests below are counting across exactly
+// what the process would build.
+//
+// The chains are joined with a newline so that a `strings.Count` over the result
+// counts elements in the PROCESS rather than in one pipeline, which is the level
+// the exclusivity rule is stated at.
 func theFourCombinations(t *testing.T) map[string]string {
 	t.Helper()
 	const card = "2747401380"
+	const nativeDevice = "native-endpoint-id"
 	conform := FallbackConformTarget()
+
+	render := func(videoCapture, audioCapture string) string {
+		audioDevice := nativeDevice
+		if audioCapture != "" {
+			// Exactly one of the two is ever given; refuseWrongAudioSource is the
+			// rule and NewCapture enforces it. An empty device on osxaudiosrc or
+			// wasapi2src is not an error, it is THE SYSTEM DEFAULT INPUT.
+			audioDevice = ""
+		}
+		var chains []string
+		for _, legs := range PlanCapture(CaptureSources{
+			VideoCaptureID: videoCapture,
+			AudioCaptureID: audioCapture,
+			AudioDeviceID:  audioDevice,
+		}) {
+			chains = append(chains, captureDescription(legs, conform, ""))
+		}
+		return strings.Join(chains, "\n")
+	}
+
 	return map[string]string{
-		"slate+native": pipelineDescription("vtenc_h264", DefaultAudioBitrateBps, conform, "", "", ""),
-		"card+native":  pipelineDescription("vtenc_h264", DefaultAudioBitrateBps, conform, card, "", ""),
-		"card+card":    pipelineDescription("vtenc_h264", DefaultAudioBitrateBps, conform, card, card, ""),
-		"slate+card":   pipelineDescription("vtenc_h264", DefaultAudioBitrateBps, conform, "", card, ""),
+		"slate+native": render("", ""),
+		"card+native":  render(card, ""),
+		"card+card":    render(card, card),
+		"slate+card":   render("", card),
 	}
 }
 
@@ -69,6 +104,16 @@ func TestTheNativeSlateSeatIsUntouched(t *testing.T) {
 	}
 	if strings.Contains(desc, "fakesink") {
 		t.Errorf("a fakesink appears on a seat that needs no clock companion:\n%s", desc)
+	}
+	// AND THE SEAM IS THE ONLY THING BELOW EITHER LEG. No encoder, no muxer, no
+	// srtq: those moved to sendDescription with the split, and a capture
+	// description that grew one back would be a device inside the pipeline that
+	// is destroyed at STOP.
+	for _, gone := range []string{nameVideoEncod, nameMux, nameSRTQueue, "aacparse", "h264parse"} {
+		if strings.Contains(desc, gone) {
+			t.Errorf("the capture layer contains %q; everything below the proxysinks belongs to "+
+				"the send pipeline, which has a different lifetime:\n%s", gone, desc)
+		}
 	}
 }
 
@@ -196,10 +241,15 @@ func TestNoCaptureLegEverSetsTheConnectionProperty(t *testing.T) {
 // in internal/sender is written against.
 func TestEverythingBelowTheCommentarySourceIsIdentical(t *testing.T) {
 	// The chain starts at the audioconvert that makes the format legal for
-	// chlevel and ends at the mux. Everything between is written once in
-	// pipelineDescription and must render once here.
-	const from = " ! audioconvert ! level name=chlevel"
-	const to = "queue name=aq max-size-time=1000000000"
+	// chlevel and ends at the proxysink. Everything between is written once in
+	// captureDescription and must render once here.
+	//
+	// The lower bound MOVED with the seam: it used to be the aq queue feeding the
+	// muxer, which is now in the send pipeline. The claim is unchanged — one
+	// graph below the source, whatever is on top of it — and it now runs as far as
+	// the seam, which is where the send side picks it up with caps it asserts.
+	const from = " ! audioconvert ! level name=" + channelLevelElementName
+	const to = "proxysink name=" + nameAudioProxySink
 
 	var want, wantShape string
 	for shape, desc := range theFourCombinations(t) {
@@ -254,7 +304,9 @@ func TestTheClockCompanionCannotDisturbTheSlateLeg(t *testing.T) {
 		t.Errorf("the slate leg is missing from a slate + card seat:\n%s", desc)
 	}
 	slateLeg := slate[strings.Index(slate, "filesrc name="+nameSlateSrc):]
-	slateLeg = slateLeg[:strings.Index(slateLeg, "\n")]
+	if i := strings.Index(slateLeg, "\n"); i >= 0 {
+		slateLeg = slateLeg[:i]
+	}
 	if !strings.Contains(desc, slateLeg) {
 		t.Errorf("the slate leg is not character-for-character what it is without the clock "+
 			"companion.\nwithout: %s\nwith:\n%s", slateLeg, desc)

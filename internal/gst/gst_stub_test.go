@@ -15,9 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 )
 
 func TestListInputDevicesReturnsFakes(t *testing.T) {
@@ -88,22 +86,22 @@ func TestListInputDevicesIsACopy(t *testing.T) {
 	}
 }
 
-func TestStartRequiresSlateAndDevice(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{AudioDeviceID: "{guid}"}); err == nil {
-		t.Error("want error for empty SlatePath")
-	}
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png"}); err == nil {
-		t.Error("want error for empty AudioDeviceID")
-	}
-	if p.State() != StubStateStopped {
-		t.Errorf("state after failed Start = %q, want %q", p.State(), StubStateStopped)
-	}
-}
-
+// TestStartRequiresSlateAndDevice, TestStartRefusesARenderEndpoint,
+// TestStubRefusesAVideoCaptureIDThatIsNotACard and TestStubResolvesTheConformTarget
+// WERE HERE, AND EVERY RULE THEY ASSERTED STILL RUNS.
+//
+// All four were about what a pipeline may be told to OPEN — a slate, a device, a
+// card, a raster — and a send pipeline is told none of those. NewStubCapture makes
+// the identical refusals in the identical order, through the same shared helpers
+// (refuseWrongAudioSource, parseDeckLinkPersistentID, ConformTarget.resolve), and
+// capture_stub_test.go exercises them on every seat shape the operator has.
+//
+// They are named here rather than silently deleted because a reader who
+// remembers them needs to be told where they went, not left to conclude the
+// rules were dropped.
 func TestStartInstallsNoSink(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if p.State() != StubStateRunning {
@@ -121,8 +119,8 @@ func TestStartInstallsNoSink(t *testing.T) {
 }
 
 func TestReplaceSinkFailureLadder(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -160,8 +158,8 @@ func TestReplaceSinkFailureLadder(t *testing.T) {
 }
 
 func TestInjectErrorReachesErrorsChannel(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -180,8 +178,8 @@ func TestInjectErrorReachesErrorsChannel(t *testing.T) {
 }
 
 func TestInjectErrorDropsRatherThanBlocks(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	for range stubErrorBuffer {
@@ -195,8 +193,8 @@ func TestInjectErrorDropsRatherThanBlocks(t *testing.T) {
 }
 
 func TestStopClosesErrorsAndIsIdempotent(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if err := p.Stop(); err != nil {
@@ -220,12 +218,145 @@ func TestStopClosesErrorsAndIsIdempotent(t *testing.T) {
 }
 
 func TestNewReturnsAStubPipeline(t *testing.T) {
-	p, err := New()
+	p, err := New(stubSeatCapture(t))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	if _, ok := p.(*StubPipeline); !ok {
 		t.Fatalf("New returned %T, want *StubPipeline", p)
+	}
+}
+
+// TestNewRefusesASendPipelineWithNothingBehindIt is the refusal that makes the
+// central claim of the seam a compile-and-run guarantee rather than a convention.
+//
+// A proxysrc with no proxysink bound to it does not fail. It reaches PLAYING, SRT
+// connects, every lamp goes green and the switcher receives silence — the
+// permanent-false-green class this codebase is organised against. There is no
+// symptom to notice and no error to classify, so the refusal has to be at
+// construction, and it has to be in BOTH twins or Gate A accepts what the card
+// does not.
+func TestNewRefusesASendPipelineWithNothingBehindIt(t *testing.T) {
+	if _, err := New(CaptureSet{}); err == nil {
+		t.Fatal("New built a send pipeline over an empty capture set. Nothing downstream would " +
+			"report it: the pipeline reaches PLAYING, the sink connects and the feed carries zero " +
+			"bytes with every indicator green")
+	}
+}
+
+// TestEverySendSessionAfterTheFirstStillCarriesMedia is the zero-byte second
+// session, asserted against the SHIPPED Start rather than against NewSend.
+//
+// It is named in PLAN.md step 5 so that it cannot be quietly dropped, and the two
+// halves it pins are the two the seam can lose silently.
+//
+// THE ARMING. gstproxysink.c resets sent_stream_start/sent_caps only on
+// READY->PAUSED, so in an always-live capture pipeline every consumer AFTER THE
+// FIRST receives no STREAM_START, no CAPS and no SEGMENT — measured 1,133,076
+// bytes on cycle 1 and 0 bytes on cycles 2 and 3, with SRT connected and every
+// lamp green. Nothing downstream reports it: proxysink returns GST_FLOW_OK
+// unconditionally. So the assertion is a COUNT, one arming per session, and not
+// "the first one worked".
+//
+// THE RELEASE. Stop has to give the claim back, or the second START is refused
+// with ErrSeamBusy over a session that no longer exists — which is a feed that
+// will not start rather than a feed that carries nothing, but it is the same
+// mechanism failing in the other direction and one test should catch both.
+func TestEverySendSessionAfterTheFirstStillCarriesMedia(t *testing.T) {
+	set := stubSeatCapture(t)
+	commentary, ok := set.Commentary.(*StubCapture)
+	if !ok {
+		t.Fatalf("the commentary capture is %T, want the Gate A stub", set.Commentary)
+	}
+
+	for cycle := 1; cycle <= 3; cycle++ {
+		p, err := New(set)
+		if err != nil {
+			t.Fatalf("cycle %d: New: %v", cycle, err)
+		}
+		if err := p.Start(SendOpts{}); err != nil {
+			t.Fatalf("cycle %d: Start: %v. A second send session refused the seam, which means "+
+				"the previous Stop did not release it", cycle, err)
+		}
+		if got := commentary.Armings(); got != cycle {
+			t.Fatalf("after send session %d the commentary seam had been armed %d times, want "+
+				"%d. A session that skips the arming does not fail: SRT connects, the lamp goes "+
+				"green and the switcher receives silence", cycle, got, cycle)
+		}
+		if err := p.Stop(); err != nil {
+			t.Fatalf("cycle %d: Stop: %v", cycle, err)
+		}
+	}
+}
+
+// TestASecondSendPipelineIsRefusedWhileTheFirstIsRunning is the other half of the
+// single-consumer rule, at the level the application holds.
+//
+// A second proxysrc attaching to a live proxysink does not fail — it SILENTLY
+// STEALS THE STREAM AND KILLS THE FIRST, measured, consumer A stopped dead at
+// 5.994 s the instant consumer B attached at 6.007 s, with nothing on either bus
+// and both pipelines still reporting PLAYING. There is no refusal inside the
+// element, so this one is the refusal.
+func TestASecondSendPipelineIsRefusedWhileTheFirstIsRunning(t *testing.T) {
+	set := stubSeatCapture(t)
+
+	first, err := New(set)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := first.Start(SendOpts{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer first.Stop()
+
+	second, err := New(set)
+	if err != nil {
+		t.Fatalf("New (second): %v", err)
+	}
+	err = second.Start(SendOpts{})
+	if err == nil {
+		t.Fatal("a second send pipeline took a seam the first still holds. On the real element " +
+			"that does not fail: it steals the stream and takes the running feed off air with " +
+			"nothing on either bus")
+	}
+	if !errors.Is(err, ErrSeamBusy) {
+		t.Errorf("the refusal does not wrap ErrSeamBusy: %v", err)
+	}
+}
+
+// TestACaptureWillNotGoToNullUnderARunningSendPipeline is the teardown ORDER,
+// enforced rather than documented.
+//
+// Taking a device to NULL underneath a bound proxysrc is measured silent in every
+// direction: 0 buffers, no EOS, no ERROR and no WARNING on either bus, the send
+// pipeline still PLAYING and SRT still connected. The refusal is what turns that
+// into a caller error at the moment it is made.
+func TestACaptureWillNotGoToNullUnderARunningSendPipeline(t *testing.T) {
+	set := stubSeatCapture(t)
+
+	p, err := New(set)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Start(SendOpts{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := set.Commentary.Stop(); err == nil {
+		t.Fatal("the commentary capture went to NULL under a running send pipeline. Nothing " +
+			"downstream would report it — the send pipeline stays PLAYING, SRT stays connected " +
+			"and the switcher receives silence")
+	} else if !errors.Is(err, ErrSeamBusy) {
+		t.Errorf("the refusal does not wrap ErrSeamBusy: %v", err)
+	}
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// And once the seam is released it goes down, which is the half that proves
+	// the refusal is a sequencing rule and not a deadlock.
+	if err := set.Commentary.Stop(); err != nil {
+		t.Errorf("the commentary capture would not stop after the send pipeline had: %v", err)
 	}
 }
 
@@ -249,8 +380,8 @@ func TestInitIsANoOp(t *testing.T) {
 // peer and the retry lands inside the re-accept refusal window it was sized to
 // clear.
 func TestRemoveSinkDetachesWithoutInstalling(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if err := p.ReplaceSink(SinkOpts{Host: "m2lx.example", Port: 9001}); err != nil {
@@ -279,8 +410,8 @@ func TestRemoveSinkDetachesWithoutInstalling(t *testing.T) {
 // call RemoveSink unconditionally on entry to DRAINING without first asking
 // whether a sink is installed — including after a connect attempt that failed.
 func TestRemoveSinkIsIdempotent(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -303,8 +434,8 @@ func TestRemoveSinkIsIdempotent(t *testing.T) {
 // step with ReplaceSink's and ForceKeyUnit's, so a caller shutting down cannot
 // tell them apart.
 func TestRemoveSinkAfterStopFails(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if err := p.Stop(); err != nil {
@@ -319,8 +450,8 @@ func TestRemoveSinkAfterStopFails(t *testing.T) {
 // 6.2 cycle on the stub: CONNECTED, DRAINING (RemoveSink), BACKOFF, CONNECTING
 // (ReplaceSink). It is the sequence internal/sender is required to perform.
 func TestRemoveSinkThenReplaceSinkReconnects(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	sink := SinkOpts{Host: "m2lx.example", Port: 9001}
@@ -347,34 +478,12 @@ func TestRemoveSinkThenReplaceSinkReconnects(t *testing.T) {
 // defect's Gate A half — see device_id.go for the field failure).
 // ---------------------------------------------------------------------------
 
-// TestStartRefusesARenderEndpoint proves the refusal on the stub, which — via
-// the shared refuseRenderEndpoint helper — is also a statement about the real
-// twin. The fixture is the operator's actual playback endpoint id.
-func TestStartRefusesARenderEndpoint(t *testing.T) {
-	p := NewStubPipeline()
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: "{0.0.0.00000000}.{8678ce58-90c0-4827-8ff7-c9edd8d074ed}",
-	})
-	if err == nil {
-		t.Fatal("Start accepted a RENDER endpoint as the commentary input; the pipeline would " +
-			"preroll and then fail asynchronously with wasapi2's error 1551, which the sender " +
-			"misreads as a network failure and retries forever")
-	}
-	if !errors.Is(err, ErrNotACaptureDevice) {
-		t.Errorf("the refusal does not wrap ErrNotACaptureDevice: %v", err)
-	}
-	if p.State() != StubStateStopped {
-		t.Errorf("state after the refusal = %q, want %q", p.State(), StubStateStopped)
-	}
-}
-
 // TestStubDeviceListNamespacesAreContract pins the property the file headers
 // of gst_stub.go and return_stub.go now promise: every fake capture id is in
 // the capture namespace and every fake playback id is in the render
 // namespace, per the classifier both twins share. A stub device that failed
 // this would let a wiring bug — the headphone dropdown's value reaching
-// PipelineOpts.AudioDeviceID, or vice versa — pass at Gate A and surface in a
+// CaptureOpts.AudioDeviceID, or vice versa — pass at Gate A and surface in a
 // commentary booth.
 // The capture half is scoped to the NATIVE entries. A DeckLink persistent-id
 // is a bare gint64 rendered as decimal and belongs to neither namespace by
@@ -410,8 +519,8 @@ func TestStubDeviceListNamespacesAreContract(t *testing.T) {
 // pipeline, outranks the ordinary connection-failure ladder, and never
 // clears — recovery is Stop, New, Start.
 func TestMarkFatalLatchesEveryReplaceSink(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	p := NewStubPipeline(stubSeatCapture(t))
+	if err := p.Start(SendOpts{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	sink := SinkOpts{Host: "m2lx.example", Port: 9001}
@@ -638,6 +747,72 @@ func startSequence(t *testing.T, fset *token.FileSet, file *ast.File) string {
 	t.Helper()
 	return funcBody(t, fset, file, "cgoPipeline", "Start") + "\n" +
 		funcBody(t, fset, file, "cgoPipeline", "startBuiltLocked")
+}
+
+// captureStartSequence is the CAPTURE pipeline's build, as one text: cgoCapture's
+// Start followed by buildLocked.
+//
+// EVERY GUARD THAT USED TO READ startSequence FOR A DEVICE READS THIS INSTEAD,
+// and the move is exactly the move the code made. When one pipeline carried both
+// capture and send, the slate path, the two persistent-ids, the render-endpoint
+// refusal, the mix matrix, the cough mute and the signal watchdog were all in
+// cgoPipeline.startBuiltLocked. They are now in cgoCapture.buildLocked, upstream
+// of the proxysink, and a send pipeline has no device in it at all.
+//
+// The comment on startSequence says a guard that passes because it can no longer
+// see the code it forbids is worse than one that fails. That is precisely what
+// re-pointing these guards prevents, and it has now happened twice to the same
+// set of rules: once when the build was extracted from Start, and once when the
+// capture was extracted from the pipeline. Read that comment before moving any
+// of them again.
+func captureStartSequence(t *testing.T) string {
+	t.Helper()
+	fset, file := parseSource(t, captureCgoSourceFile)
+	return funcBody(t, fset, file, "", "NewCapture") + "\n" +
+		funcBody(t, fset, file, "cgoCapture", "Start") + "\n" +
+		funcBody(t, fset, file, "cgoCapture", "buildLocked")
+}
+
+// stubSeatCapture is the ordinary seat's capture layer — a slate picture and a
+// platform microphone, as two independent pipelines — built and started, and
+// returned as the set a stub send pipeline is minted over.
+//
+// It exists because a send pipeline is MINTED ONLY BY CAPTURE. Every test below
+// that used to say NewStubPipeline() now has to say what is behind it, and that
+// is the point rather than a cost: "a send pipeline with no device behind it"
+// does not fail at runtime, it reaches PLAYING and carries zero bytes with every
+// lamp green, so the type makes it unconstructible instead.
+//
+// The captures are stopped through t.Cleanup, which runs
+// last-registered-first — so a send pipeline the test stopped itself, or one
+// registered for cleanup after this call, is already gone by the time
+// CapturePipeline.Stop runs and refuses a still-held seam.
+func stubSeatCapture(t *testing.T) CaptureSet {
+	t.Helper()
+
+	const endpoint = "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}"
+	var set CaptureSet
+	for _, legs := range PlanCapture(CaptureSources{AudioDeviceID: endpoint}) {
+		c, err := NewStubCapture(CaptureOpts{
+			Legs:          legs,
+			SlatePath:     "slate.png",
+			AudioDeviceID: endpoint,
+		})
+		if err != nil {
+			t.Fatalf("building the %s capture: %v", legs, err)
+		}
+		t.Cleanup(func() { _ = c.Stop() })
+		if err := c.Start(); err != nil {
+			t.Fatalf("starting the %s capture: %v", legs, err)
+		}
+		if legs.Picture != PictureNone {
+			set.Picture = c
+		}
+		if legs.Commentary != CommentaryNone {
+			set.Commentary = c
+		}
+	}
+	return set
 }
 
 // receiverName returns the type name of a method's receiver, without the
@@ -900,9 +1075,8 @@ func TestBusHandlerDoesNotLogOnTheStreamingThread(t *testing.T) {
 // shared mode can only produce its endpoint's mix format, and Dante Virtual
 // Soundcard is commonly run at 44.1 or 96 kHz. The capsfilter that matters is
 // the one below audioresample, pinning what enters mfaacenc.
-func TestPipelineDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+func TestCaptureDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
+	body := captureDescriptionSource(t)
 
 	if strings.Contains(body, "! audio/x-raw,rate=") {
 		t.Fatal("the audio branch pins a sample rate upstream of audioresample; " +
@@ -918,8 +1092,15 @@ func TestPipelineDescriptionHasNoCapsfilterAboveTheResampler(t *testing.T) {
 	if convert < 0 || resample < 0 || convert > resample {
 		t.Fatal("the audio branch no longer converts and resamples whatever the endpoint gives us")
 	}
-	if !strings.Contains(body, "audio/x-raw,format=S16LE,rate=48000,channels=2") {
-		t.Fatal("nothing pins what enters mfaacenc any more")
+	// THE CAPSFILTER THAT MATTERS IS NOW THE SEAM CONTRACT, and it is rendered
+	// from seamAudioCaps rather than written out — because the SEND side asserts
+	// the identical string after aproxsrc, and two spellings of one contract is
+	// how the two sides drift into a silent wrong encode. capturedesc_cgo_test.go
+	// checks the two rendered strings against each other; this checks that the
+	// capture side still pins anything at all.
+	if !strings.Contains(body, "seamAudioCaps") {
+		t.Fatal("nothing pins what crosses the seam any more; the send side's capsfilter after " +
+			"aproxsrc would then be asserting a contract the capture side does not keep")
 	}
 }
 
@@ -958,11 +1139,10 @@ func TestPipelineDescriptionScalesTheSlate(t *testing.T) {
 	// target and would be the easier of the two to write a literal into, because
 	// a reader who has just learned what a card produces is thinking about 1080
 	// rather than about the switcher's configuration.
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+	body := captureDescriptionSource(t)
 	for _, literal := range []string{"width=1920", "height=1080", "framerate=50"} {
 		if strings.Contains(body, literal) {
-			t.Errorf("pipelineDescription contains the literal %q again; the conform target is "+
+			t.Errorf("captureDescription contains the literal %q again; the conform target is "+
 				"an option and 1080p50 belongs in FallbackConformTarget, where a facility that is "+
 				"not configured for it can be given something else", literal)
 		}
@@ -1016,14 +1196,20 @@ func TestPipelineDescriptionScalesBeforeFreezing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The LIVE CAPTURE video leg.
+// The CAPTURE description's two picture legs.
 //
-// pipelineDescription now renders one of two video legs, chosen by whether a
-// DeckLink card was configured, and the guards above had to learn which half
-// they were reading. slateLegSource and captureLegSource are that split, and it
-// is made by TEXT POSITION rather than by re-rendering the function, for the
-// same reason every other guard in this file reads source: gst_cgo.go cannot be
-// compiled at Gate A, so there is nothing to call.
+// captureDescription renders one of two picture legs, chosen by legs.Picture,
+// and the guards below have to know which half they are reading. slateLegSource
+// and captureLegSource are that split, and it is made by TEXT POSITION rather
+// than by re-rendering the function, for the same reason every guard in this
+// file reads source: capturedesc_cgo.go cannot be compiled at Gate A, so there
+// is nothing to call.
+//
+// THEY READ capturedesc_cgo.go NOW. They used to read pipelineDescription, which
+// is deleted: it rendered capture AND send as one string, built at START and
+// destroyed at STOP. Every assertion below survived the move — what changed is
+// which function is opened and, for the handful noted at their own sites, where
+// the leg now ENDS, because the encoder and the muxer are the send pipeline's.
 //
 // The split is deliberately FRAGILE IN THE SAFE DIRECTION. If the function is
 // restructured so the marker is not there, these fail loudly and immediately
@@ -1037,14 +1223,14 @@ func TestPipelineDescriptionScalesBeforeFreezing(t *testing.T) {
 // element does not silently unsplit the two halves.
 const captureLegMarker = "videoCaptureFactory"
 
-// slateLegSource is pipelineDescription's source ABOVE the capture leg: the
-// slate branch, the mux and the sink queue.
+// slateLegSource is captureDescription's source ABOVE the capture leg: the slate
+// branch and its proxy tail.
 func slateLegSource(t *testing.T) string {
 	t.Helper()
-	body := pipelineDescriptionSource(t)
+	body := captureDescriptionSource(t)
 	i := strings.Index(body, captureLegMarker)
 	if i < 0 {
-		t.Fatalf("pipelineDescription no longer mentions %s, so the slate leg and the live "+
+		t.Fatalf("captureDescription no longer mentions %s, so the slate leg and the live "+
 			"capture leg cannot be told apart in its source. Re-derive this split from the new "+
 			"shape rather than deleting it: without it a guard written for the slate can be "+
 			"satisfied by a line in the capture leg and go green while checking nothing",
@@ -1053,24 +1239,33 @@ func slateLegSource(t *testing.T) string {
 	return body[:i]
 }
 
-// captureLegSource is pipelineDescription's source FROM the capture leg
-// onwards, which is the capture branch plus the shared encoder-and-mux tail.
+// captureLegSource is captureDescription's source FROM the capture leg onwards:
+// the conform chain, the tee, the broadcast branch and the commentary chain.
 func captureLegSource(t *testing.T) string {
 	t.Helper()
-	body := pipelineDescriptionSource(t)
+	body := captureDescriptionSource(t)
 	i := strings.Index(body, captureLegMarker)
 	if i < 0 {
-		t.Fatalf("pipelineDescription no longer mentions %s; see slateLegSource", captureLegMarker)
+		t.Fatalf("captureDescription no longer mentions %s; see slateLegSource", captureLegMarker)
 	}
 	return body[i:]
 }
 
-// pipelineDescriptionSource is the comment-free source of the one function both
+// captureDescriptionSource is the comment-free source of the one function both
 // halves come out of.
-func pipelineDescriptionSource(t *testing.T) string {
+func captureDescriptionSource(t *testing.T) string {
 	t.Helper()
-	fset, file := parseSource(t, cgoSourceFile)
-	return funcBody(t, fset, file, "", "pipelineDescription")
+	fset, file := parseSource(t, captureDescSourceFile)
+	return funcBody(t, fset, file, "", "captureDescription")
+}
+
+// sendDescriptionSource is the comment-free source of the OTHER half of the
+// seam: the one string every seat sends through, with two parameters and no
+// third.
+func sendDescriptionSource(t *testing.T) string {
+	t.Helper()
+	fset, file := parseSource(t, captureDescSourceFile)
+	return funcBody(t, fset, file, "", "sendDescription")
 }
 
 // TestCaptureLegNeverSetsTheConnectionProperty is the guard on the one
@@ -1086,12 +1281,14 @@ func pipelineDescriptionSource(t *testing.T) string {
 // debugging at midnight will have, which is why this is a test and not a
 // comment.
 //
-// It reads pipelineDescription AND THE WHOLE OF THE START SEQUENCE, because
-// those are the two places a property can reach an element: the parse string and
-// g_object_set. The start sequence is BOTH halves — see startSequence — and that
-// is not tidiness here, it is the whole guard: the g_object_set half moved into
-// startBuiltLocked, so a version of this test that went on reading Start alone
-// would have passed for ever by no longer being able to see the code it forbids.
+// It reads BOTH DESCRIPTIONS AND BOTH START SEQUENCES, because those are the two
+// places a property can reach an element: the parse string and g_object_set. That
+// is not tidiness, it is the whole guard — this test has twice been left reading
+// only the place the code USED to be. The g_object_set half moved into
+// startBuiltLocked once, and then the whole capture half moved into
+// capture_cgo.go and capturedesc_cgo.go; a version that went on reading one
+// function would have passed for ever by no longer being able to see the code it
+// forbids.
 // capturefault_cgo.go is deliberately not covered — it READS the property to
 // name it in a no-signal message, which is the opposite operation and is
 // somebody else's file.
@@ -1109,8 +1306,7 @@ func TestCaptureLegNeverSetsTheConnectionProperty(t *testing.T) {
 	capFset, capFile := parseSource(t, captureCgoSourceFile)
 
 	for _, fn := range []struct{ name, body string }{
-		{"pipelineDescription", funcBody(t, fset, file, "", "pipelineDescription")},
-		{"the Start sequence", startSequence(t, fset, file)},
+		{"the send Start sequence", startSequence(t, fset, file)},
 		{"captureDescription", funcBody(t, descFset, descFile, "", "captureDescription")},
 		{"sendDescription", funcBody(t, descFset, descFile, "", "sendDescription")},
 		{"the capture Start sequence",
@@ -1147,9 +1343,15 @@ func TestCaptureLegNamesEveryElementWithTheCapturePrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading %s: %v", cgoSourceFile, err)
 	}
+	// nameVideoCapQueue IS GONE FROM THIS LIST, and it went with the head queue
+	// it named. The broadcast branch's queue is now the SEAM's — nameVideoProxyQueue,
+	// declared in seam.go with the leak policy beside it, because the queue in
+	// front of every proxysink is one of the three invariants that file exists to
+	// hold. Its prefix rule is checked in seam_test.go, against the classifier's
+	// vprox entry rather than against the vcap one.
 	for _, decl := range []string{
 		"nameVideoCapConv", "nameVideoCapDeint", "nameVideoCapScale",
-		"nameVideoCapRate", "nameVideoCapTee", "nameVideoCapQueue",
+		"nameVideoCapRate", "nameVideoCapTee",
 	} {
 		m := regexp.MustCompile(decl + `\s*=\s*"([^"]*)"`).FindSubmatch(src)
 		if m == nil {
@@ -1169,12 +1371,28 @@ func TestCaptureLegNamesEveryElementWithTheCapturePrefix(t *testing.T) {
 	body := captureLegSource(t)
 	for _, want := range []string{
 		"videoconvert name=", "deinterlace name=", "videoscale name=",
-		"videorate name=", "tee name=", "queue name=",
+		"videorate name=", "tee name=",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the capture leg has an element built without %q. An unnamed element is "+
 				"named by GStreamer, matches no prefix, and its failures become fatal", want)
 		}
+	}
+	// The branch's head queue is the seam's and is rendered by videoProxyTail, so
+	// the naming rule for it is checked where the tail is written rather than
+	// here — but the leg must still USE the tail, or it ends somewhere of its own.
+	if !strings.Contains(body, "videoProxyTail()") {
+		t.Error("the capture leg no longer ends in videoProxyTail(); its head queue and its " +
+			"proxysink would be written out by hand, which is a second spelling of the seam")
+	}
+	seam, err := os.ReadFile(seamSourceFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v", seamSourceFile, err)
+	}
+	if !strings.Contains(string(seam), `"queue name=" + nameVideoProxyQueue`) {
+		t.Errorf("%s no longer names the picture leg's head queue from nameVideoProxyQueue; an "+
+			"unnamed queue is named by GStreamer, matches no prefix, and its failures become "+
+			"fatal", seamSourceFile)
 	}
 }
 
@@ -1233,35 +1451,48 @@ func TestCaptureLegConformsBeforeTheTee(t *testing.T) {
 	}
 }
 
-// TestBothVideoLegsMeetAtTheSameEncoder is the guard the whole two-leg design
-// rests on, and the one to read first if anything downstream ever behaves
-// differently depending on what the video leg is.
+// TestBothVideoLegsMeetAtTheSameSeam is the guard the whole two-leg design rests
+// on, and the one to read first if anything downstream ever behaves differently
+// depending on what the picture leg is.
 //
-// Everything from the H.264 encoder down — h264parse, the byte-stream
-// capsfilter, vq, mpegtsmux, srtq, ReplaceSink and every reconnect rule in
-// internal/sender — must be one graph, written once, for both sources. Written
-// twice it would be two graphs that are equal today, and the day they stopped
-// being equal the symptom would not be a build failure: it would be a feed that
-// behaves differently on the seat with a card in it.
-func TestBothVideoLegsMeetAtTheSameEncoder(t *testing.T) {
-	body := pipelineDescriptionSource(t)
+// REWRITTEN, AND THE MEETING POINT MOVED. It used to be
+// TestBothVideoLegsMeetAtTheSameEncoder and it counted the H.264 encoder line in
+// pipelineDescription. The encoder is now in the SEND pipeline, on the far side
+// of the proxy, so the two picture legs cannot meet there — they meet at the
+// PROXY TAIL, and that is the stronger form of the same claim: everything from
+// videoProxyTail down (the leaky queue, the proxysink, and then in the send
+// pipeline the encoder, h264parse, vq, mpegtsmux, srtq, ReplaceSink and every
+// reconnect rule in internal/sender) is one graph, written once, for both
+// sources.
+//
+// Written twice it would be two graphs that are equal today, and the day they
+// stopped being equal the symptom would not be a build failure: it would be a
+// feed that behaves differently on the seat with a card in it.
+func TestBothVideoLegsMeetAtTheSameSeam(t *testing.T) {
+	body := captureDescriptionSource(t)
 
-	// The encoder's INSERTION, not the parameter — funcBody renders the
-	// signature too, so `encoderName` alone would always be found twice.
-	if n := strings.Count(body, `encoderName + " name="`); n != 1 {
-		t.Errorf("pipelineDescription inserts the H.264 encoder %d times, want exactly 1. The two "+
-			"video legs must MEET at one capsfilter and share every element below it; a second "+
-			"encoder line is a second graph that only has to stay equal by hand", n)
+	// The tail's INSERTION, once per leg and rendered from ONE function, so a
+	// second spelling of the queue or the proxysink cannot appear on one leg.
+	if n := strings.Count(body, "videoProxyTail()"); n != 2 {
+		t.Errorf("captureDescription inserts videoProxyTail() %d times, want exactly 2 — once "+
+			"for the slate leg and once for the card leg's broadcast branch. Anything else is "+
+			"either a leg that ends somewhere of its own or a second spelling of the seam that "+
+			"only has to stay equal by hand", n)
+	}
+	// And the SEND side is written once for the one video leg it has: the tail
+	// below the encoder is what internal/sender reasons about.
+	send := sendDescriptionSource(t)
+	if n := strings.Count(send, `encoderName + " name="`); n != 1 {
+		t.Errorf("sendDescription inserts the H.264 encoder %d times, want exactly 1", n)
 	}
 	for _, tail := range []string{
 		"h264parse config-interval=-1",
 		"video/x-h264,stream-format=byte-stream,alignment=au",
-		"queue name=vq max-size-time=1000000000",
+		"nameMuxVideoQueue",
 	} {
-		if n := strings.Count(body, tail); n != 1 {
-			t.Errorf("%q appears %d times in pipelineDescription, want exactly 1: the mux tail "+
-				"is shared by both video legs and is what lets internal/sender reason about one "+
-				"graph", tail, n)
+		if n := strings.Count(send, tail); n != 1 {
+			t.Errorf("%q appears %d times in sendDescription, want exactly 1: the mux tail is "+
+				"what lets internal/sender reason about one graph", tail, n)
 		}
 	}
 }
@@ -1275,47 +1506,64 @@ func TestBothVideoLegsMeetAtTheSameEncoder(t *testing.T) {
 // the picture a commentary position transmits, with no setting anywhere saying
 // so. The condition must be the option field and only the option field.
 func TestTheVideoLegIsChosenOnlyByTheConfiguredCard(t *testing.T) {
-	body := pipelineDescriptionSource(t)
-	if !strings.Contains(body, `videoCapture != ""`) {
-		t.Error("pipelineDescription no longer chooses the video leg on whether a card id was " +
-			"supplied. An empty PipelineOpts.VideoCaptureID must mean THE SLATE, byte for byte, " +
-			"on every seat that has configured nothing")
+	// THE DECISION MOVED UP ONE LEVEL AND THE CLAIM IS UNCHANGED. It used to be
+	// pipelineDescription testing `videoCapture != ""`; it is now PlanCapture
+	// turning an empty VideoCaptureID into PictureSlate, once, before anything is
+	// built, and captureDescription switching on the leg it was handed. That is
+	// the same decision made in one place instead of two, and PlanCapture is
+	// untagged so this half is checked BEHAVIOURALLY at Gate A rather than by
+	// reading text — see TestPlanCaptureAppliesTheFusionRule.
+	if got := PlanCapture(CaptureSources{AudioDeviceID: "some-endpoint"}); len(got) == 0 ||
+		got[0].Picture != PictureSlate {
+		t.Errorf("PlanCapture with no VideoCaptureID planned %+v; an empty id must mean THE "+
+			"SLATE, byte for byte, on every seat that has configured nothing", got)
+	}
+	if got := PlanCapture(CaptureSources{VideoCaptureID: "2747401380", AudioDeviceID: "e"}); len(got) == 0 ||
+		got[0].Picture != PictureCard {
+		t.Errorf("PlanCapture with a card id planned %+v, want a card picture leg", got)
 	}
 
-	// Start must decide the same way, and must not consult an enumeration.
-	fset, file := parseSource(t, cgoSourceFile)
-	start := startSequence(t, fset, file)
-	if !strings.Contains(start, `opts.VideoCaptureID == ""`) &&
-		!strings.Contains(start, `opts.VideoCaptureID != ""`) {
-		t.Error("Start no longer branches on opts.VideoCaptureID, so the element it configures " +
-			"and the element pipelineDescription built can disagree")
+	body := captureDescriptionSource(t)
+	if !strings.Contains(body, "PictureSlate") || !strings.Contains(body, "PictureCard") {
+		t.Error("captureDescription no longer branches on the picture leg it was handed, so the " +
+			"planner's decision and the string are two decisions again")
+	}
+
+	// The capture build must decide the same way, and must not consult an
+	// enumeration. It reads the LEG-SET rather than the id, which is the one
+	// change: PlanCapture turns an empty VideoCaptureID into PictureSlate before
+	// anything is built, so the branch below is the same decision made once and
+	// carried, rather than the same string tested twice.
+	start := captureStartSequence(t)
+	if !strings.Contains(start, "PictureCard") && !strings.Contains(start, "PictureSlate") {
+		t.Error("the capture build no longer branches on the picture leg, so the element it " +
+			"configures and the element captureDescription built can disagree")
 	}
 	if strings.Contains(start, "ListInputDevices") {
-		t.Error("Start enumerates devices to decide the video leg. The leg is chosen by " +
-			"CONFIGURATION alone: a card that happens to be fitted must never become the " +
+		t.Error("the capture build enumerates devices to decide the video leg. The leg is chosen " +
+			"by CONFIGURATION alone: a card that happens to be fitted must never become the " +
 			"picture a commentary position transmits")
 	}
 }
 
 // TestCaptureLegSetsThePersistentIDOutsideTheParseString mirrors the rule the
 // slate path and the audio device id already follow, for the reason
-// pipelineDescription gives: user-supplied strings do not go through
+// captureDescription gives: user-supplied strings do not go through
 // gst_parse_launch's quoting rules. It also pins the reuse — the id goes to the
 // video source through the SAME configureDeckLinkSource the audio source uses,
 // because one saved persistent-id serves both entries the card publishes and
 // two setters would be two chances to disagree about the same string.
 func TestCaptureLegSetsThePersistentIDOutsideTheParseString(t *testing.T) {
-	body := pipelineDescriptionSource(t)
+	body := captureDescriptionSource(t)
 	if strings.Contains(body, "persistent-id") || strings.Contains(body, "propPersistentID") {
 		t.Error("the capture leg puts the persistent-id in the parse string. User-supplied " +
 			"strings are set with g_object_set; the parser's quoting rules are not something to " +
 			"trust a persisted id to")
 	}
 
-	fset, file := parseSource(t, cgoSourceFile)
-	start := startSequence(t, fset, file)
+	start := captureStartSequence(t)
 	if !strings.Contains(start, "configureDeckLinkSource") {
-		t.Error("Start no longer points the video capture source at the card through " +
+		t.Error("the capture build no longer points the video capture source at the card through " +
 			"configureDeckLinkSource. That function is shared with the audio source on purpose: " +
 			"the card publishes ONE persistent-id for both, and a second setter is a second set " +
 			"of rules about the identical saved string")
@@ -1375,59 +1623,6 @@ func TestCaptureCapsAreTheSpatialCapsPlusTheRate(t *testing.T) {
 	if !strings.HasSuffix(ntsc.captureCaps(), ",framerate=30000/1001") {
 		t.Errorf("captureCaps() for 1080p29.97 = %q; the rate must be the exact fraction",
 			ntsc.captureCaps())
-	}
-}
-
-// TestStubRefusesAVideoCaptureIDThatIsNotACard is the Gate A half of the
-// refusal the real build makes before it builds anything.
-//
-// The failure it prevents is silent by construction: the decklink elements'
-// persistent-id default is -1, meaning "use device-number instead", meaning
-// whichever card the driver enumerated first. A CoreAudio unique-id or a WASAPI
-// endpoint GUID wired into the video option by a caller reaching for the wrong
-// field would therefore not fail — it would transmit a picture from a card
-// nobody chose, with every lamp green.
-func TestStubRefusesAVideoCaptureIDThatIsNotACard(t *testing.T) {
-	for _, id := range []string{
-		"BuiltInMicrophoneDevice",
-		"{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
-		"90:a3c204a4:00000000:Audio",
-		"-1",
-	} {
-		p := NewStubPipeline()
-		err := p.Start(PipelineOpts{
-			SlatePath:      "slate.png",
-			AudioDeviceID:  "BuiltInMicrophoneDevice",
-			VideoCaptureID: id,
-		})
-		if err == nil {
-			t.Errorf("Start accepted VideoCaptureID %q. It is not a DeckLink persistent-id, and "+
-				"the element would silently fall back to device-number 0", id)
-			_ = p.Stop()
-			continue
-		}
-		if !strings.Contains(err.Error(), "VideoCaptureID") {
-			t.Errorf("Start refused %q with %v, which does not name the field the operator or "+
-				"the caller has to fix", id, err)
-		}
-		_ = p.Stop()
-	}
-
-	// The real id from the fitted card must be accepted, and so must an empty
-	// one — which is the slate and is every seat shipping today.
-	for _, id := range []string{"", "2747401380"} {
-		p := NewStubPipeline()
-		if err := p.Start(PipelineOpts{
-			SlatePath:      "slate.png",
-			AudioDeviceID:  "BuiltInMicrophoneDevice",
-			VideoCaptureID: id,
-		}); err != nil {
-			t.Errorf("Start refused VideoCaptureID %q: %v", id, err)
-		}
-		if got := p.StartedWith().VideoCaptureID; got != id {
-			t.Errorf("StartedWith().VideoCaptureID = %q, want %q", got, id)
-		}
-		_ = p.Stop()
 	}
 }
 
@@ -1686,50 +1881,6 @@ func TestConformTargetString(t *testing.T) {
 	}
 }
 
-// TestStubResolvesTheConformTarget keeps the twin honest: the stub must apply
-// the SAME resolution the real build applies, so that a Gate A test reading
-// StartedWith() is reading what a real pipeline would have been built with.
-func TestStubResolvesTheConformTarget(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: stubCaptureID}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if got := p.StartedWith().ConformTo; got != FallbackConformTarget() {
-		t.Errorf("ConformTo = %v, want the default %v", got, FallbackConformTarget())
-	}
-
-	p = NewStubPipeline()
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		// An odd height: the shape resolve refuses. The stub must refuse it
-		// identically, or a Gate A test would prove a format works that the
-		// real build silently replaces.
-		ConformTo: ConformTarget{Width: 1280, Height: 721, FrameRateNum: 50, FrameRateDen: 1},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if got := p.StartedWith().ConformTo; got != FallbackConformTarget() {
-		t.Errorf("an unusable ConformTo was stored as %v; want the default %v",
-			got, FallbackConformTarget())
-	}
-
-	p = NewStubPipeline()
-	want := ConformTarget{Width: 1280, Height: 720, FrameRateNum: 50, FrameRateDen: 1}
-	err = p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		ConformTo:     want,
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if got := p.StartedWith().ConformTo; got != want {
-		t.Errorf("ConformTo = %v, want %v: a usable target must reach the pipeline unchanged", got, want)
-	}
-}
-
 // TestListInputDevicesFiltersLoopbackAndRenderIDs guards the enumeration half
 // of the loopback defect.
 //
@@ -1848,14 +1999,17 @@ func TestDarwinCaptureIDsAreResolvedNotPersisted(t *testing.T) {
 	}
 }
 
-// TestPlatformElementContractIsPinned checks the two factory names that the
-// send pipeline swaps per platform, in both files, by exact value.
+// TestPlatformElementContractIsPinned checks the two factory names the port
+// swaps per platform, in both files, by exact value.
 //
-// pipelineDescription builds the audio branch out of captureSourceFactory and
-// aacEncoderFactory rather than literals, which makes the ordering guards below
-// portable — and makes it possible to repoint either port at a different
-// element by editing one const, with nothing else in the package noticing. This
-// is what stops that being a silent change.
+// THEY ARE NOW ON OPPOSITE SIDES OF THE SEAM, which is why this test looks in two
+// functions instead of one. captureSourceFactory (wasapi2src / osxaudiosrc) is
+// the COMMENTARY CAPTURE's source and belongs to captureDescription;
+// aacEncoderFactory (mfaacenc / atenc) is the SEND pipeline's encoder and belongs
+// to sendDescription. Both are built from consts rather than literals, which
+// makes the ordering guards portable and makes it possible to repoint either port
+// by editing one const with nothing else in the package noticing. This is what
+// stops that being a silent change.
 //
 // aacEncoderFactory is the one that carries a licence consequence.
 // build/licenses/NOTICE.txt section G says this product ships no third-party
@@ -1900,15 +2054,18 @@ func TestPlatformElementContractIsPinned(t *testing.T) {
 		}
 	}
 
-	// And the pipeline string must actually be built from them, or pinning the
-	// consts pins nothing.
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
-	for _, want := range []string{"captureSourceFactory", "aacEncoderFactory"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("pipelineDescription no longer uses %s; the audio branch has been hardcoded "+
-				"to one platform's element again", want)
-		}
+	// And the two strings must actually be built from them, or pinning the consts
+	// pins nothing. One each, on the side of the seam that owns it — a guard that
+	// looked for both in one function would go green on a build where either had
+	// been hardcoded, because the other would satisfy it.
+	if body := captureDescriptionSource(t); !strings.Contains(body, "captureSourceFactory") {
+		t.Error("captureDescription no longer uses captureSourceFactory; the commentary source " +
+			"has been hardcoded to one platform's element again")
+	}
+	if body := sendDescriptionSource(t); !strings.Contains(body, "aacEncoderFactory") {
+		t.Error("sendDescription no longer uses aacEncoderFactory; the AAC encoder has been " +
+			"hardcoded to one platform's element again, which build/licenses/NOTICE.txt " +
+			"section G is a claim about")
 	}
 }
 
@@ -2006,15 +2163,37 @@ func calleeName(call *ast.CallExpr) string {
 // success for exactly this reason; Start must mirror it or it reports a
 // running pipeline whose capture chain is already dead.
 func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(startSequence(t, fset, file), "\n")
-
-	refuse := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID)")
+	// THE REFUSAL IS THE CAPTURE BUILD'S, because the device is. Nothing in a send
+	// pipeline opens an endpoint, so a guard that went on reading the send Start
+	// would have passed for ever by no longer being able to see the code it
+	// requires — the failure startSequence's comment warns about, happening for a
+	// second time to the same rule.
+	capLines := strings.Split(captureStartSequence(t), "\n")
+	capRefuse := lastLineMatching(capLines, func(s string) bool {
+		return strings.Contains(s, "refuseWrongAudioSource(")
 	})
-	parse := lastLineMatching(lines, func(s string) bool {
+	capParse := lastLineMatching(capLines, func(s string) bool {
 		return strings.Contains(s, "ParseLaunch(")
 	})
+	if capRefuse < 0 {
+		t.Error("the capture build never calls refuseWrongAudioSource; a playback endpoint reaches " +
+			"wasapi2src and fails asynchronously as a fake network error, and a seat with NEITHER " +
+			"source reaches osxaudiosrc with an empty device, which is the SYSTEM DEFAULT INPUT " +
+			"and not an error")
+	}
+	if capParse < 0 {
+		t.Fatal("the capture build never calls ParseLaunch")
+	}
+	if capRefuse >= 0 && capRefuse > capParse {
+		t.Error("the capture build refuses a render endpoint only after building the pipeline; " +
+			"the refusal must be synchronous and up front")
+	}
+
+	// THE FATAL RE-CHECK IS STILL THE SEND PIPELINE'S, and it is still between
+	// PLAYING and p.started, for the same reason: a state change can return
+	// success while a bus error has already latched.
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(startSequence(t, fset, file), "\n")
 	play := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "BlockSetState(gogst.StatePlaying")
 	})
@@ -2024,28 +2203,13 @@ func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 	started := lastLineMatching(lines, func(s string) bool {
 		return s == "p.started = true"
 	})
-
-	if refuse < 0 {
-		t.Error("Start never calls refuseWrongAudioSource(opts.AudioDeviceID, opts.AudioCaptureID); " +
-			"a playback endpoint reaches wasapi2src and fails asynchronously as a fake network " +
-			"error, and a seat with NEITHER source reaches osxaudiosrc with an empty device, " +
-			"which is the SYSTEM DEFAULT INPUT and not an error")
-	}
-	if parse < 0 {
-		t.Fatal("Start never calls ParseLaunch")
-	}
-	if refuse >= 0 && refuse > parse {
-		t.Error("Start refuses a render endpoint only after building the pipeline; the refusal " +
-			"must be synchronous and up front")
-	}
 	if play < 0 || started < 0 {
 		t.Fatal("Start no longer has the BlockSetState(PLAYING) / p.started = true shape these " +
 			"guards expect; re-read them before restructuring")
 	}
 	if fatal < 0 || fatal < play || fatal > started {
 		t.Error("Start does not re-check p.fatalError() between BlockSetState and p.started = true; " +
-			"an asynchronous wasapi2 open failure lets Start report a running pipeline whose " +
-			"capture chain is already dead")
+			"an asynchronous failure lets Start report a running pipeline whose chain is already dead")
 	}
 }
 
@@ -2055,8 +2219,7 @@ func TestStartRefusesRenderIDsAndRechecksFatal(t *testing.T) {
 // before the property is set lets a field log match the failure to the
 // request instead of leaving the id to be argued about.
 func TestStartLogsTheEndpointID(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := startSequence(t, fset, file)
+	body := captureStartSequence(t)
 
 	logged := false
 	for idx := strings.Index(body, "log.Printf("); idx >= 0; {
@@ -2064,7 +2227,7 @@ func TestStartLogsTheEndpointID(t *testing.T) {
 		if end > len(body) {
 			end = len(body)
 		}
-		if strings.Contains(body[idx:end], "opts.AudioDeviceID") {
+		if strings.Contains(body[idx:end], "AudioDeviceID") {
 			logged = true
 			break
 		}
@@ -2075,8 +2238,169 @@ func TestStartLogsTheEndpointID(t *testing.T) {
 		idx += 1 + next
 	}
 	if !logged {
-		t.Error("Start never logs opts.AudioDeviceID; wasapi2's asynchronous error 1551 quotes " +
-			"the requested id verbatim, and without this line the log cannot say what was requested")
+		t.Error("the capture build never logs the requested AudioDeviceID; wasapi2's asynchronous " +
+			"error 1551 quotes the requested id verbatim, and without this line the log cannot " +
+			"say what was requested")
+	}
+}
+
+// TestTheSendStartClaimsAndArmsTheSeamBeforeTheParse is the ORDER GUARD over the
+// most consequential five lines in this package, and every position in it was
+// paid for in a measurement.
+//
+// NewSend BEFORE ParseLaunch, because it both CLAIMS and ARMS. Arming after the
+// parse would still be before PLAYING and would still look right; what it would
+// lose is the claim, and a second proxysrc attaching to a live proxysink does not
+// fail — it steals the stream and kills the first, measured, with nothing on
+// either bus.
+//
+// Bind AFTER the arming and BEFORE PLAYING. Binding first attaches a consumer to
+// a proxysink whose sticky events have not been reset, which is the zero-byte
+// session this whole seam exists to prevent; binding after PLAYING attaches it to
+// a pipeline that has already decided it has no upstream.
+//
+// attachLiveWatch BEFORE PLAYING, because a probe added afterwards misses the
+// buffers the liveness gate is then waiting for, and a healthy seam would be
+// refused by its own detector.
+//
+// The gate closed BEFORE PLAYING, unchanged from the pre-seam build: Start
+// installs no sink, so srtq's src pad has no peer, and without the gate the
+// queue's loop pushes into nothing and posts an error before the first
+// ReplaceSink ever runs.
+func TestTheSendStartClaimsAndArmsTheSeamBeforeTheParse(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(startSequence(t, fset, file), "\n")
+
+	at := func(what, needle string) int {
+		i := lastLineMatching(lines, func(s string) bool { return strings.Contains(s, needle) })
+		if i < 0 {
+			t.Fatalf("the send Start no longer %s (%q). Re-derive this guard from the new shape "+
+				"rather than deleting it, and read the comment above first — every position in "+
+				"that list is there because something measurable broke without it", what, needle)
+		}
+		return i
+	}
+
+	seam := at("claims and arms the capture seam", "NewSend(p.set)")
+	parse := at("parses a pipeline", "gogst.ParseLaunch(")
+	bind := at("binds the proxysrcs", "p.seam.Bind(")
+	gate := at("closes the gate", "p.gateClosed.Store(true)")
+	watch := at("attaches the muxer watchdog", "attachLiveWatch(")
+	play := at("goes to PLAYING", "BlockSetState(gogst.StatePlaying")
+	verdict := at("gates on media having arrived", "p.awaitFirstMediaLocked()")
+	poller := at("starts the liveness poller", "p.live.run(")
+	started := at("marks itself started", "p.started = true")
+
+	for _, order := range []struct {
+		earlier, later int
+		what           string
+	}{
+		{seam, parse, "the seam must be claimed and ARMED before anything is parsed: a session " +
+			"that skipped the arming carries zero bytes with SRT connected and every lamp green"},
+		{parse, bind, "the proxysrcs cannot be bound before they have been parsed"},
+		{bind, play, "binding after PLAYING attaches the consumer to a pipeline that has already " +
+			"decided it has no upstream"},
+		{gate, play, "the gate must be shut before the pipeline can produce a buffer, because " +
+			"srtq's src pad has no peer until the first ReplaceSink"},
+		{watch, play, "the watchdog's probes must be in place before PLAYING or the first " +
+			"buffers cross unseen and the liveness gate refuses a healthy seam"},
+		{play, verdict, "the liveness gate measures what arrived AFTER the pipeline was playing"},
+		{verdict, poller, "the poller must not be running while the gate is deciding whether " +
+			"there was ever a feed: both would be measuring the same silence, and the poller's " +
+			"verdict calls back into an object still inside Start"},
+		{verdict, started, "Start must not report success before the liveness gate has passed; " +
+			"that gate is the only thing standing between a missed arming and a green lamp over " +
+			"silence"},
+	} {
+		if order.earlier > order.later {
+			t.Error(order.what)
+		}
+	}
+}
+
+// TestTheSendTeardownReleasesTheSeamAfterReachingNull is the other end of the
+// same rule, and it is the one that cannot be recovered from afterwards.
+//
+// gst_proxy_src_dispose clears only the src's weak reference on the sink; the
+// SINK's reference on the old src survives until the old src is finalised, which
+// Go may not do promptly. Release the claim while this pipeline is still PAUSED
+// or PLAYING and the next session's arming cannot repair it —
+// gst_proxy_sink_sink_chain re-stores the sticky events on the old proxysrc's
+// still-active pad, the flags go TRUE before the new proxysrc binds, and the new
+// session carries ZERO BYTES with SRT connected and every lamp green.
+//
+// The watchdog goes the other way round, BEFORE the state change, because its
+// poller reads pads the probes write: removing the probes first would leave the
+// poller reading a counter nothing can update on a pipeline already going to NULL.
+func TestTheSendTeardownReleasesTheSeamAfterReachingNull(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "teardownLocked"), "\n")
+
+	watch := lastLineMatching(lines, func(s string) bool { return strings.Contains(s, "p.live.Stop()") })
+	null := lastLineMatching(lines, func(s string) bool {
+		return strings.Contains(s, "BlockSetState(gogst.StateNull")
+	})
+	release := lastLineMatching(lines, func(s string) bool { return strings.Contains(s, "p.seam.Stop()") })
+
+	if release < 0 {
+		t.Fatal("teardownLocked never releases the capture seam. The claim would be held for the " +
+			"life of the process and every later START refused with ErrSeamBusy over a session " +
+			"that no longer exists")
+	}
+	if null < 0 {
+		t.Fatal("teardownLocked no longer takes the pipeline to NULL; re-derive this guard")
+	}
+	if release < null {
+		t.Error("teardownLocked releases the seam BEFORE the pipeline has reached NULL. The next " +
+			"session's arming cannot repair a proxysink whose old consumer is still alive, and " +
+			"that session carries zero bytes with SRT connected and every lamp green")
+	}
+	if watch < 0 {
+		t.Fatal("teardownLocked never stops the muxer watchdog; its poller would outlive the " +
+			"pipeline and read probes that have gone")
+	}
+	if watch > null {
+		t.Error("teardownLocked takes the pipeline to NULL before joining the watchdog's poller, " +
+			"which leaves it reading counters nothing can update on a pipeline being disposed")
+	}
+}
+
+// TestTheSendPipelineOpensNoDevice is the seam's central claim, checked as text
+// because it is a claim about what the source does NOT contain.
+//
+// A send pipeline whose description or build reached for a device would be the
+// pre-seam pipeline growing back one line at a time, and every symptom of that is
+// downstream and slow: the card held by two pipelines, a device change that
+// blanks the picture, a preview that dies with the session. Naming the forbidden
+// identifiers here makes it a compile-time-visible failure at the moment it is
+// written.
+func TestTheSendPipelineOpensNoDevice(t *testing.T) {
+	fset, file := parseSource(t, cgoSourceFile)
+	descFset, descFile := parseSource(t, captureDescSourceFile)
+
+	for _, fn := range []struct{ name, body string }{
+		{"sendDescription", funcBody(t, descFset, descFile, "", "sendDescription")},
+		{"the send Start sequence", startSequence(t, fset, file)},
+	} {
+		for _, forbidden := range []string{
+			"configureCaptureSource",  // the platform endpoint
+			"configureDeckLinkSource", // the card
+			"captureSourceFactory",
+			"videoCaptureFactory",
+			"audioCaptureFactory",
+			"nameSlateSrc",
+			"attachPreview",
+			"startSignalWatch",
+			"applyStartChannelMapLocked",
+			"applyCoughMuteLocked",
+		} {
+			if strings.Contains(fn.body, forbidden) {
+				t.Errorf("%s mentions %s. The send pipeline's source of media is a proxysrc and "+
+					"it opens NOTHING: a device, a slate, a preview, a matrix or a mute here is "+
+					"the pre-seam pipeline growing back, and it would take the always-live "+
+					"capture down with it", fn.name, forbidden)
+			}
+		}
 	}
 }
 
@@ -2111,14 +2435,26 @@ func TestMarkFatalSiteWrapsErrPipelineFatal(t *testing.T) {
 // chain down and the commentary off air, which is the failure the whole
 // sink-pad gate was added to prevent.
 //
-// The bus error filter had to put SOMETHING in front of the store, because a
-// video capture fault must leave the gate open. What it may not put there is
-// captureLegsFor: that is a cgo call, a parent lookup and a
-// gst_bin_get_by_name over the whole graph, and an srtout-N error takes this
-// path on EVERY peer loss. classifyBusError with the zero captureLegs is three
-// string comparisons and is the correct first answer for every source that is
-// not the video capture leg — see its doc comment — so the expensive half
-// belongs below the store, on the one path whose class it can still change.
+// # WHAT THIS TEST USED TO SAY, AND WHY THAT CLAIM IS GONE
+//
+// It used to assert a two-stage classification: classifyBusError with the zero
+// captureLegs ABOVE the store, and captureLegsFor — a cgo call, a parent lookup
+// and a gst_bin_get_by_name over the whole graph — strictly BELOW it, on the one
+// path whose class it could still change. The second stage existed because a
+// video capture fault had to leave the gate open, and because on a fused seat a
+// video element's error is an audio fault wearing a video element's name.
+//
+// The send bus no longer carries any capture element at all. The slate, both
+// DeckLink sources, the conform chain, the preview branch and both level elements
+// live in a CapturePipeline with a bus of its own; this graph is two proxysrcs,
+// two encoders, the muxer and the sink, so there is no error on it that may leave
+// the gate open and nothing to establish from the graph. The expensive stage is
+// therefore not merely below the store — it is deleted, along with captureLegsFor
+// itself.
+//
+// What survives is the property the test was actually protecting: NOTHING that
+// crosses into C runs before the store. That is now checkable as an absolute
+// rather than as an ordering, which is a stronger guard than the one it replaces.
 //
 // Nothing else at Gate A would notice: the ordering is invisible to every
 // behavioural test in this package, and the cost of getting it wrong is not a
@@ -2132,21 +2468,43 @@ func TestBusHandlerClosesTheGateBeforeAnyCgoCall(t *testing.T) {
 		t.Fatal("onBusMessage no longer closes the gate on a bus error; a failing sink now keeps " +
 			"receiving media and BUILD-NOTES.md section 8.6 is back")
 	}
-	classify := strings.Index(body, "classifyBusError(")
+	classify := strings.Index(body, "classifySendBusError(")
 	if classify < 0 {
-		t.Fatal("onBusMessage no longer classifies bus errors; a video capture fault is fatal " +
-			"again and takes the commentary off air")
+		t.Fatal("onBusMessage no longer classifies bus errors, so an srtout-N error is no longer " +
+			"told apart from a fatal one and internal/sender's ladder cannot repair a sink it " +
+			"could have replaced")
 	}
 	if classify > gate {
-		t.Error("the classification has moved BELOW the gate close, so a video capture fault now " +
-			"shuts the gate and starves the SRT peer — which defeats the sparing entirely")
+		t.Error("the classification has moved BELOW the gate close. It has to be above it: the " +
+			"store is unconditional only because the classification costs three string " +
+			"comparisons, and a class that decided whether to store would have to be computed " +
+			"first")
 	}
-	if legs := strings.Index(body, "captureLegsFor("); legs >= 0 && legs < gate {
-		t.Error("captureLegsFor is called BEFORE the gate closes. It is a cgo call and a " +
-			"gst_bin_get_by_name over the whole graph, and this path is taken by every srtout-N " +
-			"error on every peer loss: it puts a bin traversal in front of the store while the " +
-			"buffer carrying GST_FLOW_ERROR into srtq is racing us. Pass captureLegs{} to " +
-			"classifyBusError first and refine the video-capture case below the store")
+
+	// THE ABSOLUTE. Any of these before the store is a cgo call, a GObject lock or
+	// a bin traversal in front of the one store that is racing a buffer carrying
+	// GST_FLOW_ERROR into srtq.
+	for _, banned := range []string{"captureLegsFor(", "captureFatalError(", "GetByName(", "GetParent("} {
+		if i := strings.Index(body, banned); i >= 0 && i < gate {
+			t.Errorf("%s is called BEFORE the gate closes. It crosses into C, and this path is "+
+				"taken by every srtout-N error on every peer loss: it puts a cgo call in front of "+
+				"the store while the buffer carrying GST_FLOW_ERROR into srtq is racing us",
+				banned)
+		}
+	}
+
+	// AND THE CAPTURE CLASSES ARE GONE FROM THIS HANDLER. They describe elements
+	// that cannot post on this bus, and capturefault.go's proxy prefixes ("vprox",
+	// "aprox") match THIS graph's vproxsrc and aproxsrc as well as the capture
+	// side's tails — so a vproxsrc error would have been spared with the gate left
+	// OPEN and an aproxsrc error handed to a DeckLink diagnosis of a graph with no
+	// card in it.
+	for _, gone := range []string{"classVideoCapture", "classPreview", "classAudioCapture"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("onBusMessage still branches on %s. No capture element exists in the send "+
+				"graph, and that branch is reachable only by the two proxysrcs whose names share "+
+				"a prefix with the capture side's proxy tails", gone)
+		}
 	}
 }
 
@@ -2246,243 +2604,6 @@ func TestInitResolvesTheBundleThroughThePlatformSeam(t *testing.T) {
 // render-endpoint refusal, for tests that are not about that refusal.
 const stubCaptureID = "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}"
 
-func TestStubEmitsLevelsWhileStarted(t *testing.T) {
-	frames := make(chan Levels, 128)
-	p := NewStubPipeline()
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		// Non-blocking capture, as the contract requires of the callback: the
-		// stub's ticker goroutine must never wait on this test.
-		OnLevels: func(l Levels) {
-			select {
-			case frames <- l:
-			default:
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer p.Stop()
-
-	deadline := time.After(3 * time.Second)
-	var got []Levels
-	for len(got) < 4 {
-		select {
-		case l := <-frames:
-			got = append(got, l)
-		case <-deadline:
-			t.Fatalf("only %d level frames arrived in 3s at a 50ms interval; want at least 4", len(got))
-		}
-	}
-
-	for i, l := range got {
-		if len(l.PeakDB) != levelStubChannels || len(l.RMSDB) != levelStubChannels {
-			t.Fatalf("frame %d has %d peak / %d rms channels, want %d of each: the real "+
-				"pipeline pins channels=2 and the fakes must match it",
-				i, len(l.PeakDB), len(l.RMSDB), levelStubChannels)
-		}
-		for ch := range l.PeakDB {
-			peak, rms := l.PeakDB[ch], l.RMSDB[ch]
-			if peak < levelSilenceDB || peak > 0 {
-				t.Errorf("frame %d channel %d peak = %v dBFS, outside [%d, 0]", i, ch, peak, levelSilenceDB)
-			}
-			if rms < levelSilenceDB || rms > 0 {
-				t.Errorf("frame %d channel %d rms = %v dBFS, outside [%d, 0]", i, ch, rms, levelSilenceDB)
-			}
-			if rms > peak {
-				t.Errorf("frame %d channel %d rms %v is above its peak %v; no real signal does that",
-					i, ch, rms, peak)
-			}
-		}
-	}
-}
-
-// TestStubEmitsPerChannelLevelsAtTheNegotiatedWidth is the picker meter's Gate A
-// life-support: without it the sixteen-strip UI can only be driven by the real
-// card, which is EXCLUSIVE — one process, one holder — so at most one person on
-// the project could ever watch it move.
-//
-// The width is the fake pad's, not a constant, because the whole point of the
-// picker is that the count is whatever the card negotiated. Sixteen distinct
-// starting phases is the other assertion worth making here: a picker that has
-// drawn one channel four times looks exactly like four groups of four bars
-// moving together, and stubChannelLevelsAt spreads the phases evenly precisely
-// so the fake cannot manufacture the failure it exists to expose.
-func TestStubEmitsPerChannelLevelsAtTheNegotiatedWidth(t *testing.T) {
-	const channels = 16
-
-	frames := make(chan Levels, 128)
-	p := NewStubPipeline()
-	p.SetStubInputChannels(channels)
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		OnChannelLevels: func(l Levels) {
-			select {
-			case frames <- l:
-			default:
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer p.Stop()
-
-	deadline := time.After(3 * time.Second)
-	var got []Levels
-	for len(got) < 3 {
-		select {
-		case l := <-frames:
-			got = append(got, l)
-		case <-deadline:
-			t.Fatalf("only %d per-channel frames arrived in 3s at a 100ms interval; want at least 3",
-				len(got))
-		}
-	}
-
-	for i, l := range got {
-		if len(l.PeakDB) != channels || len(l.RMSDB) != channels {
-			t.Fatalf("frame %d has %d peak / %d rms channels, want %d of each: the frame's LENGTH "+
-				"is what the renderer lays its strips out from, so a wrong width is a wrong grid",
-				i, len(l.PeakDB), len(l.RMSDB), channels)
-		}
-	}
-
-	// No two channels in lockstep, in the frame the fake actually produced.
-	seen := map[float64]int{}
-	for ch, v := range got[0].PeakDB {
-		if prev, dup := seen[v]; dup {
-			t.Errorf("channels %d and %d have identical levels (%v); the fake must not produce "+
-				"bars that move together, because that is indistinguishable from a UI drawing "+
-				"one channel twice", prev, ch, v)
-		}
-		seen[v] = ch
-	}
-}
-
-// TestStubSendsNoPerChannelLevelsForAPositionedDevice is the parity that keeps
-// the stub honest about the on-air Windows path.
-//
-// The real build creates chlevel with post-messages=false and arms it only when
-// a mix matrix was written — which happens only for an unpositioned source. An
-// ordinary microphone therefore posts not one per-channel frame for a whole
-// match, and a stub that produced them anyway would let the UI come to depend on
-// a stream the shipped build does not send.
-func TestStubSendsNoPerChannelLevelsForAPositionedDevice(t *testing.T) {
-	var mu sync.Mutex
-	channelFrames, programmeFrames := 0, 0
-
-	p := NewStubPipeline() // the default fake pad: two channels, positioned
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		OnLevels: func(Levels) {
-			mu.Lock()
-			programmeFrames++
-			mu.Unlock()
-		},
-		OnChannelLevels: func(Levels) {
-			mu.Lock()
-			channelFrames++
-			mu.Unlock()
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer p.Stop()
-
-	// Long enough for several of both, if both were running.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		mu.Lock()
-		prog := programmeFrames
-		mu.Unlock()
-		if prog >= 8 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	mu.Lock()
-	prog, chans := programmeFrames, channelFrames
-	mu.Unlock()
-
-	if prog == 0 {
-		t.Fatal("the programme meter never fired; this test cannot say anything about the picker")
-	}
-	if chans != 0 {
-		t.Errorf("the stub delivered %d per-channel frames for a POSITIONED two-channel device "+
-			"(after %d programme frames). The real build posts none: there is no matrix on such a "+
-			"pipeline, so there is nothing the picker could show that the programme meter does not",
-			chans, prog)
-	}
-}
-
-func TestStubLevelsStopWhenThePipelineStops(t *testing.T) {
-	var mu sync.Mutex
-	calls := 0
-	p := NewStubPipeline()
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: stubCaptureID,
-		OnLevels: func(Levels) {
-			mu.Lock()
-			calls++
-			mu.Unlock()
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	count := func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		return calls
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for count() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("OnLevels never fired while the pipeline was started")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if err := p.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// Stop JOINS the ticker goroutine, so the count is final the moment Stop
-	// returns — a callback delivered after this line is the join being lost.
-	after := count()
-	time.Sleep(150 * time.Millisecond) // three ticker intervals of silence
-	if got := count(); got != after {
-		t.Fatalf("OnLevels fired %d more time(s) after Stop returned; the ticker was "+
-			"signalled but not joined", got-after)
-	}
-}
-
-func TestStubStartWithNilOnLevelsIsSafe(t *testing.T) {
-	// nil OnLevels means no metering and no goroutine: the documented default.
-	// This is the "does not panic and does not wedge Stop" case.
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: stubCaptureID}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	time.Sleep(60 * time.Millisecond)
-	if err := p.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if err := p.Stop(); err != nil {
-		t.Fatalf("second Stop: %v", err)
-	}
-}
-
 func TestClampLevelDB(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2571,42 +2692,55 @@ func TestSilentLevelsIsAllChannelsAtTheFloor(t *testing.T) {
 	}
 }
 
-// TestPipelineDescriptionMetersWhatIsEncoded guards the level element's
-// PLACEMENT, which is the whole point of the input meters: after audioconvert,
-// audioresample and the S16LE/48k capsfilter, immediately before mfaacenc, so
-// what the meter shows is what is actually encoded and sent. A level element
-// moved upstream of the resample — or removed — would keep the meters moving
-// (or silent) in ways that no longer describe the on-air signal, and nothing
-// at Gate A would notice: the stub emits synthetic levels either way.
-func TestPipelineDescriptionMetersWhatIsEncoded(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "", "pipelineDescription")
+// TestTheProgrammeMeterMeasuresWhatCrossesTheSeam guards the level element's
+// PLACEMENT, which is the whole point of the input meters.
+//
+// REWRITTEN, AND THE MEASUREMENT POINT MOVED BY EXACTLY ONE QUEUE. It used to
+// assert `resample < alevel < aacEncoderFactory` inside pipelineDescription: the
+// meter sat immediately before the AAC encoder, so what it showed was what was
+// being encoded and sent. The encoder is now in the send pipeline, on the far
+// side of the proxy, so the strongest true statement is that alevel sits AFTER
+// audioresample and the seam capsfilter and IMMEDIATELY BEFORE the proxy tail —
+// with one leaky queue between it and the encoder.
+//
+// WHAT THAT COSTS IS STATED RATHER THAN GLOSSED (PLAN.md 0-BIS A3): in normal
+// operation these are the same buffers, so the promise holds; during a send-side
+// stall of more than about a second the queue drops and the meter can move while
+// the far end loses samples. levels.go restates the doc claim where the promise
+// is made. What has NOT changed is the thing this guard exists for — the meter is
+// still below the resampler and the routing matrix, so it measures the signal
+// this seat is producing and not the endpoint's raw format.
+func TestTheProgrammeMeterMeasuresWhatCrossesTheSeam(t *testing.T) {
+	body := captureDescriptionSource(t)
 
-	level := strings.Index(body, "level name=alevel")
+	level := strings.Index(body, "level name=\"+levelElementName")
 	if level < 0 {
-		t.Fatal("the audio branch has no level element named alevel; the input meters have " +
-			"nothing to measure and the levels event will never fire on a real build")
+		t.Fatal("the commentary chain has no programme level element built from levelElementName; " +
+			"the input meters have nothing to measure and the levels event will never fire on a " +
+			"real build")
 	}
-	// audioresample rather than the old "audioconvert ! audioresample" literal:
-	// audioconvert is named since the channel map landed, so the two are no
-	// longer adjacent in the source text. The ORDER this guard is about —
-	// resample, then level, then the encoder — is unaffected.
 	resample := strings.Index(body, "audioresample")
-	// The encoder is named through aacEncoderFactory rather than as a literal
-	// since the macOS port — mfaacenc on Windows, atenc on macOS. The ORDER is
-	// what this guard is about and it is unaffected;
-	// TestPlatformElementContractIsPinned checks the two values themselves.
-	enc := strings.Index(body, `aacEncoderFactory + " bitrate="`)
-	if resample < 0 || enc < 0 {
-		t.Fatal("the audio branch has been restructured; re-derive this guard from the new shape")
+	tail := strings.Index(body, "audioProxyTail()")
+	if resample < 0 || tail < 0 {
+		t.Fatal("the commentary chain has been restructured; re-derive this guard from the new shape")
 	}
-	if !(resample < level && level < enc) {
-		t.Error("the level element must sit AFTER audioresample and BEFORE the AAC encoder: it " +
-			"exists to measure the exact signal that enters the encoder, not the endpoint's raw format")
+	if !(resample < level && level < tail) {
+		t.Error("the programme level element must sit AFTER audioresample and IMMEDIATELY BEFORE " +
+			"the proxy tail: it exists to measure the exact signal this seat is producing, not " +
+			"the endpoint's raw format, and anything between it and the seam is a second thing " +
+			"that can change the audio after it has been measured")
 	}
 	if !strings.Contains(body, "interval=50000000") {
 		t.Error("the level interval is no longer 50 ms (50000000 ns); the app-side throttle and " +
 			"the UI's no-rAF rendering are both sized against 20 frames a second")
+	}
+
+	// AND NOTHING MEASURES BELOW THE SEAM. A level element in the send pipeline
+	// would read the encoder's input rather than the microphone, which on a
+	// send-side stall is exactly the reassurance nobody should be given.
+	if send := sendDescriptionSource(t); strings.Contains(send, "level name=") {
+		t.Error("sendDescription builds a level element. A meter measuring what has crossed the " +
+			"seam reads the encoder's input rather than the microphone")
 	}
 }
 
@@ -2618,14 +2752,14 @@ func TestPipelineDescriptionMetersWhatIsEncoded(t *testing.T) {
 // level-reading helper is held to the same no-logging rule
 // TestBusHandlerDoesNotLogOnTheStreamingThread pins for the handler itself.
 func TestBusHandlerForwardsLevelMessages(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+	fset, file := parseSource(t, captureCgoSourceFile)
+	body := funcBody(t, fset, file, "cgoCapture", "onBusMessage")
 
 	for _, want := range []string{
 		"gogst.MessageElement",
 		"levelStructureName",
 		"levelsFromStructure(",
-		"p.onLevels.Load()",
+		"c.onLevels.Load()",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("onBusMessage no longer contains %q; the real build would post level "+
@@ -2633,7 +2767,11 @@ func TestBusHandlerForwardsLevelMessages(t *testing.T) {
 		}
 	}
 
-	helper := funcBody(t, fset, file, "", "levelsFromStructure")
+	// levelsFromStructure is package-level in gst_cgo.go and is read by whichever
+	// bus handler is delivering, so it is fetched from that file rather than from
+	// this one's.
+	cgoFset, cgoFile := parseSource(t, cgoSourceFile)
+	helper := funcBody(t, cgoFset, cgoFile, "", "levelsFromStructure")
 	if strings.Contains(helper, "log.") {
 		t.Error("levelsFromStructure calls into the log package on a GStreamer streaming thread; " +
 			"see TestBusHandlerDoesNotLogOnTheStreamingThread for why that is forbidden")
@@ -2647,24 +2785,25 @@ func TestBusHandlerForwardsLevelMessages(t *testing.T) {
 // be published (through the atomic) BEFORE gst_parse_launch ever runs, or the
 // first frames of every session race the store.
 func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(startSequence(t, fset, file), "\n")
+	lines := strings.Split(captureStartSequence(t), "\n")
 
 	store := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.onLevels.Store(")
+		return strings.Contains(s, "c.onLevels.Store(")
 	})
 	parse := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "gogst.ParseLaunch(")
 	})
 	if store < 0 {
-		t.Fatal("Start never stores PipelineOpts.OnLevels; the real build would drop every level message")
+		t.Fatal("the capture build never stores CaptureOpts.OnLevels; the real build would drop " +
+			"every level message")
 	}
 	if parse < 0 {
-		t.Fatal("Start no longer calls gogst.ParseLaunch; re-derive this guard from the new shape")
+		t.Fatal("the capture build no longer calls gogst.ParseLaunch; re-derive this guard from " +
+			"the new shape")
 	}
 	if store > parse {
-		t.Error("Start stores OnLevels after building the pipeline; level messages posted " +
-			"during startup race the store on a streaming thread")
+		t.Error("the capture build stores OnLevels after building the pipeline; level messages " +
+			"posted during startup race the store on a streaming thread")
 	}
 }
 
@@ -2676,25 +2815,26 @@ func TestStartPublishesOnLevelsBeforeBuildingThePipeline(t *testing.T) {
 // the mapping screen works at all, so frames dropped at the start read as a dead
 // meter and send them looking for the fault somewhere else entirely.
 func TestStartPublishesOnChannelLevelsBeforeBuildingThePipeline(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(startSequence(t, fset, file), "\n")
+	lines := strings.Split(captureStartSequence(t), "\n")
 
 	store := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.onChannelLevels.Store(")
+		return strings.Contains(s, "c.onChannelLevels.Store(")
 	})
 	parse := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "gogst.ParseLaunch(")
 	})
 	if store < 0 {
-		t.Fatal("Start never stores PipelineOpts.OnChannelLevels; the per-channel meters would " +
-			"have no consumer and every chlevel frame would be dropped")
+		t.Fatal("the capture build never stores CaptureOpts.OnChannelLevels; the per-channel " +
+			"meters would have no consumer and every chlevel frame would be dropped")
 	}
 	if parse < 0 {
-		t.Fatal("Start no longer calls gogst.ParseLaunch; re-derive this guard from the new shape")
+		t.Fatal("the capture build no longer calls gogst.ParseLaunch; re-derive this guard from " +
+			"the new shape")
 	}
 	if store > parse {
-		t.Error("Start stores OnChannelLevels after building the pipeline; the level element " +
-			"starts posting the moment the pipeline reaches PLAYING, which happens inside Start")
+		t.Error("the capture build stores OnChannelLevels after building the pipeline; the level " +
+			"element starts posting the moment the pipeline reaches PLAYING, which happens inside " +
+			"the build")
 	}
 }
 
@@ -2709,21 +2849,21 @@ func TestStartPublishesOnChannelLevelsBeforeBuildingThePipeline(t *testing.T) {
 // not fail — it flickers between two different signals, which is a meter reading
 // as live while showing something that is not going to air.
 func TestBusHandlerRoutesEachMeterToItsOwnCallback(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
+	fset, file := parseSource(t, captureCgoSourceFile)
+	body := funcBody(t, fset, file, "cgoCapture", "onBusMessage")
 
-	if !strings.Contains(body, "p.onChannelLevels.Load()") {
+	if !strings.Contains(body, "c.onChannelLevels.Load()") {
 		t.Error("onBusMessage no longer loads onChannelLevels; chlevel's frames would be dropped " +
 			"and the routing screen's meters would never move, with nothing in the log to say why")
 	}
-	prog := strings.Index(body, "p.onLevels.Load()")
-	chans := strings.Index(body, "p.onChannelLevels.Load()")
+	prog := strings.Index(body, "c.onLevels.Load()")
+	chans := strings.Index(body, "c.onChannelLevels.Load()")
 	if prog < 0 || chans < 0 {
 		t.Fatal("onBusMessage no longer loads both meter callbacks; re-derive this guard")
 	}
 	// Each callback is loaded exactly once. Two loads of the same field would be
 	// two delivery paths for one meter, which is how a frame ends up on both.
-	if strings.Count(body, "p.onLevels.Load()") != 1 || strings.Count(body, "p.onChannelLevels.Load()") != 1 {
+	if strings.Count(body, "c.onLevels.Load()") != 1 || strings.Count(body, "c.onChannelLevels.Load()") != 1 {
 		t.Error("a meter callback is loaded more than once in onBusMessage; there must be exactly " +
 			"one delivery path per meter, or a frame can reach both")
 	}
@@ -2740,28 +2880,34 @@ func TestBusHandlerRoutesEachMeterToItsOwnCallback(t *testing.T) {
 // programme meter already reports: a duplicate, ten times a second, over the
 // webview bridge, for a whole match.
 func TestPerChannelMeterIsArmedFromTheMatrixDecision(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-
-	desc := funcBody(t, fset, file, "", "pipelineDescription")
+	descFset, descFile := parseSource(t, captureDescSourceFile)
+	desc := funcBody(t, descFset, descFile, "", "captureDescription")
 	if !strings.Contains(desc, "post-messages=false") {
 		t.Error("the per-channel level element is no longer built with post-messages=false; " +
-			"every native capture would start posting sixteen-channel frames nobody asked for")
+			"every native capture would start posting frames nobody asked for")
 	}
 
-	start := startSequence(t, fset, file)
-	arm := strings.Index(start, "p.armChannelMeterLocked(")
+	start := captureStartSequence(t)
+	arm := strings.Index(start, "c.armChannelMeterLocked(")
 	if arm < 0 {
-		t.Fatal("Start never arms the per-channel meter; it is built silent, so the routing " +
-			"screen's meters would never move on any machine")
+		t.Fatal("the capture build never arms the per-channel meter; it is built silent, so the " +
+			"routing screen's meters would never move on any machine")
 	}
-	if !strings.Contains(start[arm:arm+len("p.armChannelMeterLocked(")+120], "p.matrixWidth > 0") {
-		t.Error("the per-channel meter is no longer armed from whether a matrix was written; " +
-			"that condition IS the test for an unpositioned source, and without it the on-air " +
-			"Windows path grows a second meter it has no use for")
-	}
-	if !strings.Contains(start[arm:arm+len("p.armChannelMeterLocked(")+120], "opts.OnChannelLevels != nil") {
-		t.Error("the per-channel meter is armed without checking that anybody wants its frames; " +
-			"messages posted for a consumer that does not exist are cost with no reader")
+
+	// THE CONDITION ITSELF CHANGED WITH R2 AND THE CHANGE IS THE POINT. It used
+	// to be "a matrix was written", which was the same question as "this source is
+	// unpositioned" only while a matrix was written conditionally. Every seat now
+	// carries one — measured working at 1, 2, 3, 16 and 32 — so that test would arm
+	// sixteen bars on a stereo microphone. The condition is now the width itself,
+	// and the cost argument it encodes survives intact: a stereo seat still never
+	// pushes a duplicate of the programme meter over the bridge ten times a second.
+	// channelMeterWanted is the single expression both twins ask, so it is named
+	// here rather than restated.
+	if !strings.Contains(start[arm:], "c.wantChannelMeter(") &&
+		!strings.Contains(start[arm:], "channelMeterWanted(") {
+		t.Error("the per-channel meter is no longer armed through the shared condition; " +
+			"channelMeterWanted is the one place the width test and the callback test live, and " +
+			"a second copy of it would eventually disagree invisibly")
 	}
 }
 
@@ -2775,25 +2921,31 @@ func TestPerChannelMeterIsArmedFromTheMatrixDecision(t *testing.T) {
 // pipeline that no longer exists is the direction this project never lets a
 // status display be wrong in.
 func TestStopStopsTheSignalWatchdogBeforeTheTeardown(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "Stop"), "\n")
+	// The capture's Stop and its teardown are read as ONE TEXT, in the order they
+	// execute, because the watchdog stop moved INSIDE teardownLocked when the
+	// capture layer was cut: the build's own abort() path runs the same teardown,
+	// and a watchdog stopped only in Stop would outlive every failed build.
+	fset, file := parseSource(t, captureCgoSourceFile)
+	lines := strings.Split(funcBody(t, fset, file, "cgoCapture", "teardownLocked"), "\n")
 
 	stop := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.sigWatch.Stop()")
+		return strings.Contains(s, "sigWatch.Stop()")
 	})
 	teardown := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.teardownLocked()")
+		return strings.Contains(s, "BlockSetState(gogst.StateNull")
 	})
 	if stop < 0 {
-		t.Fatal("Stop never stops the signal watchdog; its goroutine would outlive the pipeline " +
-			"and go on reading a property off a disposed element")
+		t.Fatal("the capture teardown never stops the signal watchdog; its goroutine would " +
+			"outlive the pipeline and go on reading a property off a disposed element")
 	}
 	if teardown < 0 {
-		t.Fatal("Stop no longer calls teardownLocked; re-derive this guard from the new shape")
+		t.Fatal("the capture teardown no longer takes the pipeline to NULL; re-derive this guard " +
+			"from the new shape")
 	}
 	if stop > teardown {
-		t.Error("Stop tears the pipeline down before stopping the watchdog; the reader closure " +
-			"holds the capture element, and a read after disposal is a read on freed memory")
+		t.Error("the capture teardown takes the pipeline to NULL before stopping the watchdog; " +
+			"the reader closure holds the capture element, and a read after disposal is a read on " +
+			"freed memory")
 	}
 }
 
@@ -2801,8 +2953,7 @@ func TestStopStopsTheSignalWatchdogBeforeTheTeardown(t *testing.T) {
 // watchdog's lifecycle: it is the last thing Start does before returning nil, so
 // that no abort() path can leak the goroutine.
 func TestStartStartsTheWatchdogOnlyAfterPlaying(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(startSequence(t, fset, file), "\n")
+	lines := strings.Split(captureStartSequence(t), "\n")
 
 	watch := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "startSignalWatch(")
@@ -2814,18 +2965,18 @@ func TestStartStartsTheWatchdogOnlyAfterPlaying(t *testing.T) {
 		return strings.Contains(s, "return abort(")
 	})
 	if watch < 0 {
-		t.Fatal("Start never starts the signal watchdog; the lamp would stay UNKNOWN for the " +
-			"whole of every match and the one fault nothing else can see would be invisible")
+		t.Fatal("the capture build never starts the signal watchdog; the lamp would stay UNKNOWN " +
+			"for the whole of every match and the one fault nothing else can see would be invisible")
 	}
 	if play < 0 {
-		t.Fatal("Start no longer sets the pipeline PLAYING; re-derive this guard")
+		t.Fatal("the capture build no longer sets the pipeline PLAYING; re-derive this guard")
 	}
 	if watch < play {
 		t.Error("the signal watchdog is started before the pipeline is PLAYING; it would be " +
 			"polling an element that has not opened its device")
 	}
 	if abort >= 0 && watch < abort {
-		t.Error("the signal watchdog is started before Start's last abort() path; a failure " +
+		t.Error("the signal watchdog is started before the build's last abort() path; a failure " +
 			"after it would leak the goroutine and its ticker for the life of the process")
 	}
 }
@@ -2838,148 +2989,6 @@ func TestStartStartsTheWatchdogOnlyAfterPlaying(t *testing.T) {
 // states accept a map, what a positioned device does, and that a refused write
 // leaves the previous map in force.
 
-// TestStubStartAppliesTheZeroChannelMapToAWideDevice is requirement five seen
-// from the pipeline: an operator who never opens the mapping UI gets audio off
-// a sixteen-channel card.
-func TestStubStartAppliesTheZeroChannelMapToAWideDevice(t *testing.T) {
-	p := NewStubPipeline()
-	defer p.Stop()
-	p.SetStubInputChannels(16)
-
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
-		t.Fatalf("Start with no channel map: %v", err)
-	}
-	if got := p.InputChannels(); got != 16 {
-		t.Fatalf("InputChannels = %d, want 16", got)
-	}
-	m, written := p.ChannelMap()
-	if !written {
-		t.Fatal("no matrix was written for a sixteen-channel device; audioconvert cannot map an " +
-			"unpositioned stream to stereo without one and the pipeline would die with not-negotiated")
-	}
-	if !m.IsDefault() {
-		t.Errorf("the map in force is %v, want the zero value", m)
-	}
-	// The zero value has to resolve to something audible against the width the
-	// pad reported, which is the whole of the requirement.
-	matrix, err := m.MixMatrix(p.InputChannels())
-	if err != nil {
-		t.Fatalf("the map in force cannot be built against the negotiated width: %v", err)
-	}
-	if matrix[OutputLeft][0] != 1 || matrix[OutputRight][1] != 1 {
-		t.Errorf("the unset map does not put channels 1 and 2 on air at unity: %v", matrix)
-	}
-}
-
-// TestStubStartRefusesAMapTheDeviceCannotSatisfy proves the validation happens
-// at Start rather than at the first buffer. A map naming channel 12 on an
-// eight-channel device is refused with the pipeline still stopped, because the
-// alternative is a matrix of the wrong width, and a matrix of the wrong width
-// stops the capture chain rather than degrading it.
-func TestStubStartRefusesAMapTheDeviceCannotSatisfy(t *testing.T) {
-	p := NewStubPipeline()
-	defer p.Stop()
-	p.SetStubInputChannels(8)
-
-	err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: "2747401380",
-		ChannelMap:    ChannelMap{{Output: OutputLeft, Input: 11, Gain: 1}},
-	})
-	if err == nil {
-		t.Fatal("Start accepted a map naming input 11 on an eight-channel device")
-	}
-	if !errors.Is(err, ErrChannelMap) {
-		t.Errorf("Start's refusal does not wrap ErrChannelMap: %v", err)
-	}
-}
-
-// TestStubSetChannelMapIsLiveAndValidatesFirst covers the live control and the
-// order that makes it safe. The pipeline stays where it was, and a refused map
-// leaves the PREVIOUS one in force — which is what the element does too, except
-// that the element does it silently and this can be observed.
-func TestStubSetChannelMapIsLiveAndValidatesFirst(t *testing.T) {
-	p := NewStubPipeline()
-	defer p.Stop()
-	p.SetStubInputChannels(16)
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := p.ReplaceSink(SinkOpts{Host: "m2lx.example", Port: 9000}); err != nil {
-		t.Fatalf("ReplaceSink: %v", err)
-	}
-
-	good := ChannelMap{{Output: OutputLeft, Input: 4, Gain: 0.5}, {Output: OutputRight, Input: 5, Gain: 0.5}}
-	if err := p.SetChannelMap(good); err != nil {
-		t.Fatalf("SetChannelMap while running: %v", err)
-	}
-	if p.State() != StubStateSinkAttached {
-		t.Errorf("state is %s after a live channel map change; the real element renegotiates "+
-			"nothing and the pipeline never leaves PLAYING", p.State())
-	}
-
-	// 1.0000001 is the measured boundary: the element rejects it and keeps
-	// running the previous matrix, so the map recorded here must not change.
-	bad := ChannelMap{{Output: OutputLeft, Input: 0, Gain: 1.0000001}}
-	if err := p.SetChannelMap(bad); err == nil {
-		t.Fatal("a coefficient of 1.0000001 was accepted; audioconvert refuses it silently")
-	}
-	m, _ := p.ChannelMap()
-	if len(m) != len(good) || m[0] != good[0] {
-		t.Errorf("a refused map changed what is in force: %v, want %v. The element leaves the "+
-			"previous matrix running on a rejected write, so anything that recorded the bad map "+
-			"would make the application disagree with the hardware about what is on air", m, good)
-	}
-}
-
-// TestStubSetChannelMapRefusesAPositionedDevice covers the case that is every
-// microphone and the whole of the on-air Windows path: audioconvert maps a
-// positioned stream on its own, no matrix is written, and there is therefore
-// nothing to change live. Writing one would renegotiate the caps the feed is
-// running on to achieve a routing the device has no channels for.
-func TestStubSetChannelMapRefusesAPositionedDevice(t *testing.T) {
-	p := NewStubPipeline()
-	defer p.Stop()
-	if err := p.Start(PipelineOpts{
-		SlatePath:     "slate.png",
-		AudioDeviceID: "{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}",
-	}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if _, written := p.ChannelMap(); written {
-		t.Error("a matrix was written for a two-channel positioned device; the on-air path must " +
-			"set no property at all and behave exactly as it did before this mechanism existed")
-	}
-	if err := p.SetChannelMap(ChannelMap{{Output: OutputLeft, Input: 0, Gain: 1}}); err == nil {
-		t.Error("SetChannelMap was accepted on a positioned device")
-	}
-}
-
-// TestStubInputChannelsIsZeroWhenNothingIsNegotiated pins the contract the real
-// twin keeps by reading the pad's CURRENT caps: before Start and after Stop
-// there is no negotiated width, and 0 is the honest answer rather than the last
-// one that happened to be true.
-func TestStubInputChannelsIsZeroWhenNothingIsNegotiated(t *testing.T) {
-	p := NewStubPipeline()
-	p.SetStubInputChannels(16)
-	if got := p.InputChannels(); got != 0 {
-		t.Errorf("InputChannels before Start = %d, want 0", got)
-	}
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "2747401380"}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if got := p.InputChannels(); got != 16 {
-		t.Errorf("InputChannels while running = %d, want 16", got)
-	}
-	p.Stop()
-	if got := p.InputChannels(); got != 0 {
-		t.Errorf("InputChannels after Stop = %d, want 0", got)
-	}
-	if err := p.SetChannelMap(nil); err == nil {
-		t.Error("SetChannelMap was accepted on a stopped pipeline")
-	}
-}
-
 // TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad is a source guard over the
 // half of this mechanism Gate A cannot run.
 //
@@ -2990,19 +2999,19 @@ func TestStubInputChannelsIsZeroWhenNothingIsNegotiated(t *testing.T) {
 // card, a 2x8 matrix written live onto a sixteen-channel stream was accepted by
 // the property and killed the capture chain before the next level message.
 func TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
+	fset, file := parseSource(t, captureCgoSourceFile)
 
-	set := funcBody(t, fset, file, "cgoPipeline", "SetChannelMap")
-	if !strings.Contains(set, "p.negotiatedInputChannelsLocked()") {
+	set := funcBody(t, fset, file, "cgoCapture", "SetChannelMap")
+	if !strings.Contains(set, "c.negotiatedInputChannels()") {
 		t.Error("SetChannelMap no longer reads the width off the pad; the only widths it may use " +
 			"are the pad's own, because every other source of one can be stale")
 	}
-	if !strings.Contains(set, "p.writeChannelMapLocked(m, width)") {
+	if !strings.Contains(set, "c.writeChannelMapLocked(m, width)") {
 		t.Error("SetChannelMap no longer writes through writeChannelMapLocked, which is where " +
 			"validation happens before anything reaches the element")
 	}
 
-	write := funcBody(t, fset, file, "cgoPipeline", "writeChannelMapLocked")
+	write := funcBody(t, fset, file, "cgoCapture", "writeChannelMapLocked")
 	matrix := strings.Index(write, "m.MixMatrix(width)")
 	arg := strings.Index(write, "gogst.UtilSetObjectArg(")
 	if matrix < 0 || arg < 0 {
@@ -3019,20 +3028,20 @@ func TestCgoPipelineSizesTheMatrixFromTheNegotiatedPad(t *testing.T) {
 	// negotiation constraint, not a gain on a running stream. Measured —
 	// sixteen unpositioned channels into this chain with no matrix die 0.069 s
 	// after PLAYING with not-negotiated (-4).
-	lines := strings.Split(startSequence(t, fset, file), "\n")
+	lines := strings.Split(captureStartSequence(t), "\n")
 	apply := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.applyStartChannelMapLocked(")
+		return strings.Contains(s, "c.applyStartChannelMapLocked(")
 	})
 	playing := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "gogst.StatePlaying")
 	})
 	if apply < 0 || playing < 0 {
-		t.Fatal("Start no longer applies a channel map before going to PLAYING; re-derive this " +
-			"guard from the new shape")
+		t.Fatal("the capture build no longer applies a channel map before going to PLAYING; " +
+			"re-derive this guard from the new shape")
 	}
 	if apply > playing {
-		t.Error("Start writes the mix-matrix after the state change. A matrix is a negotiation " +
-			"constraint, not a gain: a pipeline that reaches PLAYING without one on an " +
-			"unpositioned device never reaches it at all")
+		t.Error("the capture build writes the mix-matrix after the state change. A matrix is a " +
+			"negotiation constraint, not a gain: a pipeline that reaches PLAYING without one on " +
+			"an unpositioned device never reaches it at all")
 	}
 }

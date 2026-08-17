@@ -593,8 +593,8 @@ bus error whose source is `mux`.**
    | `TestRearmQueueRestoresStickyEvents` | §4.10, the sticky events destroyed by the re-arm. |
    | `TestTeardownDoesNotDetachTheBusSyncHandler` | §4.12, the process-killing `SetSyncHandler(nil)`. |
    | `TestBusHandlerDoesNotLogOnTheStreamingThread` | `log.Printf` from a bus callback under a warning storm. |
-   | `TestPipelineDescriptionHasNoCapsfilterAboveTheResampler` | A rate capsfilter upstream of `audioresample`, failing Start on a 44.1 or 96 kHz DVS endpoint. |
-   | `TestPipelineDescriptionScalesTheSlate` | No `videoscale`, so next season's artwork must be exactly 1920x1080. |
+   | `TestCaptureDescriptionHasNoCapsfilterAboveTheResampler` | A rate capsfilter upstream of `audioresample`, failing Start on a 44.1 or 96 kHz DVS endpoint. (Renamed with `pipelineDescription`'s deletion; it reads `captureDescription` now.) |
+   | `TestPipelineDescriptionScalesTheSlate` | No `videoscale`, so next season's artwork must be exactly 1920x1080. (Reads `captureDescription`'s slate half.) |
    | `TestInitPointsEveryPluginPathAtTheBundle` | A plugin path variable that stops isolating the bundle. |
 
    Every one of them was verified to FAIL with the fix reverted, in a scratchpad copy of the
@@ -619,6 +619,14 @@ Gate A and cannot affect `CGO_ENABLED=0 go test ./...`.
 Note that the audio-branch assertions in it are stale in one respect: the description no longer
 contains a capsfilter directly after `wasapi2src` (§4.11 of the review, finding 7), so a test
 asserting `audio/x-raw,rate=48000` appears twice would now fail correctly.
+
+**AND THE WHOLE BLOCK BELOW IS NOW HISTORY, not a paste-ready file.** `pipelineDescription` was
+deleted on 2026-08-17 when the seam split it into `captureDescription` and `sendDescription`
+(`capturedesc_cgo.go`), and the golden-string version of everything it asserts lives in
+`capturedesc_cgo_test.go`, which renders all seven capture shapes and the one send string and
+compares them character for character against PLAN.md section 2. It is kept here because the
+`mustNotContain` list — no `srtsink`, no `start-time-selection`, no `location=`, no `device=`, no
+`passphrase` — is the reasoning behind four rules that are still live.
 
 ```go
 //go:build cgo
@@ -1430,3 +1438,130 @@ Already noted in §5: the residual race at the end of the file comment in `gst_c
 microseconds against a ~4.6 ms buffer period, it is loud rather than silent when it fires, and
 closing it would need a pipeline-shape change. If the soak produces a `gst: pipeline-fatal:` error
 naming `mux`, that is it, and it needs escalating rather than retrying.
+
+---
+
+## 10. The send pipeline over the capture seam — what was measured on 2026-08-17
+
+`startBuiltLocked` no longer builds capture. It parses `sendDescription`, claims and arms the
+proxysinks, binds `vproxsrc`/`aproxsrc` to them, and gates its own success on media having reached
+the muxer. Everything below the seam — `ReplaceSink`, `RemoveSink`, the three `srtq` pad probes,
+`rearmQueueLocked` and its sticky-event restore, the clock and base-time pinning — is untouched,
+because none of it ever saw a capture element.
+
+**The one exception is the bus classifier, corrected on 2026-08-17.** `classifyBusError` is the
+CAPTURE bus's; the send bus now has `classifySendBusError`, a two-way decision (sink-sourced, or
+fatal) with no cgo call in front of the gate at all. The old shared classifier's proxy prefixes are
+`vprox` and `aprox`, chosen for the capture tails `vproxq`/`vproxsink` and `aproxq`/`aproxsink` —
+and they also match THIS graph's `vproxsrc` and `aproxsrc`. An error under either name would have
+been classified as a capture fault on a bus with no capture in it: the video one spared with the
+gate left OPEN and no fatal latched, the audio one handed to `captureFatalError`, which goes looking
+for a DeckLink's `signal` property in a graph containing no card.
+
+It was latent rather than live, and that was checked rather than assumed: `strings -a
+/opt/homebrew/lib/gstreamer-1.0/libgstproxy.dylib` contains no `GST_ELEMENT_ERROR` format strings at
+all, so `proxysrc` posts no element errors under its own name, and errors from its internal children
+arrive named `queue0`/`internal_src` and fall to the fatal default. `captureLegsFor`'s parent-bin
+walk went with the correction — a `CapturePipeline` knows its leg-set before `gst_parse_launch`
+runs.
+
+### 10.1 The proof, and it is cheap to re-run
+
+`TestLiveShippedSendPipelineCarriesMediaOverTheSeam` (`proxyseam_live_test.go`). **No card, no
+network, no M2L-X and no sink**: a slate picture and the platform microphone, three send sessions
+built and destroyed over one always-live capture layer.
+
+```
+capture: slate slate.png + BuiltInMicrophoneDevice   (P-SLATE + C-NATIVE, two pipelines)
+  cycle 1  start 210ms       vq:src 84  aq:src 73  mux:src 251     buffers in 1.5 s
+  cycle 2  start  46ms       vq:src 77  aq:src 72  mux:src 234
+  cycle 3  start  34ms       vq:src 77  aq:src 71  mux:src 234
+  the capture layer outlived all three sessions
+```
+
+Cycle 1 is slower because it is the first `vtenc_h264` initialisation in the process; cycles 2 and 3
+are the steady state, and they are the cycles that read **zero** without the arming.
+
+### 10.2 The falsification run, which is the half that makes the numbers mean anything
+
+With `NewSend`'s call to `ArmForSend` skipped, the same binary **fails at cycle 2**, in 13.4 ms:
+
+```
+cycle 2: Start: gst: pipeline-fatal: gst: venc: GStreamer error: negotiation problem.
+  (gst_video_encoder_chain(): /GstPipeline:pipeline3/vtenc_h264:venc: encoder not initialized)
+```
+
+That is `awaitFirstMediaLocked`'s early exit on a latched fault doing exactly what its comment says:
+an unarmed VIDEO seam complains through the encoder two orders of magnitude faster than the 2 s
+liveness budget, and with a better sentence. The 2 s gate is still what catches an unarmed AUDIO
+seam, which produces no error at all.
+
+**A run with the arming skipped that PASSES means this test has stopped measuring anything.**
+
+### 10.3 The watchdog's probes are split by buffer type, and that is a log-volume measurement
+
+`gst_pad_probe_info_get_buffer` is `g_return_val_if_fail`'d on the info's own type bit, and go-gst
+v0.0.2 exposes no accessor for that bit. A single `BUFFER|BUFFER_LIST` probe that tried `GetBuffer`
+and fell back to `GetBufferList` therefore emitted
+
+```
+GStreamer-CRITICAL: gst_pad_probe_info_get_buffer:
+  assertion 'info->type & GST_PAD_PROBE_TYPE_BUFFER' failed
+```
+
+once per buffer list — about 150 lines a second on stderr from one slate-and-microphone session,
+which buries the log at the moment a field engineer needs it. Two probes per pad, each calling only
+the getter its own mask guarantees, costs six probes on three pads and emits none.
+
+### 10.4 The falsification is a SOURCE EDIT and not an environment variable
+
+`WSLCOMMS_LIVE_SKIP_PROXY_ARMING=1` is read by the two HAND-BUILT rigs
+(`proxyseam_live_test.go`'s `TestLiveProxySeamRearmsEverySendSession` and
+`proxyseamcard_live_test.go`), which do their own arming. **The shipped path does not read it and
+must not**: an environment variable that can silently disarm the seam on an operator's machine is
+precisely the permanent-false-green this whole mechanism exists against.
+
+Measured, because the doc comment on
+`TestLiveShippedSendPipelineCarriesMediaOverTheSeam` once claimed otherwise: with the variable set
+to 1, that test still PASSES and the log shows every cycle armed anyway
+(`capture P-SLATE: armed [vproxsink] in 57.083us`, cycles 1/2/3 at 175/35/45 ms with full buffer
+counts). To run the control, patch `NewSend` in `sendseam.go` to skip its `ArmForSend` loop, in a
+scratch copy of the tree. §10.2 is that run.
+
+### 10.5 The three invariants a later reader must not undo
+
+They are stated in `internal/gst/seam.go` and each one has a measurement behind it. None may be
+changed alone.
+
+1. **A `leaky=downstream` queue in front of every `proxysink`.** `proxysrc`'s internal queue is
+   `leaky=0 max-size-buffers=200` and exposes no tuning (only `async-handling`, `message-forward`,
+   `name`, `parent`, `proxysink`), so the leak has to live on the capture side. Measured on the real
+   card, identical graphs, 12 s send-side wedge: `leaky=downstream` held 50.1 fps / 36.2 preview fps
+   / 20.0 meter msg/s, `leaky=no` collapsed to 11.6 / 7.2 / 7.2 **and** made the card itself report
+   `Dropped 271 old frames`. Without the leak a stalled send pipeline destroys the preview and the
+   meters, which are the two things the always-live layer exists to deliver. Do not reach into
+   `queue0` by child name.
+2. **The arming is at START, never at STOP.** `gstproxysink.c` resets `sent_stream_start` /
+   `sent_caps` only on `READY→PAUSED`, and a proxysink in an always-live pipeline never makes that
+   transition again — so every consumer after the first gets no `STREAM_START`, no `CAPS`, no
+   `SEGMENT`. Measured twice independently: cycle 1 writes 1,133,076 bytes; cycles 2 and 3 write
+   ZERO, with SRT connected and the lamp green. START is the right moment because STOP has abnormal
+   paths through which the arming can be skipped (an aborted teardown, a Stop that failed after one
+   leg reached NULL) and START has none — it cannot proceed without it. It is also self-healing: it
+   runs as a no-op on the first START, after a STOP that failed halfway, and after an aborted send
+   build, and it can never race a reconnect because no send pipeline exists at that instant.
+3. **A device change is REFUSED while sending, and it is a safety property rather than a UX one.**
+   A new proxysink orphans the running send pipeline's proxysrc and the feed goes silently dead —
+   the same measurement as the single-consumer rule: consumer A stopped dead at 5.994 s the instant
+   B attached at 6.007 s, nothing on either bus, SRT still connected. `ClaimForSend`/`ErrSeamBusy`
+   and `CapturePipeline.Stop`'s refusal are the enforcement; `App.rebuildCapture` refusing while
+   `a.session != nil` is the operator-facing half. **A caller that discards `Stop`'s refusal has
+   discarded the enforcement** — that happened once, in `teardownCaptureLocked`, which cleared the
+   set anyway and dropped the last reference to a pipeline still holding the exclusive card.
+
+### 10.6 What is still unmeasured here
+
+Everything that needs the card or the switcher: the fused seat, three START/STOP cycles with a
+growing byte count on the wire, the mid-session reconnect's `GstEvent` seqnums across the proxy
+boundary, the 12 s send-side wedge, and the 90-minute idle hold before any START. Those are PLAN.md
+step 11's rows (b) to (e) and they need the rig.

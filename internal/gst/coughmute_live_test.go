@@ -67,9 +67,24 @@ func TestLiveCoughMuteOnAPlayingPipeline(t *testing.T) {
 	card := env("WSLCOMMS_LIVE_CARD", defaultLiveCard)
 
 	meter := &meterWatch{}
-	pipe, err := New()
+
+	// THE CAPTURE PIPELINE, AND NO SEND PIPELINE ANYWHERE IN THE PROCESS. That is
+	// the change the seam makes to this measurement and it strengthens it: the
+	// mute, the meter and the element they act on are live with nothing sending,
+	// which is the state the operator's cough button is now available in.
+	//
+	// The commentary off the card and the picture off the slate: the shape a
+	// commentary position actually runs in, and the one that exercises the clock
+	// companion as well.
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:           CaptureLegs{Commentary: CommentaryCard},
+		SlatePath:      slate,
+		AudioCaptureID: card,
+		ConformTo:      FallbackConformTarget(),
+		OnLevels:       func(l Levels) { meter.record(l) },
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewCapture: %v", err)
 	}
 	defer func() {
 		if err := pipe.Stop(); err != nil {
@@ -82,23 +97,19 @@ func TestLiveCoughMuteOnAPlayingPipeline(t *testing.T) {
 	var busErrs []error
 	go func() {
 		defer close(done)
-		for err := range pipe.Errors() {
+		for err := range pipe.Faults() {
 			busMu.Lock()
 			busErrs = append(busErrs, err)
 			busMu.Unlock()
-			t.Logf("bus error: %v", err)
+			t.Logf("capture fault: %v", err)
+		}
+	}()
+	go func() {
+		for range pipe.Warnings() {
 		}
 	}()
 
-	// The commentary off the card and the picture off the slate: the shape a
-	// commentary position actually runs in, and the one that exercises the clock
-	// companion as well.
-	if err := pipe.Start(PipelineOpts{
-		SlatePath:      slate,
-		AudioCaptureID: card,
-		ConformTo:      FallbackConformTarget(),
-		OnLevels:       func(l Levels) { meter.record(l) },
-	}); err != nil {
+	if err := pipe.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -232,11 +243,11 @@ func holdWindow(m *meterWatch, d time.Duration) muteWindow {
 // It reaches through the concrete type deliberately: the Pipeline interface does
 // not expose the GStreamer state and must not, but the claim being checked here
 // is a GStreamer one.
-func assertStillPlaying(t *testing.T, pipe Pipeline, when string) {
+func assertStillPlaying(t *testing.T, pipe CapturePipeline, when string) {
 	t.Helper()
-	p, ok := pipe.(*cgoPipeline)
+	p, ok := pipe.(*cgoCapture)
 	if !ok {
-		t.Fatalf("%s: not a cgoPipeline", when)
+		t.Fatalf("%s: not a cgoCapture", when)
 	}
 	p.mu.Lock()
 	pl := p.pipeline
@@ -287,25 +298,33 @@ func TestLiveCardReleaseAndReacquire(t *testing.T) {
 
 	for i := 1; i <= coughMuteCycles; i++ {
 		meter := &meterWatch{}
-		pipe, err := New()
-		if err != nil {
-			t.Fatalf("cycle %d: New: %v", i, err)
-		}
-		go func() {
-			for range pipe.Errors() {
-			}
-		}()
-
-		t0 := time.Now()
-		startErr := pipe.Start(PipelineOpts{
-			// BOTH legs on the card, which is the configuration a preview would
-			// hold: a picture to show and the commentary clocked off it.
+		// BOTH legs on the card — the FUSED shape — which is the configuration a
+		// preview would hold: a picture to show and the commentary clocked off it.
+		// It is one pipeline and not two by construction now, because the card is
+		// exclusive and decklinkaudiosrc cannot preroll without a decklinkvideosrc
+		// beside it; PlanCapture is where that rule lives.
+		pipe, err := NewCapture(CaptureOpts{
+			Legs:           CaptureLegs{Picture: PictureCard, Commentary: CommentaryCard},
 			SlatePath:      slate,
 			VideoCaptureID: card,
 			AudioCaptureID: card,
 			ConformTo:      FallbackConformTarget(),
 			OnLevels:       func(l Levels) { meter.record(l) },
 		})
+		if err != nil {
+			t.Fatalf("cycle %d: NewCapture: %v", i, err)
+		}
+		go func() {
+			for range pipe.Faults() {
+			}
+		}()
+		go func() {
+			for range pipe.Warnings() {
+			}
+		}()
+
+		t0 := time.Now()
+		startErr := pipe.Start()
 		startedIn := time.Since(t0)
 
 		c := cycle{n: i, start: startedIn, startEr: startErr}
@@ -363,24 +382,30 @@ func TestLiveCardReleaseAndReacquire(t *testing.T) {
 //
 // # And neither is needed
 //
-// Start ALREADY brings the whole capture chain to PLAYING WITH NO SINK
-// INSTALLED. That is not a side effect, it is the documented contract: "Start
-// builds the pipeline and takes it to PLAYING, but installs NO SINK ... capture
-// and encoding are live and correctly paced before the first connection
-// attempt." srtq's src pad is held by a blocking probe and nothing leaves the
-// process until ReplaceSink is called.
+// THE ARGUMENT THIS TEST WAS WRITTEN FROM HAS BEEN OVERTAKEN BY THE SEAM, and it
+// is answered here rather than deleted, because the conclusion survived and only
+// the mechanism changed.
 //
-// The confidence monitor hangs off the video capture tee, upstream of the
-// encoder and far upstream of srtq, so it is rendering in exactly that state.
-// The meters are posting in exactly that state. The cough mute is settable in
-// exactly that state. "See and hear before starting" is therefore not a
-// pipeline problem at all — it is the application calling gst.Start and NOT
-// calling ReplaceSink until the operator says go.
+// It used to be that Start brought the whole capture chain to PLAYING WITH NO
+// SINK INSTALLED, and that "see and hear before starting" was therefore the
+// application calling gst.Start and not calling ReplaceSink until the operator
+// said go. That was true, and it had one flaw the operator paid for: pressing
+// STOP took it all away again, and nothing could be seen or heard between
+// matches or before the first one.
 //
-// This test measures that state directly: Start, no ReplaceSink, and the
-// capture legs running. It asserts what internal/gst can assert; that
-// glimagesink draws into the surface it is handed is already true today, since
-// that is how the preview works while sending, and nothing about it changes.
+// Capture is now a pipeline of its own, built when the application opens and
+// released when it quits, ending in proxysinks. The preview, the meters, the
+// routing width, the signal lamp and the cough mute are properties of THAT
+// pipeline, so they exist from launch, survive STOP, and do not depend on a
+// session having been started and not connected. The card handover this test
+// exists to refute is not merely unnecessary now, it is unbuildable: there is
+// only ever one pipeline holding the card and it never lets go.
+//
+// This test measures that state directly: a capture pipeline, NO SEND PIPELINE
+// ANYWHERE IN THE PROCESS, and the legs running. It asserts what internal/gst can
+// assert; that glimagesink draws into the surface it is handed is already true
+// today, since that is how the preview works while sending, and nothing about it
+// changes.
 func TestLivePreviewBeforeStartNeedsNoNewPipeline(t *testing.T) {
 	liveDeckLinkInit(t)
 
@@ -391,9 +416,20 @@ func TestLivePreviewBeforeStartNeedsNoNewPipeline(t *testing.T) {
 	card := env("WSLCOMMS_LIVE_CARD", defaultLiveCard)
 
 	meter := &meterWatch{}
-	pipe, err := New()
+
+	// BOTH legs on the card: the configuration an operator wanting a preview is
+	// in, and the one where the preview branch exists at all (the slate leg has
+	// no tee, so previewBranchFor refuses it).
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:           CaptureLegs{Picture: PictureCard, Commentary: CommentaryCard},
+		SlatePath:      slate,
+		VideoCaptureID: card,
+		AudioCaptureID: card,
+		ConformTo:      FallbackConformTarget(),
+		OnLevels:       func(l Levels) { meter.record(l) },
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewCapture: %v", err)
 	}
 	defer func() {
 		if err := pipe.Stop(); err != nil {
@@ -401,25 +437,21 @@ func TestLivePreviewBeforeStartNeedsNoNewPipeline(t *testing.T) {
 		}
 	}()
 	go func() {
-		for range pipe.Errors() {
+		for range pipe.Faults() {
+		}
+	}()
+	go func() {
+		for range pipe.Warnings() {
 		}
 	}()
 
-	// BOTH legs on the card: the configuration an operator wanting a preview is
-	// in, and the one where the preview branch exists at all (the slate leg has
-	// no tee, so previewBranchFor refuses it).
-	if err := pipe.Start(PipelineOpts{
-		SlatePath:      slate,
-		VideoCaptureID: card,
-		AudioCaptureID: card,
-		ConformTo:      FallbackConformTarget(),
-		OnLevels:       func(l Levels) { meter.record(l) },
-	}); err != nil {
+	if err := pipe.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// NOTHING IS CALLED HERE. No ReplaceSink, no sink of any kind: this is the
-	// pre-live state exactly as the application would leave it.
+	// NOTHING ELSE EXISTS HERE. No send pipeline, no encoder, no muxer, no sink:
+	// this is the pre-live state exactly as the application leaves it from launch
+	// to the moment the operator presses START.
 	time.Sleep(2500 * time.Millisecond)
 
 	_, _, frames := meter.report()

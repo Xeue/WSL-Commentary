@@ -1557,6 +1557,63 @@ export function createSettingsView(handlers) {
         : previewSupported
           ? ''
           : 'This build cannot draw the preview — it has no preview bindings.';
+
+    // AND THE MICROPHONE PICKER, for exactly the same reason and with a stronger
+    // one behind it.
+    //
+    // App.refuseRemoteCaptureChange guards audioSourceKind, audioDeviceId and
+    // decklinkPersistentId as well as the two video-leg fields — without it a
+    // remote whole-document SaveConfig could take the desk's microphone away, and
+    // on a card seat close and reopen the exclusive DeckLink, from another
+    // building. The ONE control that writes all three is this dropdown, and it
+    // used to be left enabled: a remote producer who touched it, or who merely
+    // had Settings open when the desk changed device, had EVERY subsequent save
+    // refused — a port, a status key, anything — naming a field they were never
+    // told they may not change.
+    //
+    // Not gated on sendingNow. SelectCommentaryInput refuses while a feed is
+    // running with a sentence of its own that names the reason (a new proxysink
+    // orphans the running proxysrc and the feed goes silently dead), and that
+    // refusal reaches the operator through applyAudioInputSelection's catch. The
+    // video source is different: it is disabled while sending because there is no
+    // live setter for it at all.
+    audioInputSelect.disabled = remote;
+    audioInputSelect.title = remote
+      ? 'Chosen at the commentary position itself, never from a remote seat: it decides which ' +
+        'microphone the switcher hears.'
+      : '';
+  }
+
+  /**
+   * adoptAudioLeg refreshes the microphone picker from a configuration ANOTHER
+   * seat saved, and touches nothing else on the form.
+   *
+   * It is adoptVideoLeg's twin and exists for the identical reason: this form is
+   * a page cache refreshed only by open(), App.SaveConfig refuses a remote save
+   * whose audioSourceKind, audioDeviceId or decklinkPersistentId differ from the
+   * live ones, and a remote seat that had Settings open when the desk changed
+   * microphone would otherwise carry the OLD values in a disabled control — after
+   * which its next save of anything at all is refused, naming a field that seat
+   * cannot see a way to correct.
+   *
+   * The three hidden fields are written first and the picker is rebuilt from
+   * them, because the picker's value is DERIVED from the three: renderAudioInput
+   * is the one function that knows the encoding, and writing the <select> here
+   * would be a second copy of it.
+   */
+  function adoptAudioLeg(config) {
+    if (!config) return;
+    fields.audioSourceKind.input.value = config.audioSourceKind ?? '';
+    fields.audioDeviceId.input.value = config.audioDeviceId ?? '';
+    fields.decklinkPersistentId.input.value = config.decklinkPersistentId ?? '';
+    // lastLoadedConfig is the preset diff's BASELINE and is deliberately left
+    // alone, for adoptVideoLeg's reason: it is what was POPULATED.
+    renderAudioInput();
+    // The routing panel is gated on the SELECTED device's key matching the one
+    // the negotiated width was stamped with, so a device that moved under this
+    // seat has to re-run the gate or the grid goes on offering crosspoints over
+    // a pad that is not there.
+    renderChannelMapGroup();
   }
 
   /**
@@ -1576,9 +1633,14 @@ export function createSettingsView(handlers) {
    *
    * It is deliberately NOT populate(). Re-drawing the whole form under somebody
    * mid-edit is the thing app.js's onConfig handler exists to avoid, and these
-   * two controls are the only ones on the screen that can refuse a save they are
-   * not part of. Both are disabled on a remote seat, so there is no operator
-   * edit here to stomp on.
+   * two controls are disabled on a remote seat, so there is no operator edit here
+   * to stomp on.
+   *
+   * THEY ARE NO LONGER THE ONLY CONTROLS THAT CAN REFUSE A SAVE THEY ARE NOT PART
+   * OF, and that sentence used to stand here. refuseRemoteCaptureChange now
+   * guards audioSourceKind, audioDeviceId and decklinkPersistentId as well; the
+   * microphone picker is the one control that writes all three, and adoptAudioLeg
+   * above is its half of this. Anything else that joins that guard needs a third.
    *
    * On the LOCAL seat it is a no-op in practice: the only saves that reach it are
    * other seats', and no other seat can change either field.
@@ -3157,5 +3219,5 @@ export function createSettingsView(handlers) {
     await refreshRemote();
   }
 
-  return { el, open, setSending, adoptVideoLeg };
+  return { el, open, setSending, adoptVideoLeg, adoptAudioLeg };
 }

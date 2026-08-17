@@ -261,11 +261,15 @@ type StubCapture struct {
 
 	// fatal is the latched death, guarded by errMu and not by mu, because Health
 	// is asked by the send side at START while mu may be held for a rebuild.
-	errMu      sync.RWMutex
-	fatal      error
-	errs       chan error
-	warns      chan string
-	errsClosed bool
+	// pictureFatal is the PICTURE leg's, latched separately for the reason the
+	// real twin gives: the two have different repairs, and only one of them leaves
+	// the commentary running.
+	errMu        sync.RWMutex
+	fatal        error
+	pictureFatal error
+	errs         chan error
+	warns        chan string
+	errsClosed   bool
 }
 
 var _ CapturePipeline = (*StubCapture)(nil)
@@ -344,6 +348,38 @@ func NewStubCapture(opts CaptureOpts) (*StubCapture, error) {
 }
 
 func (c *StubCapture) Legs() CaptureLegs { return c.legs }
+
+// DeviceKey is the "<kind>:<id>" stamp this pipeline's commentary belongs to, and
+// StartedWith is the whole option set it was built from.
+//
+// They are the stub's equivalent of asking the real pipeline what it opened,
+// which the real one cannot answer: the id went into a g_object_set and there is
+// nothing to read back that would distinguish "this device" from "the device
+// GStreamer fell back to". They exist so that a caller's test can assert the
+// SEAT — that the pipeline holding the microphone is the one the configuration
+// named — which is the assertion that used to be made against the send
+// pipeline's options and has nowhere else to go now.
+//
+// Stub build only.
+func (c *StubCapture) DeviceKey() string { return c.deviceKey }
+
+// StartedWith returns the options this pipeline was built from, after default
+// substitution and conform resolution.
+//
+// Stub build only.
+func (c *StubCapture) StartedWith() CaptureOpts {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.opts
+}
+
+// SlatePath is StartedWith().SlatePath, named separately because it is the one
+// field a caller checks for a property of its own — that it resolved to an
+// absolute path beside the executable rather than to the working directory,
+// which differs between a developer run and an installed one.
+//
+// Stub build only.
+func (c *StubCapture) SlatePath() string { return c.StartedWith().SlatePath }
 
 // Start models the build, in the real twin's order: the device is opened, the
 // width is established, the matrix is written against it, the mute is applied,
@@ -605,11 +641,11 @@ func (c *StubCapture) ArmForSend() error {
 	if !c.started {
 		return errors.New("gst: capture pipeline has not been started, so its seam cannot be armed")
 	}
-	// A LATCHED FAULT REFUSES THE ARMING, as it does on the real twin. On a dead
-	// device the arming reports success — the IDLE probe fires immediately because
-	// the pad is idle BECAUSE it is dead — and the session that follows is a green
-	// lamp over silence.
-	if err := c.Health(); err != nil {
+	// A LATCHED FAULT IN EITHER LEG REFUSES THE ARMING, as it does on the real
+	// twin. On a dead device the arming reports success — the IDLE probe fires
+	// immediately because the pad is idle BECAUSE it is dead — and the session that
+	// follows is a green lamp over silence.
+	if err := c.anyFatal(); err != nil {
 		return fmt.Errorf("gst: this capture pipeline has already failed, so arming its seam would "+
 			"report success over a device that is producing nothing: %w", err)
 	}
@@ -738,12 +774,32 @@ func (c *StubCapture) CommentaryMuted() bool { return c.muted.Load() }
 // Faults
 // ---------------------------------------------------------------------------
 
-// Health mirrors the real twin's: nil until something has latched. It is what a
-// send pipeline's START asks before it builds.
+// Health mirrors the real twin's: nil until the COMMENTARY leg or the pipeline
+// has latched a death. It is what a send pipeline's START asks before it builds.
 func (c *StubCapture) Health() error {
 	c.errMu.RLock()
 	defer c.errMu.RUnlock()
 	return c.fatal
+}
+
+// PictureHealth mirrors the real twin's: nil until the PICTURE leg has latched a
+// death. See the interface for why it is a second question rather than a
+// refinement of the first.
+func (c *StubCapture) PictureHealth() error {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+	return c.pictureFatal
+}
+
+// anyFatal is what the seam asks: either leg's latched death stops a send,
+// because mpegtsmux emits nothing while one of its two inputs is silent.
+func (c *StubCapture) anyFatal() error {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+	if c.fatal != nil {
+		return c.fatal
+	}
+	return c.pictureFatal
 }
 
 func (c *StubCapture) Faults() <-chan error { return c.errs }
@@ -775,9 +831,7 @@ func (c *StubCapture) InjectBusError(source string, err error) {
 		c.deliverWarning("gst: the confidence monitor failed and the commentary and the picture " +
 			"are unaffected: " + err.Error())
 	case classVideoCapture:
-		c.deliverWarning("gst: the picture capture failed; the commentary capture is a separate " +
-			"pipeline and is still running, but if a send session is up the muxer stops entirely " +
-			"until this is rebuilt: " + err.Error())
+		c.FailPicture(err)
 	default:
 		c.Fail(err)
 	}
@@ -808,6 +862,40 @@ func (c *StubCapture) Fail(err error) {
 	}
 	if c.fatal == nil {
 		c.fatal = err
+	}
+	select {
+	case c.errs <- err:
+	default:
+	}
+	c.errMu.Unlock()
+}
+
+// FailPicture latches a PICTURE-LEG fault and delivers it on Faults(), exactly as
+// the real twin's bus handler does for classVideoCapture.
+//
+// It goes on Faults() and not on Warnings() for the reason the real twin's does:
+// a warning is drained and discarded, so a picture death used to change nothing
+// on screen, leave Health() answering nil and let START reach PLAYING over a dead
+// card. The commentary leg is untouched and CommentaryMuted, SetChannelMap and
+// the meters all go on working — this is not a death of the pipeline.
+//
+// Stub build only.
+func (c *StubCapture) FailPicture(err error) {
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, ErrPipelineFatal) {
+		err = fmt.Errorf("%w: %w (the picture capture has failed. The commentary capture is "+
+			"unaffected and is still running, but while a send session is up the muxer stops "+
+			"entirely until the picture is rebuilt)", ErrPipelineFatal, err)
+	}
+	c.errMu.Lock()
+	if c.errsClosed {
+		c.errMu.Unlock()
+		return
+	}
+	if c.pictureFatal == nil {
+		c.pictureFatal = err
 	}
 	select {
 	case c.errs <- err:

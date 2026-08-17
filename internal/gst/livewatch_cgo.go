@@ -12,10 +12,30 @@ import (
 	gogst "github.com/go-gst/go-gst/pkg/gst"
 )
 
-// liveWatchProbeMask is BOTH buffer types, and the second half is mandatory:
+// The watchdog watches BOTH buffer types, and the second is mandatory:
 // mpegtsmux at alignment=7 pushes buffer LISTS, and a BUFFER-only probe reads
 // zero while megabytes flow. Two independent probes lost a run each to this.
-const liveWatchProbeMask = gogst.PadProbeTypeBuffer | gogst.PadProbeTypeBufferList
+//
+// THEY ARE TWO PROBES AND NOT ONE PROBE WITH A COMBINED MASK, which is a
+// measurement rather than a preference. gst_pad_probe_info_get_buffer is
+// g_return_val_if_fail'd on the info's own type bit, and go-gst v0.0.2 exposes no
+// accessor for that bit — so a single callback that tried GetBuffer and fell
+// back to GetBufferList emitted
+//
+//	GStreamer-CRITICAL: gst_pad_probe_info_get_buffer:
+//	assertion 'info->type & GST_PAD_PROBE_TYPE_BUFFER' failed
+//
+// once per buffer list. Measured on this machine on 2026-08-17: about 150 lines a
+// second on stderr from one send session with a slate and a microphone, which
+// buries the log a field engineer reads at exactly the moment they need it.
+//
+// Split, each callback calls only the getter its own mask guarantees, so the
+// assertion cannot fire and neither callback has a branch in it. The cost is six
+// probes on three pads instead of three.
+const (
+	liveWatchBufferMask = gogst.PadProbeTypeBuffer
+	liveWatchListMask   = gogst.PadProbeTypeBufferList
+)
 
 // livePad is one watched pad's counter.
 //
@@ -32,26 +52,33 @@ type livePad struct {
 	last    time.Time
 }
 
-func (p *livePad) probe(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
-	var n int64
-	if buf := info.GetBuffer(); buf != nil {
-		n = 1
-	} else if list := info.GetBufferList(); list != nil {
-		// Counted by LENGTH. A list of seven counted as one understates the rate
-		// sevenfold, which matters here only for the log line — but the log line
-		// is what a field engineer compares against the measured healthy numbers
-		// in livewatch.go, and a figure that is wrong by 7x is worse than none.
-		n = int64(list.Length())
-	}
-	if n == 0 {
+func (p *livePad) bufferProbe(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	if info.GetBuffer() == nil {
 		return gogst.PadProbeOK
 	}
+	p.count(1)
+	return gogst.PadProbeOK
+}
+
+func (p *livePad) listProbe(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	list := info.GetBufferList()
+	if list == nil {
+		return gogst.PadProbeOK
+	}
+	// Counted by LENGTH. A list of seven counted as one understates the rate
+	// sevenfold, which matters here only for the log line — but the log line is
+	// what a field engineer compares against the measured healthy numbers in
+	// livewatch.go, and a figure that is wrong by 7x is worse than none.
+	p.count(int64(list.Length()))
+	return gogst.PadProbeOK
+}
+
+func (p *livePad) count(n int64) {
 	now := time.Now()
 	p.mu.Lock()
 	p.buffers += n
 	p.last = now
 	p.mu.Unlock()
-	return gogst.PadProbeOK
 }
 
 func (p *livePad) sample() liveWatchSample {
@@ -122,13 +149,21 @@ func attachLiveWatch(pipeline gogst.Pipeline) (*liveWatch, error) {
 			return nil, errNoPad(name, "src", "the muxer watchdog has no pad to watch")
 		}
 		p := &livePad{name: name}
-		id := pad.AddProbe(liveWatchProbeMask, p.probe)
-		if id == 0 {
-			w.detach()
-			return nil, errProbeFailed(name, "src", "the muxer watchdog")
-		}
 		w.pads = append(w.pads, p)
-		w.probes = append(w.probes, liveWatchProbe{pad: pad, id: id})
+		for _, probe := range []struct {
+			mask gogst.PadProbeType
+			fn   func(gogst.Pad, *gogst.PadProbeInfo) gogst.PadProbeReturn
+		}{
+			{liveWatchBufferMask, p.bufferProbe},
+			{liveWatchListMask, p.listProbe},
+		} {
+			id := pad.AddProbe(probe.mask, probe.fn)
+			if id == 0 {
+				w.detach()
+				return nil, errProbeFailed(name, "src", "the muxer watchdog")
+			}
+			w.probes = append(w.probes, liveWatchProbe{pad: pad, id: id})
+		}
 	}
 	return w, nil
 }

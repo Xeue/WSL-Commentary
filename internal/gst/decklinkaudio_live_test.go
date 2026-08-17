@@ -214,35 +214,12 @@ func runDeckLinkCapture(t *testing.T, videoCard string) (quiet, signal capturePh
 
 	chMeter, progMeter := &meterWatch{}, &meterWatch{}
 
-	pipe, err := New()
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	legs := CaptureLegs{Commentary: CommentaryCard}
+	if videoCard != "" {
+		legs.Picture = PictureCard
 	}
-	// THE CARD IS EXCLUSIVE and this defer is what makes the next run possible.
-	defer func() {
-		if err := pipe.Stop(); err != nil {
-			t.Errorf("Stop: %v — the card may still be held", err)
-		}
-	}()
-
-	// Drain Errors() for the life of the run. Nothing is asserted from it here —
-	// a bus error during capture fails the run through the meters being silent —
-	// but a full channel would block the delivering goroutine.
-	done := make(chan struct{})
-	var busErrs []error
-	var busMu sync.Mutex
-	go func() {
-		defer close(done)
-		for err := range pipe.Errors() {
-			busMu.Lock()
-			busErrs = append(busErrs, err)
-			busMu.Unlock()
-			t.Logf("bus error: %v", err)
-		}
-	}()
-
-	start := time.Now()
-	err = pipe.Start(PipelineOpts{
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:           legs,
 		SlatePath:      slate,
 		AudioCaptureID: card,
 		VideoCaptureID: videoCard,
@@ -254,6 +231,38 @@ func runDeckLinkCapture(t *testing.T, videoCard string) (quiet, signal capturePh
 			progMeter.record(l)
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	// THE CARD IS EXCLUSIVE and this defer is what makes the next run possible.
+	defer func() {
+		if err := pipe.Stop(); err != nil {
+			t.Errorf("Stop: %v — the card may still be held", err)
+		}
+	}()
+
+	// Drain Faults() and Warnings() for the life of the run. Nothing is asserted
+	// from either here — a fault during capture fails the run through the meters
+	// being silent — but a full channel would block the delivering goroutine.
+	done := make(chan struct{})
+	var busErrs []error
+	var busMu sync.Mutex
+	go func() {
+		defer close(done)
+		for err := range pipe.Faults() {
+			busMu.Lock()
+			busErrs = append(busErrs, err)
+			busMu.Unlock()
+			t.Logf("capture fault: %v", err)
+		}
+	}()
+	go func() {
+		for range pipe.Warnings() {
+		}
+	}()
+
+	start := time.Now()
+	err = pipe.Start()
 	if err != nil {
 		// THE REFUSAL IS PART OF THE PROOF. A busy card, a card that has gone,
 		// and a card with no signal are one generic stream error at the
@@ -460,12 +469,22 @@ func TestLiveNativeCommentaryIsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInputDevices: %v", err)
 	}
+	// A CONTINUITY DEVICE IS NEVER OPENED. The phone is in a different room from
+	// the laptop and the commentary mic, and opening it plays the Continuity
+	// connection chime out of the phone — which happened on 2026-08-16. The
+	// enumeration order is the provider's, so "the first native device" was never
+	// a safe way to choose one. See continuityDeviceNames.
 	var mic Device
 	for _, d := range devices {
-		if NormaliseDeviceKind(d.Kind) == KindNative {
-			mic = d
-			break
+		if NormaliseDeviceKind(d.Kind) != KindNative {
+			continue
 		}
+		if isContinuityDevice(d.Name) {
+			t.Logf("NOT OPENING %q: it is a Continuity device and it is in a different room", d.Name)
+			continue
+		}
+		mic = d
+		break
 	}
 	if mic.ID == "" {
 		t.Skip("this machine offers no native capture endpoint")
@@ -477,9 +496,18 @@ func TestLiveNativeCommentaryIsUnchanged(t *testing.T) {
 		t.Fatalf("resolving the slate: %v", err)
 	}
 
-	pipe, err := New()
+	prog := &meterWatch{}
+	perChannel := &meterWatch{}
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:            CaptureLegs{Commentary: CommentaryNative},
+		SlatePath:       slate,
+		AudioDeviceID:   mic.ID,
+		ConformTo:       FallbackConformTarget(),
+		OnLevels:        func(l Levels) { prog.record(l) },
+		OnChannelLevels: func(l Levels) { perChannel.record(l) },
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewCapture: %v", err)
 	}
 	defer func() {
 		if err := pipe.Stop(); err != nil {
@@ -487,19 +515,15 @@ func TestLiveNativeCommentaryIsUnchanged(t *testing.T) {
 		}
 	}()
 	go func() {
-		for range pipe.Errors() {
+		for range pipe.Faults() {
+		}
+	}()
+	go func() {
+		for range pipe.Warnings() {
 		}
 	}()
 
-	prog := &meterWatch{}
-	perChannel := &meterWatch{}
-	if err := pipe.Start(PipelineOpts{
-		SlatePath:       slate,
-		AudioDeviceID:   mic.ID,
-		ConformTo:       FallbackConformTarget(),
-		OnLevels:        func(l Levels) { prog.record(l) },
-		OnChannelLevels: func(l Levels) { perChannel.record(l) },
-	}); err != nil {
+	if err := pipe.Start(); err != nil {
 		t.Fatalf("Start: %v — the seat that ships today no longer starts", err)
 	}
 	time.Sleep(3 * time.Second)
@@ -514,13 +538,22 @@ func TestLiveNativeCommentaryIsUnchanged(t *testing.T) {
 	}
 	t.Logf("alevel : %d channels, %d frames", len(peak), frames)
 
-	// AND THE PER-CHANNEL METER MUST STAY SILENT. chlevel is built with
-	// post-messages=false and armed only when a matrix was written, which
-	// happens only for an unpositioned source. A native seat posting sixteen-wide
-	// frames would be ten frames a second over the webview bridge for a whole
+	// AND THE PER-CHANNEL METER MUST STAY SILENT ON A STEREO SEAT. The condition
+	// changed with R2 and the cost argument did not: chlevel is built with
+	// post-messages=false and is now armed on the negotiated WIDTH — more channels
+	// than the programme meter's two — rather than on whether a matrix was
+	// written, because every seat carries a matrix now. A stereo or mono microphone
+	// posting frames would be ten a second over the webview bridge for a whole
 	// match, reporting the same two numbers the programme meter already reports.
+	//
+	// A WIDE native device (a Focusrite, an RME, a 16-in aggregate) SHOULD post
+	// here, and that is R2's whole point; this seat is the built-in microphone.
+	if width := pipe.InputChannels(); width > ChannelMapOutputs {
+		t.Skipf("this machine's default input negotiated %d channels, so the picker is armed by "+
+			"design; run this against a stereo or mono endpoint", width)
+	}
 	if _, _, frames := perChannel.report(); frames != 0 {
-		t.Errorf("the per-channel meter posted %d frames on a POSITIONED native source; it must "+
+		t.Errorf("the per-channel meter posted %d frames on a stereo native source; it must "+
 			"be silent there", frames)
 	}
 }
@@ -555,8 +588,8 @@ func TestLiveNativeCommentaryIsUnchanged(t *testing.T) {
 // The GENERATOR is hand-built, and only the generator: audiotestsrc into
 // decklinkaudiosink, with a videotestsrc into decklinkvideosink beside it
 // because a DeckLink output needs a video clock exactly as its input does. The
-// thing under test is still the shipped pipelineDescription, started through this
-// package's own Pipeline, exactly as in every other test in this file.
+// thing under test is still the shipped captureDescription, started through this
+// package's own CapturePipeline, exactly as in every other test in this file.
 //
 // `connection` IS NOT SET on the sinks either. The output routing is Desktop
 // Video Setup's to decide, on the output side just as on the input side.
@@ -573,9 +606,16 @@ func TestLiveDeckLinkCommentaryFromTheCardsOwnLoopback(t *testing.T) {
 	// so this is also the clock-companion shape — the one that could not exist
 	// before this work package.
 	chMeter, progMeter := &meterWatch{}, &meterWatch{}
-	pipe, err := New()
+	pipe, err := NewCapture(CaptureOpts{
+		Legs:            CaptureLegs{Commentary: CommentaryCard},
+		SlatePath:       slate,
+		AudioCaptureID:  card,
+		ConformTo:       FallbackConformTarget(),
+		OnChannelLevels: func(l Levels) { chMeter.record(l) },
+		OnLevels:        func(l Levels) { progMeter.record(l) },
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewCapture: %v", err)
 	}
 	defer func() {
 		if err := pipe.Stop(); err != nil {
@@ -583,17 +623,15 @@ func TestLiveDeckLinkCommentaryFromTheCardsOwnLoopback(t *testing.T) {
 		}
 	}()
 	go func() {
-		for range pipe.Errors() {
+		for range pipe.Faults() {
+		}
+	}()
+	go func() {
+		for range pipe.Warnings() {
 		}
 	}()
 
-	if err := pipe.Start(PipelineOpts{
-		SlatePath:       slate,
-		AudioCaptureID:  card,
-		ConformTo:       FallbackConformTarget(),
-		OnChannelLevels: func(l Levels) { chMeter.record(l) },
-		OnLevels:        func(l Levels) { progMeter.record(l) },
-	}); err != nil {
+	if err := pipe.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	time.Sleep(2 * time.Second)

@@ -121,51 +121,25 @@ func gatherCaptureEvidence(obj gogst.Object, message string) captureEvidence {
 	return ev
 }
 
-// captureLegsFor reports how this pipeline's capture legs are wired.
+// captureLegsFor IS DELETED, and the argument it carried is answered here
+// because the next reader will look for it.
 //
-// It reads the PIPELINE rather than remembered options, and that is the point:
-// the coupling it is asking about is a property of the ELEMENT — a
+// It walked up from the message source to the parent bin and ran
+// gst_bin_get_by_name over the whole graph to ask whether the commentary capture
+// was a DeckLink — because the old single pipeline could not say at build time
+// which of the four shapes it was, and the coupling being asked about (a
 // decklinkaudiosrc cannot preroll without a decklinkvideosrc in the same
-// pipeline, because the card drives audio capture off the video clock — so the
-// honest test is "is the commentary capture a DeckLink", not "did the
-// configuration say DeckLink". A remembered flag would need a field on
-// cgoPipeline, would need to be kept in step with what Start actually built,
-// and would be wrong for exactly one release the day those two disagreed.
+// pipeline) is a property of the ELEMENT rather than of a remembered option.
 //
-// obj is the message source, from which the enclosing pipeline is reached the
-// same way siblingElement does: gst_object_get_parent, refcounted and safe from
-// a streaming thread, rather than cgoPipeline.pipeline, which is written under
-// a lock this thread may not take.
+// A CapturePipeline knows its leg-set before gst_parse_launch is called, so the
+// answer is now a field read — CaptureLegs.AudioClockedByVideo, checked against
+// the shape that was actually planned — and there is nothing to establish from
+// the graph. The send bus, which was the other caller, no longer classifies
+// capture faults at all: see classifySendBusError. The bin traversal that had to
+// be kept off the on-air path is therefore not merely moved, it is gone.
 //
-// The zero captureLegs — everything false — is both the answer when nothing can
-// be established AND the correct answer for the pipeline this application
-// builds today, whose commentary comes from wasapi2src or osxaudiosrc and whose
-// video leg is a PNG.
-func captureLegsFor(obj gogst.Object) captureLegs {
-	src, ok := obj.(gogst.Element)
-	if !ok || src == nil {
-		return captureLegs{}
-	}
-	asrc := src
-	if elementName(asrc) != captureAudioSrcName {
-		asrc = siblingElement(src, captureAudioSrcName)
-	}
-	if asrc == nil {
-		return captureLegs{}
-	}
-	return captureLegs{
-		AudioClockedByVideo: strings.HasPrefix(elementFactoryName(asrc), deckLinkFactoryPrefix),
-	}
-}
-
-// elementName is GetName with a nil guard, so the two lookups above read as one
-// expression each.
-func elementName(e gogst.Element) string {
-	if e == nil {
-		return ""
-	}
-	return e.GetName()
-}
+// elementName went with it: siblingElement is the only remaining walker and it
+// takes its names as arguments.
 
 // captureFatalError turns a capture-element bus error into the named,
 // pipeline-fatal error the operator actually reads.

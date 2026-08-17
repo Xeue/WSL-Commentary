@@ -130,6 +130,7 @@ func remoteEventNames() []string {
 		EventRemote,
 		EventMute,
 		EventPreview,
+		EventCapture,
 	}
 }
 
@@ -217,7 +218,14 @@ var remoteAllowlist = map[string]methodPolicy{
 	// routing in force, and a remote seat that could not ask would draw the
 	// routing grid with no channels in it — telling an operator who is looking
 	// for a commentator they cannot hear that there is nothing there to route.
-	"GetChannelMap":             {},
+	"GetChannelMap": {},
+	// GetCaptureState is a read and is reachable, for the reason GetChannelMap is
+	// and with one of its own: it is how a seat learns that the card or the
+	// microphone did not open. A remote producer who could see a dead meter and
+	// not the sentence explaining it would report a fault this application had
+	// already diagnosed. It reaches no hardware — it returns this side's own
+	// record of four strings — and it starts nothing.
+	"GetCaptureState":           {},
 	"IsSRTReturnSelected":       {},
 	"ListInputDevices":          {},
 	"ListOutputDevices":         {},
@@ -245,6 +253,25 @@ var remoteAllowlist = map[string]methodPolicy{
 	// not to fix it. It cannot damage anything a remote seat could not already
 	// damage with Stop, and internal/gst refuses any map that does not fit the
 	// negotiated width before a byte reaches the element.
+	//
+	// # RE-ARGUED FOR ALWAYS-LIVE CAPTURE, because one of its premises has gone
+	//
+	// The paragraph above leans on "it cannot damage anything a remote seat could
+	// not already damage with Stop". That was an equivalence between two things
+	// that were true at the same time: the routing only existed while a feed was
+	// running, so any seat that could route could also stop. The capture pad now
+	// negotiates at launch, so this method is reachable for the hour BEFORE
+	// anybody presses START — a period in which Stop is not a lever at all,
+	// because there is nothing to stop.
+	//
+	// The row stands, and the reason it stands is the one that did the work
+	// anyway. A remote producer setting up a position — watching the per-channel
+	// meters, finding which of sixteen inputs the commentator is on, and routing
+	// them to air — is the seat this method exists for, and line-up is when that
+	// work is done. What a misuse costs is also SMALLER off air, not larger:
+	// nothing is being transmitted, the change is audible on the desk's own
+	// meters immediately, and the "channelMap" event goes to every seat on every
+	// change so the desk sees the grid move under it.
 	"SetChannelMap": {mutating: true},
 
 	// SetCommentaryMute is REACHABLE, and this is the row to argue with if you
@@ -285,6 +312,26 @@ var remoteAllowlist = map[string]methodPolicy{
 	// The release half is not left to goodwill either: a remote seat that
 	// disconnects while holding the mute has it cleared from the connected-clients
 	// poll below, because nothing else ever would.
+	//
+	// # RE-ARGUED FOR ALWAYS-LIVE CAPTURE, and for the operator's A2 ruling
+	//
+	// Two premises above have changed and the row is worth re-reading against
+	// both. FIRST, the mute is now settable with nothing on air — the volume
+	// element exists from launch — so "a seat trusted to end the match" is no
+	// longer an available comparison for the pre-air hour. SECOND, and this is
+	// the one that would have frightened the author of the paragraph above, a
+	// mute latched before START is CARRIED INTO the session (PLAN.md 0-BIS A2)
+	// rather than cleared by it: a remote seat can now mute a position that is
+	// not yet on air, and it will still be muted when it goes on air.
+	//
+	// The row stands, on the THIRD condition it always rested on rather than on
+	// the first two. THE DESK ALWAYS KNOWS, and it knows in more ways than
+	// before: mutePayload still carries who muted and from where, the "mute"
+	// event still goes to every seat on every change — and the mute now sits
+	// upstream of a programme meter that is LIVE BEFORE START, so a mute set by
+	// anybody, at any time, is a flat meter on the desk's own screen. That is
+	// strictly more visibility than the build this row was written for had, in
+	// exactly the period the new risk lives in.
 	"SetCommentaryMute": {mutating: true},
 
 	// ---- the arm-gated write path and its baseline (audit-logged) ----
@@ -319,10 +366,30 @@ var remoteAllowlist = map[string]methodPolicy{
 	// NEITHER IS SELF-ENFORCING, and the reason is worth reading before touching
 	// this block: SaveConfig is remotely reachable and is a WHOLE-DOCUMENT write,
 	// so a remote seat could otherwise change either field through a method it is
-	// entitled to call. App.refuseRemoteVideoLegChange is what closes that, and
+	// entitled to call. App.refuseRemoteCaptureChange is what closes that, and
 	// these two rows are the declaration it enforces.
 	"SetVideoSource":            {hostOnly: true},
 	"SetDeckLinkPreviewEnabled": {hostOnly: true},
+
+	// SelectCommentaryInput is host-only for SetVideoSource's reason applied to
+	// the OTHER leg, and it is the sharper of the two: it decides which
+	// microphone a broadcast switcher hears this position on. A remote seat
+	// re-pointing the commentary would take the desk's microphone away from the
+	// person sitting at it — and would do it silently, because the meters would
+	// go on moving for whatever device it chose.
+	//
+	// RestartCapture is host-only for a second reason as well as that one: it
+	// blanks the picture, drops the meters and takes an opaque native window off
+	// the screen of whoever is sitting at this machine, for as long as the
+	// devices take to reopen. That is the argument SetPreviewVisible carries.
+	//
+	// NEITHER IS SELF-ENFORCING, exactly as the two rows above are not:
+	// SaveConfig is remotely reachable and is a WHOLE-DOCUMENT write, so a remote
+	// seat could otherwise re-point the commentary through a method it is
+	// entitled to call. App.refuseRemoteCaptureChange is what closes that, and
+	// these rows are the declaration it enforces.
+	"SelectCommentaryInput": {hostOnly: true},
+	"RestartCapture":        {hostOnly: true},
 
 	// ---- host-only: remote administration (local Settings screen only) ----
 	"GetRemoteState":    {hostOnly: true},
@@ -447,6 +514,8 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetPreviewState(), nil
 	case "GetChannelMap":
 		return a.GetChannelMap()
+	case "GetCaptureState":
+		return a.GetCaptureState(), nil
 	case "IsSRTReturnSelected":
 		return a.IsSRTReturnSelected()
 	case "ListInputDevices":

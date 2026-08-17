@@ -1196,7 +1196,7 @@ func TestOnConnectErrorPanicDoesNotKillTheReconnectLoop(t *testing.T) {
 func TestPipelineFatalStopsTheSenderInsteadOfRetrying(t *testing.T) {
 	logs := captureLog(t)
 
-	p := gst.NewStubPipeline()
+	p := gst.NewStubPipeline(stubCaptureSet(t))
 	clk := newFakeClock()
 	s := newSender(p, clk)
 
@@ -1296,7 +1296,7 @@ func TestPlainConnectFailureStillRetriesForeverOnTheStub(t *testing.T) {
 		t.Fatalf("test is inconsistent: %d delays for %d failures", len(want), failures)
 	}
 
-	p := gst.NewStubPipeline()
+	p := gst.NewStubPipeline(stubCaptureSet(t))
 	p.FailNextSinks(failures, errConnectRefused)
 	clk := newFakeClock()
 	s := newSender(p, clk)
@@ -1340,7 +1340,7 @@ func TestPlainConnectFailureStillRetriesForeverOnTheStub(t *testing.T) {
 // ReplaceSink, which returns the latched fatal — and the machine must stop
 // there rather than settle into the eternal amber loop.
 func TestFatalWhileConnectedTerminatesAtTheNextReplaceSink(t *testing.T) {
-	p := gst.NewStubPipeline()
+	p := gst.NewStubPipeline(stubCaptureSet(t))
 	clk := newFakeClock()
 	s := newSender(p, clk)
 
@@ -1958,22 +1958,10 @@ func TestWatcherSurvivesAPipelineThatNeverClosesItsErrorChannel(t *testing.T) {
 // channel Errors returned. Everything else about it succeeds.
 type rudePipeline struct{ errs chan error }
 
-func (p *rudePipeline) Start(gst.PipelineOpts) error   { return nil }
+func (p *rudePipeline) Start(gst.SendOpts) error       { return nil }
 func (p *rudePipeline) ReplaceSink(gst.SinkOpts) error { return nil }
 func (p *rudePipeline) RemoveSink() error              { return nil }
 func (p *rudePipeline) ForceKeyUnit() error            { return nil }
-
-// The channel-map half of gst.Pipeline. internal/sender never touches routing —
-// it reconnects a sink and nothing else — so these are the inert answers of a
-// pipeline with a positioned capture device: no negotiated width to report, and
-// no matrix to change.
-func (p *rudePipeline) InputChannels() int                 { return 0 }
-func (p *rudePipeline) SetChannelMap(gst.ChannelMap) error { return nil }
-
-// The cough mute, inert for the same reason: internal/sender never mutes
-// anything, and a reconnect must not go near the audio leg at all.
-func (p *rudePipeline) SetCommentaryMute(bool) error { return nil }
-func (p *rudePipeline) CommentaryMuted() bool        { return false }
 
 func (p *rudePipeline) Errors() <-chan error { return p.errs }
 func (p *rudePipeline) Stop() error          { return nil }

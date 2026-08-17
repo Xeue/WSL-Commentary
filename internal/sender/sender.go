@@ -98,9 +98,18 @@ var ErrNotStarted = errors.New("sender: not started")
 // two gst option structs rather than restating their fields, so that there is no
 // field-by-field translation for anyone to get wrong.
 type Opts struct {
-	// Pipeline configures the capture, encode and mux chain, which is built once
-	// by Start and never rebuilt for the life of the session.
-	Pipeline gst.PipelineOpts
+	// Pipeline configures the ENCODE AND MUX chain, which is built once by Start
+	// and never rebuilt for the life of the session.
+	//
+	// It no longer configures the capture, and the two bitrates left in it are the
+	// whole of what a send pipeline can be told. The capture chain is always-live
+	// and older than this session: it is built when the application opens, it is
+	// what the meters, the preview, the routing grid and the signal lamp read
+	// from, and it survives Stop. Nothing in this package's contract turns on
+	// that — everything it drives is downstream of the seam — but the sentence
+	// above used to say the opposite and would have sent the next reader looking
+	// for a device here.
+	Pipeline gst.SendOpts
 
 	// Sink configures the srtsink, which is rebuilt on every reconnect.
 	Sink gst.SinkOpts

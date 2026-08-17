@@ -141,7 +141,7 @@
 //
 // UPSTREAM OF alevel AND DOWNSTREAM OF chlevel.
 //
-// alevel is the programme meter, and pipelineDescription's comment on it is
+// alevel is the programme meter, and captureDescription's comment on it is
 // explicit that it measures the exact signal entering the AAC encoder because
 // "measuring upstream of the resample would keep a meter moving while the
 // on-air signal was silence, which is a reassurance the operator must never be
@@ -167,7 +167,7 @@
 //
 // # Two writers, one state, and why there are not two
 //
-// The mute has exactly one route before Start (PipelineOpts.MuteCommentary,
+// The mute has exactly one route before Start (CaptureOpts.MuteCommentary,
 // applied while the pipeline is still in NULL, so a pipeline that is meant to
 // be born muted never carries one buffer of live commentary) and exactly one
 // route afterwards (SetCommentaryMute). SetCommentaryMute REFUSES on a pipeline
@@ -193,14 +193,14 @@
 // session down and the next Start is a different Pipeline with no memory. That
 // is why the state is readable and why Start takes it as an option — the caller
 // reads CommentaryMuted off the pipeline it is discarding and hands it to the
-// next one as PipelineOpts.MuteCommentary, and the new pipeline is muted before
+// next one as CaptureOpts.MuteCommentary, and the new pipeline is muted before
 // its first buffer rather than a moment after it.
 package gst
 
 // nameCoughMute is the volume element the cough mute writes, and the name is
 // load-bearing in the two ways every name in this graph is.
 //
-// GetByName finds the element with it, so it must match pipelineDescription
+// GetByName finds the element with it, so it must match captureDescription
 // exactly — TestCoughMuteElementIsInThePipeline reads both and fails by name if
 // they ever drift, because a lookup that returns nil is a cough button that does
 // nothing on air.

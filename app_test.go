@@ -663,9 +663,9 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 7 {
+	if len(queued) != 8 {
 		t.Fatalf("domReady queued %d events, want the sender, return, picture, signal, "+
-			"channel-map, mute and preview replays: %+v", len(queued), queued)
+			"channel-map, mute, preview and capture replays: %+v", len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[0], EventSender, sender.StateConnected)
@@ -719,9 +719,29 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 		t.Fatalf("domReady queued %+v, want a %s carrying a previewStatePayload",
 			queued[6], EventPreview)
 	}
-	if gotPrev.Running || gotPrev.BeforeStart || gotPrev.Reason == "" {
-		t.Fatalf("domReady queued %+v, want not running, not available before START, and a "+
-			"reason the operator can read", gotPrev)
+	if gotPrev.Running || gotPrev.Reason == "" {
+		t.Fatalf("domReady queued %+v, want not running and a reason the operator can read",
+			gotPrev)
+	}
+	if !gotPrev.BeforeStart {
+		t.Fatalf("domReady queued %+v, want BeforeStart true: the picture capture is built at "+
+			"domReady and the preview is a branch of it, so a confidence picture no longer waits "+
+			"for a session", gotPrev)
+	}
+
+	// And the EIGHTH is the capture layer, replayed for the reason the signal
+	// lamp's is: it changes only when a device does, so a page that reloaded at
+	// half-time has nothing else to learn from about what is open. The ZERO value
+	// must still be four readable strings — "off" and not "" — because an empty
+	// state is a value no screen has a case for.
+	gotCap, ok := queued[7].data.(capturePayload)
+	if queued[7].name != EventCapture || !ok {
+		t.Fatalf("domReady queued %+v, want a %s carrying a capturePayload",
+			queued[7], EventCapture)
+	}
+	if gotCap.Picture != captureStateOff || gotCap.Commentary != captureStateOff {
+		t.Fatalf("domReady queued %+v, want both legs OFF on a machine whose capture has not "+
+			"been built yet", gotCap)
 	}
 }
 
@@ -732,9 +752,9 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 	a.domReady(context.Background())
 
 	queued := drainPump(a)
-	if len(queued) != 7 {
+	if len(queued) != 8 {
 		t.Fatalf("domReady queued %+v, want a sender, a return, a picture, a signal, a "+
-			"channel-map, a mute and a preview replay", queued)
+			"channel-map, a mute, a preview and a capture replay", queued)
 	}
 	if queued[0].data != sender.StateStopped {
 		t.Fatalf("domReady queued %+v, want %s before any session has run", queued, sender.StateStopped)
@@ -1080,13 +1100,31 @@ func assertBoundSurface(t *testing.T) {
 		"GetChannelMap": true,
 		"SetChannelMap": true,
 
+		// The ALWAYS-LIVE CAPTURE LAYER. SelectCommentaryInput and RestartCapture
+		// are HOST-ONLY, like the video leg's setters above and for the same two
+		// reasons: the first decides which microphone a broadcast switcher hears
+		// this position on, and the second blanks a native window on the screen of
+		// whoever is sitting at this machine. GetCaptureState is a read and is
+		// reachable — a remote seat that could see a dead meter and not the
+		// sentence explaining it would report a fault this application had already
+		// diagnosed. Neither setter is self-enforcing: SaveConfig writes the same
+		// three device fields and is reachable, which is what
+		// App.refuseRemoteCaptureChange closes.
+		"SelectCommentaryInput": true,
+		"RestartCapture":        true,
+		"GetCaptureState":       true,
+
 		// The video leg. SetVideoSource is the one method on this whole surface
 		// that decides what a broadcast switcher receives, and the other three are
 		// the operator's confidence monitor: whether it exists, where it goes and
 		// whether it is on screen. All four are host-only — see
 		// TestRemoteHostOnlySet — and the two that write configuration are backed
-		// by App.refuseRemoteVideoLegChange, because SaveConfig is remotely
-		// reachable and would otherwise be the way round them.
+		// by App.refuseRemoteCaptureChange, because SaveConfig is remotely
+		// reachable and would otherwise be the way round them. That guard was
+		// WIDENED with the capture layer and renamed for it: it now also covers
+		// audioSourceKind, audioDeviceId and decklinkPersistentId, because a remote
+		// whole-document save could otherwise take the desk's microphone and, on a
+		// card seat, close and reopen the exclusive DeckLink from another building.
 		"SetVideoSource":            true,
 		"SetDeckLinkPreviewEnabled": true,
 		"SetPreviewRect":            true,
@@ -1334,13 +1372,21 @@ func TestStartStopRoundTrip(t *testing.T) {
 		t.Fatalf("sink latency = %d ms, want %d ms", sink.LatencyMs, cfg.SRTLatencyMs)
 	}
 
-	// The slate and the capture device come from PipelineOpts.
-	started := stub.StartedWith()
-	if started.AudioDeviceID != cfg.AudioDeviceID {
-		t.Fatalf("pipeline device = %q, want the configured endpoint GUID", started.AudioDeviceID)
+	// THE SLATE AND THE CAPTURE DEVICE ARE THE CAPTURE PIPELINE'S NOW, and this is
+	// where the session's two halves are checked to be pointing at the same seat:
+	// the send pipeline was minted over this capture set, so the device the
+	// commentary is actually coming from is the one the configuration named.
+	capStub, ok := sess.cap.Commentary.(*gst.StubCapture)
+	if !ok {
+		t.Fatalf("the commentary capture is %T, want the Gate A stub", sess.cap.Commentary)
 	}
-	if !filepath.IsAbs(started.SlatePath) {
-		t.Fatalf("slate path %q is not absolute; it must resolve beside the executable", started.SlatePath)
+	if got := capStub.DeviceKey(); got != cfg.AudioDeviceKey() {
+		t.Fatalf("the commentary capture opened %q, want the configured endpoint %q",
+			got, cfg.AudioDeviceKey())
+	}
+	if !filepath.IsAbs(capStub.SlatePath()) {
+		t.Fatalf("slate path %q is not absolute; it must resolve beside the executable",
+			capStub.SlatePath())
 	}
 
 	// A successful connect must be followed by a forced key unit, so the far end
@@ -2342,8 +2388,13 @@ func TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned(t *testing.T) {
 // it is what took shutdownTimeout from twenty seconds to twenty-four: the sum
 // is the bound, so a new step is a new term on both sides or this test fails,
 // which is the whole point of it being written as a sum rather than a constant.
+//
+// captureStopBudget is the seventh, and it did the same thing again: the
+// always-live capture layer holds the DeckLink from launch to quit, so releasing
+// it is a step of its own, and adding it took shutdownTimeout from twenty-five to
+// twenty-nine.
 func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
-	total := senderStopBudget + returnStopBudget + pictureStopBudget +
+	total := senderStopBudget + captureStopBudget + returnStopBudget + pictureStopBudget +
 		mixerCloseBudget + controlPlaneStopBudget + rootJoinBudget
 	if total > shutdownTimeout {
 		t.Fatalf("the per-step budgets total %v, over shutdownTimeout's %v: the overall bound would "+
@@ -2353,6 +2404,7 @@ func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
 	// And the sender keeps the largest share. It is the contribution feed; it
 	// goes first and it is the one path given every chance to finish.
 	for name, budget := range map[string]time.Duration{
+		"captureStopBudget":      captureStopBudget,
 		"returnStopBudget":       returnStopBudget,
 		"pictureStopBudget":      pictureStopBudget,
 		"mixerCloseBudget":       mixerCloseBudget,
@@ -2872,9 +2924,11 @@ func TestSenderOptsCarriesAConnectErrorReporterToTheErrorEvent(t *testing.T) {
 	if opts.Sink.Passphrase != "a-passphrase" {
 		t.Fatalf("sink passphrase = %q, want the one from the credential store", opts.Sink.Passphrase)
 	}
-	if opts.Pipeline.AudioDeviceID != cfg.AudioDeviceID {
-		t.Fatalf("pipeline device = %q, want the configured endpoint GUID", opts.Pipeline.AudioDeviceID)
-	}
+	// The DEVICE is deliberately not asserted here any more, and its absence is
+	// the assertion: sender.Opts carries no device at all, because the send
+	// pipeline opens nothing. captureOpts is where the endpoint is read from the
+	// configuration, and TestCaptureOptsCarriesTheRoutingAndBothNewCallbacks
+	// checks it there.
 
 	opts.OnConnectError(errors.New("gst: replace sink: connection refused"))
 
@@ -3669,17 +3723,21 @@ func isSilentLevels(p levelsPayload) bool {
 	return true
 }
 
-func TestSessionEmitsLevelsAndAZeroFrameOnStop(t *testing.T) {
-	// The whole path at Gate A: the stub pipeline's synthetic ticker calls
-	// PipelineOpts.OnLevels (wired by senderOpts), the App-side forwarder
-	// throttles and queues "levels" events on the pump, and the session's end
-	// queues one final all-silence frame so the meters fall rather than
-	// freeze. The real build swaps only the producer.
+func TestCaptureEmitsLevelsAndAZeroFrameWhenItGoesDown(t *testing.T) {
+	// The whole path at Gate A: the stub CAPTURE pipeline's synthetic ticker calls
+	// CaptureOpts.OnLevels (wired by captureOpts), the App-side forwarder
+	// throttles and queues "levels" events on the pump, and the capture's teardown
+	// queues one final all-silence frame so the meters fall rather than freeze.
+	// The real build swaps only the producer.
+	//
+	// IT IS NO LONGER A SESSION TEST, and the move is the behaviour rather than a
+	// relocation. The meters belong to the pipeline that has the microphone open,
+	// so they run from launch and they SURVIVE STOP; what silences them is the
+	// device going — a device change, a Restart capture, or the application
+	// quitting. A zero-frame at the end of a session would now dim a meter that is
+	// still measuring a live commentator.
 	a, _ := newTestApp(t)
-
-	if err := a.Start(); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
+	captureUp(t, a)
 
 	var live *levelsPayload
 	waitFor(t, 5*time.Second, "a live levels frame to reach the frontend queue", func() bool {
@@ -3712,15 +3770,14 @@ func TestSessionEmitsLevelsAndAZeroFrameOnStop(t *testing.T) {
 		}
 	}
 
-	if err := a.Stop(); err != nil {
-		t.Fatalf("Stop() error = %v", err)
+	if err := a.stopCaptureForTeardown(); err != nil {
+		t.Fatalf("stopCaptureForTeardown() error = %v", err)
 	}
 
-	// The zero-frame is already queued by the time Stop returns: the sender
-	// stops the pipeline (which joins the stub's ticker) BEFORE closing its
-	// states channel, the forwarder goroutine sends the zero-frame after the
-	// channel closes and before its wg.Done, and Stop waits on that WaitGroup.
-	// So the LAST levels event in the queue is deterministically the silence.
+	// The zero-frame is already queued by the time the teardown returns:
+	// CapturePipeline.Stop joins the stub's ticker before it returns, and the
+	// zero-frame is sent after it and on the same goroutine. So the LAST levels
+	// event in the queue is deterministically the silence.
 	var last *levelsPayload
 	for _, e := range drainPump(a) {
 		if e.name != EventLevels {
@@ -3732,12 +3789,42 @@ func TestSessionEmitsLevelsAndAZeroFrameOnStop(t *testing.T) {
 		}
 	}
 	if last == nil {
-		t.Fatal("no levels event was queued during Stop; the zero-frame never arrived and " +
-			"the meters would freeze at the last live level")
+		t.Fatal("no levels event was queued when the capture went down; the zero-frame never " +
+			"arrived and the meters would freeze at the last live level")
 	}
 	if !isSilentLevels(*last) {
-		t.Fatalf("the final levels frame after Stop is %+v, want every channel at %v dBFS: "+
-			"a meter frozen at the last level reads as a live one", *last, float64(levelsSilenceDB))
+		t.Fatalf("the final levels frame after the capture went down is %+v, want every channel "+
+			"at %v dBFS: a meter frozen at the last level reads as a live one",
+			*last, float64(levelsSilenceDB))
+	}
+}
+
+// TestTheMetersSurviveAStop is the direct R1 assertion beside it: a STOP must
+// NOT dim the meters, because the pipeline measuring them is still open. This is
+// the half an operator notices, and it is the half a future tidy-up that moved
+// the zero-frame back into the session forwarder would break.
+func TestTheMetersSurviveAStop(t *testing.T) {
+	a, _ := newTestApp(t)
+	captureUp(t, a)
+
+	useStartingSender(a)
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	drainPump(a)
+	if err := a.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	for _, e := range drainPump(a) {
+		if e.name != EventLevels {
+			continue
+		}
+		if p, ok := e.data.(levelsPayload); ok && isSilentLevels(p) {
+			t.Fatal("STOP queued an all-silence levels frame; the capture pipeline is still open " +
+				"and still metering a live commentator, so dimming the meters would be this " +
+				"application reporting a silence that is not there")
+		}
 	}
 }
 

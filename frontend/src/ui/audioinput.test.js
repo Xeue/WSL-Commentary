@@ -576,7 +576,12 @@ test('the DeckLink commentary leg is BUILT, and nothing on the row says otherwis
   // audioDeviceId on osxaudiosrc or wasapi2src is the SYSTEM DEFAULT INPUT, so a
   // DeckLink seat that reached the platform element would put the match on air
   // off the laptop's built-in microphone with every lamp green.
-  const gst = read(repoRoot, 'internal', 'gst', 'gst_cgo.go');
+  // BOTH HALVES ARE READ OUT OF THE CAPTURE LAYER NOW. The commentary source is
+  // built by capturedesc_cgo.go and pointed at the card by app.go's captureOpts;
+  // the send pipeline has no device in it at all. Reading gst_cgo.go for this
+  // would pass against the pre-seam description that is still in the tree
+  // awaiting deletion, which is a guard passing over a corpse.
+  const gst = read(repoRoot, 'internal', 'gst', 'capturedesc_cgo.go');
   assert.match(
     gst,
     /audioCaptureFactory/,
@@ -585,9 +590,9 @@ test('the DeckLink commentary leg is BUILT, and nothing on the row says otherwis
   );
   assert.match(
     read(repoRoot, 'app.go'),
-    /AudioCaptureID = plan\.AudioCaptureID/,
-    'app.go never hands the resolved card to the pipeline, so audioSourceKind "decklink" would ' +
-      'build the platform source with no device — the system default input',
+    /AudioCaptureID:\s*plan\.AudioCaptureID/,
+    'app.go never hands the resolved card to the capture pipeline, so audioSourceKind ' +
+      '"decklink" would build the platform source with no device — the system default input',
   );
 
   // NOTHING ON THE SCREEN SAYS THE FEATURE IS MISSING. The constant is gone from

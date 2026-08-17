@@ -31,45 +31,54 @@ func readRepoFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// startedMuteStub is a running StubPipeline, since every test below needs one
+// startedMuteCapture is a running StubCapture, since every test below needs one
 // and the required options are noise.
-func startedMuteStub(t *testing.T, opts PipelineOpts) *StubPipeline {
+//
+// IT IS A CAPTURE PIPELINE AND NOT A SEND PIPELINE, which is the whole of what
+// changed: the cough mute is a volume element between the resampler's capsfilter
+// and the programme meter, upstream of the proxysink, so it belongs to the
+// pipeline that has the microphone open. It exists from launch and outlives every
+// session.
+func startedMuteCapture(t *testing.T, opts CaptureOpts) *StubCapture {
 	t.Helper()
-	if opts.SlatePath == "" {
-		opts.SlatePath = "slate.png"
+	if opts.Legs == (CaptureLegs{}) {
+		opts.Legs = CaptureLegs{Commentary: CommentaryNative}
 	}
 	if opts.AudioDeviceID == "" && opts.AudioCaptureID == "" {
 		opts.AudioDeviceID = "{0.0.1.00000000}.{stub}"
 	}
-	p := NewStubPipeline()
-	if err := p.Start(opts); err != nil {
+	c, err := NewStubCapture(opts)
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Stop() })
+	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	t.Cleanup(func() { _ = p.Stop() })
-	return p
+	return c
 }
 
 // TestCommentaryStartsUnmuted pins the default, which is the state every seat
-// that has never seen a cough button is in. The zero value of PipelineOpts must
+// that has never seen a cough button is in. The zero value of CaptureOpts must
 // put the commentator on air.
 func TestCommentaryStartsUnmuted(t *testing.T) {
-	p := startedMuteStub(t, PipelineOpts{})
-	if p.CommentaryMuted() {
-		t.Fatal("a pipeline started with the zero PipelineOpts reports the commentary MUTED. " +
+	c := startedMuteCapture(t, CaptureOpts{})
+	if c.CommentaryMuted() {
+		t.Fatal("a capture started with the zero CaptureOpts reports the commentary MUTED. " +
 			"The default has to be on air: a seat that never touches a cough button must sound " +
 			"exactly as it did before the feature existed")
 	}
 }
 
-// TestStartMutedIsMutedBeforeAnythingRuns is the option that carries a mute
-// across a rebuild. The value must be in force the moment Start returns, not
-// applied by something later, because the whole point of it is that a session
-// rebuilt after a fatal never puts a muted commentator back on air.
+// TestStartMutedIsMutedBeforeAnythingRuns is the option that carries a mute into
+// the session. The value must be in force the moment Start returns, not applied
+// by something later, because the whole point of it is that a capture built to be
+// muted never carries one buffer of live commentary.
 func TestStartMutedIsMutedBeforeAnythingRuns(t *testing.T) {
-	p := startedMuteStub(t, PipelineOpts{MuteCommentary: true})
-	if !p.CommentaryMuted() {
-		t.Fatal("PipelineOpts.MuteCommentary did not take. A pipeline rebuilt to replace one " +
-			"that died muted would put the commentator back on air with nobody touching a button")
+	c := startedMuteCapture(t, CaptureOpts{MuteCommentary: true})
+	if !c.CommentaryMuted() {
+		t.Fatal("CaptureOpts.MuteCommentary did not take. A capture rebuilt to replace one that " +
+			"died muted would put the commentator back on air with nobody touching a button")
 	}
 }
 
@@ -77,87 +86,82 @@ func TestStartMutedIsMutedBeforeAnythingRuns(t *testing.T) {
 // buttons are two ways of calling this one boolean, and both directions have to
 // work as many times as the operator presses them.
 func TestCommentaryMuteRoundTrips(t *testing.T) {
-	p := startedMuteStub(t, PipelineOpts{})
+	c := startedMuteCapture(t, CaptureOpts{})
 
 	for i, want := range []bool{true, false, true, true, false} {
-		if err := p.SetCommentaryMute(want); err != nil {
+		if err := c.SetCommentaryMute(want); err != nil {
 			t.Fatalf("call %d: SetCommentaryMute(%t): %v", i, want, err)
 		}
-		if got := p.CommentaryMuted(); got != want {
+		if got := c.CommentaryMuted(); got != want {
 			t.Fatalf("call %d: CommentaryMuted() = %t, want %t", i, got, want)
 		}
-	}
-	if n := p.Counters().CommentaryMutes; n != 5 {
-		t.Errorf("CommentaryMutes = %d, want 5", n)
-	}
-}
-
-// TestCommentaryMuteRefusesBeforeStart is the design decision, not a nil check.
-//
-// There is exactly ONE route to the mute before Start — PipelineOpts.MuteCommentary
-// — and exactly one after it. A latch here would be a second memory of the same
-// fact, and two memories of "is the microphone open" can disagree. That is the
-// central charge coughmute.go lays against zeroing the mix matrix, so building
-// it here would be incoherent.
-func TestCommentaryMuteRefusesBeforeStart(t *testing.T) {
-	p := NewStubPipeline()
-
-	if err := p.SetCommentaryMute(true); err == nil {
-		t.Fatal("SetCommentaryMute succeeded on a pipeline that has not started. It must refuse: " +
-			"a second place to remember the wanted mute is a second place for it to disagree with " +
-			"PipelineOpts.MuteCommentary, and which one won would be a property of the order of " +
-			"two lines rather than of anything the operator can see")
-	}
-	if p.CommentaryMuted() {
-		t.Fatal("a refused SetCommentaryMute changed the state anyway, which is the worst of " +
-			"both: the call reported failure and the application now believes it is muted")
 	}
 }
 
 // TestCommentaryMuteRefusesAfterStop keeps a dead pipeline from accepting
 // writes, for the same reason SetChannelMap does.
+//
+// THE PRE-START REFUSAL THAT USED TO SIT BESIDE IT IS GONE, and it was deleted
+// rather than lost: the operator ruled on 2026-08-16 that a latch set before
+// START is still set at START. The argument it answered — that one control must
+// not have two memories — is met by there being only ONE memory again, the
+// element's own, read back after every write, because the element now exists from
+// launch. capture_stub_test.go's TestTheMuteIsCarriedIntoTheSessionAndSettable
+// WithoutOne is that rule stated as a test.
 func TestCommentaryMuteRefusesAfterStop(t *testing.T) {
-	p := NewStubPipeline()
-	if err := p.Start(PipelineOpts{SlatePath: "slate.png", AudioDeviceID: "{guid}"}); err != nil {
+	c, err := NewStubCapture(CaptureOpts{
+		Legs:          CaptureLegs{Commentary: CommentaryNative},
+		AudioDeviceID: "{guid}",
+	})
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := p.SetCommentaryMute(true); err != nil {
+	if err := c.SetCommentaryMute(true); err != nil {
 		t.Fatalf("SetCommentaryMute: %v", err)
 	}
-	if err := p.Stop(); err != nil {
+	if err := c.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	if err := p.SetCommentaryMute(false); err == nil {
-		t.Fatal("SetCommentaryMute succeeded on a stopped pipeline")
+	if err := c.SetCommentaryMute(false); err == nil {
+		t.Fatal("SetCommentaryMute succeeded on a stopped capture pipeline")
 	}
 	// AND THE STATE SURVIVES. This is the half a reader will want to delete as
-	// untidy, and it is the half that carries a cough across a rebuild: the
-	// caller reads the mute off the pipeline it is discarding and hands it to
-	// the replacement as PipelineOpts.MuteCommentary. A Stop that zeroed it
-	// would answer "unmuted" for a session that ended muted.
-	if !p.CommentaryMuted() {
+	// untidy, and it is the half that carries a cough across a rebuild: the caller
+	// reads the mute off the pipeline it is discarding and hands it to the
+	// replacement as CaptureOpts.MuteCommentary. A Stop that zeroed it would answer
+	// "unmuted" for a capture that ended muted.
+	if !c.CommentaryMuted() {
 		t.Fatal("Stop cleared the mute state. A caller rebuilding after a latched fatal reads " +
 			"this to decide whether the replacement starts muted, and would put a coughing " +
 			"commentator back on air")
 	}
 }
 
-// TestCommentaryMuteSurvivesAReconnect is the requirement stated as a test.
+// TestCommentaryMuteSurvivesAReconnect is the requirement stated as a test, and
+// the seam has made it STRUCTURAL rather than behavioural.
 //
 // A reconnect is RemoveSink, backoff, ReplaceSink — internal/sender's loop — and
-// none of the three may disturb the mute. On the real build this is structural
-// (everything upstream of srtq stays in PLAYING and no sink method goes near the
-// audio leg, which TestReconnectDoesNotTouchTheCoughMute reads the source to
-// confirm); here it is checked behaviourally, on the twin every Gate A caller
-// is actually developed against.
+// none of the three may disturb the mute. It cannot now, because the mute is not
+// on the object those methods are called on at all: the send pipeline has no
+// audio leg, no volume element and no way to reach one. This drives both halves
+// anyway, because "cannot by construction" is the claim, and a test that
+// exercises it is how the claim stays true after the next refactor.
 func TestCommentaryMuteSurvivesAReconnect(t *testing.T) {
-	p := startedMuteStub(t, PipelineOpts{})
+	c := startedMuteCapture(t, CaptureOpts{})
+	p := NewStubPipeline(CaptureSet{Picture: c, Commentary: c})
+	if err := p.Start(SendOpts{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop()
 
 	if err := p.ReplaceSink(SinkOpts{Host: "m2lx.example", Port: 1234}); err != nil {
 		t.Fatalf("ReplaceSink: %v", err)
 	}
-	if err := p.SetCommentaryMute(true); err != nil {
+	if err := c.SetCommentaryMute(true); err != nil {
 		t.Fatalf("SetCommentaryMute: %v", err)
 	}
 
@@ -165,14 +169,14 @@ func TestCommentaryMuteSurvivesAReconnect(t *testing.T) {
 	if err := p.RemoveSink(); err != nil {
 		t.Fatalf("RemoveSink: %v", err)
 	}
-	if p.CommentaryMuted() != true {
+	if !c.CommentaryMuted() {
 		t.Fatal("RemoveSink cleared the cough mute: the socket dropped and the commentator went " +
 			"back on air without touching anything")
 	}
 	if err := p.ReplaceSink(SinkOpts{Host: "m2lx.example", Port: 1234}); err != nil {
 		t.Fatalf("ReplaceSink: %v", err)
 	}
-	if p.CommentaryMuted() != true {
+	if !c.CommentaryMuted() {
 		t.Fatal("the mute cleared when the socket reconnected. That is a cough on air")
 	}
 }
@@ -187,24 +191,34 @@ func TestCommentaryMuteSurvivesAReconnect(t *testing.T) {
 // somebody softens that abort, a cough button that reports success and does
 // nothing.
 func TestCoughMuteElementIsInThePipeline(t *testing.T) {
-	body := pipelineDescriptionSource(t)
+	body := captureDescriptionSource(t)
 
 	if !strings.Contains(body, "volume name=") {
-		t.Fatal("pipelineDescription has no volume element. There is no cough mute on the send " +
-			"path at all, and every button that claims to mute the commentary is lying")
+		t.Fatal("captureDescription has no volume element. There is no cough mute anywhere at " +
+			"all, and every button that claims to mute the commentary is lying")
 	}
 	if !strings.Contains(body, "nameCoughMute") {
-		t.Fatal("the volume element in pipelineDescription is no longer named through " +
+		t.Fatal("the volume element in captureDescription is no longer named through " +
 			"nameCoughMute, so GetByName and the parse string can drift and the mute would be " +
 			"looked up by a name nothing built")
+	}
+	// AND IT IS IN THE CAPTURE PIPELINE, WHICH IS WHAT MAKES IT WORK BEFORE START.
+	// The element exists from launch, so a latch set before a session is still set
+	// at START (PLAN.md 0-BIS A2). A volume element in the send description would
+	// put the control back inside the session's lifetime and take the pre-air
+	// latch with it.
+	if strings.Contains(sendDescriptionSource(t), "volume name=") {
+		t.Error("sendDescription builds a volume element. The cough mute belongs to the capture " +
+			"pipeline, which exists from launch; one in the send pipeline is a control that " +
+			"cannot be reached until START and disappears at STOP")
 	}
 }
 
 // TestTheCoughMuteIsAboveTheProgrammeMeter is the most important guard in this
 // file, and it is about honesty rather than about muting.
 //
-// alevel exists to measure the exact signal entering the AAC encoder, so that no
-// meter can keep moving while silence goes to air — pipelineDescription's own
+// alevel exists to measure the exact signal this seat is producing, so that no
+// meter can keep moving while silence goes to air — captureDescription's own
 // comment says so at length. A mute placed BELOW that meter recreates precisely
 // that failure by hand: the commentator coughs, the mute engages, and the
 // programme meter goes on bouncing to a voice nobody is receiving.
@@ -213,12 +227,16 @@ func TestCoughMuteElementIsInThePipeline(t *testing.T) {
 // Measured on 2026-08-16 through this chain: 89 level messages either way, rms
 // -12.006563271339424 unmuted against -699.99999984363217 muted.
 func TestTheCoughMuteIsAboveTheProgrammeMeter(t *testing.T) {
-	body := pipelineDescriptionSource(t)
+	body := captureDescriptionSource(t)
 
 	mute := strings.Index(body, "volume name=")
-	level := strings.Index(body, "level name=alevel")
-	enc := strings.Index(body, `aacEncoderFactory + " bitrate="`)
-	if mute < 0 || level < 0 || enc < 0 {
+	level := strings.Index(body, "level name=\"+levelElementName")
+	// THE LOWER BOUND MOVED WITH THE SEAM. It used to be the AAC encoder, which
+	// is now in the send pipeline; the strongest true statement on this side is
+	// that the meter is between the mute and the PROXY TAIL, with nothing else in
+	// between that could change the audio after it has been measured.
+	tail := strings.Index(body, "audioProxyTail()")
+	if mute < 0 || level < 0 || tail < 0 {
 		t.Fatal("the audio branch has been restructured; re-derive this guard from the new shape")
 	}
 	if !(mute < level) {
@@ -226,17 +244,17 @@ func TestTheCoughMuteIsAboveTheProgrammeMeter(t *testing.T) {
 			"the commentator's voice while silence went to air, which is exactly the false " +
 			"reassurance alevel's placement exists to make impossible")
 	}
-	if !(level < enc) {
-		t.Error("the programme meter is no longer between the mute and the encoder")
+	if !(level < tail) {
+		t.Error("the programme meter is no longer between the mute and the seam")
 	}
 
 	// And BELOW the per-channel picker, so the mapping panel goes on showing
 	// which of a card's sixteen inputs the commentator is on while they cough.
 	// That question's answer does not change because they are off air for two
 	// seconds.
-	picker := strings.Index(body, "level name="+channelLevelElementName)
+	picker := strings.Index(body, "level name=\"+channelLevelElementName")
 	if picker < 0 {
-		t.Fatal("pipelineDescription no longer builds the per-channel picker meter")
+		t.Fatal("captureDescription no longer builds the per-channel picker meter")
 	}
 	if !(picker < mute) {
 		t.Error("the cough mute sits ABOVE the per-channel picker, so every one of the mapping " +
@@ -253,11 +271,11 @@ func TestTheCoughMuteIsAboveTheProgrammeMeter(t *testing.T) {
 // applyCoughMuteLocked that wrote a matrix, would reintroduce the coupling while
 // leaving every behavioural test above green.
 func TestCoughMuteIsNotTheMixMatrix(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
+	fset, file := parseSource(t, captureCgoSourceFile)
 
 	for _, fn := range []struct{ recv, name string }{
-		{"cgoPipeline", "SetCommentaryMute"},
-		{"cgoPipeline", "applyCoughMuteLocked"},
+		{"cgoCapture", "SetCommentaryMute"},
+		{"cgoCapture", "applyCoughMuteLocked"},
 	} {
 		body := funcBody(t, fset, file, fn.recv, fn.name)
 		for _, forbidden := range []string{"nameAudioConv", "mix-matrix", "MixMatrix", "aconv"} {
@@ -280,15 +298,22 @@ func TestCoughMuteIsNotTheMixMatrix(t *testing.T) {
 // same property, the read-back value is what is stored, and a disagreement is an
 // error rather than a log line.
 func TestCoughMuteIsReadBackFromTheElement(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "applyCoughMuteLocked")
+	fset, file := parseSource(t, captureCgoSourceFile)
+	body := funcBody(t, fset, file, "cgoCapture", "applyCoughMuteLocked")
 
+	// The hasProperty pre-check that used to head this list is gone, and its
+	// guarantee is not: the read-back's type assertion answers the same question
+	// LATER AND BETTER. A missing property made hasProperty skip the write and
+	// return nil — success, with the microphone open — whereas an ObjectProperty
+	// that does not come back as a boolean is an ERROR naming the element. The
+	// thing being protected against was never "the property is absent"; it was
+	// "this code reported a mute it did not perform".
 	for _, want := range []string{
-		"hasProperty(p.cough, propMute)",     // no GLib CRITICAL into a void
-		"p.cough.SetObjectProperty(propMute", // the write
-		"p.cough.ObjectProperty(propMute)",   // the read BACK
+		"c.cough.SetObjectProperty(propMute", // the write
+		"c.cough.ObjectProperty(propMute)",   // the read BACK
+		"if !ok {",                           // a value that is not a boolean is an error
 		"got != mute",                        // and the comparison
-		"p.muted.Store(got)",                 // storing what the ELEMENT said
+		"c.muted.Store(got)",                 // storing what the ELEMENT said
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("applyCoughMuteLocked no longer contains %q. Without the read-back the "+
@@ -296,32 +321,32 @@ func TestCoughMuteIsReadBackFromTheElement(t *testing.T) {
 				"one thing about a cough button that must never be a belief", want)
 		}
 	}
-	if strings.Contains(body, "p.muted.Store(mute)") {
+	if strings.Contains(body, "c.muted.Store(mute)") {
 		t.Error("applyCoughMuteLocked stores the REQUESTED value rather than the one read back " +
 			"off the element, which turns CommentaryMuted back into a recollection")
 	}
 }
 
-// TestCoughMuteIsAppliedBeforePlaying pins the ORDER inside startBuiltLocked. A
-// pipeline asked to start muted must be muted before it can produce a buffer;
+// TestCoughMuteIsAppliedBeforePlaying pins the ORDER inside the capture build. A
+// capture asked to start muted must be muted before it can produce a buffer;
 // applying it after the state change would put however many milliseconds of live
-// commentary on air, which for the one case the option exists for — rebuilding a
-// session that was muted when it died — is the exact failure it prevents.
+// commentary into the proxysink, which for the case the option exists for — a
+// latch set before START, which the operator ruled is carried into the session —
+// is the exact failure it prevents.
 func TestCoughMuteIsAppliedBeforePlaying(t *testing.T) {
-	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "startBuiltLocked")
+	body := captureStartSequence(t)
 
-	apply := strings.Index(body, "applyCoughMuteLocked(opts.MuteCommentary)")
+	apply := strings.Index(body, "applyCoughMuteLocked(")
 	if apply < 0 {
-		t.Fatal("startBuiltLocked never applies PipelineOpts.MuteCommentary, so a pipeline built " +
-			"to replace one that died muted starts with the commentator on air")
+		t.Fatal("the capture build never applies CaptureOpts.MuteCommentary, so a capture built " +
+			"to carry a pre-air latch starts with the commentator on air")
 	}
 	play := strings.Index(body, "gogst.StatePlaying")
 	if play < 0 {
-		t.Fatal("startBuiltLocked no longer names gogst.StatePlaying; re-derive this guard")
+		t.Fatal("the capture build no longer names gogst.StatePlaying; re-derive this guard")
 	}
 	if !(apply < play) {
-		t.Error("the cough mute is applied AFTER the pipeline is taken to PLAYING. A pipeline " +
+		t.Error("the cough mute is applied AFTER the pipeline is taken to PLAYING. A capture " +
 			"that must begin muted would carry live commentary for the length of the state change")
 	}
 }

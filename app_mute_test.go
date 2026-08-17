@@ -46,45 +46,100 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Nothing is sending
+// Nothing is sending — which is no longer a reason to refuse
 // ---------------------------------------------------------------------------
 
-func TestMuteBeforeStartIsRefusedAndSaysWhy(t *testing.T) {
+// TestAMuteLatchedBeforeStartIsAcceptedAndCarried is the operator's A2 ruling
+// (PLAN.md 0-BIS), and it REVERSES the test that stood here.
+//
+// That test asserted the refusal, on the argument written out beside
+// SetCommentaryMute: a mute accepted before START would have to be either
+// forgotten (a control that lies) or carried into the session (a commentator who
+// comes on air muted because of something pressed twenty minutes earlier).
+//
+// The argument was sound about a build in which the volume element came into
+// existence at START. Always-live capture creates the third state whether or not
+// anybody wants it, the operator was asked, and the answer was CARRY IT — because
+// the fear was of a control that LIES, and it is met by VISIBILITY instead: the
+// mute sits upstream of alevel, so a muted commentator has a flat programme meter
+// AND a mute banner, before and after START. Both halves of that are asserted
+// here, and the answer is written out where the argument stood in app.go.
+func TestAMuteLatchedBeforeStartIsAcceptedAndCarried(t *testing.T) {
+	a, _ := newTestApp(t)
+	captureUp(t, a)
+
+	got, err := a.SetCommentaryMute(true, 1)
+	if err != nil {
+		t.Fatalf("SetCommentaryMute before START error = %v; the element exists from launch and "+
+			"the operator has ruled that a latch set now is carried into the session", err)
+	}
+	if !got.Muted || !got.Available {
+		t.Fatalf("got %+v, want a live, muted control on a capture that is open", got)
+	}
+
+	// AND IT IS STILL THERE AT START. This is the half the old design refused in
+	// order to avoid; it is now the behaviour, and it is only safe because the
+	// meter and the banner have been showing it the whole time.
+	useStartingSender(a)
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Stop() })
+
+	if state := a.GetCommentaryMute(); !state.Muted {
+		t.Fatalf("the session came up UNMUTED (%+v) over a latch the operator set before it; "+
+			"START silently discarding a live control is the failure A2 chose against", state)
+	}
+}
+
+func TestMuteWithNoCaptureIsRefusedAndPointsAtTheDevice(t *testing.T) {
+	// The one refusal that is left, and it is a different fact from the one that
+	// went: there is no capture pipeline, so there is no element to write to.
+	// The sentence must therefore point at the DEVICE and at Restart capture, and
+	// never at START — pressing START would change nothing about whether this
+	// call can be served.
 	a, _ := newTestApp(t)
 
 	got, err := a.SetCommentaryMute(true, 1)
 	if err == nil {
-		t.Fatal("SetCommentaryMute succeeded with no session; there is no pipeline to mute, and " +
-			"accepting it would mean either forgetting it (a control that lies) or carrying it into " +
-			"the next START (a position that comes on air silent)")
+		t.Fatal("SetCommentaryMute succeeded with no capture open; there is no volume element to " +
+			"write to, and reporting success would be a control that lies")
 	}
-	if !errors.Is(err, errMuteNoSession) {
-		t.Errorf("error = %v, want errMuteNoSession", err)
+	if !errors.Is(err, errMuteNoCapture) {
+		t.Errorf("error = %v, want errMuteNoCapture", err)
 	}
-	// The message has to say what to DO, not merely what is wrong. "No pipeline"
-	// is a true statement an operator cannot act on.
-	if !strings.Contains(err.Error(), "START") {
-		t.Errorf("error %q does not mention START; the operator is left with a fact and no action", err)
+	// The message has to say what to DO, not merely what is wrong.
+	if !strings.Contains(err.Error(), "Restart capture") {
+		t.Errorf("error %q does not say how to recover; the operator is left with a fact and no "+
+			"action", err)
+	}
+	if strings.Contains(err.Error(), "START") {
+		t.Errorf("error %q still sends the operator to START, which cannot help: the capture is "+
+			"built at launch and START does not open a device", err)
 	}
 	if got.Muted {
 		t.Error("the refused call reported Muted; a refusal must not move the state it refused to change")
 	}
 	if got.Available {
-		t.Error("Available is true with no session; the control must draw itself as not yet live")
+		t.Error("Available is true with no capture; the control must draw itself as not yet live")
 	}
 }
 
-func TestGetCommentaryMuteBeforeAnySessionExplainsItself(t *testing.T) {
+func TestGetCommentaryMuteBeforeAnyCaptureExplainsItself(t *testing.T) {
 	a, _ := newTestApp(t)
 
 	got := a.GetCommentaryMute()
 	if got.Muted || got.Available {
-		t.Errorf("got %+v, want unmuted and unavailable on a machine that has never pressed START", got)
+		t.Errorf("got %+v, want unmuted and unavailable on a machine with no capture open", got)
 	}
 	// The zero value must still carry a sentence: a disabled control with no
 	// explanation is the defect the Reason field exists to remove.
 	if got.Reason == "" {
 		t.Error("Reason is empty on the zero value; a control that is switched off must say why")
+	}
+	if strings.Contains(got.Reason, "press START") {
+		t.Errorf("Reason %q tells the operator to press START, which no longer makes the control "+
+			"live; the element exists from launch", got.Reason)
 	}
 	if got.By != "" {
 		t.Errorf("By = %q with nothing muted; the seat is a fact about a mute that exists", got.By)
@@ -182,35 +237,49 @@ func TestRapidPushToMuteIsSafeToHammer(t *testing.T) {
 // Session boundaries
 // ---------------------------------------------------------------------------
 
-func TestStartBeginsUnmutedAndSaysSo(t *testing.T) {
+func TestTheCaptureComingUpMakesTheMuteLiveAndSaysSo(t *testing.T) {
+	// The moment the cough control becomes live is now the CAPTURE BUILD and no
+	// longer START, because the volume element belongs to the pipeline that has
+	// the microphone open. A page that had been showing a disabled control has to
+	// learn that it is live, and there is no getter it polls — so the event is the
+	// only way it can.
 	a, _ := newTestApp(t)
 	silencePump(a)
-	startedSession(t, a)
+	captureUp(t, a)
 
 	got := a.GetCommentaryMute()
 	if got.Muted {
-		t.Fatal("the session began MUTED; a position that comes on air silent because of a stale " +
-			"flag is exactly as bad as one that coughs on air")
+		t.Fatal("a freshly built capture came up MUTED with nothing latched; the state published " +
+			"must be the one read back off the element")
 	}
 	if !got.Available {
-		t.Error("Available is false on a running session; the cough control must be live")
+		t.Error("Available is false over an open capture; the cough control must be live")
 	}
 	if got.Reason != "" {
 		t.Errorf("Reason = %q on an available control; the sentence is for when it is NOT", got.Reason)
 	}
 
 	if !containsEvent(drainPump(a), EventMute) {
-		t.Error("no mute event was emitted at START; a page that had been showing a disabled " +
-			"control has no way to learn that it is now live")
+		t.Error("no mute event was emitted when the capture came up; a page that had been showing " +
+			"a disabled control has no way to learn that it is now live")
 	}
 }
 
-func TestAMuteHeldAcrossStopIsNotCarriedIntoTheNextStart(t *testing.T) {
-	// The stale-flag failure, driven end to end. An operator latches the mute,
-	// stops, and starts again twenty minutes later — a different half, a
-	// different commentator. If anything remembered the mute, they are inaudible
-	// and every lamp is green.
+func TestAMuteHeldAcrossStopIsStillHeldAtTheNextStart(t *testing.T) {
+	// REVERSED BY THE OPERATOR'S A2 RULING, and this test used to assert the
+	// opposite: that a mute latched before the last STOP was cleared by the next
+	// START, on the grounds that a commentator inaudible because of something
+	// pressed twenty minutes earlier is the worst outcome available.
+	//
+	// What answers that now is not the session boundary but the SCREEN. The mute
+	// is upstream of the programme meter, the meter is live from launch, and the
+	// mute banner is drawn from an event that goes out on every change — so the
+	// twenty minutes in that sentence are twenty minutes of a flat meter beside a
+	// red badge, on both seats. A boundary that silently discarded the operator's
+	// own live control was the other way to be wrong, and it is the one they
+	// chose against.
 	a, _ := newTestApp(t)
+	captureUp(t, a)
 	useStartingSender(a)
 
 	if err := a.Start(); err != nil {
@@ -226,22 +295,28 @@ func TestAMuteHeldAcrossStopIsNotCarriedIntoTheNextStart(t *testing.T) {
 		t.Fatalf("Stop() error = %v", err)
 	}
 
+	if got := a.GetCommentaryMute(); !got.Muted {
+		t.Fatalf("STOP cleared the mute (%+v); the element it acts on is still open and still "+
+			"muted, so the control must go on saying so", got)
+	}
+
 	if err := a.Start(); err != nil {
 		t.Fatalf("the second Start() error = %v", err)
 	}
 	defer a.Stop()
 
-	if got := a.GetCommentaryMute(); got.Muted {
-		t.Fatalf("the new session came up MUTED (%+v): a mute latched before the last STOP has "+
-			"followed a commentator who was not there when it was pressed", got)
+	if got := a.GetCommentaryMute(); !got.Muted {
+		t.Fatalf("the new session came up UNMUTED (%+v): START discarded a latch the operator "+
+			"was holding, which is a live control that lies about its own state", got)
 	}
 }
 
-func TestStopClearsALatchedMuteAndTellsTheScreen(t *testing.T) {
-	// Without the event, a latched cough button stays drawn over a session that
-	// has gone — a control the operator cannot release, because there is nothing
-	// left for it to act on.
+func TestStopLeavesTheCoughControlExactlyWhereItWas(t *testing.T) {
+	// The other half of R1's promise, and the one an operator notices: everything
+	// they were watching survives STOP. The cough control is the sharpest case,
+	// because clearing it would UNMUTE a commentator who is still being metered.
 	a, _ := newTestApp(t)
+	captureUp(t, a)
 	useStartingSender(a)
 
 	if err := a.Start(); err != nil {
@@ -251,33 +326,67 @@ func TestStopClearsALatchedMuteAndTellsTheScreen(t *testing.T) {
 		t.Fatalf("SetCommentaryMute error = %v", err)
 	}
 
-	silencePump(a)
-	drainPump(a)
 	if err := a.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
 
+	got := a.GetCommentaryMute()
+	if !got.Muted {
+		t.Error("the mute was cleared by the end of the session; the capture that owns the element " +
+			"is still open")
+	}
+	if !got.Available {
+		t.Error("Available went false at STOP; the control acts on a capture pipeline, which STOP " +
+			"does not touch")
+	}
+	if got.By != muteSeatDesk {
+		t.Errorf("the seat that muted was forgotten (%+v) over a mute that is still in force", got)
+	}
+}
+
+func TestATeardownClearsTheMuteBecauseTheElementHasGone(t *testing.T) {
+	// The moment the control really does go away: the capture is torn down. That
+	// is a device change, a Restart capture or the application quitting — and NOT
+	// a STOP. Without the event a latched cough button stays red over a pipeline
+	// that no longer exists, which is a control the operator cannot release.
+	a, _ := newTestApp(t)
+	captureUp(t, a)
+
+	if _, err := a.SetCommentaryMute(true, 1); err != nil {
+		t.Fatalf("SetCommentaryMute error = %v", err)
+	}
+
+	silencePump(a)
+	drainPump(a)
+	if err := a.stopCaptureForTeardown(); err != nil {
+		t.Fatalf("stopCaptureForTeardown() error = %v", err)
+	}
+
 	if !containsEvent(drainPump(a), EventMute) {
-		t.Error("no mute event at the end of the session; the button stays red over a pipeline " +
+		t.Error("no mute event when the capture went down; the button stays red over an element " +
 			"that no longer exists")
 	}
 	got := a.GetCommentaryMute()
 	if got.Muted {
-		t.Error("the mute survived the end of the session in the record")
+		t.Error("the mute survived the teardown in the record")
 	}
 	if got.Available {
-		t.Error("Available is true with no session; the control must go back to being not-yet-live")
+		t.Error("Available is true with no capture; the control must go back to being not-yet-live")
 	}
 	if got.By != "" || got.ByAddr != "" {
 		t.Errorf("the seat that muted is still recorded (%+v) against a mute that no longer exists", got)
 	}
 }
 
-func TestASelfStoppedSessionAlsoClearsTheMute(t *testing.T) {
-	// The path App.Stop does not cover. A capture chain that dies stops the
-	// sender itself; the operator never pressed anything, and a mute latched at
-	// the moment it happened must not outlive it.
+func TestASelfStoppedSessionLeavesTheMuteAlone(t *testing.T) {
+	// The path App.Stop does not cover: a sender that stops itself. It used to
+	// clear the mute, because it used to take the capture with it; it no longer
+	// touches the capture at all, so the control the operator is holding stays
+	// exactly as they left it. That is the same answer the operator-Stop path
+	// gives, which is the property worth pinning — a mute must not depend on WHICH
+	// way a session ended.
 	a, _ := newTestApp(t)
+	captureUp(t, a)
 	latest := useStartingSender(a)
 
 	if err := a.Start(); err != nil {
@@ -289,10 +398,13 @@ func TestASelfStoppedSessionAlsoClearsTheMute(t *testing.T) {
 
 	latest().stop()
 
-	waitFor(t, 5*time.Second, "the mute to be cleared by the self-stop", func() bool {
-		got := a.GetCommentaryMute()
-		return !got.Muted && !got.Available
+	waitFor(t, 5*time.Second, "the session to end", func() bool {
+		return !a.sessionUp.Load()
 	})
+	if got := a.GetCommentaryMute(); !got.Muted || !got.Available {
+		t.Fatalf("a self-stopped session moved the cough control (%+v); it acts on a capture "+
+			"pipeline, which the sender stopping does not touch", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -391,19 +503,19 @@ func TestReconciliationPublishesTheTruthWhenThePipelineDisagrees(t *testing.T) {
 		t.Fatalf("SetCommentaryMute error = %v", err)
 	}
 
-	// The pipeline loses the mute without this side being told, which is exactly
-	// what a rebuild would look like from here.
-	pipe := a.currentPipeline()
-	if pipe == nil {
-		t.Fatal("no pipeline")
+	// The capture pipeline loses the mute without this side being told, which is
+	// exactly what a rebuild would look like from here.
+	cap, _ := a.currentCommentary()
+	if cap == nil {
+		t.Fatal("no capture pipeline")
 	}
-	if err := pipe.SetCommentaryMute(false); err != nil {
-		t.Fatalf("clearing the mute on the pipeline directly: %v", err)
+	if err := cap.SetCommentaryMute(false); err != nil {
+		t.Fatalf("clearing the mute on the capture pipeline directly: %v", err)
 	}
 
 	silencePump(a)
 	drainPump(a)
-	a.reconcileMute(pipe)
+	a.reconcileMute(cap)
 
 	if !containsEvent(drainPump(a), EventMute) {
 		t.Error("the reconciliation found the pipeline unmuted and published nothing; the screen " +
@@ -452,12 +564,22 @@ func TestDomReadyReplaysTheMuteBecauseAMuteIsSilent(t *testing.T) {
 // The preview's honest answer
 // ---------------------------------------------------------------------------
 
-func TestPreviewStateBeforeStartExplainsItselfRatherThanGoingBlank(t *testing.T) {
-	// The owner asked for the preview and the monitoring to be live before
-	// START. Half of that is already true — the WebRTC programme return owes
-	// nothing to START — and half of it cannot be made true, because the capture
-	// card admits exactly one user and there is no atomic handover. A page that
-	// is not told the difference draws a dead black panel for both.
+// TestPreviewStateSaysAPreviewNoLongerWaitsForStart replaces
+// TestPreviewStateBeforeStartExplainsItselfRatherThanGoingBlank, which asserted
+// BeforeStart false "because the card measurements say it cannot".
+//
+// That was never quite what the measurements said, and previewStatePayload's own
+// comment recorded the difference at length: internal/gst measured the preview
+// rendering perfectly with the pipeline started and no sink installed, so the
+// missing piece was this APPLICATION splitting "bring the capture up" from "go
+// on air" — not the card. The always-live capture layer IS that split, and this
+// field was deliberately written as a field rather than as a frontend constant
+// so that the day it happened, one line would carry it.
+//
+// What still has to be true is the half that made the old test worth having: a
+// preview that is NOT on screen must say why, in a sentence, rather than leaving
+// a black rectangle that reads as a fault.
+func TestPreviewStateSaysAPreviewNoLongerWaitsForStart(t *testing.T) {
 	a, _ := newTestApp(t)
 
 	cfg := validConfig()
@@ -468,22 +590,24 @@ func TestPreviewStateBeforeStartExplainsItselfRatherThanGoingBlank(t *testing.T)
 	a.cfgMu.Unlock()
 
 	got := a.GetPreviewState()
-	if got.Running {
-		t.Fatal("Running is true with no session; the preview is a branch of the contribution " +
-			"pipeline and cannot exist without one")
+	if !got.BeforeStart {
+		t.Fatal("BeforeStart is false: it tells the page a confidence picture needs a session, " +
+			"which stopped being true when the picture capture moved to domReady")
 	}
-	if got.BeforeStart {
-		t.Fatal("BeforeStart is true: it claims a preview can run before START, which the card " +
-			"measurements say it cannot")
+	if got.Running {
+		// No NSApplication in a `go test` binary, so no overlay surface: the
+		// pipeline could exist and the window cannot.
+		t.Fatal("Running is true with no overlay surface")
 	}
 	if got.Reason == "" {
 		t.Fatal("Reason is empty; the page has nothing to say and draws an empty panel, which " +
 			"reads as a fault on a machine that is working perfectly")
 	}
-	// It must tell the operator the thing that stops them worrying: their own
-	// camera is what is missing, not the programme they are watching.
-	if !strings.Contains(got.Reason, "START") {
-		t.Errorf("Reason %q does not tell the operator what to press", got.Reason)
+	// And the reason must no longer be an instruction to press START, because
+	// pressing it would not put a picture there.
+	if strings.Contains(got.Reason, "START") {
+		t.Errorf("Reason %q still tells the operator to press START for a picture that does not "+
+			"wait for one", got.Reason)
 	}
 }
 
@@ -602,6 +726,20 @@ func containsEvent(events []pumpEvent, name string) bool {
 	return false
 }
 
+// captureUp builds the ALWAYS-LIVE CAPTURE LAYER, which is what domReady does at
+// launch and what almost every test in this file now needs instead of a session.
+//
+// The cough mute, the routing grid and the meters all belong to the capture
+// pipeline; a session neither creates nor destroys it. A test that started a
+// session to get a mute would be testing the lifetime this change removed.
+func captureUp(t *testing.T, a *App) {
+	t.Helper()
+	if err := a.rebuildCapture("a test asked for one"); err != nil {
+		t.Fatalf("rebuildCapture() error = %v; the stub capture must come up for this test to "+
+			"mean anything", err)
+	}
+}
+
 // startedSession runs a session whose pipeline is ACTUALLY STARTED, and returns
 // the running pipeline.
 //
@@ -620,15 +758,16 @@ func containsEvent(events []pumpEvent, name string) bool {
 func startedSession(t *testing.T, a *App) gst.Pipeline {
 	t.Helper()
 
+	captureUp(t, a)
 	useStartingSender(a)
 	if err := a.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 	t.Cleanup(func() { _ = a.Stop() })
 
-	pipe := a.currentPipeline()
+	pipe := a.currentSend()
 	if pipe == nil {
-		t.Fatal("Start() left no pipeline")
+		t.Fatal("Start() left no send pipeline")
 	}
 	return pipe
 }
@@ -705,9 +844,16 @@ func configHasJSONTag(tag string) bool {
 }
 
 // Compile-time statement of the seam this file exercises: the two methods the
-// cough control drives are on gst.Pipeline itself, so there is no build in which
-// the button exists and does nothing.
+// cough control drives are on gst.CapturePipeline itself, so there is no build in
+// which the button exists and does nothing.
+//
+// IT NAMES THE CAPTURE PIPELINE AND NOT THE SEND PIPELINE, and that is where the
+// mute has always belonged: it is a volume element in the chain that has the
+// microphone open, upstream of the programme meter and of the proxysink. What the
+// move buys the operator is that the control is answerable with nothing sending —
+// the element exists from launch — and that a reconnect cannot reach it, because
+// the object internal/sender drives has no audio leg at all.
 var _ interface {
 	SetCommentaryMute(bool) error
 	CommentaryMuted() bool
-} = gst.Pipeline(nil)
+} = gst.CapturePipeline(nil)

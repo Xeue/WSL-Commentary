@@ -104,13 +104,54 @@ these are the ones that change what a package may assume:
 
 `frontend/vite.config.js` does not exist. If WP-5b needs one, WP-5b creates it; nobody else.
 
-**The three-way split inside `internal/gst` is not decorative.** The contribution pipeline, the
-picture pipeline and the return pipeline share the process and nothing else: separate types,
-separate bus handlers, separate reconnect machines, separate locks. There is deliberately no code
-path from a monitor into the sender or back. A return monitor failing must never disturb the
-contribution feed, and the way that is guaranteed is by there being nothing to share. The one thing
-the picture path does borrow from the return path is `fakeSinkName`, and the comment at the top of
-`picture.go` says so and says it is the only one.
+**The split inside `internal/gst` is not decorative, and it is now FOUR-WAY.** The always-live
+**capture** pipelines, the **send** pipeline, the **picture** monitor and the **return** monitor
+each have their own type, their own bus handler, their own lock and their own lifetime. There is
+deliberately no code path from a monitor into the sender or back. A return monitor failing must
+never disturb the contribution feed, and the way that is guaranteed is by there being nothing to
+share. The one thing the picture path borrows from the return path is `fakeSinkName`, and the
+comment at the top of `picture.go` says so and says it is the only one.
+
+**The capture layer joined the split and brought the one exception with it — SAY IT OUT LOUD.**
+The sentence above used to read "share the process and nothing else", and that is no longer
+literally true: the capture pipelines and the send pipeline **share buffers**, across a
+`proxysink` / `proxysrc` seam. This is an amendment rather than an undocumented exception,
+because it is exactly the kind of thing rule 3 exists to stop being discovered.
+
+What is shared and what is not:
+
+| | shared | not shared |
+|---|---|---|
+| capture ↔ send | media buffers across the proxy, and the process clock and base time | type, bus, lock, teardown, fault channel, lifetime |
+| capture ↔ picture / return | nothing | everything |
+| send ↔ picture / return | nothing | everything |
+
+The seam's three invariants are stated in `internal/gst/seam.go` and none may be undone alone:
+
+1. **A leaky (`leaky=downstream`) queue in front of every `proxysink`.** `proxysrc`'s internal
+   queue is `leaky=0 max-size-buffers=200` and exposes no tuning, so without the capture-side leak
+   a wedged send pipeline drags the producer down with it. Measured on the card under a 12 s
+   wedge: 50.1 fps and 20.0 meter msg/s with the leak, against 11.6 fps and 7.2 msg/s without,
+   plus `Dropped 271 old frames` from the card itself.
+2. **The seam is armed at START, never at STOP.** `gstproxysink.c` resets `sent_stream_start` and
+   `sent_caps` only on `READY→PAUSED`, and a proxysink in an always-live pipeline never makes that
+   transition again — so every consumer after the FIRST receives no `STREAM_START`, no `CAPS` and
+   no `SEGMENT`. Measured: cycle 1 writes 1,133,076 bytes, cycles 2 and 3 write **zero**, with SRT
+   connected and every lamp green. `CapturePipeline.ArmForSend` runs an IDLE-probe READY cycle
+   before `gst_parse_launch`, and it is at START because STOP has abnormal paths through which it
+   can be skipped and START has none.
+3. **One consumer per `proxysink`, enforced in Go.** A second `proxysrc` attaching to a live
+   `proxysink` does not fail — it silently steals the stream and kills the first (measured: A
+   stopped dead at 5.994 s the instant B attached at 6.007 s, nothing on either bus). There is no
+   refusal inside the element, so `ClaimForSend` / `ErrSeamBusy` is the refusal, and
+   `CapturePipeline.Stop` refuses while a claim is held.
+
+**`proxysrc` was previously recorded here as MEASURED AND REJECTED, and that record is corrected
+rather than removed.** The measurement stands — a leaky=0 internal queue and a producer death that
+is silent across the boundary — and both objections are what invariants 1 and the send side's
+2 s muxer watchdog exist to answer. What was rejected was `proxysrc` *instead of a tee, inside one
+pipeline*; what shipped is a tee for the preview and a proxy for the boundary between two
+pipelines that must have separate lifetimes.
 
 ---
 
@@ -149,10 +190,22 @@ selected by build tag:
 
 | cgo half | stub twin | supplies |
 |---|---|---|
-| `gst_cgo.go` | `gst_stub.go` | the contribution pipeline, `ListInputDevices` |
+| `capture_cgo.go` | `capture_stub.go` | `NewCapture` — one always-live capture pipeline |
+| `gst_cgo.go` | `gst_stub.go` | the SEND pipeline (`New`, `Start`, `ReplaceSink`), `ListInputDevices` |
 | `picture_cgo.go` | `picture_stub.go` | `newPicturePipe` — one picture attempt |
 | `return_cgo.go` | `return_stub.go` | `newReturnPipe`, `ListOutputDevices` |
 | `overlay_windows.go` | `overlay_darwin.go` / `overlay_other.go` | the native child window |
+
+Three more files are `cgo && !gststub` with no stub twin, because what they hold is the cgo
+mechanism itself rather than a pipeline: `capturedesc_cgo.go` (both parse strings, behind the tag
+only because `captureSourceFactory` and `aacEncoderFactory` live in `elements_*.go`),
+`proxy_cgo.go` (`armProxySink`'s IDLE-probe READY cycle and `bindProxySrc`'s object-valued
+`g_object_set`, which go-gst does not bind) and `livewatch_cgo.go` (the `BUFFER|BUFFER_LIST`
+probes). **Neither Gate A nor Gate B compiles any of them** — both select the stub twin — so the
+arming, the IDLE probe, the CAPS probe and the muxer watchdog have had no `-race` exercise
+anywhere, and the live tests in `internal/gst` are the only thing that has ever run them. That is a
+property of the gates, and it is stated here so nobody reads a green Gate B as coverage of the
+seam.
 
 Since the macOS port there is a **second** axis of build tags inside the cgo half, and it is a
 different axis: not cgo-versus-stub but Windows-versus-macOS. Everything true on every platform
@@ -445,10 +498,40 @@ This is not the `docs/architecture.md` ban on REST format — that ban is on rea
 **detection**, and detection still comes from `switcher_status` alone.
 
 ### `internal/gst` — the contribution pipeline — WP-3a
-`Device{ID, Name, Kind}`; `ID` is the IMMDevice endpoint GUID and is the only thing persisted or
-passed to `wasapi2src`. `Pipeline` with `Start(PipelineOpts)`, `ReplaceSink(SinkOpts)`,
-`ForceKeyUnit()`, `Errors()`, `Stop()`; package functions `Init(appDir)`, `ListInputDevices()`,
-`New()`.
+`Device{ID, Name, Kind, Channels, Positioned}`; `ID` is the IMMDevice endpoint GUID (or the
+CoreAudio UID, or a DeckLink persistent-id) and is the only thing persisted or passed to the
+capture element.
+
+**Rule 3, 2026-08-17: THE CONTRIBUTION PIPELINE IS NOW TWO PIPELINES, AND BOTH INTERFACES CHANGED.**
+This is the interface change the always-live capture layer forced, reported centrally rather than
+left to be discovered:
+
+| before | after |
+|---|---|
+| `Pipeline.Start(PipelineOpts)` | `Pipeline.Start(SendOpts)` — the SEND pipeline only |
+| `PipelineOpts` (13 fields) | **deleted.** Nine fields to `CaptureOpts`, two to `SendOpts` |
+| `New()` | `New(CaptureSet)` — a send pipeline is MINTED ONLY BY CAPTURE |
+| — | `NewCapture(CaptureOpts) (CapturePipeline, error)` |
+| — | `PlanCapture(CaptureSources) []CaptureLegs` — the fusion rule |
+| — | `CaptureSet{Picture, Commentary}` — the SAME object when fused |
+| — | `ErrSeamBusy` — the single-consumer refusal |
+| `sender.Opts.Pipeline gst.PipelineOpts` | `sender.Opts.Pipeline gst.SendOpts` |
+
+`Pipeline` is now `Start(SendOpts) / ReplaceSink(SinkOpts) / RemoveSink() / ForceKeyUnit() /
+Errors() / Stop()` and nothing else: `InputChannels`, `SetChannelMap`, `SetCommentaryMute` and
+`CommentaryMuted` moved to `CapturePipeline`, because they are properties of the pipeline that HAS
+THE DEVICE OPEN and not of a send session. `CapturePipeline` adds `Legs`, `Start`, `ArmForSend`,
+`ProxySinks`, `ClaimForSend`, `ReleaseFromSend`, `Health`, `PictureHealth`, `Faults`, `Warnings`
+and `Stop`.
+
+**`ConformTo` moved from `PipelineOpts` to `CaptureOpts`, and that is the consequential one.**
+With the conform chain in the CAPTURE pipeline the caps crossing the proxy are pinned for the life
+of the process, so the DeckLink changing raster — the 720x486 NTSC placeholder before it locks, the
+real input after, back again when the cable is pulled — renegotiates `videoscale`'s SINK caps only
+and the encoder never sees a caps change at all.
+
+Package functions: `Init(appDir)`, `ListInputDevices()`, `New(CaptureSet)`, `NewCapture(CaptureOpts)`,
+`PlanCapture(CaptureSources)`, `FallbackConformTarget()`, `ConformTargetFromRate(...)`.
 
 **`Device.Kind` added 2026-08-15, rule 3.** `DeviceKind` is `"native"` (the platform's own audio
 stack) or `"decklink"` (a Blackmagic card from GStreamer's decklink provider), and it exists
@@ -483,12 +566,31 @@ The classification must run **before** the gate close, not merely replace the `i
 closing the gate on a video fault would stop media reaching the sink and starve the SRT peer,
 defeating the sparing.
 
-**Element names in `pipelineDescription` are therefore load-bearing.** The audio capture element
+**Element names in `captureDescription` are therefore load-bearing.** The audio capture element
 is `asrc` whatever factory is behind it; every element of a video capture leg carries the `vcap`
-prefix. An element that does not rejoins the fatal default **silently** — the failure direction is
-safe and therefore invisible — which is why the names are constants in `capturefault.go`.
+prefix, and the two proxy tails carry `vprox` and `aprox`. An element that does not rejoins the
+fatal default **silently** — the failure direction is safe and therefore invisible — which is why
+the names are constants in `capturefault.go` and `seam.go`.
 
-**The video leg becomes a live DeckLink capture when `PipelineOpts.VideoCaptureID` names a card,
+**The SEND bus has its own two-way classifier, `classifySendBusError`, and does not consult the
+capture classes at all.** It contains no capture element — the slate, both DeckLink sources, the
+conform chain, the preview branch and both level elements are in a `CapturePipeline` with a bus of
+its own — so `classVideoCapture`, `classPreview` and `classAudioCapture` describe elements that
+cannot post there. Keeping them would have been worse than dead: `vprox`/`aprox` also match this
+graph's `vproxsrc` and `aproxsrc`, so a video-proxy error would have been spared with the gate left
+OPEN and an audio-proxy one handed to a DeckLink diagnosis of a graph containing no card.
+`captureLegsFor`'s parent-bin walk is **deleted** with it — a `CapturePipeline` knows its leg-set
+before `gst_parse_launch` runs, so the answer is a field read.
+
+**A PICTURE-leg death is latched and reported, not merely logged.** `PictureHealth()` is a second
+question from `Health()` because the two have different repairs — the commentary goes on being
+captured, metered and muted, and `RestartCapture` is the fix — but `ArmForSend` refuses on either,
+because `mpegtsmux` emits nothing at all while one of its two inputs is silent (measured:
+`vq:src` 0, `aq:src` 187 at full rate, `mux:src` 0). Before this, a picture death reached
+`deliverWarning` and stopped: nothing on screen changed, `Health()` answered nil, START reached
+PLAYING over a dead card and the refusal two seconds later named a pad rather than the card.
+
+**The video leg becomes a live DeckLink capture when `CaptureOpts.VideoCaptureID` names a card,
 2026-08-16, rule 3.** The **zero value is the slate**, byte for byte the graph that ships today, and
 the leg is chosen by that field and **nothing else** — there is no card detection, so a DeckLink
 fitted for an unrelated purpose can never become the picture a commentary position transmits. The
@@ -503,20 +605,29 @@ see one fixed format forever. Proven end to end against the live M2L-X instance 
 525i59.94 input (720x486, interlaced, bt601, PAR 10:11) left the leg as 1920x1080p50 square-pixel
 bt709 progressive for 45 s with `error_packet_count` and `discontinuous_packet_count` both **0**.
 
+**Since 2026-08-17 the leg ends at a `proxysink` rather than at the encoder**, and everything from
+the encoder down is `sendDescription`'s. The two picture legs still MEET at one point and share
+every element below it — that point is now the proxy tail (`videoProxyTail`), which is a leaky
+queue and a `proxysink`, and the send pipeline picks it up with caps it asserts.
+
 **The confidence monitor is a branch of that tee** (`preview.go`, `preview_cgo.go`,
-`preview_stub.go`), and a tee **inside** the contribution pipeline crosses no boundary this
-document draws — `proxysrc` was measured and **rejected** (its queue is `leaky=0`, so a wedged
-consumer stalls the producer 50→0 fps in under two seconds and the producer's death is silent
-across it), and a **second `decklinkvideosrc` is impossible** because the card is exclusive. Four
-properties of it are contract:
+`preview_stub.go`), and a tee **inside** one pipeline is still the right shape for it — a **second
+`decklinkvideosrc` is impossible** because the card is exclusive. The note that used to sit here
+saying `proxysrc` was "measured and **rejected**" is corrected at the top of this document rather
+than deleted: the measurement stands, both of its objections are what the seam's leaky queue and
+the send side's muxer watchdog exist to answer, and what was rejected was `proxysrc` *instead of a
+tee inside one pipeline* rather than as the boundary between two. Four properties of the preview
+are contract:
 
 - **The head queue is `leaky=downstream`.** A `tee` pushes to its src pads serially on the upstream
   streaming thread, so a preview that merely renders slowly drags the **broadcast** leg from 50 fps
   to 20.8. It scales **before** it converts and caps at 12.5 fps first, which is worth about four
   times the branch's whole cost.
-- **It is built at `Start` from configuration and is never toggled live.** `set_state(NULL)` on such
-  a branch inside a blocking pad probe took the on-air leg from 50 fps to **0 permanently**, with
-  the pipeline still reporting PLAYING.
+- **It is built with the CAPTURE PIPELINE, at `domReady`, from configuration, and is never toggled
+  live.** (It used to be built at `Start`; the measurement behind "never toggled live" is unchanged
+  and only the lifetime moved.) `set_state(NULL)` on such a branch inside a blocking pad probe took
+  the on-air leg from 50 fps to **0 permanently**, with the pipeline still reporting PLAYING.
+  Changing it is therefore a `RestartCapture`, off air.
 - **Every property in the parse string must be one that cannot fail to parse.** An unknown property
   is a hard `gst_parse_launch` error and the string is the *contribution* pipeline's, so an optional
   monitor could otherwise stop the commentary going on air. Only `GstQueue`'s and `GstBaseSink`'s
@@ -529,7 +640,7 @@ properties of it are contract:
   **once more without the branch** before reporting failure. The commentary is the product and the
   monitor is not.
 
-**The video leg's two capsfilters are rendered from `PipelineOpts.ConformTo`, not constants.**
+**The video leg's two capsfilters are rendered from `CaptureOpts.ConformTo`, not constants.**
 `ConformTarget{Width, Height, FrameRateNum, FrameRateDen}`, whose **zero value means "nothing is
 known"** and resolves to `FallbackConformTarget()` = 1920x1080p50 — the value that used to be
 hardcoded, so an unread switcher behaves exactly as before. The rate is an exact fraction because
@@ -542,9 +653,12 @@ transcription. A second parser here would be a second grammar that drifts.
 
 Two contract points that are easy to get wrong and cost a day each:
 
-- **`Start` installs no sink.** It plays the capture/encode/mux chain with the `srtq` src pad
-  blocked. The first `ReplaceSink` installs the first sink. That is what lets the chain stay in
-  PLAYING for the life of the process, which is the structural fix for the backwards-DTS bug.
+- **`Start` installs no sink.** It plays the encode/mux chain with the `srtq` src pad blocked. The
+  first `ReplaceSink` installs the first sink. That is what lets the chain stay in PLAYING for the
+  life of the process, which is the structural fix for the backwards-DTS bug. It DOES open a
+  device — it has none to open; the capture layer opened it at `domReady` — and it refuses unless
+  media has reached `vq:src`, `aq:src` and `mux:src` within two seconds of PLAYING, which is the
+  gate that makes a missed arming loud instead of green.
 - **`Errors()` is closed by `Stop()`**, and implementations drop rather than block when it is
   full. Synchronous failures come back from the method that caused them and never appear there.
 
@@ -568,6 +682,58 @@ control and not a licensing one; what keeps GPL code out of the shipped artefact
 `build/forbidden-names.ps1`, which is now applied at three points by
 `build/bundle-gst-darwin.sh` (wanted list, computed closure, staged tree) exactly as
 `build/bundle-gst.ps1` applies it on Windows.
+
+### `internal/gst` — the ALWAYS-LIVE CAPTURE LAYER — added 2026-08-17, rule 3
+
+`CapturePipeline` (`capture.go`, `capture_cgo.go`, `capture_stub.go`), `CaptureOpts`,
+`CaptureLegs`, `CaptureSources`, `CaptureSet`, `PlanCapture`, `NewCapture`, `ErrSeamBusy`.
+
+**It is built at `domReady` and lives until the application quits.** It never sends: it ends in one
+or two `proxysink`s and knows nothing about SRT, the encoder, the muxer or the session. Every one of
+its methods may be called with no send pipeline anywhere in the process, and that is the whole point
+— the meters, the preview, the routing width, the signal lamp and the cough mute exist before START
+and survive STOP.
+
+**The DeckLink is held from launch to quit and that is an accepted facility change** (PLAN.md 0-BIS
+A1). Nothing else on the machine can open it while `wslcomms` runs. Three mitigations make it safe
+and all three are contract: the app NEVER fails to launch because of the card (a picture leg whose
+card will not open is rebuilt as the slate, and the fault goes on the capture event with the reason
+naming what IS going out); there is an explicit `RestartCapture`; and a cable fault now surfaces at
+launch instead of twenty minutes before kick-off. A **fused** seat gets no slate fallback — dropping
+the card would take the microphone with it — so it stays down, says why, and START refuses with the
+same sentence the panel is showing.
+
+**`PlanCapture` is THE FUSION RULE and it decides how many pipelines there are.**
+
+| picture | commentary | pipelines |
+|---|---|---|
+| slate | CoreAudio / WASAPI | two, independent |
+| slate | card | two, independent (the commentary carries a `decklinkvideosrc` clock companion) |
+| card | CoreAudio / WASAPI | two, independent |
+| card | card | **ONE FUSED PIPELINE** |
+
+It is not an optimisation. `decklinkaudiosrc` cannot preroll without a `decklinkvideosrc` in the
+SAME pipeline (measured: 0 buffers, 0 level messages against 160), and the card is EXCLUSIVE — two
+DeckLink sources in one process fail 3/3 and two processes fail 3/3 — so **at most one pipeline may
+ever contain DeckLink elements**. `CaptureSet.Picture` and `.Commentary` are THE SAME OBJECT on a
+fused seat, which is why every loop over a set goes through `Pipelines()`: arming it twice runs the
+READY cycle over the same proxysinks again, and claiming it twice refuses the seat its own consumer
+with `ErrSeamBusy`.
+
+**Only an audio device change is cheap.** Splitting picture capture from commentary capture is what
+makes selecting a microphone a live operation that does not close the card. The fused seat is the
+one that pays a picture blank when the commentary moves on or off the card, and that is a setup
+action done once.
+
+**`InputChannels()` reads 0 for about 7 ms after `Start` returns.** Measured on the card: `Start`
+completed at +108 ms and `aconv:sink` published its negotiated caps at +115 ms. That is the shipped
+contract of a live source — it returns `NO_PREROLL` as soon as its state change completes, which can
+be before the first `CAPS` event has travelled downstream — and not a defect. **The application must
+take the width from `CaptureOpts.OnInputChannels(deviceKey, width)` and must not read
+`InputChannels()` synchronously after `Start` and believe a zero.**
+
+**Idle cost, measured on the real card over fifteen minutes with no consumer:** 20.1 % of one core,
+~97 MB RSS, not leaking.
 
 ### `internal/gst` — the SRT picture — WP-P
 `PictureMonitor` with `Start(PictureOpts)` / `Stop()` / `States()`, `NewPictureMonitor()`,
@@ -623,7 +789,14 @@ frontend on the `sender` event. `Sender` with `Start(Opts)`/`Stop()`/`States()`.
 `New(p gst.Pipeline) Sender`: the pipeline is **injected**, so WP-3b writes its own fake
 `gst.Pipeline` in its test files and never needs cgo. `BackoffLadder` is 7, 7, 10, 15, 20 s then
 `BackoffCap` 30 s forever; the first delay must stay ≥ 6 s to clear M2L-X's re-accept refusal
-window. `Opts` composes `gst.PipelineOpts` and `gst.SinkOpts` rather than restating their fields.
+window. `Opts` composes `gst.SendOpts` and `gst.SinkOpts` rather than restating their fields —
+`gst.PipelineOpts` until 2026-08-17, a one-line change with the semantics untouched, because
+everything `internal/sender` reasons about is DOWNSTREAM of the capture seam. The state machine,
+the backoff ladder, the DRAINING→BACKOFF→CONNECTING order and the `ErrPipelineFatal` self-stop are
+unchanged, and a reconnect never disturbs the producer: it calls only `RemoveSink`, a sleep and
+`ReplaceSink`, none of which touches a proxysrc, and the closed gate drops at `srtq:sink` so
+`vq`/`aq`/`mux` keep counting throughout and the muxer watchdog cannot false-positive across the
+7 s ladder.
 
 ### `internal/kvs` — WP-4
 `Credentials` and `Fetch(ctx, m2lx.Client, eventID)`. The JSON tags on `Credentials` are what
@@ -787,12 +960,42 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `SetRemoteListener(enabled, bind, httpPort, httpsPort)` | `error` | WP-5b | **host-only** |
 | `GetConformTarget()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
 | `GetSwitcherFormat()` | `*ConformTargetView` (nil when unknown) | WP-5b | open |
-| `GetChannelMap()` | `channelMapPayload {inputChannels, map, isDefault}` | WP-3a | open |
+| `GetChannelMap()` | `channelMapPayload {deviceKey, inputChannels, map, isDefault}` | WP-3a | open |
 | `SetChannelMap(map)` | `error` | WP-3a | open |
 | `SetVideoSource(source)` | `error` | none — see below | **host-only** |
 | `SetDeckLinkPreviewEnabled(enabled)` | `error` | none — see below | **host-only** |
 | `SetPreviewRect(x,y,w,h,ratio)` | `error` | WP-5b | **host-only** |
 | `SetPreviewVisible(visible)` | `error` | WP-5b | **host-only** |
+| `GetPreviewState()` | `previewStatePayload` | WP-5b | open |
+| `SelectCommentaryInput(kind, deviceId, persistentId)` | `error` | WP-5b | **host-only** |
+| `RestartCapture()` | `error` | WP-5b | **host-only** |
+| `GetCaptureState()` | `capturePayload` | WP-5b | open |
+| `GetCommentaryMute()` | `mutePayload` | WP-5b | open |
+| `SetCommentaryMute(muted, seq)` | `mutePayload, error` | WP-5b | open |
+| `CredentialStoreName()` | `string` | WP-5b | open |
+| `ListEvents()` | `[]m2lx.EventSummary` | WP-5b | open |
+
+**The last eight rows were MISSING from this table and are added 2026-08-17.** Three
+(`SelectCommentaryInput`, `RestartCapture`, `GetCaptureState`) arrived with the always-live capture
+layer; the other five had drifted. The table is not self-checking — `remoteAllowlist` is, through
+`TestRemoteAllowlistCoversEveryBoundMethod`, which classifies every exported `*App` method in both
+directions — so this list is kept in step by hand and diffing it against that allowlist is how the
+gap was found.
+
+`SelectCommentaryInput` and `RestartCapture` are host-only for the reason `SetVideoSource` is:
+which microphone this position is heard on is a decision about what a broadcast switcher receives,
+and `RestartCapture` additionally blanks an opaque native window on the screen of whoever is sitting
+at this machine. `SelectCommentaryInput` deliberately **does not save** — an operator auditioning
+microphones twenty minutes before kick-off must be able to hear each one without rewriting
+`config.json`, and the live selection is dropped by the next `SaveConfig`.
+
+`GetCaptureState` is **open**, and the argument is worth stating because it is the row a tidy-up
+would flip. There is no event replay on connect, so this read is a remote producer's ONLY chance to
+learn a launch-time capture failure: a producer who could see a dead meter and not the sentence
+explaining it would report a fault this application had already diagnosed. It must NOT be gated on
+`backend.captureAvailable()` in the frontend either — that probe is all-or-nothing over three method
+names, two of which are host-only and therefore pruned from the shim, so the gate reads false on
+every remote seat and made the open row unreachable.
 
 `GetChannelMap` and `SetChannelMap` are added 2026-08-16 with the DeckLink routing screen. They
 are the two halves of one control and neither is useful alone.
@@ -803,13 +1006,22 @@ BROADCAST SWITCHER RECEIVES; the preview trio concern an opaque native window on
 whoever is sitting at this machine, and are host-only for the reason `SetPictureRect` and
 `SetPictureVisible` are.
 
-**HOST-ONLY IS NOT SELF-ENFORCING FOR THE FIRST TWO, and the gap is closed in code rather than
-noted here.** `videoSource` and `decklinkPreviewEnabled` are ordinary configuration fields, and
-`SaveConfig` is **open** and is a whole-document write from a page's cache — so a remote seat could
-change either of them without ever naming the host-only method, and the classification above would
-be a decoration. `App.refuseRemoteVideoLegChange` is what enforces it: a REMOTE `SaveConfig` whose
-document would CHANGE either field is refused, naming the field, while an identical restatement
-passes through untouched so ordinary remote saves of unrelated fields are unaffected.
+**HOST-ONLY IS NOT SELF-ENFORCING FOR THE CONFIGURATION-BACKED ONES, and the gap is closed in code
+rather than noted here.** `videoSource`, `decklinkPreviewEnabled`, `audioSourceKind`,
+`audioDeviceId` and `decklinkPersistentId` are ordinary configuration fields, and `SaveConfig` is
+**open** and is a whole-document write from a page's cache — so a remote seat could change any of
+them without ever naming the host-only method, and the classification above would be a decoration.
+`App.refuseRemoteCaptureChange` (renamed from `refuseRemoteVideoLegChange` and **widened to the
+three audio fields on 2026-08-17**) is what enforces it: a REMOTE `SaveConfig` whose document would
+CHANGE any of the five is refused, naming the field, while an identical restatement passes through
+untouched so ordinary remote saves of unrelated fields are unaffected.
+
+The widening is not symmetry for its own sake. Without it a remote whole-document save could take
+the desk's microphone, and on a card seat CLOSE AND REOPEN THE EXCLUSIVE DECKLINK, from another
+building. Its frontend half matters as much: the microphone picker is disabled on a remote seat and
+`settings.adoptAudioLeg` refreshes it when another seat saves, because a stale cache of any of those
+five fields has every subsequent save refused, naming a field that seat was never told it may not
+change.
 
 `SetVideoSource` and `SetDeckLinkPreviewEnabled` have **no caller**, deliberately, and the table
 says so rather than naming one that does not exist. The Settings screen writes both fields through
@@ -896,7 +1108,9 @@ and the log cannot disagree.
   a node that is streaming right now. A disagreement between the two is logged naming both, rather
   than the override being ignored in silence.
 - **`Start` no longer refuses `audioSourceKind:"decklink"`. The capture leg landed and the refusal
-  went with it.** `decklinkaudiosrc` is built with `channels=16` **explicitly** (never
+  went with it.** (And since 2026-08-17 `Start` opens no device at all: the capture layer is built
+  at `domReady` and `Start` mints a SEND pipeline over it. The paragraphs below describe how the
+  commentary capture is built, which is now `NewCapture`'s job.) `decklinkaudiosrc` is built with `channels=16` **explicitly** (never
   `channels=max`: it publishes a caps *choice* until the card is opened, and `fixedChannelCount`
   refuses it by name rather than guessing a width), alongside a `decklinkvideosrc` for the same card
   in the same pipeline, because DeckLink audio **cannot preroll without it**.
@@ -952,10 +1166,36 @@ Added 2026-08-16 with the DeckLink capture work, three more:
 **`channelLevels`** (the same `{peak, rms []float64}` shape as `levels`, but one entry per
 **capture** channel and measured **upstream** of the routing — 10/s, not 20/s, and emitted only on
 an unpositioned source, so a native seat sends none at all),
-**`channelMap`** (`{inputChannels, map, isDefault}`, on session start and end, replayed on
-`domReady` from a cache rather than from the pad), and
+**`channelMap`** (`{deviceKey, inputChannels, map, isDefault}`), and
 **`signal`** (`{state: 'UNKNOWN'|'OK'|'LOST', flaps: number}`, the capture card's input lock,
 debounced in `internal/gst`).
+
+**`deviceKey` is not optional and the event's timing changed, 2026-08-17.** It is
+`"<kind>:<deviceId>"` — WHICH DEVICE that width was measured on — and the routing panel is gated on
+it matching the SELECTED device. Without it there is a window between selecting a Focusrite and the
+capture renegotiating in which the grid still holds the previous device's sixteen, and a crosspoint
+pressed in that window writes a 2×16 matrix onto a two-channel pad: the measured
+`streaming stopped, reason error (-5)`, which reads as a broken device. The event's old description
+here — "on session start and end, replayed on `domReady` from a cache rather than from the pad" — is
+now wrong in its first half: it fires on **every capture build and device change**, because the pad
+negotiates at launch and has no session to belong to. The `domReady` replay is still from the cache,
+for the reason it always was: that callback is the Wails main thread and must not block on a lock
+`internal/gst` holds across state changes.
+
+**Three more, added 2026-08-17, and the event list here was six short of `remoteEventNames()`:**
+**`mute`** (`{muted, by, byAddr, available, reason, seq}` — the cough mute; emitted on change and
+replayed on `domReady`, because a mute is SILENT and a reloaded page showing an unmuted commentator
+who is not being heard is wrong in the one direction that costs a match),
+**`preview`** (`previewStatePayload {running, beforeStart, reason, …}` — why there is or is not a
+confidence monitor), and
+**`capture`** (`{picture, commentary, reason, audioDeviceName}`, each leg one of
+`off | opening | live | failed`).
+
+`capture` is the only event on this list that fires BEFORE a session and goes on firing after one.
+It is emitted from every capture build and teardown path AND from each capture pipeline's fault
+drain — the last of those added 2026-08-17, because without it a pipeline that died at run time left
+the panel reading `live` for the rest of the day, and a page reloaded at half-time read the same
+stale record through `GetCaptureState` and drew a healthy microphone over a dead one.
 
 Two rules on those three. **`levels` and `channelLevels` must never be treated as substitutes**:
 both level elements post a GstStructure named `level` — reproduced here, 65 messages in one run,

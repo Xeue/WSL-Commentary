@@ -57,19 +57,51 @@ func TestGetChannelMapReportsNoChannelsWithNoSession(t *testing.T) {
 	}
 }
 
-func TestSetChannelMapWithNoSessionSaysToPressStart(t *testing.T) {
+// TestSetChannelMapWithNoCaptureNamesTheDeviceAndNotStart replaces
+// TestSetChannelMapWithNoSessionSaysToPressStart, which asserted the opposite
+// and was right about the build it was written for.
+//
+// That test required the refusal to say "press START once", because the capture
+// pad came into existence at START and pressing it was genuinely the thing to
+// do. The pad now negotiates at launch, so START would change nothing about
+// whether this call can be served — an instruction that cannot help is worse
+// than none, because the operator follows it and comes back none the wiser.
+//
+// What CAN still be missing is a capture, so the sentence has to point at the
+// device and at Restart capture.
+func TestSetChannelMapWithNoCaptureNamesTheDeviceAndNotStart(t *testing.T) {
 	a, _ := newTestApp(t)
 
 	err := a.SetChannelMap(gst.ChannelMap{{Output: gst.OutputLeft, Input: 0, Gain: 1}})
 	if err == nil {
-		t.Fatal("SetChannelMap succeeded with no pipeline; there is no capture pad to route and " +
+		t.Fatal("SetChannelMap succeeded with no capture open; there is no pad to route and " +
 			"reporting success would leave the grid showing a routing that is not in force")
 	}
-	// The message has to say what to DO. "No pipeline" is a true statement an
-	// operator cannot act on; "press START once" is the same fact as an
-	// instruction, and it is what the screen itself says.
-	if !strings.Contains(err.Error(), "START") {
-		t.Errorf("SetChannelMap error = %q, want it to name START as the thing to do", err)
+	if strings.Contains(err.Error(), "START") {
+		t.Errorf("SetChannelMap error = %q still sends the operator to START, which cannot open "+
+			"a device: the capture is built at launch and START mints a send pipeline over it", err)
+	}
+	// The message has to say what to DO. "There is no pad" is a true statement an
+	// operator cannot act on.
+	if !strings.Contains(err.Error(), "Restart capture") {
+		t.Errorf("SetChannelMap error = %q, want it to name the recovery control", err)
+	}
+}
+
+// TestSetChannelMapWorksWithNothingSending is the direct R2 assertion, and it is
+// the requirement the deleted refusal above stood in the way of: the routing is
+// a control over a capture pad, the pad is open before anybody presses anything,
+// so an operator can find and fix a commentator's channel at line-up.
+func TestSetChannelMapWorksWithNothingSending(t *testing.T) {
+	a, _ := newTestApp(t)
+	captureUp(t, a)
+
+	if a.sessionUp.Load() {
+		t.Fatal("a session is running; this test is about the state in which none is")
+	}
+	if err := a.SetChannelMap(gst.ChannelMap{{Output: gst.OutputLeft, Input: 0, Gain: 1}}); err != nil {
+		t.Fatalf("SetChannelMap with nothing sending error = %v; the whole point of the seam is "+
+			"that the routing grid works an hour before kick-off", err)
 	}
 }
 
@@ -261,11 +293,15 @@ func TestChannelMapPayloadCopiesTheMapItPublishes(t *testing.T) {
 	}
 }
 
-func TestSenderOptsCarriesTheRoutingAndBothNewCallbacks(t *testing.T) {
+// TestCaptureOptsCarriesTheRoutingAndBothNewCallbacks reads captureOpts and not
+// senderOpts, because that is where all four of these now live: the routing, the
+// two meters and the signal lamp are properties of the pipeline that HAS the
+// device, and a send pipeline is told nothing but two bitrates.
+func TestCaptureOptsCarriesTheRoutingAndBothNewCallbacks(t *testing.T) {
 	a, _ := newTestApp(t)
 
 	// A store holding TWO devices' routings, with the key spelled out rather than
-	// asked for: senderOpts must reach the one belonging to the device this
+	// asked for: captureOpts must reach the one belonging to the device this
 	// configuration captures from, and a test that built its key with the same
 	// call the code under test uses would agree with any spelling at all.
 	cfg := config.Defaults()
@@ -276,26 +312,26 @@ func TestSenderOptsCarriesTheRoutingAndBothNewCallbacks(t *testing.T) {
 		"native:usb-mic-1":    {{Output: gst.OutputLeft, Input: 0, Gain: 1}},
 	}
 
-	opts := a.senderOpts(cfg, "")
+	opts := a.captureOpts(cfg, capturePlan{AudioCaptureID: "2747401380"}, 0, gst.FallbackConformTarget(), false)
 
-	if len(opts.Pipeline.ChannelMap) != 1 || opts.Pipeline.ChannelMap[0].Input != 4 {
-		t.Errorf("PipelineOpts.ChannelMap = %+v, want the routing saved for the CARD; without it "+
+	if len(opts.ChannelMap) != 1 || opts.ChannelMap[0].Input != 4 {
+		t.Errorf("CaptureOpts.ChannelMap = %+v, want the routing saved for the CARD; without it "+
 			"a card starts on channels 1 and 2 whatever the operator saved — and picking the "+
 			"wrong device's entry would start it on somebody else's microphone",
-			opts.Pipeline.ChannelMap)
+			opts.ChannelMap)
 	}
 	// All three hooks, because each one is a whole feature that is inert without
 	// it: no OnChannelLevels is a routing grid with dead meters, and no OnSignal
 	// is a lamp that never moves off UNKNOWN over a card that has lost its input.
-	if opts.Pipeline.OnLevels == nil {
-		t.Error("PipelineOpts.OnLevels is nil; the input meters would never move")
+	if opts.OnLevels == nil {
+		t.Error("CaptureOpts.OnLevels is nil; the input meters would never move")
 	}
-	if opts.Pipeline.OnChannelLevels == nil {
-		t.Error("PipelineOpts.OnChannelLevels is nil; the routing grid's per-channel meters " +
+	if opts.OnChannelLevels == nil {
+		t.Error("CaptureOpts.OnChannelLevels is nil; the routing grid's per-channel meters " +
 			"would never move and the operator could not find the commentator")
 	}
-	if opts.Pipeline.OnSignal == nil {
-		t.Error("PipelineOpts.OnSignal is nil; the signal lamp would stay UNKNOWN for the whole " +
+	if opts.OnSignal == nil {
+		t.Error("CaptureOpts.OnSignal is nil; the signal lamp would stay UNKNOWN for the whole " +
 			"of a match over a card that had lost its input, which nothing else can detect")
 	}
 }
@@ -307,11 +343,11 @@ func TestSenderOptsCarriesTheRoutingAndBothNewCallbacks(t *testing.T) {
 func TestAnUnroutedConfigStartsWithNoMapAtAll(t *testing.T) {
 	a, _ := newTestApp(t)
 
-	opts := a.senderOpts(config.Defaults(), "")
-	if !opts.Pipeline.ChannelMap.IsDefault() {
+	opts := a.captureOpts(config.Defaults(), capturePlan{}, 0, gst.FallbackConformTarget(), false)
+	if !opts.ChannelMap.IsDefault() {
 		t.Fatalf("a configuration nobody has routed produced %+v, want the zero map. The zero "+
-			"value is what internal/gst resolves to the card's first two channels, and it is "+
+			"value is what internal/gst resolves to the device's first two channels, and it is "+
 			"bit-for-bit what this application sent before the routing screen existed",
-			opts.Pipeline.ChannelMap)
+			opts.ChannelMap)
 	}
 }

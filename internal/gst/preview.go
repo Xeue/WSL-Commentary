@@ -321,7 +321,7 @@ const (
 // ---------------------------------------------------------------------------
 
 // PreviewOpts is the operator's choice about the confidence monitor, as it
-// reaches the pipeline. It is a field of PipelineOpts and is read exactly once,
+// reaches the pipeline. It is a field of CaptureOpts and is read exactly once,
 // at Start; see the file header for why there is no live toggle.
 //
 // The ZERO VALUE IS OFF, and off is the default everywhere: in config, in the
@@ -357,13 +357,13 @@ type PreviewOpts struct {
 // wanted reports whether a preview branch should be attempted at all, and says
 // in the log why not when the answer is no.
 //
-// videoCapture is PipelineOpts.VideoCaptureID: empty when the video leg is the
+// videoCapture is CaptureOpts.VideoCaptureID: empty when the picture leg is the
 // frozen slate, and a DeckLink persistent-id when it is a live capture.
 //
 // # THE SLATE CASE IS NOT A NICETY, IT IS THE ONE THAT WOULD TAKE THE FEED OFF AIR
 //
 // The tee this branch hangs off is built ONLY in the capture leg — see
-// pipelineDescription, where the slate leg deliberately ends at its capsfilter
+// captureDescription, where the slate leg deliberately ends at its proxy tail
 // with nothing after it. A branch rendered against a tee that is not in the
 // string is not a preview that fails to appear: it is `vcaptee.` naming an
 // element that does not exist, which gst_parse_launch refuses, which fails
@@ -429,7 +429,7 @@ func (o PreviewOpts) wanted(videoCapture string) bool {
 // failure into a success.
 //
 // The returned string BEGINS WITH A NEWLINE, so that it can be concatenated onto
-// the end of pipelineDescription's string without the caller having to know
+// the end of captureDescription's string without the caller having to know
 // whether there is a branch at all.
 func previewBranchFor(opts PreviewOpts, videoCapture string) string {
 	if !opts.wanted(videoCapture) {
