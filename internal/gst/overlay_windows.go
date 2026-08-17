@@ -794,6 +794,25 @@ func (o *overlay) destroy() {
 	}
 }
 
+// pictureWindowAlive reports whether handle still names a live window.
+//
+// It is the picture monitor's guard against rebuilding a d3d11videosink into a
+// window that has been destroyed. The overlay is a CHILD of the application
+// window (see the file header), so an ordinary application close destroys this
+// HWND along with its parent; d3d11videosink then reports "Output window was
+// closed", and without this guard the monitor's reconnect loop would build a
+// fresh sink into a handle that no longer names anything — which wedges inside
+// gstd3d11 with no timeout and cannot be interrupted, leaving a process that
+// will not exit. IsWindow is the exact question, and it is the same call apply()
+// already makes before it touches the window. A zero handle is not a window.
+func pictureWindowAlive(handle uintptr) bool {
+	if handle == 0 {
+		return false
+	}
+	alive, _, _ := procIsWindow.Call(handle)
+	return alive != 0
+}
+
 // wake posts the pump a nudge. It never blocks, which is the property the whole
 // file is arranged around; see the file header.
 func (o *overlay) wake() error {

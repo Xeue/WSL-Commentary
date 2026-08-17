@@ -806,3 +806,19 @@ func (o *overlay) Close() error {
 	})
 	return nil
 }
+
+// pictureWindowAlive reports whether the render target still exists, for the
+// picture monitor's reconnect guard.
+//
+// On macOS it returns true, and that is a deliberate limit rather than an
+// oversight. The guard exists for the WINDOWS hazard: rebuilding a
+// d3d11videosink into a destroyed child HWND wedges gstd3d11 with no timeout and
+// leaves a process that will not exit. The macOS surface is an NSView the sink
+// releases on the main thread during teardown, and there is no cheap
+// thread-safe "is this NSView still alive" question to ask from a GStreamer
+// streaming thread — a raw view pointer says nothing about whether the object
+// behind it is still valid, and reaching for AppKit off the main thread is the
+// very thing overlay_darwin.go is arranged to avoid. So this platform keeps the
+// behaviour it had, and if a macOS analogue of the Windows wedge is ever
+// observed, this is the single place the check belongs.
+func pictureWindowAlive(uintptr) bool { return true }

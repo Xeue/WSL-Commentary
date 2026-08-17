@@ -751,6 +751,19 @@ type pictureMonitor struct {
 	newPipe func() (picturePipe, error)
 	clock   pictureClock
 
+	// windowAlive reports whether the render target named by
+	// PictureOpts.WindowHandle still exists. It is the guard against the one
+	// thing this loop must never do: rebuild a video sink into a window that has
+	// been destroyed, which on Windows wedges gstd3d11 with no timeout and cannot
+	// be interrupted — the fault that left a wslcomms process unable to exit. See
+	// pictureWindowAlive (per platform) and the check at the top of loop.
+	//
+	// It is a seam for the same reason newPipe and clock are: newPictureMonitor
+	// defaults it to "always alive" so the unit tests, which pass synthetic
+	// handles that are not real windows, keep reconnecting; NewPictureMonitor
+	// wires the real per-platform check for the shipped build.
+	windowAlive func(handle uintptr) bool
+
 	states   chan PictureState
 	quit     chan struct{}
 	loopDone chan struct{}
@@ -776,20 +789,34 @@ var _ PictureMonitor = (*pictureMonitor)(nil)
 
 // NewPictureMonitor returns a PictureMonitor backed by the real GStreamer
 // pipeline in a cgo build and by the stub in a Gate A build.
+//
+// It wires the real per-platform window-liveness check onto the monitor. That
+// wiring lives here rather than in newPictureMonitor because the check is the
+// one seam the unit tests must NOT get the real version of: they drive the loop
+// with synthetic window handles that are not real windows, and the real check
+// would report every one of them dead and stop the loop before it reconnected
+// once. See pictureMonitor.windowAlive.
 func NewPictureMonitor() PictureMonitor {
-	return newPictureMonitor(newPicturePipe, realPictureClock{})
+	m := newPictureMonitor(newPicturePipe, realPictureClock{})
+	m.windowAlive = pictureWindowAlive
+	return m
 }
 
 // newPictureMonitor builds a monitor over an injected pipeline factory and
 // clock. NewPictureMonitor uses the real ones; the tests use a fake pipe and a
 // fake clock so the whole ladder runs in microseconds.
+//
+// windowAlive defaults to "always alive" so a test that has not set it keeps
+// its existing behaviour; NewPictureMonitor overrides it with the real check
+// and a test that wants to exercise the destroyed-window path sets its own.
 func newPictureMonitor(newPipe func() (picturePipe, error), clk pictureClock) *pictureMonitor {
 	return &pictureMonitor{
-		newPipe:  newPipe,
-		clock:    clk,
-		states:   make(chan PictureState, pictureStatesBuffer),
-		quit:     make(chan struct{}),
-		loopDone: make(chan struct{}),
+		newPipe:     newPipe,
+		clock:       clk,
+		windowAlive: func(uintptr) bool { return true },
+		states:      make(chan PictureState, pictureStatesBuffer),
+		quit:        make(chan struct{}),
+		loopDone:    make(chan struct{}),
 	}
 }
 
@@ -872,6 +899,30 @@ func (m *pictureMonitor) loop(opts PictureOpts) error {
 
 	for {
 		if m.quitting() {
+			return lastCloseErr
+		}
+
+		// The render target must still exist before a sink is built into it. This
+		// is the guard that keeps the reconnect loop from doing the single worst
+		// thing on this path: on Windows the overlay is a CHILD of the application
+		// window, so an ordinary application close destroys the overlay HWND with
+		// its parent, d3d11videosink reports "Output window was closed", and this
+		// loop would otherwise back off and then rebuild a fresh d3d11videosink
+		// into a handle that no longer names a window. That rebuild WEDGES inside
+		// gstd3d11 — gst_element_set_state to PLAYING never returns, takes no
+		// timeout and cannot be interrupted — and a wedged media thread is what
+		// turns the process's ordinary exit into a DLL_PROCESS_DETACH deadlock
+		// under the loader lock: the wslcomms that will not close and has to be
+		// killed by hand. So a destroyed window is TERMINAL for this monitor. It
+		// stops, the page falls back to the mosaic, and — since the window is only
+		// ever destroyed when the process itself is going — this is the same stop
+		// teardown was about to ask for, reached before the wedge instead of after
+		// it. See pictureMonitor.windowAlive and exit_windows.go.
+		if opts.WindowHandle != 0 && m.windowAlive != nil && !m.windowAlive(opts.WindowHandle) {
+			log.Printf("gst: picture monitor: the output window (0x%x) has been destroyed; stopping "+
+				"rather than reconnecting — rebuilding the video sink into a window that no longer "+
+				"exists cannot connect and wedges the graphics driver with no way back",
+				opts.WindowHandle)
 			return lastCloseErr
 		}
 

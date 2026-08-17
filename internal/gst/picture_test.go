@@ -607,6 +607,70 @@ func TestPictureMonitorReachesShowing(t *testing.T) {
 	}
 }
 
+func TestPictureMonitorStopsWhenTheOutputWindowIsDestroyed(t *testing.T) {
+	// THE ZOMBIE THIS PREVENTS. The overlay is a child of the application window,
+	// so an ordinary application close destroys the picture's HWND. Once it is
+	// gone, rebuilding a video sink into that handle wedges gstd3d11 with no
+	// timeout and cannot be interrupted, and a wedged media thread turns the
+	// process's own exit into a DLL_PROCESS_DETACH deadlock: the wslcomms that
+	// will not close and has to be killed by hand. So a destroyed window is
+	// TERMINAL — the loop must stop, not reconnect into nothing.
+	//
+	// The window is reported dead through the injected windowAlive seam rather
+	// than through the error text, because the guard does not read the error: a
+	// gone window is a gone window whatever GStreamer called the failure.
+	h := newPictureHarness()
+	h.release = make(chan time.Time) // hold the loop in backoff until we release it
+	m := newPictureMonitor(h.newPipe, h)
+
+	windowGone := make(chan struct{})
+	m.windowAlive = func(uintptr) bool {
+		select {
+		case <-windowGone:
+			return false
+		default:
+			return true
+		}
+	}
+
+	if err := m.Start(validPictureOpts()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	expectPictureState(t, m.States(), PictureStateConnecting)
+	expectPictureState(t, m.States(), PictureStateShowing)
+
+	// The far end of the picture — here, the render window — goes away while
+	// SHOWING. The sink reports it and the loop falls into backoff.
+	if !h.lastPipe().inject(errors.New("picsink: Output window was closed")) {
+		t.Fatal("could not inject the window-closed error onto the showing pipeline")
+	}
+	expectPictureState(t, m.States(), PictureStateBackoff)
+
+	// The HWND is now destroyed. Releasing the backoff sends the loop back to the
+	// top, where the window check must catch it.
+	close(windowGone)
+	h.release <- time.Now()
+
+	// It must STOP, not reconnect: the next state is Stopped with no second
+	// Connecting in front of it, and the states channel closes behind it.
+	expectPictureState(t, m.States(), PictureStateStopped)
+	if s, ok := <-m.States(); ok {
+		t.Fatalf("the monitor emitted %q and kept going; a destroyed window must end the loop", s)
+	}
+
+	// And it must not have built a second pipeline into the dead window — the one
+	// pipe is the SHOWING attempt, and there is no reconnect attempt after it.
+	if got := h.pipeCount(); got != 1 {
+		t.Fatalf("built %d pipelines; want 1 — the loop rebuilt a sink into the destroyed window", got)
+	}
+
+	// Stop remains safe and idempotent after the monitor has stopped itself: it
+	// finds loopDone already closed and returns the loop's error.
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop() after a self-stop error = %v", err)
+	}
+}
+
 func TestPictureMonitorPassesTheOptionsThroughNormalised(t *testing.T) {
 	// The pipeline must be given the DEFAULTED options, not the raw ones. Start
 	// normalises its own copy and the monitor carries that copy; a pipeline

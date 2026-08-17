@@ -83,3 +83,10 @@ func NewOverlaySurface(_ string, purpose string) (PictureOverlay, error) {
 		"into by d3d11videosink) or macOS (an NSView rendered into by glimagesink), and this is " +
 		runtime.GOOS)
 }
+
+// pictureWindowAlive is the picture monitor's window-liveness guard on a build
+// with no native surface. There is never a real window here, so there is
+// nothing to go stale and nothing to protect against: it reports alive so the
+// reconnect loop behaves exactly as it did before the guard existed. See
+// overlay_windows.go for the platform where the check does the work.
+func pictureWindowAlive(uintptr) bool { return true }
