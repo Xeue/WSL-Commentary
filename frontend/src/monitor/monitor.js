@@ -77,12 +77,23 @@
  * ---------------------
  * spec §7: "If the peer connection fails or the signalling socket closes, tear
  * the whole thing down, re-fetch credentials in Go and redo the chain. No
- * refresh scheduler." That is exactly what happens here. There is no partial
- * recovery, no ICE restart, no credential refresh timer. Every restart begins
- * with a fresh getCredentials() and runs the whole four-step chain again. The
- * only thing between one attempt and the next is the short delay ladder in
- * backoff.js, which exists so that a dead network does not turn into a hot loop
- * against AWS.
+ * refresh scheduler." That is what happens on a real failure, with ONE refinement
+ * the spec's wording did not anticipate: the signalling socket closing is only a
+ * failure while the connection is still being ESTABLISHED. AWS KVS routinely
+ * closes that socket once the peer connection is up — the SDP and ICE exchange
+ * are done and the media flows peer-to-peer over DTLS/SRTP with no further use
+ * for signalling — so a close (or error) after connect is expected and is
+ * ignored, because tearing a healthy return down and rebuilding it would drop
+ * the commentator's audio for a second for no reason, repeatedly, every time KVS
+ * recycled the socket. A peer connection that genuinely fails still rebuilds, via
+ * onconnectionstatechange. See peerConnectionIsUp in peer.js and the two sc.on
+ * handlers below.
+ *
+ * There is otherwise no partial recovery, no ICE restart, no credential refresh
+ * timer. Every restart begins with a fresh getCredentials() and runs the whole
+ * four-step chain again. The only thing between one attempt and the next is the
+ * short delay ladder in backoff.js, which exists so that a dead network does not
+ * turn into a hot loop against AWS.
  *
  * What is deliberately NOT rebuilt on a restart: the AudioContext and the DOM
  * wrappers. Both live for the lifetime of the monitor object. Chromium caps
@@ -96,7 +107,13 @@ import { createMosaicView } from './video.js';
 import { createReturnAudio } from './audio.js';
 import { normaliseCredentials, credentialsExpired, describeCredentials } from './credentials.js';
 import { resolveViewerEndpoints, fetchIceServers, createSignalingClient, newViewerClientId } from './signalling.js';
-import { createViewerPeerConnection, createViewerOffer, applyAnswer, closePeerConnection } from './peer.js';
+import {
+  createViewerPeerConnection,
+  createViewerOffer,
+  applyAnswer,
+  closePeerConnection,
+  peerConnectionIsUp,
+} from './peer.js';
 import { VIDEO_MID, normaliseReturnMid, busForMid } from './buses.js';
 import { normaliseTile } from './geometry.js';
 import { normaliseChannelMode } from './channels.js';
@@ -519,16 +536,44 @@ export function createMonitor(opts) {
 
       sc.on('error', (err) => {
         if (stale(s)) return;
+        // Only fatal while we are still CONNECTING. Once the peer connection is
+        // up the media flows over DTLS/SRTP and the signalling socket is no
+        // longer in the path, so an error on it does not touch the audio — see
+        // peerConnectionIsUp. Rebuilding here would drop a healthy return.
+        if (peerConnectionIsUp(s.pc)) {
+          console.info(
+            '[monitor] signalling socket error after the connection was established; ' +
+              'the media is unaffected and the socket is no longer needed',
+            err,
+          );
+          return;
+        }
         emitError(toMonitorError(MonitorErrorCode.SIGNALLING_FAILED, 'signalling socket', err));
         scheduleRestart();
       });
 
       sc.on('close', () => {
         if (stale(s)) return;
+        // AWS KVS routinely CLOSES the signalling socket once the peer connection
+        // is established — that is its normal lifecycle, not a fault. The media is
+        // already flowing peer-to-peer and needs no signalling, so this close must
+        // NOT disturb it. If the connection later drops, onconnectionstatechange
+        // ('failed') rebuilds with a fresh socket. Only a close while we are still
+        // connecting means the chain could not complete and has to be redone. This
+        // is the deliberate refinement of spec §7's "if the signalling socket
+        // closes, tear the whole thing down": it separates the socket closing
+        // AFTER connect (expected) from BEFORE (fatal). See peerConnectionIsUp.
+        if (peerConnectionIsUp(s.pc)) {
+          console.info(
+            '[monitor] signalling socket closed after the connection was established; ' +
+              'expected — the media is unaffected and the socket is no longer needed',
+          );
+          return;
+        }
         emitError(
           new MonitorError(
             MonitorErrorCode.SIGNALLING_CLOSED,
-            'the signalling socket closed; tearing the monitor down and redoing the chain',
+            'the signalling socket closed before the monitor connected; redoing the chain',
           ),
         );
         scheduleRestart();

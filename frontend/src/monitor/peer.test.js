@@ -18,6 +18,7 @@ import {
   applyAnswer,
   stopReceivers,
   closePeerConnection,
+  peerConnectionIsUp,
 } from './peer.js';
 import { TRANSCEIVER_PLAN } from './buses.js';
 import { MonitorErrorCode } from './errors.js';
@@ -274,4 +275,33 @@ test('closePeerConnection is safe on null and safe twice', () => {
   closePeerConnection(pc);
   closePeerConnection(pc);
   assert.equal(pc.closed, true);
+});
+
+// ---------------------------------------------------------------------------
+// peerConnectionIsUp — the test that stops a benign KVS signalling-socket close
+// from tearing down a healthy return.
+// ---------------------------------------------------------------------------
+
+test('peerConnectionIsUp is true once media can flow without signalling', () => {
+  // 'connected' is the whole point: the DTLS/SRTP transport exists, so KVS
+  // closing the signalling socket at this moment must NOT rebuild the monitor.
+  assert.equal(peerConnectionIsUp({ connectionState: 'connected' }), true);
+
+  // 'disconnected' counts as up too: ICE recovers short outages on its own with
+  // no signalling, and promotes to 'failed' if it cannot. Tearing down from the
+  // signalling side here would throw away a connection about to come back.
+  assert.equal(peerConnectionIsUp({ connectionState: 'disconnected' }), true);
+});
+
+test('peerConnectionIsUp is false while still connecting, so a lost socket is fatal', () => {
+  // Before the transport exists the signalling socket is the only way to finish
+  // the handshake, so losing it must redo the chain.
+  assert.equal(peerConnectionIsUp({ connectionState: 'new' }), false);
+  assert.equal(peerConnectionIsUp({ connectionState: 'connecting' }), false);
+  // 'failed'/'closed' are owned by onconnectionstatechange, not the signalling
+  // handler, so they are not "up" here either.
+  assert.equal(peerConnectionIsUp({ connectionState: 'failed' }), false);
+  assert.equal(peerConnectionIsUp({ connectionState: 'closed' }), false);
+  // A null connection (no attempt yet) is never up.
+  assert.equal(peerConnectionIsUp(null), false);
 });

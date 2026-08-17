@@ -172,3 +172,36 @@ export function closePeerConnection(pc) {
     /* already closed */
   }
 }
+
+/**
+ * peerConnectionIsUp reports whether pc has a negotiated media transport — i.e.
+ * whether the DTLS/SRTP connection exists and media flows WITHOUT the signalling
+ * socket.
+ *
+ * It is the test the monitor applies when the KVS signalling socket closes or
+ * errors. The signalling channel exists ONLY to establish the connection: the
+ * SDP offer/answer and the trickled ICE candidates. Once connectionState reaches
+ * 'connected' the media flows peer-to-peer over DTLS/SRTP and the signalling
+ * socket is no longer in the path — AWS KVS routinely closes it at that point,
+ * by design. So a signalling close AFTER this returns true is expected and must
+ * not disturb the audio; a close BEFORE it means the connection could not be
+ * established and the whole chain has to be redone.
+ *
+ * 'disconnected' counts as up, for the same reason onconnectionstatechange
+ * leaves it alone: ICE consent-freshness recovers from a short outage on its own
+ * with no signalling, and promotes to 'failed' if it cannot — at which point the
+ * connection-state handler, not the signalling handler, rebuilds. Tearing the
+ * media down from the signalling side while ICE is still trying to recover would
+ * throw away a connection that was about to come back.
+ *
+ * A null pc, or one still in 'new'/'connecting', is NOT up: the setup has not
+ * finished, so losing signalling there is fatal to this attempt.
+ *
+ * @param {RTCPeerConnection|null} pc
+ * @returns {boolean}
+ */
+export function peerConnectionIsUp(pc) {
+  if (!pc) return false;
+  const s = pc.connectionState;
+  return s === 'connected' || s === 'disconnected';
+}
