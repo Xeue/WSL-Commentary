@@ -10,11 +10,11 @@ import (
 	"testing"
 )
 
-// Config stopped being a comparable struct when decklinkChannelMap was added:
-// it holds a slice now, and == on a struct containing one does not compile. The
-// two whole-struct comparisons in this file therefore use reflect.DeepEqual,
-// which is the right answer for both anyway — they are asking whether two
-// configurations say the same thing, and for a routing list that is
+// Config stopped being a comparable struct when the channel routing was added:
+// it holds a map of slices now, and == on a struct containing either does not
+// compile. The two whole-struct comparisons in this file therefore use
+// reflect.DeepEqual, which is the right answer anyway — they are asking whether
+// two configurations say the same thing, and for a routing that is
 // element-by-element rather than by identity.
 
 // withAppData points the user config directory at a fresh temp directory for
@@ -928,4 +928,279 @@ func TestEffectiveSRTHostDoesNotMutateTheConfig(t *testing.T) {
 	if c.M2LXHost != "https://m2lx.example.com:8443" {
 		t.Errorf("EffectiveSRTHost() changed M2LXHost to %q", c.M2LXHost)
 	}
+}
+
+// TestAudioDeviceKeyIsTheSpellingTheFrontendBUILDS pins the string itself. It is
+// the ONE thing about ChannelMaps that cannot be caught anywhere else: a key Go
+// and the frontend spell differently is a routing saved under a name nothing
+// will ever look up again — no error, no refusal, just a grid that comes up
+// empty the next morning with the operator's channels still in the file.
+//
+// frontend/src/ui/audioinput.js's encodeAudioInput is the other half:
+// `${normaliseAudioSourceKind(kind)}:${id}`.
+func TestAudioDeviceKeyIsTheSpellingTheFrontendBuilds(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			"a card, named",
+			Config{AudioSourceKind: AudioSourceDeckLink, DeckLinkPersistentID: "2747401380"},
+			"decklink:2747401380",
+		},
+		{
+			// Empty is a REAL key here, not a missing one: "the only card in this
+			// machine" is the documented normal case for decklinkPersistentId.
+			"a card, unnamed",
+			Config{AudioSourceKind: AudioSourceDeckLink},
+			"decklink:",
+		},
+		{
+			"a platform endpoint",
+			Config{AudioSourceKind: AudioSourceNative, AudioDeviceID: "BF568F24-731B-41DB-932E-AC7E260BC71A"},
+			"native:BF568F24-731B-41DB-932E-AC7E260BC71A",
+		},
+		{
+			// An empty kind is "native" everywhere else in this package, so it has to
+			// be "native" in the key too or an upgraded config.json files its routing
+			// somewhere the next launch cannot find.
+			"an empty kind",
+			Config{AudioDeviceID: "usb-mic-1"},
+			"native:usb-mic-1",
+		},
+		{
+			// Validate refuses this configuration, but a key must still be built for
+			// it, and it must be the one the frontend's normaliseAudioSourceKind
+			// builds — which reads anything it does not recognise as native.
+			"a kind nothing recognises",
+			Config{AudioSourceKind: "wasapi", AudioDeviceID: "usb-mic-1"},
+			"native:usb-mic-1",
+		},
+		{
+			// The id half is carried VERBATIM, colons included. Only the first
+			// separator divides the halves, on both sides.
+			"an id containing the separator",
+			Config{AudioSourceKind: AudioSourceNative, AudioDeviceID: "AppleHDA:in:0"},
+			"native:AppleHDA:in:0",
+		},
+		{
+			// The kind decides WHICH id field is read. A stale id beside the other
+			// kind is two answers to one question and must not reach the key.
+			"a stale card id beside a native kind",
+			Config{AudioSourceKind: AudioSourceNative, AudioDeviceID: "usb-mic-1", DeckLinkPersistentID: "2747401380"},
+			"native:usb-mic-1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.AudioDeviceKey(); got != tt.want {
+				t.Errorf("AudioDeviceKey() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCurrentChannelMapIsALookupAndNeverAResolver: an absent key stays nil all
+// the way out. Nil is what internal/gst reads as "nobody has chosen" and
+// resolves, at the negotiated width, to the first two input channels — so a
+// helpful default returned here would freeze today's default into every seat and
+// take away the screen's ability to say that nobody has chosen.
+func TestCurrentChannelMapIsALookupAndNeverAResolver(t *testing.T) {
+	mine := []ChannelContribution{{Output: 0, Input: 4, Gain: 1}, {Output: 1, Input: 5, Gain: 1}}
+	c := &Config{
+		AudioSourceKind:      AudioSourceDeckLink,
+		DeckLinkPersistentID: "2747401380",
+		ChannelMaps: map[string][]ChannelContribution{
+			"decklink:2747401380": mine,
+			"native:usb-mic-1":    {{Output: 0, Input: 0, Gain: 1}},
+		},
+	}
+	if got := c.CurrentChannelMap(); !reflect.DeepEqual(got, mine) {
+		t.Errorf("CurrentChannelMap() = %+v, want the card's routing %+v", got, mine)
+	}
+
+	// THE WHOLE POINT OF THE MAP. Switching the seat to a microphone must reach
+	// the microphone's routing and leave the card's alone — this is the read half
+	// of the property the schema change exists for, and the write half is the
+	// Settings form's.
+	c.AudioSourceKind = AudioSourceNative
+	c.AudioDeviceID = "usb-mic-1"
+	if got := c.CurrentChannelMap(); len(got) != 1 || got[0].Input != 0 {
+		t.Errorf("CurrentChannelMap() = %+v, want the microphone's routing", got)
+	}
+	if !reflect.DeepEqual(c.ChannelMaps["decklink:2747401380"], mine) {
+		t.Error("reading the microphone's routing disturbed the card's")
+	}
+
+	// A device nobody has routed.
+	c.AudioDeviceID = "usb-mic-2"
+	if got := c.CurrentChannelMap(); got != nil {
+		t.Errorf("CurrentChannelMap() = %+v for an unrouted device, want nil", got)
+	}
+	// And on a configuration with no store at all, which is every config.json
+	// written before this field existed.
+	if got := (&Config{}).CurrentChannelMap(); got != nil {
+		t.Errorf("CurrentChannelMap() = %+v with no channelMaps at all, want nil", got)
+	}
+}
+
+// TestLoadMigratesTheLegacyDeckLinkChannelMap is PLAN step 8's proof: a config
+// carrying the retired sixteen-entry array loads with that routing intact, under
+// the key of the card it was always about.
+func TestLoadMigratesTheLegacyDeckLinkChannelMap(t *testing.T) {
+	dir := withAppData(t)
+	write := func(t *testing.T, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, AppDataDirName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, AppDataDirName, FileName), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("a card seat keeps its routing", func(t *testing.T) {
+		write(t, `{
+		  "audioSourceKind": "decklink",
+		  "decklinkPersistentId": "2747401380",
+		  "decklinkChannelMap": [
+		    {"output": 0, "input": 12, "gain": 1},
+		    {"output": 1, "input": 13, "gain": 0.5}
+		  ]
+		}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []ChannelContribution{
+			{Output: 0, Input: 12, Gain: 1},
+			{Output: 1, Input: 13, Gain: 0.5},
+		}
+		if !reflect.DeepEqual(got.ChannelMaps, map[string][]ChannelContribution{"decklink:2747401380": want}) {
+			t.Fatalf("Load() channelMaps = %+v, want the routing under decklink:2747401380", got.ChannelMaps)
+		}
+		// The read path, which is what actually carries it to the pipeline.
+		if !reflect.DeepEqual(got.CurrentChannelMap(), want) {
+			t.Errorf("CurrentChannelMap() = %+v after the migration, want %+v", got.CurrentChannelMap(), want)
+		}
+	})
+
+	t.Run("a seat that has moved to a microphone does not inherit the card's routing", func(t *testing.T) {
+		// The old array was INERT on a native seat — it was read only when
+		// audioSourceKind was "decklink" — and it must stay inert. Filing a card's
+		// sixteen-wide routing against a two-channel microphone is precisely the
+		// corruption the per-device store exists to prevent, and the migration is
+		// the last place it should happen.
+		write(t, `{
+		  "audioSourceKind": "native",
+		  "audioDeviceId": "usb-mic-1",
+		  "decklinkChannelMap": [{"output": 0, "input": 12, "gain": 1}]
+		}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.CurrentChannelMap() != nil {
+			t.Errorf("the microphone inherited %+v from the card's old routing", got.CurrentChannelMap())
+		}
+		if len(got.ChannelMaps["decklink:"]) != 1 {
+			t.Errorf("channelMaps = %+v, want the old array parked under the card's key so it is "+
+				"there again if the seat goes back to the card", got.ChannelMaps)
+		}
+	})
+
+	t.Run("an empty legacy array migrates to nothing", func(t *testing.T) {
+		// Empty means NOBODY HAS CHOSEN. Materialising it into an explicit empty
+		// entry would turn "not chosen" into "chosen" on every machine that ever
+		// launched this build.
+		write(t, `{"audioSourceKind": "decklink", "decklinkChannelMap": []}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ChannelMaps != nil {
+			t.Errorf("channelMaps = %+v, want nil", got.ChannelMaps)
+		}
+	})
+
+	t.Run("channelMaps wins and the migration cannot fire again", func(t *testing.T) {
+		// Once a build that knows about devices has written the store, its silence
+		// about a device is an ANSWER and not an absence to be filled from a retired
+		// key. An empty {} counts, which is what makes the migration one-way.
+		write(t, `{
+		  "audioSourceKind": "decklink",
+		  "decklinkPersistentId": "2747401380",
+		  "channelMaps": {},
+		  "decklinkChannelMap": [{"output": 0, "input": 12, "gain": 1}]
+		}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.ChannelMaps) != 0 {
+			t.Errorf("channelMaps = %+v, want the empty store the file carries", got.ChannelMaps)
+		}
+	})
+
+	t.Run("a malformed legacy key is ignored, not fatal", func(t *testing.T) {
+		// The key has no field left to be wrong about and the document parses
+		// without it. Refusing to load a commentary position's configuration over a
+		// spelling this build has retired is not a trade to make before a match.
+		write(t, `{"audioSourceKind": "decklink", "decklinkChannelMap": "left and right"}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatalf("Load() refused a config over the retired key: %v", err)
+		}
+		if got.ChannelMaps != nil {
+			t.Errorf("channelMaps = %+v, want nil", got.ChannelMaps)
+		}
+	})
+
+	t.Run("the retired key is gone from the next Save", func(t *testing.T) {
+		write(t, `{
+		  "audioSourceKind": "decklink",
+		  "decklinkPersistentId": "2747401380",
+		  "decklinkChannelMap": [{"output": 0, "input": 12, "gain": 1}]
+		}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := got.Save(); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, AppDataDirName, FileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := raw["decklinkChannelMap"]; ok {
+			t.Error("Save wrote the retired key back; the migration would then be re-runnable " +
+				"against a store it has already filled")
+		}
+		if _, ok := raw["channelMaps"]; !ok {
+			t.Error("Save dropped channelMaps; the migrated routing would be lost on the next launch")
+		}
+	})
+
+	t.Run("a seat that has never routed writes no key at all", func(t *testing.T) {
+		// omitempty, and it is the same decision the retired field carried: a
+		// config.json should not grow a "channelMaps" nobody chose.
+		write(t, `{"audioSourceKind": "native", "audioDeviceId": "usb-mic-1"}`)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "channelMaps") {
+			t.Errorf("an unrouted seat wrote a channelMaps key: %s", data)
+		}
+	})
 }

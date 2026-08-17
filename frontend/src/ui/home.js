@@ -115,7 +115,35 @@ import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../mo
 // this seat contributing", which no other lamp on this row gives, and a lamp
 // that appeared and disappeared with a setting would be a lamp nobody learns to
 // look at. See videosource.js's deriveCameraLamp.
-const LAMP_NAMES = ['SENDING', LAMP_CAMERA, 'SWITCHER SEES FEED', 'VIDEO', 'AUDIO', 'MONITOR'];
+//
+// ============= AND WHY TWO OF THEM SAY "SWITCHER" IN THEIR NAME =============
+//
+// The last three lamps are one fact each about what M2L-X REPORTS RECEIVING,
+// read off the switcher's own telemetry socket (lamps.js's deriveStatusLamps).
+// Two of them used to be called VIDEO and AUDIO, which was survivable while
+// nothing on this screen measured this desk's own video or audio outside a
+// session. Both do now: the meters beside the picture are the commentary
+// capture's, live from launch, and the CAMERA lamp is the card's, live from
+// launch.
+//
+// So a commentator would sit in front of a MOVING INPUT METER beside a lamp
+// reading "AUDIO — NO STATUS" — which is a true statement about a quiet
+// telemetry socket and reads, to the person it is in front of, as "this
+// application says my microphone is dead". They would go looking for a fault at
+// the desk, twenty minutes before kick-off, in a rig that is working. The names
+// say whose fact it is, which is the whole cost of the fix and the whole of it.
+//
+// These strings are the KEYS app.js paints through (home.lamps['SWITCHER
+// VIDEO']) and the labels drawn on the pills, so renaming one is one edit here
+// and one at its call site; videosource.test.js pins the list and its order.
+const LAMP_NAMES = [
+  'SENDING',
+  LAMP_CAMERA,
+  'SWITCHER SEES FEED',
+  'SWITCHER VIDEO',
+  'SWITCHER AUDIO',
+  'MONITOR',
+];
 
 // The Return dropdown offers all seven audio tracks. It used to offer two, CLN
 // and PGM. That was fine as long as the documented routing held. It did not:
@@ -174,7 +202,9 @@ const LAMP_NAMES = ['SENDING', LAMP_CAMERA, 'SWITCHER SEES FEED', 'VIDEO', 'AUDI
  *   showError(message, severity)        adds a row to the alert column. Every
  *   showNote(message)                   message is kept with timestamps and
  *   clearError()                        repeat counts (errorlog.js); dismissing
- *                                       one row means "I have seen this"
+ *   clearErrorIf(message)               one row means "I have seen this".
+ *                                       clearErrorIf retires the rows carrying
+ *                                       one message, for faults that resolve
  *
  * There is no setStatusUnavailable. The switcher-status banner is withdrawn —
  * see the block above the match bar, and alerts.js for why staleness raises
@@ -595,9 +625,30 @@ export function createHomeView(handlers) {
 
   // --- the input meters, at the right edge of the picture area -------------
   //
-  // A slim vertical stereo pair fed from the SEND pipeline's "levels" event:
-  // the level of what is ACTUALLY being encoded and sent, which is the one
-  // meter that goes quiet when the wrong device is selected.
+  // A slim vertical stereo pair fed from the "levels" event: the level of the
+  // commentary as it leaves the capture pipeline, measured immediately before
+  // the queue that feeds the encoder. It is the one meter that goes quiet when
+  // the wrong device is selected, and it is downstream of the cough mute, so a
+  // muted commentator has a flat meter as well as a mute banner.
+  //
+  // ================= THEY ARE LIVE FROM LAUNCH, NOT FROM START ===============
+  //
+  // They used to be the SEND pipeline's own measurement, so they began at START
+  // and fell to silence at STOP. Capture is a pipeline of its own now, built at
+  // launch and held until the application quits, so the meters move while the
+  // operator is still setting up and go on moving after STOP. That is the point
+  // of the change — a commentator finds out that their microphone is dead while
+  // there is still time to fix it — and it is why the note under them exists.
+  //
+  // ONE PROMISE IS WEAKER THAN IT WAS, and it is written down here because it
+  // cannot be seen from the screen: what this meter shows is what reaches the
+  // encoder IN NORMAL OPERATION, and not during a send-side stall. The queue in
+  // front of the proxysink is leaky=downstream, deliberately (a non-leaky one
+  // was measured dragging the preview to 7.2 fps and the meters to 7.2 msg/s and
+  // making the card itself drop frames), so a stall of more than about a second
+  // DROPS that second of commentary rather than delaying it. The meter can move
+  // over audio the far end never receives. A stall that long is already a
+  // reconnect-class event and the SENDING lamp is the thing that says so.
   //
   // ============= OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING =================
   //
@@ -626,7 +677,8 @@ export function createHomeView(handlers) {
   const metersEl = document.createElement('div');
   metersEl.className = 'input-meters input-meters-idle';
   metersEl.title =
-    'Commentary input level, measured on the encoded feed itself. Green to -18 dBFS, amber to -6, red above.';
+    'Commentary input level, measured where the capture pipeline hands the audio to the encoder — ' +
+    'live from launch, whether or not you are sending. Green to -18 dBFS, amber to -6, red above.';
   const meterChannels = ['L', 'R'].map((name) => {
     const channel = document.createElement('div');
     channel.className = 'input-meter';
@@ -660,6 +712,22 @@ export function createHomeView(handlers) {
     return { fills, peakMark };
   });
 
+  // The line beside the meters, and it is not a decoration: on a CoreAudio seat
+  // the operating system's microphone indicator — the orange dot in the menu bar
+  // — is now lit from launch to quit rather than only while sending, because the
+  // input really is open the whole time. A commentator who has learnt to read
+  // that dot as "I am live" would read it wrong on every seat, all day, and no
+  // lamp in this application would contradict them.
+  //
+  // It is STATIC. It says the same words in every state, so it can never appear,
+  // change or clear — the column's rule — and it names the one control that does
+  // answer the question it is about.
+  const metersNote = document.createElement('p');
+  metersNote.className = 'input-meters-note';
+  metersNote.textContent =
+    'Open from launch: the input is live, and its recording light is on, before anything is sent. ' +
+    'The SENDING lamp is what says you are on air.';
+
   // --- the card's confidence preview, at the right edge --------------------
   //
   // A SECOND RESERVED RECTANGLE, and the same mechanism as the first: the
@@ -682,10 +750,11 @@ export function createHomeView(handlers) {
   // It is drawn INSIDE the reserved box and is never hidden by this file. The
   // native surface is opaque and on top, so the caption is visible exactly when
   // there is no picture over it — which is the one thing this page genuinely
-  // cannot learn from Go, since the preview branch is built at START from the
-  // saved configuration and there is no event that says whether it was. A box
-  // showing a caption is a box explaining itself; a box showing a picture needs
-  // no caption. app.js supplies the words (videosource.js's describePreviewBox).
+  // cannot learn from Go: the preview branch is built with the picture capture
+  // at launch, the build retries without it if the surface will not attach, and
+  // no event reports the branch itself. A box showing a caption is a box
+  // explaining itself; a box showing a picture needs no caption. app.js supplies
+  // the words (videosource.js's describePreviewBox, from the capture state).
   const previewTile = document.createElement('div');
   previewTile.className = 'preview-tile';
   // HIDDEN UNTIL SOMETHING SAYS OTHERWISE, so that a seat which has never
@@ -1315,7 +1384,7 @@ export function createHomeView(handlers) {
     alertsRegion,
     makeRailSection('Cough mute', coughModeGroup),
     makeRailSection('Session', actionRow, presetIndicator),
-    makeRailSection('Status', lampsEl, metersEl),
+    makeRailSection('Status', lampsEl, metersEl, metersNote),
     makeRailSection('Audio', controls),
     makeRailSection('Picture', sourceGroup),
     railStrip,
@@ -1610,8 +1679,8 @@ export function createHomeView(handlers) {
   renderPicture();
 
   // Peak-hold state for the input meters. One instance for the view's life:
-  // the session-end zero-frame resets it below, so a new session starts with
-  // no ghost of the old one's peaks.
+  // the zero-frame emitted when capture goes down resets it below, so the next
+  // device comes up with no ghost of the last one's peaks.
   const inputPeakHold = createPeakHold();
 
   /**
@@ -1619,15 +1688,16 @@ export function createHomeView(handlers) {
    * ({peak: number[], rms: number[]}, dBFS per channel).
    *
    * Called on every event, ~20 Hz — no rAF loop, deliberately: at that rate
-   * the event IS the frame clock, and the peak-hold ticks with it, so a
-   * stopped session (which stops the events after its zero-frame) also stops
-   * all meter work rather than leaving a timer painting nothing.
+   * the event IS the frame clock, and the peak-hold ticks with it, so capture
+   * going down (which stops the events after its zero-frame) also stops all
+   * meter work rather than leaving a timer painting nothing.
    *
-   * The bar is the RMS; the marker is the held peak. An all-silence frame —
-   * the zero-frame app.go emits when the session ends — or a null/malformed
-   * one dims the whole assembly and resets the hold: empty and dimmed, no
-   * text clutter, because "no session" is not a level and must not look like
-   * one.
+   * The bar is the RMS; the marker is the held peak. An all-silence frame — the
+   * zero-frame app.go emits when a capture pipeline goes away, which is a device
+   * change, a restart or the application quitting and NOT the end of a session —
+   * or a null/malformed one dims the whole assembly and resets the hold: empty
+   * and dimmed, no text clutter, because "nothing is arriving" is not a level
+   * and must not look like one.
    */
   function setLevels(frame) {
     const silent = isSilentFrame(frame);
@@ -1871,5 +1941,12 @@ export function createHomeView(handlers) {
     showError,
     showNote,
     clearError,
+    // Exposed for the faults that RESOLVE. The picture receiver's backoff has
+    // used it inside this file since the column was built; the capture faults
+    // app.js raises are the second family — a card that failed to open at launch
+    // and opened on a restart must not leave a row saying it did not, and
+    // clearing the whole feed to retire one row would eat everything else the
+    // operator has not read yet.
+    clearErrorIf,
   };
 }

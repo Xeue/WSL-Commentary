@@ -202,10 +202,29 @@ export function mountApp(root) {
   const coughMute = createCoughMute({
     apply: (muted) => backend.setCommentaryMute(muted),
     onChange: (readout) => home.setMuteReadout(readout),
-    // The BUILD's answer only. "There is no session to mute yet" is a different
-    // fact with a different sentence and it arrives on the payload's `available`
-    // and `reason` — conflating the two would tell an operator who has simply
-    // not pressed START that their application cannot mute at all.
+    // The BUILD's answer only, and nothing about a session.
+    //
+    // ============ THE MUTE IS AVAILABLE BEFORE START, AND IS CARRIED =========
+    //
+    // It used to be refused without a session, and app.go argued that refusal at
+    // length: a mute accepted before START would have to be either forgotten (a
+    // control that lies) or carried into the session (a commentator who comes on
+    // air muted because of something pressed twenty minutes earlier), and neither
+    // was acceptable, so there was no third state to hold.
+    //
+    // Always-live capture creates that third state whether or not anybody wants
+    // it: the `volume name=coughmute` element lives in the commentary capture
+    // pipeline now, so it exists from launch and a mute written to it is real
+    // before anything is sent. The operator's ruling is CARRY IT, and the fear —
+    // a control that lies — is answered by VISIBILITY rather than by taking the
+    // control away. The mute sits upstream of the meter, so a muted commentator
+    // has a FLAT PROGRAMME METER and a MUTE BANNER, before START and after it;
+    // the write-then-read-back discipline that stops this file ever drawing a
+    // mute it did not land is untouched.
+    //
+    // So there is nothing here to gate on a session, and nothing may be added.
+    // "This build cannot mute at all" is what this line is about, and it is a
+    // different sentence from anything a running feed could say.
     //
     // NOT gated on isRemoteClient(). A remote seat MAY mute: app_remote.go
     // classifies SetCommentaryMute as reachable-and-mutating deliberately, and
@@ -374,12 +393,15 @@ export function mountApp(root) {
   //
   // ===================== AND IT HAS NO START AND NO STOP =====================
   //
-  // The preview is a BRANCH of the contribution pipeline — a tee off the one
-  // capture, because the card is exclusive — so it exists exactly when a session
-  // started with it exists. There is nothing to start here and, more to the
-  // point, nothing may stop it: tearing the branch down on a running pipeline is
-  // the set_state(NULL) inside a blocking pad probe that was measured to take the
-  // ON-AIR leg to 0 fps permanently, with the pipeline still reporting PLAYING.
+  // The preview is a BRANCH of the PICTURE CAPTURE pipeline — a tee off the one
+  // capture, because the card is exclusive — and that pipeline is built at
+  // launch and held until the application quits. So it exists exactly when the
+  // saved configuration asks for it, with or without a session: there is nothing
+  // to start here and, more to the point, nothing may stop it. Tearing the
+  // branch down on a running pipeline is the set_state(NULL) inside a blocking
+  // pad probe that was measured to take the ON-AIR leg to 0 fps permanently,
+  // with the pipeline still reporting PLAYING — and that pipeline is now PLAYING
+  // for the whole life of the process, so the rule applies for longer, not less.
   //
   /** Whether the saved configuration puts live capture on the video leg. */
   let currentVideoSource = normaliseVideoSource(undefined);
@@ -389,6 +411,20 @@ export function mountApp(root) {
   let currentSignal = null;
   /** Whether this build can position the preview surface at all. */
   let previewBindingsPresent = false;
+  /**
+   * The last "capture" event — {picture, commentary, reason, audioDeviceName} —
+   * or null before one has arrived.
+   *
+   * It is what the preview's caption is written from, because it is the only
+   * thing that actually says whether there is a picture to paint. It replaces
+   * the sender state in that role: a session is no longer what opens the card.
+   */
+  let currentCapture = null;
+  /**
+   * The capture fault currently standing in the alert column, so it can be taken
+   * down again when it clears. Empty when there is none.
+   */
+  let captureAlert = '';
 
   const previewOverlay = createOverlay({
     measure: () => home.measurePreviewRect(),
@@ -429,36 +465,47 @@ export function mountApp(root) {
   }
 
   /**
-   * renderPreview decides whether the preview box exists, what its caption says,
-   * and whether the native surface should be on screen.
-   *
-   * The box is reserved from the SAVED CONFIGURATION and not from anything about
-   * the running session, because the page cannot know whether Go built a preview
-   * branch this time — the branch is decided at Start and there is no event that
-   * reports it. The caption closes that gap honestly: an opaque native window
-   * covers it when there is a picture, so what the operator sees is either their
-   * camera or a sentence explaining why it is not there.
-   */
-  /**
    * renderPreviewCaptionOnly is renderPreview's half that cannot move anything:
    * the words, and not the box they sit in.
    *
-   * It exists for the remote-save path. See adoptVideoConfig for why a producer
-   * on another seat pressing Save must never resize this commentator's picture.
+   * TWO callers now, and they want it for the same property. The remote-save path
+   * uses it because a producer on another seat pressing Save must never resize
+   * this commentator's picture (see adoptVideoConfig). The "capture" event uses
+   * it because a capture event cannot change the RESERVATION — that is read from
+   * configuration, which capture does not touch — so calling the whole of
+   * renderPreview for one would be measuring and re-measuring two native surfaces
+   * every time a device finished opening, to arrive back at the same rectangle.
    */
   function renderPreviewCaptionOnly() {
-    const running = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
-    home.setPreviewCaption(describePreviewBox(running));
+    home.setPreviewCaption(describePreviewBox(currentCapture?.picture));
   }
 
+  /**
+   * renderPreview decides whether the preview box exists, what its caption says,
+   * and whether the native surface should be on screen.
+   *
+   * The box is reserved from the SAVED CONFIGURATION and from nothing else, and
+   * the surface is wanted on exactly the same terms. IT NO LONGER ASKS WHETHER A
+   * SESSION IS UP, and that is the change: the picture capture is built at launch
+   * and held until the application quits, so a seat with the card selected and
+   * the preview ticked has its confidence picture before START and still has it
+   * after STOP. Gating the surface on `running` would have hidden a live preview
+   * on the desk that asked for it, for the whole of the period the operator uses
+   * it in — which is the setting-up, before anything is sent.
+   *
+   * What the page still cannot know is whether the preview BRANCH was built (the
+   * capture build retries without it if the surface will not attach, and there is
+   * no event for the branch itself). The caption closes that gap honestly: an
+   * opaque native window covers it when there is a picture, so what the operator
+   * sees is either their camera or a sentence explaining why it is not there.
+   */
   function renderPreview() {
     const effects = deriveVideoSourceEffects(currentVideoSource, currentInputDevices);
     const reserved = previewBindingsPresent && effects.wantCard && currentPreviewEnabled;
-    const running = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
 
-    home.setPreviewCaption(describePreviewBox(running));
+    home.setPreviewCaption(describePreviewBox(currentCapture?.picture));
     home.setPreviewReserved(reserved);
-    previewOverlay.setWanted(reserved && running);
+    previewOverlay.setWanted(reserved);
 
     // RESERVING IS A LAYOUT CHANGE, and .pgm-tile is sized against what is left
     // in the stage — so the commentator's picture has just moved. Both surfaces
@@ -466,6 +513,60 @@ export function mountApp(root) {
     // rectangle is a native window sitting over the controls beside it.
     overlay.sync();
     previewOverlay.sync();
+  }
+
+  /**
+   * renderCapture takes one "capture" event: the preview's caption, and the
+   * fault, if there is one, in the alert column.
+   *
+   * ===================== A CAPTURE FAULT IS AN ALERT, NOT A BANNER ===========
+   *
+   * It goes to the column with everything else, because the column is the one
+   * surface on this screen that can gain and lose rows without moving the
+   * picture. It is an ALERT and not a note: a commentary capture that did not
+   * open means there is no microphone at all — the meters will not move, and
+   * pressing START would put a silent seat on air with every switcher lamp
+   * green — and a picture capture that did not open means the card is not being
+   * captured, whatever the CAMERA lamp's watchdog has or has not measured.
+   *
+   * ONE ROW, RAISED AND RETIRED. The event repeats on every state change, and a
+   * device that will not open can produce a run of them; recording each one
+   * would bury the column in copies of the same sentence. So the message is
+   * compared against the one standing and only a CHANGE is acted on, and the
+   * standing row is taken down by name when capture recovers — clearErrorIf, not
+   * clearError, so a restart does not eat somebody else's unrelated alert.
+   */
+  function renderCapture() {
+    renderPreviewCaptionOnly();
+
+    const message = describeCaptureFault(currentCapture);
+    if (message === captureAlert) return;
+    if (captureAlert) home.clearErrorIf(captureAlert);
+    captureAlert = message;
+    if (message) home.showError(message);
+  }
+
+  /**
+   * describeCaptureFault renders a failed capture leg as one sentence, or '' when
+   * neither leg has failed.
+   *
+   * The payload carries ONE reason for both legs, which is why this is one
+   * sentence naming whichever legs are down rather than a message each. The
+   * reason is Go's own words and is passed through verbatim: it names the device
+   * and the way out ("plug it in and use Restart capture"), and rewording it here
+   * would be a second, worse copy of a sentence that has been through review.
+   */
+  function describeCaptureFault(capture) {
+    if (!capture) return '';
+    const failed = [];
+    if (capture.picture === backend.CAPTURE_STATE.FAILED) failed.push('the picture');
+    if (capture.commentary === backend.CAPTURE_STATE.FAILED) failed.push('the commentary input');
+    if (failed.length === 0) return '';
+    const reason = String(capture.reason || '').trim();
+    const what = failed.join(' and ');
+    return reason
+      ? `Capture is down — ${what} could not be opened: ${reason}`
+      : `Capture is down — ${what} could not be opened, and no reason was given.`;
   }
 
   /**
@@ -512,9 +613,15 @@ export function mountApp(root) {
    * The READOUTS are adopted either way, and must be: a CAMERA lamp on this desk
    * still reading SLATE after somebody else moved this position onto the card is
    * the worse half of the same coin. So a remote save changes what the page
-   * SAYS, and never where the picture IS. The next thing this desk does that
-   * legitimately re-runs renderPreview — a local save, a Start, a device change —
+   * SAYS, and never where the picture IS. The next LOCAL save or applied preset
    * picks the reservation up.
+   *
+   * That list used to include "a Start", because the sender edge re-ran
+   * renderPreview. It does not any more — the preview follows capture, which does
+   * not care whether anything is being sent — so a local save and a locally
+   * applied preset are now the only two things that can reserve the box. That is
+   * a SMALLER set than before and deliberately so: every member of it is this
+   * desk's own hand, which is the rule this comment exists to state.
    */
   function adoptVideoConfig(config, local) {
     currentVideoSource = normaliseVideoSource(config?.videoSource);
@@ -686,10 +793,18 @@ export function mountApp(root) {
     // fault in the feed — that is a different socket to a different port with
     // its own lamp — and an alert that fires when everything is fine trains an
     // operator to ignore the surface it appears on. See ui/alerts.js.
+    //
+    // The last two are painted through their FULL names — 'SWITCHER VIDEO' and
+    // 'SWITCHER AUDIO' — because that is what they are: M2L-X's report of what it
+    // is receiving, and nothing about this desk. They were VIDEO and AUDIO until
+    // the meters and the camera lamp went live before START, at which point a
+    // commentator watching their own input meter move beside a lamp reading
+    // "AUDIO — NO STATUS" would have concluded their microphone was dead. See
+    // home.js's LAMP_NAMES for the whole argument.
     const { switcher, video, audio } = deriveStatusLamps(currentStatus, currentConformTarget);
     home.lamps['SWITCHER SEES FEED'].update(switcher);
-    home.lamps.VIDEO.update(video);
-    home.lamps.AUDIO.update(audio);
+    home.lamps['SWITCHER VIDEO'].update(video);
+    home.lamps['SWITCHER AUDIO'].update(audio);
   }
 
   /**
@@ -735,12 +850,15 @@ export function mountApp(root) {
     // would be one Wails round trip per rung for an answer known not to differ.
     const isRunning = !!state && state !== backend.SENDER_STATE.STOPPED;
     if (isRunning !== wasRunning) refreshConformTarget();
-    // The preview's caption and the surface's visibility both turn on whether a
-    // session is up — "press START" against "STOP and START to see it" — so they
-    // follow the same edge. Only on the edge, for the reason above it: the
-    // sender cycles through CONNECTING and BACKOFF during a retry ladder and
-    // none of those change either answer.
-    if (isRunning !== wasRunning) renderPreview();
+    // THE PREVIEW IS NO LONGER REDRAWN FROM HERE, and the deletion is the
+    // change rather than a tidy-up. Both halves of it used to turn on whether a
+    // session was up: the caption said "press START" against "STOP and START to
+    // see it", and the surface was only wanted while running. Neither is true of
+    // a picture capture that is built at launch and held until the application
+    // quits — the box fills in before anything is sent and stays filled after
+    // STOP. The caption now follows the "capture" event, which is the thing that
+    // actually decides whether there is a picture, and the surface follows the
+    // saved configuration alone. See renderPreview.
   });
 
   // THE CARD'S VIDEO SIGNAL, debounced in Go. This is the wire that makes black
@@ -754,6 +872,41 @@ export function mountApp(root) {
     renderCameraLamp();
   });
 
+  // WHAT IS ACTUALLY OPEN. The capture pipelines are built at launch and live
+  // until the application quits, so this event is the only thing on the page
+  // that knows whether the card and the microphone were taken — a question that
+  // used to be answered by START failing.
+  //
+  // Subscribed HERE, at mount, and not inside init(): the Go side publishes the
+  // launch state as soon as the DOM is ready, and a subscription made after an
+  // awaited configuration load is a subscription that can miss it. The state is
+  // then read back once, immediately below, for the same belt-and-braces reason
+  // the commentary mute is adopted rather than assumed.
+  backend.onCapture((payload) => {
+    currentCapture = payload || null;
+    renderCapture();
+  });
+
+  // And read it back once, so a page that loaded late — a reload mid-match, a
+  // remote seat opening for the first time — knows what is open rather than
+  // waiting for the next state change. getCaptureState never throws: every way
+  // of not knowing arrives as a payload that says which kind of not-knowing it
+  // is, so there is nothing to handle beyond the read itself.
+  //
+  // AN EVENT WINS OVER THIS READ, always. The read may resolve after an event
+  // that overtook it, and adopting it then would paint a stale "opening" over a
+  // "live" that has already been drawn.
+  Promise.resolve()
+    .then(() => backend.getCaptureState())
+    .then((payload) => {
+      if (currentCapture) return;
+      currentCapture = payload || null;
+      renderCapture();
+    })
+    .catch((err) => {
+      console.error('wslcomms: could not read the capture state', err);
+    });
+
   backend.onStatus((status) => {
     currentStatus = status;
     renderStatusLamps();
@@ -764,13 +917,20 @@ export function mountApp(root) {
     home.showError(String(message));
   });
 
-  // The input meters beside the picture: the SEND pipeline's own peak/RMS
-  // measurement of what is being encoded and sent, at most 20 frames a second.
+  // The input meters beside the picture: the CAPTURE pipeline's own peak/RMS
+  // measurement, taken where it hands the audio to the encoder, at most 20
+  // frames a second. They run from launch — the pipeline they belong to is built
+  // before anything is sent — which is what makes a dead microphone visible at
+  // line-up instead of at kick-off.
+  //
   // Pure forwarding — the scale, zones and peak-hold all live in ui/meters.js
-  // and the painting in home.js — and no session-state bookkeeping here: the
-  // Go side ends every session with an all-silence zero-frame, which is what
-  // dims the meters, so this wire never has to know whether a session is
-  // running.
+  // and the painting in home.js — and STILL no session-state bookkeeping here,
+  // for a reason that has moved rather than gone: the all-silence zero-frame
+  // that dims the meters is now emitted when CAPTURE goes down (a device change,
+  // a restart, the application quitting) rather than at the end of a session, so
+  // this wire has never had to know whether anything is running and must not
+  // learn. A meter cleared on the STOP edge would contradict the pipeline that
+  // is still measuring.
   backend.onLevels((frame) => home.setLevels(frame));
 
   // The native PICTURE receiver's own state. This is what drives the fallback:
@@ -862,10 +1022,11 @@ export function mountApp(root) {
     });
 
     // AND THE VIDEO LEG'S READOUTS, which is a display change and nothing else:
-    // the leg itself is built at Start, so adopting another seat's save here can
-    // only correct what this page SAYS about it. Not adopting would be the worse
-    // half of the same coin — a CAMERA lamp on this desk still reading SLATE
-    // after somebody else moved this position onto the card.
+    // the leg itself is built and rebuilt by the Go side, so adopting another
+    // seat's save here can only correct what this page SAYS about it. Not
+    // adopting would be the worse half of the same coin — a CAMERA lamp on this
+    // desk still reading SLATE after somebody else moved this position onto the
+    // card.
     //
     // Whether another seat should be able to make that change at all is a
     // question for the Go side and not for this line: App.SaveConfig is
@@ -1373,10 +1534,11 @@ export function mountApp(root) {
     applyReturnOptionsFromConfig();
 
     // WHAT THIS SEAT SENDS. Re-applied from a Settings save because that is the
-    // screen the field lives on, and safe to re-apply because it changes NOTHING
-    // that is running: the video leg is read once, at Start, so this moves a lamp
-    // and a reserved rectangle and not one byte the switcher receives. The
-    // Settings hint and the preview's own caption are what say the rest.
+    // screen the field lives on, and it moves a lamp and a reserved rectangle
+    // and not one byte the switcher receives: the rebuild these fields trigger
+    // is the CAPTURE side's, and both controls are refused outright while a feed
+    // is up (VIDEO_LEG_WHILE_SENDING), so nothing that is on air can be reached
+    // from here. The Settings hint and the preview's own caption say the rest.
     // TRUE: this desk saved or applied it, so it may resize its own picture.
     adoptVideoConfig(config, true);
 

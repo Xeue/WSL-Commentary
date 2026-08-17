@@ -34,6 +34,7 @@ import {
   describeOverall,
   OVERALL,
   OVERALL_WORDS,
+  OVERALL_WORDS_BEFORE_START,
   SETTLED_GREY_TEXTS,
   rankOf,
 } from './overall.js';
@@ -41,14 +42,21 @@ import { LEVEL } from './lamps.js';
 
 const lamp = (level, text) => ({ level, text });
 
+// The lamp NAMES are home.js's, in row order. The last two say SWITCHER because
+// they are the switcher's report of what it is receiving and this desk now
+// measures its own audio and video before START — see home.js's LAMP_NAMES.
+// They are fixture data here (this reduction is a pure function of whatever it
+// is handed), but a fixture that does not match the row is a fixture whose
+// `detail` assertions prove nothing about what an operator would read.
+
 /** A healthy running seat on a SLATE position — every seat shipping today. */
 function healthySlateSeat() {
   return [
     { name: 'SENDING', lamp: lamp(LEVEL.GREEN, 'SENDING') },
     { name: 'CAMERA', lamp: lamp(LEVEL.GREY, 'SLATE') },
     { name: 'SWITCHER SEES FEED', lamp: lamp(LEVEL.GREEN, 'STREAMING') },
-    { name: 'VIDEO', lamp: lamp(LEVEL.GREEN, '1080P50') },
-    { name: 'AUDIO', lamp: lamp(LEVEL.GREEN, 'AAC 48K STEREO') },
+    { name: 'SWITCHER VIDEO', lamp: lamp(LEVEL.GREEN, '1080P50') },
+    { name: 'SWITCHER AUDIO', lamp: lamp(LEVEL.GREEN, 'AAC 48K STEREO') },
     { name: 'MONITOR', lamp: lamp(LEVEL.GREEN, 'CONNECTED') },
   ];
 }
@@ -59,10 +67,27 @@ function standbySeat() {
     { name: 'SENDING', lamp: lamp(LEVEL.GREY, 'NOT STARTED') },
     { name: 'CAMERA', lamp: lamp(LEVEL.GREY, 'SLATE') },
     { name: 'SWITCHER SEES FEED', lamp: lamp(LEVEL.GREY, 'NO STATUS') },
-    { name: 'VIDEO', lamp: lamp(LEVEL.GREY, 'NO STATUS') },
-    { name: 'AUDIO', lamp: lamp(LEVEL.GREY, 'NO STATUS') },
+    { name: 'SWITCHER VIDEO', lamp: lamp(LEVEL.GREY, 'NO STATUS') },
+    { name: 'SWITCHER AUDIO', lamp: lamp(LEVEL.GREY, 'NO STATUS') },
     { name: 'MONITOR', lamp: lamp(LEVEL.GREY, 'NOT STARTED') },
   ];
+}
+
+/**
+ * A seat before START with capture already live and a fault in it: the card is
+ * selected and its input is unplugged.
+ *
+ * THIS SEAT DID NOT EXIST BEFORE. Nothing was captured, measured or watched
+ * until START, so the pre-air row was all grey and there was no red to word.
+ * The card and the microphone are open from launch now, so this is the state the
+ * pre-air vocabulary is for — and it is the one that must read as an
+ * instruction, because it is the last moment at which anything can be fixed
+ * cheaply.
+ */
+function preAirCardFaultSeat() {
+  const seat = standbySeat();
+  seat.find((e) => e.name === 'CAMERA').lamp = lamp(LEVEL.RED, 'NO SIGNAL');
+  return seat;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +110,7 @@ test('a stale status feed reads WORKING, never GOOD', () => {
   // "STATUS UNAVAILABLE" when the telemetry socket has been quiet; those greys
   // are NOT settled answers, they are the application unable to see.
   const seat = healthySlateSeat();
-  for (const name of ['SWITCHER SEES FEED', 'VIDEO', 'AUDIO']) {
+  for (const name of ['SWITCHER SEES FEED', 'SWITCHER VIDEO', 'SWITCHER AUDIO']) {
     seat.find((e) => e.name === name).lamp = lamp(LEVEL.GREY, 'STATUS UNAVAILABLE');
   }
   const o = deriveOverallStatus(seat, { running: true });
@@ -115,24 +140,24 @@ test('SLATE is the only settled grey, and a CAMERA that is merely unmeasured is 
 
 test('one red lamp makes it a FAULT, whatever else is green', () => {
   const seat = healthySlateSeat();
-  seat.find((e) => e.name === 'AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
+  seat.find((e) => e.name === 'SWITCHER AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
   const o = deriveOverallStatus(seat, { running: true });
   assert.equal(o.state, OVERALL.FAULT);
   assert.equal(o.level, LEVEL.RED);
-  assert.equal(o.detail, 'AUDIO: NO AUDIO (DROPPED?)', 'a summary that cannot say which lamp is a verdict');
+  assert.equal(o.detail, 'SWITCHER AUDIO: NO AUDIO (DROPPED?)', 'a summary that cannot say which lamp is a verdict');
 });
 
 test('red beats amber, and the row order decides which of two equals is named', () => {
   const seat = healthySlateSeat();
   seat.find((e) => e.name === 'SENDING').lamp = lamp(LEVEL.AMBER, 'RETRYING');
-  seat.find((e) => e.name === 'VIDEO').lamp = lamp(LEVEL.RED, 'WRONG FORMAT');
-  seat.find((e) => e.name === 'AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
+  seat.find((e) => e.name === 'SWITCHER VIDEO').lamp = lamp(LEVEL.RED, 'WRONG FORMAT');
+  seat.find((e) => e.name === 'SWITCHER AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
 
   const o = deriveOverallStatus(seat, { running: true });
   assert.equal(o.state, OVERALL.FAULT, 'red outranks amber');
   assert.equal(
     o.detail,
-    'VIDEO: WRONG FORMAT',
+    'SWITCHER VIDEO: WRONG FORMAT',
     'the LEFTMOST of two equally bad lamps, which is the one the eye reaches first on the row ' +
       'this summarises',
   );
@@ -201,21 +226,102 @@ test('a lamp with no level is treated as grey, not as green', () => {
 // What it says
 // ---------------------------------------------------------------------------
 
-test('the four words differ in length and share no prefix', () => {
+test('the four words differ in length and share no prefix — in BOTH vocabularies', () => {
   // At the distance this is read from, word SHAPE arrives before the letters do.
-  const words = Object.values(OVERALL_WORDS);
-  assert.equal(new Set(words).size, words.length, 'no two states may say the same word');
-  assert.equal(
-    new Set(words.map((w) => w.length)).size,
-    words.length,
-    'and no two may be the same length, so the shape alone separates them',
-  );
-  for (const a of words) {
-    for (const b of words) {
-      if (a === b) continue;
-      assert.equal(a.startsWith(b), false, `"${a}" starts with "${b}": the first glance is ambiguous`);
+  // There are two sets of four now, one for a seat that is on air and one for a
+  // seat that is not, and the property has to hold inside each of them: an
+  // operator reads one set at a time and never a mixture.
+  for (const [which, table] of [
+    ['on air', OVERALL_WORDS],
+    ['before START', OVERALL_WORDS_BEFORE_START],
+  ]) {
+    const words = Object.values(table);
+    assert.equal(new Set(words).size, words.length, `${which}: no two states may say the same word`);
+    assert.equal(
+      new Set(words.map((w) => w.length)).size,
+      words.length,
+      `${which}: and no two may be the same length, so the shape alone separates them`,
+    );
+    for (const a of words) {
+      for (const b of words) {
+        if (a === b) continue;
+        assert.equal(
+          a.startsWith(b),
+          false,
+          `${which}: "${a}" starts with "${b}": the first glance is ambiguous`,
+        );
+      }
     }
   }
+
+  // AND ACROSS THE TWO, no word may mean two different things. A word that said
+  // one state on air and another off it would be the worst of both: the operator
+  // learns it once and it is wrong half the time.
+  const meanings = new Map();
+  for (const table of [OVERALL_WORDS, OVERALL_WORDS_BEFORE_START]) {
+    for (const [state, word] of Object.entries(table)) {
+      const seen = meanings.get(word);
+      assert.ok(
+        seen === undefined || seen === state,
+        `"${word}" means ${seen} on one side of START and ${state} on the other`,
+      );
+      meanings.set(word, state);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The pre-air vocabulary
+// ---------------------------------------------------------------------------
+
+test('before START, red says NOT READY and amber says CHECK', () => {
+  // ================== WHY TWO WORDS CHANGE AND NOTHING ELSE =================
+  //
+  // Same lamps, same reduction, same colours and the same glyph — only the word
+  // differs, and only in the two states whose ON-AIR word misreads off air:
+  //
+  //   FAULT reads as "something has broken", and an operator who has started
+  //   nothing reads that as broken in the APPLICATION. NOT READY is the same red
+  //   saying the thing they can act on.
+  //
+  //   WORKING is the dangerous one: it means "this application cannot presently
+  //   see all of it", and beside a START button it is read as "it is working".
+  //   CHECK cannot be read as reassurance.
+  const red = deriveOverallStatus(preAirCardFaultSeat(), { running: false });
+  assert.equal(red.state, OVERALL.FAULT, 'the STATE is unchanged — this is wording, not logic');
+  assert.equal(red.level, LEVEL.RED, 'and so is the colour, and so is the glyph that goes with it');
+  assert.equal(red.text, 'NOT READY');
+  assert.equal(red.detail, 'CAMERA: NO SIGNAL', 'and it still names the lamp it came from');
+
+  const amberSeat = standbySeat();
+  amberSeat.find((e) => e.name === 'MONITOR').lamp = lamp(LEVEL.AMBER, 'RECONNECTING');
+  const amber = deriveOverallStatus(amberSeat, { running: false });
+  assert.equal(amber.state, OVERALL.WORKING);
+  assert.equal(amber.level, LEVEL.AMBER);
+  assert.equal(amber.text, 'CHECK');
+
+  // ON AIR, THE SAME TWO SEATS SAY WHAT THEY ALWAYS SAID. This is the half that
+  // proves the change is a vocabulary and not a new rule.
+  assert.equal(deriveOverallStatus(preAirCardFaultSeat(), { running: true }).text, 'FAULT');
+  assert.equal(deriveOverallStatus(amberSeat, { running: true }).text, 'WORKING');
+});
+
+test('a seat that is merely idle is STANDING BY, and never GOOD, in either vocabulary', () => {
+  // The pre-air words must not reach a seat that has nothing wrong with it. The
+  // idle seat's greys take case 1 before any wording is chosen, and GOOD is
+  // unreachable off air because SENDING is grey NOT STARTED and NOT STARTED is
+  // not on the settled list. That is what stops an indicator that has learnt to
+  // speak about pre-air faults from also learning to bless an idle seat.
+  const idle = deriveOverallStatus(standbySeat(), { running: false });
+  assert.equal(idle.state, OVERALL.STANDBY);
+  assert.equal(idle.text, 'STANDING BY', 'the one word that is the same on both sides of START');
+
+  // Even with every OTHER lamp green: SENDING grey off air is the whole guard.
+  const nearly = healthySlateSeat();
+  nearly.find((e) => e.name === 'SENDING').lamp = lamp(LEVEL.GREY, 'NOT STARTED');
+  const o = deriveOverallStatus(nearly, { running: false });
+  assert.equal(o.state, OVERALL.STANDBY, 'a healthy seat that is not sending is not GOOD');
+  assert.notEqual(o.state, OVERALL.GOOD);
 });
 
 test('describeOverall always says where the detail lives', () => {
@@ -224,9 +330,16 @@ test('describeOverall always says where the detail lives', () => {
   assert.match(good, /column beside the picture/, 'the six lamps must not look deleted');
 
   const seat = healthySlateSeat();
-  seat.find((e) => e.name === 'AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
+  seat.find((e) => e.name === 'SWITCHER AUDIO').lamp = lamp(LEVEL.RED, 'NO AUDIO (DROPPED?)');
   const bad = describeOverall(deriveOverallStatus(seat, { running: true }));
-  assert.match(bad, /^FAULT — AUDIO: NO AUDIO \(DROPPED\?\)\./);
+  assert.match(bad, /^FAULT — SWITCHER AUDIO: NO AUDIO \(DROPPED\?\)\./);
+
+  // And off air the same seat opens with the pre-air word, because describeOverall
+  // reads the text the reduction already chose rather than choosing one of its
+  // own. Two places that picked a word would be two places that can disagree
+  // about what the indicator says, on the control and in its own tooltip.
+  const preAir = describeOverall(deriveOverallStatus(seat, { running: false }));
+  assert.match(preAir, /^NOT READY — SWITCHER AUDIO: NO AUDIO \(DROPPED\?\)\./);
 });
 
 test('describeOverall survives being handed nothing', () => {
@@ -257,7 +370,7 @@ test('an unrecognised lamp level is not a good one', () => {
   // unbreakable property is that it fails towards concern, never away from it.
   for (const bogus of ['RED', 'Red', 'critical', 'orange', 'ok', 0, 1, {}, []]) {
     const out = deriveOverallStatus(
-      [{ name: 'AUDIO', lamp: { level: bogus, text: 'WHO KNOWS' } }],
+      [{ name: 'SWITCHER AUDIO', lamp: { level: bogus, text: 'WHO KNOWS' } }],
       { running: true },
     );
     assert.notEqual(
@@ -270,18 +383,18 @@ test('an unrecognised lamp level is not a good one', () => {
 
   // Not running, and the same unknown level: STANDBY, for the same reason every
   // other grey gives STANDBY before START. Still not GOOD.
-  const idle = deriveOverallStatus([{ name: 'AUDIO', lamp: { level: 'RED', text: 'X' } }], null);
+  const idle = deriveOverallStatus([{ name: 'SWITCHER AUDIO', lamp: { level: 'RED', text: 'X' } }], null);
   assert.equal(idle.state, OVERALL.STANDBY);
 
   // One bogus level does not drag down a real red beside it: the red still wins,
   // and still names itself.
   const mixed = deriveOverallStatus(
     [
-      { name: 'AUDIO', lamp: { level: 'nonsense', text: 'X' } },
-      { name: 'VIDEO', lamp: { level: LEVEL.RED, text: 'NO SIGNAL' } },
+      { name: 'SWITCHER AUDIO', lamp: { level: 'nonsense', text: 'X' } },
+      { name: 'SWITCHER VIDEO', lamp: { level: LEVEL.RED, text: 'NO SIGNAL' } },
     ],
     { running: true },
   );
   assert.equal(mixed.state, OVERALL.FAULT);
-  assert.equal(mixed.detail, 'VIDEO: NO SIGNAL');
+  assert.equal(mixed.detail, 'SWITCHER VIDEO: NO SIGNAL');
 });

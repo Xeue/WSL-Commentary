@@ -52,6 +52,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { validateConfig, isConfigValid } from './validate.js';
+// The routing ceiling, from the module that mirrors internal/gst's own constant
+// rather than typed as a literal here — see the channel-routing test below.
+import { MAX_INPUT_CHANNELS } from './channelmap.js';
 import { SECRET_KEY_M2LX, SECRET_KEY_SRT, SECRET_KEY_SRT_RETURN, setSecret, isSecretSetThisSession } from './backend.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -61,14 +64,13 @@ const ui = (name) => read(here, name);
 
 /**
  * jsonTagName is the NAME half of a Go struct tag: everything before the first
- * comma. `json:"decklinkChannelMap,omitempty"` names the key
- * "decklinkChannelMap" and says one thing about how it is encoded, and the tests
- * below mirror KEYS.
+ * comma. `json:"channelMaps,omitempty"` names the key "channelMaps" and says
+ * one thing about how it is encoded, and the tests below mirror KEYS.
  *
  * It exists because two of them used the whole tag text, which was right only
  * for as long as no field carried an option — and the first one that did failed
  * them by asserting that settings.js must restate the literal
- * "decklinkChannelMap,omitempty". Go's own reflection does exactly this split
+ * "channelMaps,omitempty". Go's own reflection does exactly this split
  * (internal/presets/fields_test.go), which is the authority both sides mirror.
  */
 const jsonTagName = (tag) => tag.split(',')[0];
@@ -341,14 +343,23 @@ test('a DeckLink device NUMBER is refused by name, and a persistent ID is not', 
   }
 });
 
+/** The routing store as it is saved: one device's key, one device's routing. */
+const CARD_KEY = 'decklink:2747401380';
+const withRouting = (map) => ({ ...validForm(), channelMaps: { [CARD_KEY]: map } });
+
 test('the channel routing is refused whole, never trimmed, and absent is valid', () => {
-  // ABSENT IS THE NORMAL STATE. Empty means nobody has chosen, and Go resolves
-  // it to the card's first two embedded channels — which is bit-for-bit what
-  // this application sent before the routing screen existed. A validator that
-  // required a routing would make every native seat's Settings screen unsavable.
+  // ABSENT IS THE NORMAL STATE. An absent key means nobody has chosen for that
+  // device, and Go resolves it to the device's first two input channels — which
+  // is bit-for-bit what this application sent before the routing screen existed.
+  // A validator that required a routing would make every seat's Settings screen
+  // unsavable.
+  for (const maps of [undefined, null, {}]) {
+    const errors = validateConfig({ ...validForm(), channelMaps: maps });
+    assert.equal(errors.channelMaps, undefined, `${JSON.stringify(maps)} must be accepted`);
+  }
   for (const map of [undefined, null, []]) {
-    const errors = validateConfig({ ...validForm(), decklinkChannelMap: map });
-    assert.equal(errors.decklinkChannelMap, undefined, `${JSON.stringify(map)} must be accepted`);
+    const errors = validateConfig(withRouting(map));
+    assert.equal(errors.channelMaps, undefined, `${JSON.stringify(map)} must be accepted`);
   }
 
   // The routing an operator can actually build in the grid: two mics summed to
@@ -358,26 +369,60 @@ test('the channel routing is refused whole, never trimmed, and absent is valid',
     { output: 0, input: 4, gain: 0.5 },
     { output: 1, input: 15, gain: -1 },
   ];
-  assert.equal(validateConfig({ ...validForm(), decklinkChannelMap: good }).decklinkChannelMap, undefined);
+  assert.equal(validateConfig(withRouting(good)).channelMaps, undefined);
+
+  // EVERY DEVICE IS CHECKED, not just the one this seat happens to be using: the
+  // form saves the store whole, so a routing for a card that is not plugged in
+  // today still reaches config.json today.
+  assert.match(
+    validateConfig({
+      ...validForm(),
+      channelMaps: { 'native:usb-mic-1': good, [CARD_KEY]: [{ output: 2, input: 0, gain: 1 }] },
+    }).channelMaps,
+    /two/,
+  );
+
+  // AND THE MESSAGE NAMES THE DEVICE. Without the key in it, the operator is
+  // sent to the grid in front of them — which is a different device's, is
+  // perfectly valid, and shows nothing wrong.
+  assert.match(
+    validateConfig(withRouting([{ output: 2, input: 0, gain: 1 }])).channelMaps,
+    new RegExp(CARD_KEY),
+  );
+
+  // The store itself, from a hand-edited file that put a list where the object
+  // goes.
+  assert.match(
+    validateConfig({ ...validForm(), channelMaps: [] }).channelMaps,
+    /one per capture device/,
+  );
 
   // Every refusal is a HAND-EDITED file's, because the grid cannot express any
   // of these — which is exactly why they have to be caught here rather than at
   // the element, whose own rejection is silent and leaves the previous routing
   // in force.
+  // THE CEILING IS IMPORTED, NEVER TYPED. It used to be a literal 16 here and in
+  // three of the expected messages, which pinned this table to one hardware
+  // generation: internal/gst raised gst.MaxInputChannels to 32 for the wider
+  // interfaces (a 2x32 mix-matrix passes audio and `level` reports 32 rms
+  // entries per message, measured), and a literal would have failed this test on
+  // a channel that is now perfectly legal. channelmap.test.js is what holds the
+  // JS mirror equal to the Go constant; this reads the mirror.
+  const tooWide = new RegExp(`at most ${MAX_INPUT_CHANNELS}`);
   const bad = [
-    [{ output: 2, input: 0, gain: 1 }, /two/],           // a third output
-    [{ output: 0, input: 16, gain: 1 }, /at most 16/],   // past the widest card
-    [{ output: 0, input: -1, gain: 1 }, /at most 16/],   // counted from zero
+    [{ output: 2, input: 0, gain: 1 }, /two/],                        // a third output
+    [{ output: 0, input: MAX_INPUT_CHANNELS, gain: 1 }, tooWide],     // past the widest input
+    [{ output: 0, input: -1, gain: 1 }, tooWide],                     // counted from zero
     [{ output: 0, input: 0, gain: 1.0001 }, /router with attenuation/],
     [{ output: 0, input: 0, gain: Number.NaN }, /router with attenuation/],
-    [{ output: 0, input: 0 }, /router with attenuation/], // no gain at all
-    [{ output: 0, gain: 1 }, /at most 16/],               // no input
+    [{ output: 0, input: 0 }, /router with attenuation/],             // no gain at all
+    [{ output: 0, gain: 1 }, tooWide],                                // no input
     ['nonsense', /not a routing entry/],
   ];
   for (const [entry, expected] of bad) {
-    const errors = validateConfig({ ...validForm(), decklinkChannelMap: [entry] });
-    assert.ok(errors.decklinkChannelMap, `${JSON.stringify(entry)} must be refused`);
-    assert.match(errors.decklinkChannelMap, expected);
+    const errors = validateConfig(withRouting([entry]));
+    assert.ok(errors.channelMaps, `${JSON.stringify(entry)} must be refused`);
+    assert.match(errors.channelMaps, expected);
   }
 
   // TWO CONTRIBUTIONS TO ONE CROSSPOINT is the refusal worth its own case: one
@@ -387,16 +432,10 @@ test('the channel routing is refused whole, never trimmed, and absent is valid',
     { output: 0, input: 3, gain: 1 },
     { output: 0, input: 3, gain: 0.25 },
   ];
-  assert.match(
-    validateConfig({ ...validForm(), decklinkChannelMap: doubled }).decklinkChannelMap,
-    /already routed to/,
-  );
+  assert.match(validateConfig(withRouting(doubled)).channelMaps, /already routed to/);
 
   // Not an array at all — a hand-edited file with an object where the list goes.
-  assert.match(
-    validateConfig({ ...validForm(), decklinkChannelMap: { output: 0 } }).decklinkChannelMap,
-    /must be a list/,
-  );
+  assert.match(validateConfig(withRouting({ output: 0 })).channelMaps, /must be a list/);
 });
 
 // ---------------------------------------------------------------------------
@@ -2025,25 +2064,72 @@ test('the four new fields are classified in the Go whitelist, two each way', () 
   }
 });
 
-test('the DeckLink channel map is loaded and restated, though it has no box', () => {
+test('the channel routing store is loaded and restated, though it has no box', () => {
   // THE SAME DATA-LOSS RULE AS EVERY OTHER FIELD, applied to the one value on
   // this screen that is a MATRIX rather than a box: collectConfig replaces the
   // whole document, so a field it does not restate is a field a Save deletes.
   // What would be deleted here is which of a card's sixteen embedded channels
   // the commentary arrives on — and it would be deleted by a seat that is not
-  // even using the card, because the group is hidden on a native input.
+  // even using the card, because the grid on screen belongs to whichever device
+  // this seat is capturing from.
   //
   // The routing itself is proved in channelmap.test.js; this is the settings
   // screen's half of the contract.
   const js = ui('settings.js');
   const collect = js.slice(js.indexOf('function collectConfig()'), js.indexOf('function clearAllErrors()'));
   const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('function refreshSecretBadges'));
-  assert.ok(collect.includes('decklinkChannelMap'), 'collectConfig must restate the channel map');
-  assert.ok(populate.includes('decklinkChannelMap'), 'populate must read it, or the form saves a blank over it');
+  assert.ok(collect.includes('channelMaps'), 'collectConfig must restate the routing store');
+  assert.ok(populate.includes('channelMaps'), 'populate must read it, or the form saves a blank over it');
   assert.match(
     js,
-    /decklinkChannelMap: \[\],/,
-    'blankConfig must default it to an EMPTY map: empty means "whatever the capture does by ' +
-      'itself", which is the first two embedded channels — the routing every seat already had',
+    /channelMaps: \{\},/,
+    'blankConfig must default it to an EMPTY store: an absent key means "whatever the capture ' +
+      'does by itself", which is the first two input channels — the routing every seat already had',
+  );
+});
+
+test('a save writes one device’s grid and carries every other device’s routing', () => {
+  // THE PROPERTY THE PER-DEVICE STORE EXISTS FOR. The grid on screen is sized to
+  // the width the CURRENT device's pad negotiated, so it can only ever speak for
+  // that device. Plugging in a two-channel USB microphone to check something and
+  // then pressing Save on an unrelated field must not narrow a card's sixteen-
+  // wide routing to a two-wide one — silently, with a commentator's channel
+  // assignment in it, from a screen showing a different device entirely.
+  //
+  // Read from source: collectConfig needs the real DOM (see this file's header),
+  // and what is load-bearing here is structural — that the visible grid is
+  // written OVER the carried store and never instead of it.
+  const js = ui('settings.js');
+  const collectMaps = js.slice(
+    js.indexOf('function collectChannelMaps()'),
+    js.indexOf('function renderChannelMapGroup()'),
+  );
+  assert.ok(collectMaps.length > 0, 'settings.js must define collectChannelMaps');
+  assert.match(
+    collectMaps,
+    /\{ \.\.\.carriedChannelMaps \}/,
+    'the other devices\' routings must be carried, not rebuilt from the one grid on screen',
+  );
+  assert.match(
+    collectMaps,
+    /maps\[key\] = map;\s*else delete maps\[key\]/,
+    'an empty grid must REMOVE the key: absent means "nobody has chosen", and an explicit empty ' +
+      'list says the same thing in a spelling nothing else uses',
+  );
+
+  // AND THE KEY IS THE ONE GO BUILDS. internal/config.AudioDeviceKey is
+  // "<kind>:<id>" through the same encodeAudioInput grammar the picker uses; a
+  // key spelled two ways is a routing filed where nothing will look for it again.
+  const keyOf = js.slice(
+    js.indexOf('function currentAudioDeviceKey()'),
+    js.indexOf('function adoptChannelMaps('),
+  );
+  assert.ok(keyOf.length > 0, 'settings.js must define currentAudioDeviceKey');
+  assert.match(keyOf, /return encodeAudioInput\(kind, id\)/);
+  assert.match(
+    keyOf,
+    /fields\.decklinkPersistentId\.input\.value[\s\S]{0,120}fields\.audioDeviceId\.input\.value/,
+    'the key must be built from the three fields collectConfig itself writes, so a saved ' +
+      'document cannot disagree with its own key',
   );
 });

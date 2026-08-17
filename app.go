@@ -245,7 +245,7 @@
 //	"statusKeyCandidates" a []m2lx.StatusKeyCandidate
 //	"levels"              a levelsPayload {peak:[...], rms:[...]} — the input meters
 //	"channelLevels"       a levelsPayload, one entry per CAPTURE channel — the picker
-//	"channelMap"          a channelMapPayload {inputChannels, map, isDefault}
+//	"channelMap"          a channelMapPayload {deviceKey, inputChannels, map, isDefault}
 //	"signal"              a signalPayload {state, flaps} — the video capture's input lock
 //
 // The "error" event carries first-run configuration problems, gst.Init failures,
@@ -503,9 +503,9 @@ const (
 	// ordinary microphone produces not one frame of this for a whole match.
 	EventChannelLevels = "channelLevels"
 
-	// EventChannelMap carries a channelMapPayload: how many channels the capture
-	// pad NEGOTIATED, the routing in force, and whether that routing is the
-	// unchosen default.
+	// EventChannelMap carries a channelMapPayload: WHICH DEVICE the report is
+	// about, how many channels its capture pad NEGOTIATED, the routing in force,
+	// and whether that routing is the unchosen default.
 	//
 	// The width is the load-bearing half. The routing grid is sized from it and
 	// from nothing else, because a mix matrix whose width does not match what the
@@ -515,6 +515,13 @@ const (
 	// the device publishes max-channels=16 whatever its element is configured to
 	// produce. Zero is a normal value and means "nothing has negotiated" — before
 	// the first Start, and after a session ends — and it draws no grid at all.
+	//
+	// The DEVICE KEY is what makes the width safe to draw. Any multichannel
+	// device gets this grid now, not only the card, so a width alone no longer
+	// identifies what it measured — and the routing store in config.json is keyed
+	// by device, so a grid saved against the wrong one files a commentator's
+	// channel assignment where nothing will look for it again. The screen draws
+	// nothing until the key in the report is the key of the device it is showing.
 	//
 	// It is emitted when a session starts (which is when the pad negotiates) and
 	// when one ends, and replayed on domReady, so a Settings screen left open
@@ -990,12 +997,13 @@ type App struct {
 	sigMu      sync.Mutex
 	lastSignal gst.SignalReport
 
-	// chanMu guards lastChannelMap, the DeckLink routing CURRENTLY IN FORCE on
+	// chanMu guards lastChannelMap, the capture routing CURRENTLY IN FORCE on
 	// the running pipeline. Another leaf lock, held for one assignment.
 	//
-	// It is not the same thing as config.Config.DeckLinkChannelMap and the
-	// difference is the whole reason it exists. The config field is what was
-	// SAVED; this is what the pipeline was started with and what every live
+	// It is not the same thing as the entry config.Config.ChannelMaps holds for
+	// this seat's device, and the difference is the whole reason it exists. The
+	// config field is what was SAVED; this is what the pipeline was started with
+	// and what every live
 	// SetChannelMap since has written. They agree on a normal launch and diverge
 	// the moment somebody re-routes without pressing Save — and at that moment
 	// the routing screen must show what the commentator is actually being heard
@@ -1014,9 +1022,23 @@ type App struct {
 	// which runs on the Wails main thread and therefore may not take a lock
 	// internal/gst holds across state changes — a page reloaded during a
 	// reconnect would freeze the window for the length of it.
+	//
+	// lastDeviceKey is WHICH DEVICE that width was measured on, in
+	// config.Config.AudioDeviceKey's spelling, and it travels with the width
+	// everywhere the width goes — see channelMapPayload for what a width with no
+	// device on it lets a routing screen do.
+	//
+	// It is recorded from the configuration the pipeline was BUILT FROM, at the
+	// moment it is built, and never re-read from the current configuration
+	// afterwards. The difference is the whole reason it is cached rather than
+	// derived: a save that changes the commentary input does not reach a running
+	// pipeline, so a key re-derived at publish time would name the newly selected
+	// device while the width still describes the one actually capturing — which
+	// is precisely the mismatch the stamp exists to make visible.
 	chanMu            sync.Mutex
 	lastChannelMap    gst.ChannelMap
 	lastInputChannels int
+	lastDeviceKey     string
 
 	// chanLevelWidth is how many channels the per-channel picker meter was last
 	// drawn at, or 0 if it has never been fed this session.
@@ -1556,9 +1578,9 @@ func (a *App) domReady(ctx context.Context) {
 	// routing screen calls GetChannelMap when it opens, which does read the pad,
 	// so the live number is one screen-open away and this one is free.
 	a.chanMu.Lock()
-	chanWidth, chanMap := a.lastInputChannels, a.lastChannelMap
+	chanKey, chanWidth, chanMap := a.lastDeviceKey, a.lastInputChannels, a.lastChannelMap
 	a.chanMu.Unlock()
-	a.events.send(EventChannelMap, channelMapPayloadFrom(chanWidth, chanMap))
+	a.events.send(EventChannelMap, channelMapPayloadFrom(chanKey, chanWidth, chanMap))
 
 	// The cough mute, and this one has to be replayed for a reason none of the
 	// others share: a mute is SILENT. A reloaded page that came back showing an
@@ -2349,7 +2371,12 @@ func (a *App) startSession() error {
 	// goes to PLAYING, so this is the first moment there is a real number to
 	// size a routing grid against. A Settings screen left open across a START
 	// therefore sizes itself without being reopened.
-	a.publishChannelMap(pipe)
+	//
+	// STAMPED WITH THE DEVICE THIS cfg NAMES, from the same call senderOpts used
+	// to choose which saved routing to start with. One derivation, one config
+	// value, so the width and the routing on screen cannot end up describing two
+	// different pieces of hardware.
+	a.publishChannelMap(pipe, cfg.AudioDeviceKey())
 
 	// THE MUTE IS PUT INTO ITS DEFINED STATE — off — and published. This is the
 	// line that stops a position coming on air muted because of something
@@ -3623,13 +3650,19 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// so the forwarder may take sigMu for the one assignment it makes.
 			OnSignal: a.signalForwarder(),
 
-			// The routing the card starts with. The zero value is not silence: it
-			// means nobody has chosen, and internal/gst resolves it to the card's
-			// first two embedded channels — bit-for-bit what this application sent
-			// before the routing screen existed. It is IGNORED on a positioned
-			// capture source, which is every microphone and the whole of the
-			// on-air Windows path.
-			ChannelMap: gstChannelMap(cfg.DeckLinkChannelMap),
+			// The routing the capture starts with — THE ONE SAVED FOR THE DEVICE
+			// THIS SEAT IS CAPTURING FROM, and no other. config.ChannelMaps holds
+			// one per device, keyed by capture kind and device id, so a card's
+			// sixteen-wide routing cannot reach a two-channel microphone that
+			// happened to be selected when somebody last pressed Save. Nothing here
+			// picks the key: CurrentChannelMap reads the same three fields that
+			// decide which capture element gets built.
+			//
+			// The zero value is not silence: it means nobody has chosen for this
+			// device, and internal/gst resolves it at the negotiated width to the
+			// first two input channels — bit-for-bit what this application sent
+			// before the routing screen existed.
+			ChannelMap: gstChannelMap(cfg.CurrentChannelMap()),
 		},
 		Sink: gst.SinkOpts{
 			Host:       srtHost,
@@ -4328,17 +4361,42 @@ func (a *App) channelLevelsForwarder() func(gst.Levels) {
 }
 
 // channelMapPayload is the "channelMap" event's wire shape and GetChannelMap's
-// return value: what the capture pad negotiated, the routing in force against
-// it, and whether that routing is the one nobody chose.
+// return value: WHICH DEVICE this report is about, what its capture pad
+// negotiated, the routing in force against it, and whether that routing is the
+// one nobody chose.
 //
-// The three fields answer three different questions and the UI needs all three.
+// The four fields answer four different questions and the UI needs all four.
 // InputChannels sizes the grid — and ONLY it may, because a matrix built against
 // any other number stops the capture chain rather than degrading it. Map is what
 // is in force right now, which after a live re-route is not what config.json
 // says. IsDefault is what separates "nobody has routed this position" from "one
 // contribution happens to look like the default", so the screen can say the
 // first rather than implying somebody chose it.
+//
+// # WHY THE WIDTH IS STAMPED WITH A DEVICE
+//
+// DeviceKey is config.Config.AudioDeviceKey's spelling — "<capture kind>:<device
+// id>" — of the device the other three fields are about, and it is the half that
+// makes a width safe to act on rather than merely true.
+//
+// The routing store is per device now, and the routing screen draws a grid only
+// while the width it holds belongs to the device the form is showing. Without
+// the stamp there is no way for it to tell: a report saying "16" is
+// indistinguishable from a report saying "16" about something else, so a seat
+// that moved from the card to a two-channel interface would go on offering
+// sixteen crosspoints, and one pressed there writes a 2x16 matrix onto a
+// two-channel pad — measured on the real card as "streaming stopped, reason
+// error (-5)", the capture chain dead before the next level message.
+//
+// THE EMPTY KEY IS A REAL ANSWER and it must not be filled in with the
+// configuration's own key as a convenience. It means "this report is about no
+// device": nothing has negotiated, so there is nothing to route. Every
+// configured seat keys as at least "native:", so an empty key matches no form on
+// any screen and draws no grid — which is the correct reading, and is why
+// forgetChannelMap clears it rather than leaving the last device's name on a
+// report that no longer describes one.
 type channelMapPayload struct {
+	DeviceKey     string         `json:"deviceKey"`
 	InputChannels int            `json:"inputChannels"`
 	Map           gst.ChannelMap `json:"map"`
 	IsDefault     bool           `json:"isDefault"`
@@ -4355,10 +4413,17 @@ type channelMapPayload struct {
 // The map is always a non-nil slice, so the wire form is [] rather than null:
 // the frontend tests Array.isArray before adopting a map, and null would take
 // the "this build cannot tell me" path rather than the "nobody has chosen" one.
-func channelMapPayloadFrom(inputChannels int, m gst.ChannelMap) channelMapPayload {
+//
+// The device key is PASSED IN rather than read from the configuration here, and
+// that is the same discipline startSession keeps for the map itself: the caller
+// knows which device the width it is holding was measured on, and re-deriving it
+// from config.json would let the two disagree the moment somebody saves a
+// different input while a pipeline built from the old one is still running.
+func channelMapPayloadFrom(deviceKey string, inputChannels int, m gst.ChannelMap) channelMapPayload {
 	out := make(gst.ChannelMap, 0, len(m))
 	out = append(out, m...)
 	return channelMapPayload{
+		DeviceKey:     deviceKey,
 		InputChannels: inputChannels,
 		Map:           out,
 		IsDefault:     m.IsDefault(),
@@ -4429,10 +4494,10 @@ func (a *App) GetChannelMap() (channelMapPayload, error) {
 
 	a.chanMu.Lock()
 	a.lastInputChannels = width
-	m := a.lastChannelMap
+	m, key := a.lastChannelMap, a.lastDeviceKey
 	a.chanMu.Unlock()
 
-	return channelMapPayloadFrom(width, m), nil
+	return channelMapPayloadFrom(key, width, m), nil
 }
 
 // SetChannelMap changes which of the capture device's channels reach the feed's
@@ -4467,21 +4532,25 @@ func (a *App) SetChannelMap(m gst.ChannelMap) error {
 	// what is IN FORCE, and a refused write left the previous matrix in force.
 	a.chanMu.Lock()
 	a.lastChannelMap = m
-	width := a.lastInputChannels
+	width, key := a.lastInputChannels, a.lastDeviceKey
 	a.chanMu.Unlock()
 
 	// Republished so that a SECOND SEAT follows the change. A remote operator's
 	// routing grid must not go on showing the map it last read while somebody at
 	// the desk re-routes the commentator; two seats disagreeing about where the
 	// audio is coming from is worse than either answer alone.
-	a.events.send(EventChannelMap, channelMapPayloadFrom(width, m))
+	a.events.send(EventChannelMap, channelMapPayloadFrom(key, width, m))
 	return nil
 }
 
 // publishChannelMap emits the current routing state and refreshes the cache the
 // domReady replay reads. It is called once when a session starts, which is when
 // the capture pad negotiates and therefore the first moment the width is real.
-func (a *App) publishChannelMap(pipe gst.Pipeline) {
+//
+// The DEVICE KEY comes from the caller, which is the only place that holds the
+// configuration this pipeline was built from — see the lastDeviceKey field for
+// why it is recorded here and not re-read later.
+func (a *App) publishChannelMap(pipe gst.Pipeline, deviceKey string) {
 	width := 0
 	if pipe != nil {
 		width = pipe.InputChannels()
@@ -4489,10 +4558,11 @@ func (a *App) publishChannelMap(pipe gst.Pipeline) {
 
 	a.chanMu.Lock()
 	a.lastInputChannels = width
+	a.lastDeviceKey = deviceKey
 	m := a.lastChannelMap
 	a.chanMu.Unlock()
 
-	a.events.send(EventChannelMap, channelMapPayloadFrom(width, m))
+	a.events.send(EventChannelMap, channelMapPayloadFrom(deviceKey, width, m))
 }
 
 // forgetChannelMap publishes the end-of-session state — no negotiated channels,
@@ -4508,13 +4578,20 @@ func (a *App) publishChannelMap(pipe gst.Pipeline) {
 // map means "nobody has chosen", which is precisely what the routing screen must
 // fall back to once there is no pipeline: it then draws what config.json says,
 // rather than a live routing that has stopped being live.
+//
+// The DEVICE KEY is cleared for the same reason as the width, and clearing it is
+// the honest answer rather than a tidy one: with no pipeline there is no device
+// this report is about. Leaving the last session's key behind would let a
+// routing screen match it against the form in front of it and go on believing
+// the report — a grid drawn at a width nothing is negotiating.
 func (a *App) forgetChannelMap() {
 	a.chanMu.Lock()
 	a.lastChannelMap = nil
 	a.lastInputChannels = 0
+	a.lastDeviceKey = ""
 	a.chanMu.Unlock()
 
-	a.events.send(EventChannelMap, channelMapPayloadFrom(0, nil))
+	a.events.send(EventChannelMap, channelMapPayloadFrom("", 0, nil))
 }
 
 // signalPayload is the "signal" event's wire shape.

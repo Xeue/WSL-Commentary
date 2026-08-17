@@ -24,11 +24,13 @@
 //
 // From frontend/: `npm run dev`, then open the printed localhost URL in any
 // browser. `window.go` will not exist there, so every call below is served
-// by the fake backend: three plausible input devices (mirroring
-// internal/gst/gst_stub.go's defaultStubDevices), a config seeded from
-// internal/config's documented defaults (Defaults(), spec section 9), and
-// secrets that report "not set" until this module's own setSecret fake has
-// been called in the running session.
+// by the fake backend: a table of plausible input devices between them
+// presenting 1, 2, 3, 8, 16 and 32 channels (the five that mirror
+// internal/gst/gst_stub.go's defaultStubDevices, plus four that reach the
+// widths those five cannot), a config seeded from internal/config's documented
+// defaults (Defaults(), spec section 9), and secrets that report "not set"
+// until this module's own setSecret fake has been called in the running
+// session.
 //
 // The fake also drives the three Go -> JS events so the lamps have something
 // to react to: start() moves SENDING through CONNECTING to CONNECTED (the
@@ -39,11 +41,32 @@
 // this file's FAKE_* constants; nothing here is reachable from production
 // code once a real Wails runtime is present.
 //
+// # THE FAKE CAPTURE IS LIVE FROM MODULE LOAD, AND THAT IS THE POINT
+//
+// Capture is no longer built at START. The real application builds its picture
+// and commentary capture pipelines when the window is ready and holds them to
+// quit, so the meters move, the preview paints, the pad has negotiated a width
+// and the signal watchdog is reporting before anybody presses anything — and
+// all five survive STOP. A fake that stood its card up inside start() and took
+// it down inside stop() modelled the OLD lifetime, which means every screen
+// built against it would be developed against a state machine the product no
+// longer has: the routing grid would only ever be seen while sending, and
+// "does this survive STOP" — the one question this whole change exists to
+// answer yes to — would be untestable in the dev loop. So fakeCaptureUp() runs
+// at the foot of this file, not inside fakeStart(), and fakeStop() takes
+// nothing away.
+//
+// It starts only in a BROWSER. A `node --test` run imports this module with no
+// `window`, and a ticker started there keeps the process alive for ever; the
+// suite would hang rather than fail, which is the worst way to find out. See
+// fakeBrowserSession.
+//
 // For manual poking from the browser devtools console while running against
 // the fakes, the fake event bus is exposed as `window.__wslcommsFake` with
 // `emitStatus(status)`, `emitSender(state)`, `emitError(message)`,
-// `setDevices(list)` and `setDeviceError(message|null)`. It is never created
-// when a real Wails runtime is detected.
+// `setDevices(list)`, `setDeviceError(message|null)`, `setSignal(state, flaps)`
+// and `selectInput(kind, id)`. It is never created when a real Wails runtime is
+// detected.
 
 // The preset whitelist's JS mirror, used ONLY by the fake backend below so a
 // dev session drops the same non-instance keys a real ApplyPreset would.
@@ -188,33 +211,53 @@ async function callGo(method, ...args) {
 // a caller that mishandles it should fail in the browser tab, not at the
 // facility.
 //
-// The last two entries are ONE PHYSICAL BOX seen twice: an UltraStudio 4K Mini
-// enumerated through CoreAudio and through the DeckLink driver, the same name
-// from both, exactly as it was measured. They are in the fake because that pair
-// is the case ui/devices.js's labelDevices exists for, and a dev session in
-// which the list never collides is a dev session in which the labelling can be
-// broken without anybody noticing. The CoreAudio twin is the SILENT one
-// (-96 dBFS on all sixteen channels with the mic live).
+// The UltraStudio pair is ONE PHYSICAL BOX seen twice: enumerated through
+// CoreAudio and through the DeckLink driver, the same name from both, exactly
+// as it was measured. They are in the fake because that pair is the case
+// ui/devices.js's labelDevices exists for, and a dev session in which the list
+// never collides is a dev session in which the labelling can be broken without
+// anybody noticing. The CoreAudio twin is the SILENT one (-96 dBFS on all
+// sixteen channels with the mic live).
+//
+// ===================== `channels` IS NEW, AND IT IS NOT DECORATION ==========
+//
+// The routing panel is drawn for EVERY negotiated width, not only for a card —
+// "we could have a multitrack system device. For example a focusrite or RME
+// interface", and at the other end "on a mono you may want to route it to be
+// dual mono". So the widths this table can present ARE the dev loop's coverage
+// of the routing screen, and the five mirrored entries can only present 2 and
+// 16 between them. The four entries below the rule are here to reach 1, 3, 8
+// and 32 — every width the plan measured a matrix working at, and 32 is
+// gst.MaxInputChannels itself.
+//
+// This field is the JS fake's own; the Go stub does not publish it yet. When it
+// does (as gst.Device.Channels, read from structure 0 of the enumerated device's
+// caps) the two tables must agree, and the mirror claim above becomes checkable
+// rather than a promise.
 const FAKE_DEVICES = [
   {
     id: '{0.0.1.00000000}.{b3f8fa53-0004-438e-9003-51a46e139bfc}',
     name: 'DVS Receive  1-2 (Dante Virtual Soundcard)',
     kind: 'native',
+    channels: 2,
   },
   {
     id: '{0.0.1.00000000}.{c41a9d7e-0004-438e-9003-51a46e13a0c1}',
     name: 'DVS Receive  3-4 (Dante Virtual Soundcard)',
     kind: 'native',
+    channels: 2,
   },
   {
     id: '{0.0.1.00000000}.{9f6d2b18-0004-438e-9003-51a46e13a4d5}',
     name: 'Microphone (Focusrite Scarlett 2i2 USB)',
     kind: 'native',
+    channels: 2,
   },
   {
     id: '{0.0.1.00000000}.{4b1e77a2-0004-438e-9003-51a46e13b7e0}',
     name: 'Blackmagic UltraStudio 4K Mini',
     kind: 'native',
+    channels: 16,
   },
   {
     // A BARE PERSISTENT-ID, not a WASAPI endpoint GUID, because that is what
@@ -228,8 +271,63 @@ const FAKE_DEVICES = [
     id: '2747401380',
     name: 'Blackmagic UltraStudio 4K Mini',
     kind: 'decklink',
+    channels: 16,
+  },
+
+  // --- the widths the mirrored five cannot reach -----------------------------
+
+  {
+    // FAKE_DEFAULT_INPUT_ID: what an unconfigured seat gets. One channel, so the
+    // dev loop OPENS on the mono case — the width with the newest copy on it
+    // (dual mono is DefaultChannelMap's answer for a one-channel device) and the
+    // one nothing exercised while the routing screen was a card screen.
+    id: '{0.0.1.00000000}.{1c7d40ef-0004-438e-9003-51a46e13c2f4}',
+    name: 'Built-in Microphone',
+    kind: 'native',
+    channels: 1,
+  },
+  {
+    // Three, and the count is not academic: a real 3-channel CoreAudio device
+    // probed 3 and negotiated 3 with channel-mask=0x0 on the measured machine,
+    // which is the evidence that an ordinary system device is unpositioned in
+    // exactly the way the card is. It is also the only ODD width here, and an
+    // odd width is where a grid that assumes pairs falls over.
+    id: '{0.0.1.00000000}.{7e05b3a9-0004-438e-9003-51a46e13d5b6}',
+    name: 'Aggregate Device (mic + loopback)',
+    kind: 'native',
+    channels: 3,
+  },
+  {
+    // The operator's own example of why the panel cannot be a DeckLink panel.
+    id: '{0.0.1.00000000}.{a248c61d-0004-438e-9003-51a46e13e8c7}',
+    name: 'Focusrite Scarlett 18i8 USB',
+    kind: 'native',
+    channels: 8,
+  },
+  {
+    // 32 = gst.MaxInputChannels. Anything wider is refused BY NAME at selection,
+    // off air, rather than by a Start that fails. Note for whoever raises
+    // channelmap.js's MAX_INPUT_CHANNELS from 16: until that lands this device
+    // draws a 16-wide grid over a 32-wide pad, which is the clamp doing its job
+    // and not the fake lying.
+    id: '{0.0.1.00000000}.{d9b12f70-0004-438e-9003-51a46e13f9d8}',
+    name: 'DVS Receive  1-32 (Dante Virtual Soundcard)',
+    kind: 'native',
+    channels: 32,
   },
 ];
+
+/**
+ * FAKE_DEFAULT_INPUT_ID is which device an EMPTY native audioDeviceId opens.
+ *
+ * Empty is not "no device". osxaudiosrc and wasapi2src with no `device` property
+ * open the PLATFORM DEFAULT INPUT, which is why config.Validate requires an id
+ * for a native seat but the pipeline still comes up without one — and why the
+ * fake must resolve it to a real entry rather than reporting nothing negotiated.
+ * A fake that treated "" as "no capture" would show a first-run dev session an
+ * empty screen where the product shows a live mono meter.
+ */
+const FAKE_DEFAULT_INPUT_ID = '{0.0.1.00000000}.{1c7d40ef-0004-438e-9003-51a46e13c2f4}';
 
 // defaultFakeConfig mirrors internal/config.Defaults(): every documented
 // default from specification section 9, with the fields that have no
@@ -246,6 +344,13 @@ function defaultFakeConfig() {
     pbkeylen: 0,
     statusKey: '',
     audioDeviceId: '',
+    // config.DefaultAudioSourceKind. Spelled out rather than left absent because
+    // the fake capture opens from these three fields at module load, and "the
+    // field is missing" and "the field says native" have to be the same thing
+    // here for the same reason EffectiveAudioSourceKind makes them the same
+    // thing in Go.
+    audioSourceKind: 'native',
+    decklinkPersistentId: '',
     videoSource: 'slate', // config.DefaultVideoSource — the still slate, as ever
     decklinkPreviewEnabled: false, // config's default: the operator's monitor starts off
     headphoneDeviceId: '', // a browser mediaDeviceId — the WebRTC return path
@@ -380,13 +485,32 @@ function clearFakeSenderTimers() {
 //
 // The same deterministic waveform internal/gst's stub twin emits (gst_stub.go
 // via levels.go's stubLevelsAt): a triangle from -40 up to -6 dBFS and back
-// over six seconds at 20 frames a second, right channel a quarter-period
-// behind the left, RMS 8 dB under the peak. Mirrored by value rather than
-// imported from anywhere because there is nowhere to import it from — the Go
-// stub is the other side of the boundary — and matching it means a dev session
-// in the browser and a Gate A session in the app show the same moving meters.
-// The final all-silence frame on stop mirrors app.go's zero-frame: -100 dBFS
-// per channel, the clamped floor, so the meters fall rather than freeze.
+// over six seconds at 20 frames a second, RMS 8 dB under the peak. Mirrored by
+// value rather than imported from anywhere because there is nowhere to import
+// it from — the Go stub is the other side of the boundary — and matching it
+// means a dev session in the browser and a Gate A session in the app show the
+// same moving meters. The final all-silence frame mirrors app.go's zero-frame:
+// -100 dBFS per channel, the clamped floor, so the meters fall rather than
+// freeze. It is emitted when CAPTURE goes down — a device change, a restart, a
+// quit — and no longer when the session stops, because the session stopping no
+// longer takes the microphone away.
+//
+// ===================== THE PROGRAMME METER IS COMPUTED, NOT INVENTED ========
+//
+// alevel sits BELOW the mix matrix in the real pipeline, so the stereo pair it
+// meters is the routing grid's own output. The fake reproduces that: the
+// per-channel frame is generated first, and the programme frame is the channel
+// frame REDUCED THROUGH THE MAP IN FORCE.
+//
+// That is what makes a wrong matrix visible in a dev session. Rows are outputs
+// and columns are inputs, a transpose is invisible at 2x2, and a fake whose
+// channels all moved together — or whose programme meter was its own
+// independent waveform — would show a flipped stereo pair, a dual mono and a
+// correct routing as three identical pictures. Here, flipping L and R swaps the
+// two programme bars, dual mono makes them equal, and routing to a silent input
+// drops one to the floor, live, in the next frame. The real thing does the same
+// thing in 119 us, which is why the screen that writes the map has no Apply
+// button.
 const FAKE_LEVELS_LOW_DB = -40;
 const FAKE_LEVELS_HIGH_DB = -6;
 const FAKE_LEVELS_PERIOD = 120; // 50 ms steps: a six-second sweep
@@ -405,11 +529,21 @@ function fakeLevelAt(step, channel) {
   return FAKE_LEVELS_HIGH_DB - (span * (phase - half)) / half;
 }
 
+/**
+ * startFakeLevels drives the PROGRAMME meter, at the real alevel's 50 ms
+ * interval, off whatever the per-channel generator is producing this step and
+ * whatever routing the grid has written.
+ *
+ * It shares fakeLevelsStep with the per-channel ticker rather than counting its
+ * own: two counters would let the two meters disagree about the same instant,
+ * and "the input meter moved but the programme meter did not" is a real fault
+ * this fake would then be unable to tell from a rounding difference.
+ */
 function startFakeLevels() {
-  if (fakeLevelsInterval) return;
+  if (fakeLevelsInterval || !fakeBrowserSession) return;
   fakeLevelsStep = 0;
   fakeLevelsInterval = setInterval(() => {
-    const peak = [fakeLevelAt(fakeLevelsStep, 0), fakeLevelAt(fakeLevelsStep, 1)];
+    const peak = fakeProgrammePeaksAt(fakeLevelsStep);
     fakeEmit(EVENT_LEVELS, {
       peak,
       rms: peak.map((p) => Math.max(FAKE_LEVELS_SILENCE_DB, p - FAKE_LEVELS_RMS_BELOW_PEAK_DB)),
@@ -423,8 +557,8 @@ function stopFakeLevels() {
     clearInterval(fakeLevelsInterval);
     fakeLevelsInterval = null;
   }
-  // The zero-frame, exactly as app.go emits one when the session ends: the
-  // meters must fall to silence, not freeze at the last level.
+  // The zero-frame, exactly as app.go emits one when a capture pipeline goes
+  // down: the meters must fall to silence, not freeze at the last level.
   fakeEmit(EVENT_LEVELS, {
     peak: [FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB],
     rms: [FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB],
@@ -441,15 +575,14 @@ function fakeStart() {
   }
   fakeSenderRunning = true;
   clearFakeSenderTimers();
-  // Levels begin with the session, not with the connection: the real pipeline
-  // is capturing and encoding from Start onwards — the sink comes later — and
-  // the level element measures upstream of the sink, so the meters move even
-  // while the SRT caller is still dialling. The fake keeps that property.
-  startFakeLevels();
-  // And the card comes up with the session: the pad negotiates, the video
-  // signal appears and the sixteen per-channel meters start moving. See
-  // fakeCardUp, at the foot of this file with the rest of the DeckLink fake.
-  fakeCardUp();
+  // START TOUCHES NOTHING ABOUT CAPTURE, and the absence is the model.
+  //
+  // The meters are already moving, the pad has already negotiated, the signal
+  // is already being reported and the preview is already painting — capture came
+  // up at module load, an hour before this in a real seat. What START builds is
+  // the send pipeline alone. Anything here that started a meter would be
+  // reintroducing the lifetime the split removed, and the first symptom would be
+  // a dev session in which the routing grid still needs a START to size itself.
   fakeEmit(EVENT_SENDER, SENDER_STATE.CONNECTING);
   fakeSenderTimers.push(
     setTimeout(() => {
@@ -471,8 +604,12 @@ function fakeStop() {
   }
   fakeSenderRunning = false;
   clearFakeSenderTimers();
-  stopFakeLevels();
-  fakeCardDown();
+  // AND STOP TAKES NOTHING AWAY. Meters, per-channel meters, the negotiated
+  // width, the routing, the signal lamp and the cough mute all stand. That is
+  // the operator-visible half of the change — "everything you were watching
+  // stays" — and it is the assertion the dev loop is here to make available:
+  // a fake that silenced the meters on STOP would agree with the old product
+  // and disagree with this one, and nobody would notice until the rig.
   fakeEmit(EVENT_SENDER, SENDER_STATE.STOPPED);
   fakeEmit(EVENT_STATUS, makeFakeStatus({ streamState: STREAM_STATE.STOPPED, healthy: false }));
   return Promise.resolve();
@@ -525,10 +662,23 @@ function installFakeConsoleHandle() {
       fakeSignal = { state: String(state || SIGNAL_STATE.UNKNOWN), flaps: Number(flaps) || 0 };
       fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
     },
+    // setChannelCount(8) forces a width the device table does not offer, for the
+    // narrower question of what a saved map wider than the pad does. It is a LIE
+    // to the fake — the device on screen still says what it says — so reach for
+    // selectInput first and this only when no device has the width you want.
     setChannelCount: (channels) => {
-      fakeChannelMap.inputChannels = Number(channels) || 0;
+      fakeCommentaryWidth = fakeClampWidth(channels);
       fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
     },
+    // selectInput('native', id) re-points the fake commentary capture the way
+    // the Settings picker does, WITHOUT saving — which is the interaction R2
+    // exists for: the grid must re-size before anybody presses Save. Called with
+    // no id it takes the platform default input.
+    selectInput: (kind, id) => selectCommentaryInput(kind, id, ''),
+    // restartCapture() from the console is the cable-fault recovery: the card is
+    // held from launch to quit, so this is the only way back short of a reload.
+    restartCapture: () => restartCapture(),
+    captureState: () => ({ ...fakeCapture }),
   };
 }
 
@@ -539,6 +689,20 @@ function installFakeConsoleHandle() {
 
 /** True once, at load time, if this session is running against the fakes. */
 export const usingFakeBackend = !hasWails();
+
+/**
+ * fakeBrowserSession is usingFakeBackend AND a real browser — the only
+ * condition under which the fake may start a ticker.
+ *
+ * `node --test` imports this module with no `window` at all, so every fake is
+ * reachable from the suite; but setInterval there holds the event loop open and
+ * the run never exits. It does not fail either. It HANGS, which is the failure
+ * mode that costs an afternoon rather than a minute, and it would arrive the
+ * moment capture became live at module load. So the tickers ask this, not
+ * usingFakeBackend, and a source-reading test that imports this file gets the
+ * fake's data and none of its clocks.
+ */
+const fakeBrowserSession = usingFakeBackend && typeof window !== 'undefined';
 
 /**
  * isRemoteClient reports whether this page is a REMOTE browser reaching the app
@@ -599,7 +763,28 @@ export async function getConfig() {
 /** Persists the configuration. Does not restart a running session. */
 export async function saveConfig(config) {
   if (hasWails()) return callGo('SaveConfig', config);
+  const before = fakeConfig;
   fakeConfig = JSON.parse(JSON.stringify(config));
+  // A save that changes what capture is BUILT FROM rebuilds it, which is what
+  // app.go does through rebuildCapture. Only these fields; a save is a whole
+  // document and rebuilding on every one of them would blank the picture every
+  // time somebody corrects a typo in the alias.
+  const captureFields = [
+    'videoSource',
+    'decklinkPreviewEnabled',
+    'audioSourceKind',
+    'audioDeviceId',
+    'decklinkPersistentId',
+  ];
+  if (captureFields.some((k) => before[k] !== fakeConfig[k])) {
+    // The save is the moment the configuration becomes the truth again, so a
+    // live selection made without one is superseded rather than carried: the
+    // form that was just saved contains the device, and rebuilding from a stale
+    // live selection would ignore the save that named a different one.
+    fakeCommentarySelection = null;
+    fakeCaptureDown();
+    fakeCaptureUp();
+  }
 }
 
 /**
@@ -1926,15 +2111,40 @@ export async function setRemoteListener(enabled, bind, httpPort, httpsPort) {
 }
 
 // ---------------------------------------------------------------------------
-// The DeckLink channel map, its per-channel meters, and the card's video signal
+// The channel map, its per-channel meters, and the card's video signal
 // ---------------------------------------------------------------------------
 //
-// Two bindings and three events, for the three questions the DeckLink routing
-// screen (ui/channelmap.js, drawn inside Settings) has to answer:
+// Two bindings and three events, for the three questions the routing screen
+// (ui/channelmap.js, drawn inside Settings) has to answer:
 //
 //   HOW WIDE IS THE GRID, AND WHAT IS ROUTED   GetChannelMap / "channelMap"
 //   WHICH CHANNEL IS THE COMMENTATOR ON        "channelLevels"
 //   IS THE CARD SEEING A PICTURE               "signal"
+//
+// ===================== IT IS NOT A DECKLINK SCREEN ANY MORE =================
+//
+// It was, and every name in this block used to say so. The operator did not
+// agree: "The channel selector only existing for decklink sources isn't right.
+// We could have a multitrack system device. For example a focusrite or RME
+// interface." And at the narrow end, where this side had proposed to hide it:
+// "I think we always show it. You may want to flip the channels on a stereo
+// source, on a mono you may want to route it to be dual mono etc."
+//
+// The evidence agrees with him and it is not a matter of taste. GStreamer's
+// gstosxcoreaudio.c sets `layout = NULL; /* no supported for sources */`
+// unconditionally for every source, so NO CoreAudio device of any width can emit
+// a positioned channel mask above two channels — a Focusrite or an RME is
+// byte-for-byte the same unpositioned problem as the card. Corroborated on this
+// machine: a real 3-channel CoreAudio device negotiated channels=3,
+// channel-mask=0x0, and a 16-in CoreAudio device negotiated channels=16,
+// channel-mask=0x0, identical in shape to decklinkaudiosrc's 16.
+//
+// So the matrix is uniform at every width including 1 and 2, both cases are
+// real routing decisions, and both are already expressible in the model: a
+// stereo flip is {Left<-in 2, Right<-in 1}, and dual mono is
+// {Left<-in 1, Right<-in 1} — which DefaultChannelMap already produces for a
+// one-channel device. The "signal" event stays card-only, because it is a
+// question about a DeckLink's video input and nothing else has one.
 //
 // The MODEL is internal/gst/channelmap.go's and nothing here restates it. A map
 // is a LIST of contributions — [{output, input, gain}], input counted from ZERO,
@@ -1950,23 +2160,44 @@ export async function setRemoteListener(enabled, bind, httpPort, httpsPort) {
 // pipeline instantly — measured on the card: writing a 2x8 matrix to a pipeline
 // running 2x16 gave "Internal data stream error ... streaming stopped, reason
 // error (-5)", with the capture chain dead before the next level message and
-// every coefficient in the matrix perfectly legal. And what a DeckLink
-// ADVERTISES is not what it negotiates: the device structure publishes
-// max-channels=16 whatever the element is configured to produce. So the count
-// crosses this boundary as gst.Pipeline.InputChannels(), read from the pad's own
+// every coefficient in the matrix perfectly legal. And what a device ADVERTISES
+// is not what it negotiates: the DeckLink structure publishes max-channels=16
+// whatever the element is configured to produce. So the count crosses this
+// boundary as the capture pipeline's InputChannels(), read from the pad's own
 // caps, and ui/channelmap.js's MAX_INPUT_CHANNELS is a ceiling on that report
-// rather than a size. Zero is a normal answer — it is what InputChannels()
-// returns before Start — and it draws no grid at all.
+// rather than a size.
+//
+// ZERO NO LONGER MEANS "PRESS START". Capture is built at launch and the pad
+// negotiates within about a tenth of a second of it — measured on the fitted
+// card with no consumer, no encoder and no SRT anywhere in the process:
+// aconv:sink NEGOTIATED channels=16 at t=0.1176 s, send pipeline exists: NO.
+// Zero is now only ever the reopen window of a device change, or a capture that
+// failed and said why on the "capture" event. It still draws no grid.
 //
 // ===================== THE LEVELS HERE ARE NOT THE LEVELS ON THE MAIN SCREEN =
 //
-// There are TWO level elements in the contribution pipeline and they answer
-// different questions. alevel meters the stereo that is actually encoded and
-// sent (EVENT_LEVELS, 50 ms) — the meter that goes quiet when the wrong device
-// is selected. chlevel meters the CAPTURE's own channels upstream of the mix
-// down to two (EVENT_CHANNEL_LEVELS, 100 ms) — the meter that answers "which of
-// these sixteen moves when I talk", which is the entire reason the mapping UI is
-// usable.
+// There are TWO level elements in the commentary capture pipeline and they
+// answer different questions. alevel meters the stereo pair that goes on to be
+// encoded and sent (EVENT_LEVELS, 50 ms) — the meter that goes quiet when the
+// wrong device is selected, and the meter the cough mute flattens, because the
+// mute sits immediately above it. chlevel meters the CAPTURE's own channels
+// upstream of the mix down to two (EVENT_CHANNEL_LEVELS, 100 ms) — the meter
+// that answers "which of these sixteen moves when I talk", which is the entire
+// reason the mapping UI is usable, and it stays ABOVE the mute so a coughing
+// commentator can still be located on the grid.
+//
+// BOTH ARE LIVE FROM LAUNCH AND BOTH SURVIVE STOP. What used to be "the send
+// pipeline's own measurement" is now the capture pipeline's, taken immediately
+// upstream of the proxysink rather than immediately upstream of the AAC
+// encoder. In normal operation those are the same buffers. During a send-side
+// stall longer than about a second they are not: the capture-side queue in
+// front of each proxysink is leaky=downstream, so the far end LOSES that audio
+// while these meters go on moving. That is a deliberate policy — measured, a
+// non-leaky queue dragged the preview to 7.2 fps and the meters to 7.2 msg/s
+// and made the card itself drop packets — and the promise that no meter can
+// move while silence goes to air therefore holds in normal operation and NOT
+// during a stall. A stall that long is already a reconnect-class event and the
+// SENDING lamp is the thing that reports it.
 //
 // KEEPING THEM APART IS LOAD-BEARING, and it was measured: every level element
 // in the process posts a GstStructure named "level", so a handler matching on the
@@ -2002,10 +2233,48 @@ const CHANNEL_MAP_METHODS = Object.freeze({
 /** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
 const CHANNEL_MAP_METHOD_NAMES = Object.freeze(Object.values(CHANNEL_MAP_METHODS));
 
-// EventChannelMap: {inputChannels, map, isDefault} — what the capture pad
-// negotiated and the routing in force. Emitted when the pad negotiates, which is
-// when a session starts, so a Settings screen left open across a START sizes its
-// grid without being reopened.
+// EventChannelMap: {inputChannels, map, isDefault, deviceKey} — what the capture
+// pad negotiated, the routing in force, and WHICH DEVICE both of those are
+// about. Emitted when the pad negotiates, which is now when the commentary
+// capture is built or rebuilt: at launch, and again on every device change. A
+// Settings screen left open across either one re-sizes its grid without being
+// reopened, and a screen opened before anything happened is already sized.
+//
+// ===================== deviceKey IS NOT OPTIONAL ============================
+//
+// It is `${kind}:${id}` — the same two fields, in the same order, that
+// ui/audioinput.js encodes into an <option> value — and without it there is a
+// window with no honest way through it.
+//
+// IT IS THE CONFIGURED PAIR, VERBATIM, NEVER THE RESOLVED DEVICE. An empty
+// native id means the platform default input and an empty decklinkPersistentId
+// means the only card, and both of those RESOLVE to some particular box — but
+// the key must stay `native:` and `decklink:`, because the only thing it is ever
+// compared against is the picker's own <option> value, which is built from the
+// configuration and not from what opened. Stamping the resolved id instead would
+// mean an unconfigured seat's key matched no option on the screen, and the
+// routing panel would never appear at all on the one seat that has not been set
+// up yet.
+//
+// Selecting a Focusrite while a card is open does not re-negotiate instantly.
+// For the length of that reopen the last width anybody published is the CARD's
+// 16, and a grid that believes it offers sixteen crosspoints over a
+// two-channel pad. Press one and the map written is 2x16. The measurement on
+// the real card: "Internal data stream error ... streaming stopped, reason
+// error (-5)", the capture chain dead before the next level message, every
+// coefficient in the matrix perfectly legal. Go's SetChannelMap validates the
+// map against InputChannels() and refuses one that does not fit, so the write
+// itself is safe — but a refusal is not a good answer to a button that should
+// never have been on screen, and refusal cannot help the OTHER half of the
+// problem at all: a narrowed grid collected at Save writes a 2-wide routing
+// over the card's saved 16-wide one, silently, with a commentator's channel
+// assignment in it.
+//
+// So the width and the identity travel together, in one payload, and the screen
+// draws a grid only while the key it holds is the key of the device the picker
+// is showing. That is also why the saved routing is per-device
+// (config.ChannelMaps, keyed the same way): a single slot cannot say which
+// device its contents belong to.
 export const EVENT_CHANNEL_MAP = 'channelMap';
 
 // EventChannelLevels: {peak: number[], rms: number[]}, one entry per NEGOTIATED
@@ -2052,62 +2321,212 @@ export function channelMapAvailable() {
   return CHANNEL_MAP_METHOD_NAMES.every(hasBinding);
 }
 
-// --- the fake card ---------------------------------------------------------
+// --- the fake pad, its per-channel meters, and the saved routing ------------
 //
-// A `npm run dev` session has no card, so the fake stands one up: sixteen
-// channels negotiated the moment the fake session starts, a signal, and
-// per-channel frames in which only SOME channels carry audio. That asymmetry is
-// the point — a fake where all sixteen moved together would let the whole
-// find-the-commentator interaction break without anybody noticing in the dev
-// loop, which is the same trap internal/gst's stubChannelLevelsAt documents when
-// it refuses to reuse the stereo stub's quarter-period phase rule.
+// A `npm run dev` session has no devices at all, so the fake negotiates a pad
+// for whichever entry of FAKE_DEVICES the commentary capture is pointed at, and
+// emits per-channel frames in which only SOME channels carry audio and no two
+// of them move together.
+//
+// BOTH HALVES OF THAT ASYMMETRY ARE LOAD-BEARING and they answer different
+// failures. Only-some-channels-live is the find-the-commentator interaction: a
+// fake where all sixteen moved would let it break without anybody noticing in
+// the dev loop, the same trap internal/gst's stubChannelLevelsAt documents when
+// it refuses to reuse the stereo stub's quarter-period phase rule. And
+// no-two-alike is the matrix itself: rows are outputs, columns are inputs, a
+// transpose is invisible at 2x2, and identical channels would make a flipped
+// map, a dual mono and a correct routing look the same on the programme meter
+// they all feed.
 
-/** Which fake channels carry audio. Zero-based, so these draw as Ch 3 and Ch 8. */
-const FAKE_LIVE_CHANNELS = [2, 7];
-const FAKE_INPUT_CHANNELS = 16;
+/**
+ * Which fake input channels carry audio on a device with more than two of them.
+ * Zero-based, so these draw as Ch 3, Ch 8 and Ch 24 — never Ch 1 and Ch 2, so
+ * the default routing is deliberately NOT the answer and the operator has to
+ * use the grid. Trimmed to the negotiated width by fakeLiveChannelsFor.
+ */
+const FAKE_LIVE_CHANNELS = [2, 7, 23];
 
-let fakeChannelMap = {
-  // 0 until the fake session starts, exactly as gst.Pipeline.InputChannels() is
-  // 0 before Start: there are no caps until something has negotiated, and the
-  // screen's "press START once" state is a real state that must be reachable.
-  inputChannels: 0,
-  map: [],
-};
+/**
+ * FAKE_CHANNEL_PHASE_STEPS is how far apart in the triangle two adjacent input
+ * channels sit. 13 is coprime with FAKE_LEVELS_PERIOD's 120, so no two of the
+ * 32 channels this fake can present are ever in step — which is the property
+ * the transpose argument above rests on, and it is why this is not the stereo
+ * fake's quarter-period offset (that repeats every four channels).
+ */
+const FAKE_CHANNEL_PHASE_STEPS = 13;
+
+/**
+ * FAKE_MAX_INPUT_CHANNELS mirrors gst.MaxInputChannels, raised from 16 to 32
+ * with the measurement beside it: a 2x32 mix-matrix passes audio and `level`
+ * reports 32 rms entries per message, verified on the measured machine, and
+ * levelMaxChannels is already 64. Wider than this is a NAMED REFUSAL of that
+ * device at selection time, off air — never a Start that refuses.
+ */
+const FAKE_MAX_INPUT_CHANNELS = 32;
+
+/**
+ * fakeCommentaryWidth is what the fake commentary pad has negotiated, and
+ * fakeCommentaryKey is WHICH DEVICE negotiated it. They move together, always,
+ * for the reason EVENT_CHANNEL_MAP's comment gives at length: a width without
+ * an identity is a grid that can be pressed against the wrong pad.
+ *
+ * Zero is the reopen window of a device change and the state of a capture that
+ * failed — no longer "nobody has pressed START".
+ */
+let fakeCommentaryWidth = 0;
+let fakeCommentaryKey = '';
+
+/**
+ * fakeChannelMaps is the saved routing, PER DEVICE, keyed `${kind}:${id}` —
+ * mirroring config.ChannelMaps, which replaced the single decklinkChannelMap
+ * slot for a reason this fake has to be able to demonstrate.
+ *
+ * With always-live capture, selecting a 2-channel microphone to check something
+ * and then pressing Save on an unrelated field would, with one slot, overwrite
+ * the card's 16-channel routing with a 2-wide one — silently, with a
+ * commentator's channel assignment in it. A dev session against a single-slot
+ * fake would show that as working.
+ */
+const fakeChannelMaps = new Map();
+
 let fakeChannelLevelsInterval = null;
-let fakeChannelLevelsStep = 0;
 let fakeSignal = { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
 
+/**
+ * The device key: `${kind}:${id}`, trimmed, with an unrecognised kind reading as
+ * native.
+ *
+ * THREE PLACES SPELL THIS AND ALL THREE MUST AGREE — audioinput.js's
+ * encodeAudioInput (which builds it for every <option> the picker lists),
+ * config.AudioDeviceKeyFor in Go (which files the saved routing under it), and
+ * this. A key spelled two ways is a routing filed where nothing will look for it
+ * again: no error, no refusal, just a grid that comes up empty the next morning
+ * with the operator's channels still in the file. The trim is Go's; without it
+ * an id with trailing whitespace files under a key the other two cannot build.
+ */
+function fakeDeviceKey(kind, id) {
+  const k = kind === 'decklink' ? 'decklink' : 'native';
+  return `${k}:${typeof id === 'string' ? id.trim() : ''}`;
+}
+
+/** A reported width, clamped the way gst.MaxInputChannels clamps one. */
+function fakeClampWidth(channels) {
+  const n = Math.floor(Number(channels));
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, FAKE_MAX_INPUT_CHANNELS);
+}
+
+/**
+ * fakeLiveChannelsFor decides which inputs carry audio at a given width.
+ *
+ * At 1 and 2 the device IS the commentator — a mono mic, or a stereo pair off a
+ * desk — so every channel it has carries audio, and the question the grid
+ * answers there is not WHICH channel but which way round they come out. Above
+ * two, the commentator is on some pair among many and finding it is the whole
+ * job.
+ */
+function fakeLiveChannelsFor(width) {
+  if (width <= 0) return [];
+  if (width <= 2) return Array.from({ length: width }, (_, i) => i);
+  return FAKE_LIVE_CHANNELS.filter((i) => i < width);
+}
+
+/** One per-channel peak frame, in dBFS, at the shared 50 ms step. */
+function fakeChannelPeaksAt(step, width) {
+  const live = fakeLiveChannelsFor(width);
+  const peak = [];
+  for (let i = 0; i < width; i += 1) {
+    // The silent channels emit the clamped floor rather than nothing at all: an
+    // absent entry and a silent one must look different, and only the second is
+    // what a live device with nothing plugged into that pair actually sends.
+    peak.push(
+      live.includes(i)
+        ? fakeLevelAt(step + i * FAKE_CHANNEL_PHASE_STEPS, 0)
+        : FAKE_LEVELS_SILENCE_DB,
+    );
+  }
+  return peak;
+}
+
+/**
+ * fakeDefaultChannelMap is gst.DefaultChannelMap's answer, restated here
+ * because the fake has no Go side to ask: input 1 to Left, input 2 to Right —
+ * and on a ONE-CHANNEL device, input 1 to BOTH. That last case is dual mono,
+ * it is what an operator gets without touching anything, and it is one of the
+ * two narrow cases the operator ruled the panel must be drawn for.
+ */
+function fakeDefaultChannelMap(width) {
+  if (width <= 0) return [];
+  return [
+    { output: 0, input: 0, gain: 1 },
+    { output: 1, input: width >= 2 ? 1 : 0, gain: 1 },
+  ];
+}
+
+/** The routing actually in force for the current device: saved, or the default. */
+function fakeEffectiveChannelMap(width) {
+  const saved = fakeChannelMaps.get(fakeCommentaryKey);
+  return Array.isArray(saved) && saved.length > 0 ? saved : fakeDefaultChannelMap(width);
+}
+
+/**
+ * fakeProgrammePeaksAt reduces this step's per-channel frame through the map in
+ * force, which is what alevel is measuring in the real pipeline.
+ *
+ * The reduction is a MAX over the contributions rather than a sum. Two
+ * correlated signals summed would need a phase-accurate model this fake has no
+ * business having, and every question the meter is asked here — did the flip
+ * take, is this dual mono, is that input the silent one — is answered the same
+ * way by either. Gain is applied in dB, so a zero gain lands on the floor.
+ */
+function fakeProgrammePeaksAt(step) {
+  const width = fakeCommentaryWidth;
+  if (width <= 0) return [FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB];
+  const inputs = fakeChannelPeaksAt(step, width);
+  const map = fakeEffectiveChannelMap(width);
+  return [0, 1].map((output) => {
+    let peak = FAKE_LEVELS_SILENCE_DB;
+    for (const c of map) {
+      if (!c || Number(c.output) !== output) continue;
+      const from = inputs[Number(c.input)];
+      const gain = Math.abs(Number(c.gain));
+      if (typeof from !== 'number' || !Number.isFinite(gain)) continue;
+      peak = Math.max(peak, from + 20 * Math.log10(gain));
+    }
+    return Math.max(FAKE_LEVELS_SILENCE_DB, Math.min(0, peak));
+  });
+}
+
 function fakeChannelMapState() {
+  const saved = fakeChannelMaps.get(fakeCommentaryKey);
+  const map = Array.isArray(saved) ? saved : [];
   return {
-    inputChannels: fakeChannelMap.inputChannels,
-    map: fakeChannelMap.map.map((c) => ({ ...c })),
+    inputChannels: fakeCommentaryWidth,
+    map: map.map((c) => ({ ...c })),
     // gst.ChannelMap.IsDefault: an empty map means nobody has chosen, and the Go
-    // side resolves it to channel 1 left / channel 2 right.
-    isDefault: fakeChannelMap.map.length === 0,
+    // side resolves it to channel 1 left / channel 2 right (or dual mono at
+    // width 1) — see fakeDefaultChannelMap.
+    isDefault: map.length === 0,
+    // Which device the two fields above are ABOUT. Never omitted, not even when
+    // the width is zero: "nothing negotiated, and it was this device that failed
+    // to" is a different sentence from "nothing negotiated".
+    deviceKey: fakeCommentaryKey,
   };
 }
 
 /**
- * startFakeChannelLevels drives the per-channel meters off the same triangle
- * waveform the stereo fake uses, at the real element's 100 ms interval. The
- * silent channels emit the clamped floor rather than nothing at all: an absent
- * entry and a silent one must look different, and only the second is what a live
- * card with nothing plugged into that pair actually sends.
+ * startFakeChannelLevels drives the per-channel meters at the real chlevel's
+ * 100 ms interval, off the same step counter the programme meter uses so the
+ * two can never disagree about one instant.
  */
 function startFakeChannelLevels() {
-  if (fakeChannelLevelsInterval) return;
-  fakeChannelLevelsStep = 0;
+  if (fakeChannelLevelsInterval || !fakeBrowserSession) return;
   fakeChannelLevelsInterval = setInterval(() => {
-    const peak = [];
-    for (let i = 0; i < FAKE_INPUT_CHANNELS; i += 1) {
-      const live = FAKE_LIVE_CHANNELS.indexOf(i);
-      peak.push(live < 0 ? FAKE_LEVELS_SILENCE_DB : fakeLevelAt(fakeChannelLevelsStep, live));
-    }
+    const peak = fakeChannelPeaksAt(fakeLevelsStep, fakeCommentaryWidth);
     fakeEmit(EVENT_CHANNEL_LEVELS, {
       peak,
       rms: peak.map((p) => Math.max(FAKE_LEVELS_SILENCE_DB, p - FAKE_LEVELS_RMS_BELOW_PEAK_DB)),
     });
-    fakeChannelLevelsStep += 2; // 100 ms steps against fakeLevelAt's 50 ms phase
   }, 100);
 }
 
@@ -2116,51 +2535,37 @@ function stopFakeChannelLevels() {
     clearInterval(fakeChannelLevelsInterval);
     fakeChannelLevelsInterval = null;
   }
-  const silence = new Array(FAKE_INPUT_CHANNELS).fill(FAKE_LEVELS_SILENCE_DB);
+  const silence = new Array(Math.max(fakeCommentaryWidth, 0)).fill(FAKE_LEVELS_SILENCE_DB);
   fakeEmit(EVENT_CHANNEL_LEVELS, { peak: silence, rms: silence.slice() });
 }
 
 /**
- * fakeCardUp / fakeCardDown are what the fake session does either side of a
- * start: the pad negotiates, the signal is measured, the per-channel meters run
- * — and all three go away again on stop, because a lamp still green after STOP
- * is the fake teaching a habit the real thing will punish. It mirrors app.go's
- * forgetSignal, which publishes UNKNOWN for exactly that reason.
- */
-function fakeCardUp() {
-  fakeChannelMap.inputChannels = FAKE_INPUT_CHANNELS;
-  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
-  fakeSignal = { state: SIGNAL_STATE.OK, flaps: 0 };
-  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
-  startFakeChannelLevels();
-}
-
-function fakeCardDown() {
-  fakeChannelMap.inputChannels = 0;
-  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
-  fakeSignal = { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
-  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
-  stopFakeChannelLevels();
-}
-
-/**
  * Reads what the capture pad negotiated and the routing in force:
- * {inputChannels, map, isDefault}. inputChannels is the width every map sent
- * back must fit inside; map is the list of contributions, empty when nobody has
- * chosen; isDefault says which of those two an empty list is.
+ * {inputChannels, map, isDefault, deviceKey}. inputChannels is the width every
+ * map sent back must fit inside; map is the list of contributions, empty when
+ * nobody has chosen; isDefault says which of those two an empty list is; and
+ * deviceKey is `${kind}:${id}` for the device the other three are about.
  *
  * NEVER THROWS, for the reason getConformTarget does not: this is called on the
  * Settings screen's open path, and an older build without the binding must leave
  * the rest of the screen intact. Zero channels is the honest answer to every way
  * of not knowing, and it is the answer that draws no grid.
+ *
+ * THE FALLBACK'S EMPTY deviceKey IS DELIBERATE and it must never be filled in
+ * with the device the caller happens to have selected. An empty key matches no
+ * selection, so a screen that gates on "the key I hold is the key of the device
+ * on screen" draws nothing — which is the right outcome for an older build,
+ * a failed call and a signed-out one alike. Inventing the key here would turn
+ * "we could not ask" into "this device negotiated zero channels".
  */
 export async function getChannelMap() {
   if (hasWails()) {
+    const nothing = { inputChannels: 0, map: [], isDefault: true, deviceKey: '' };
     try {
       const got = await callGoBound(CHANNEL_MAP_METHODS.state);
-      return got && typeof got === 'object' ? got : { inputChannels: 0, map: [], isDefault: true };
+      return got && typeof got === 'object' ? got : nothing;
     } catch {
-      return { inputChannels: 0, map: [], isDefault: true };
+      return nothing;
     }
   }
   return fakeChannelMapState();
@@ -2180,11 +2585,25 @@ export async function getChannelMap() {
  * and writes nothing if the map does not fit; a caller that swallowed the error
  * would be showing a routing that is not the one in force.
  *
+ * IT WRITES TO WHICHEVER DEVICE CAPTURE IS ON, and takes no device argument.
+ * That is Go's shape and it is the right one: there is exactly one commentary
+ * capture, the map is a property of the element inside it, and a key passed here
+ * could only ever be a second opinion about which device that is. What stops a
+ * map being written against the wrong pad is upstream of this call — the grid is
+ * drawn only while the "channelMap" event's deviceKey matches the device on
+ * screen — plus Go's own refusal of a map that does not fit InputChannels().
+ *
  * @param {Array<{output: number, input: number, gain: number}>} map
  */
 export async function setChannelMap(map) {
   if (hasWails()) return callGoBound(CHANNEL_MAP_METHODS.set, map);
-  fakeChannelMap.map = Array.isArray(map) ? map.map((c) => ({ ...c })) : [];
+  const written = Array.isArray(map) ? map.map((c) => ({ ...c })) : [];
+  // Stored under the CURRENT device's key, which is what makes a dev session
+  // able to show the thing config.ChannelMaps exists for: route the card, pick
+  // a stereo microphone, route that, come back, and the card's sixteen are
+  // still there.
+  fakeChannelMaps.set(fakeCommentaryKey, written);
+  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
 }
 
 /** Subscribes to the "channelMap" event. Returns an unsubscribe function. */
@@ -2465,4 +2884,482 @@ export async function getCommentaryMute() {
 /** Subscribes to the "mute" event. Returns an unsubscribe function. */
 export function onCommentaryMute(cb) {
   return subscribe(EVENT_MUTE, cb);
+}
+
+// ---------------------------------------------------------------------------
+// Always-live capture
+// ---------------------------------------------------------------------------
+//
+// Three bindings and one event, for the lifetime change the rest of this module
+// now assumes.
+//
+// ===================== WHAT MOVED, AND WHY THE SEAM IS HERE =================
+//
+// There used to be ONE pipeline. It was built at START and destroyed at STOP,
+// and everything an operator could see came with it: the preview, the input
+// meters, the per-channel meters, the negotiated width the routing grid is
+// sized from, the card's signal state, the cough mute. Before START there was
+// nothing to look at and nothing to configure; after STOP it all went away
+// again.
+//
+// It is now split at a proxysink/proxysrc seam. CAPTURE pipelines — picture and
+// commentary — are built when the window is ready and held until the
+// application quits. The SEND pipeline is built at START and destroyed at STOP,
+// and it contains no device, no preview, no slate, no channel map and no mute.
+//
+// The three consequences this side has to deliver:
+//
+//   PICTURE AND METERS WORK FROM LAUNCH, before anybody presses START.
+//   THE ROUTING PANEL APPEARS AS SOON AS A DEVICE IS SELECTED, at any width,
+//     for any device, sized to what its pad negotiated — "so you can configure
+//     it before sending".
+//   METERS, PREVIEW, ROUTING WIDTH, SIGNAL AND MUTE ALL SURVIVE STOP.
+//
+// ===================== THE THREE OPERATOR RULINGS THIS ENCODES ==============
+//
+// A1. THE DECKLINK IS HELD FROM LAUNCH TO QUIT. There is no Acquire and no
+//     Release, deliberately: nothing else on the machine can open the card
+//     while this application runs, and that was accepted with its eyes open,
+//     because the failure it removes is a cable fault discovered twenty minutes
+//     before kick-off rather than at launch. RestartCapture is what makes it
+//     survivable — it is the only way back from a contention loss or a pulled
+//     cable short of quitting, and it exists precisely because there is no
+//     release control.
+//
+// A2. A COUGH MUTE LATCHED BEFORE START IS CARRIED INTO THE SESSION. The mute
+//     element lives in the commentary capture now, so it exists from launch;
+//     there is no longer a state in which there is nothing to mute. See the
+//     cough mute section above for why that is answered by VISIBILITY rather
+//     than by refusal.
+//
+// A3. DURING A SEND-SIDE STALL THE COMMENTARY IS DROPPED, NOT DELAYED. See the
+//     level-events comment above: the queues in front of the proxysinks are
+//     leaky=downstream, and the meters can therefore move over audio the far
+//     end never receives, for as long as a stall lasts.
+//
+// ===================== SELECTING A DEVICE IS A CALL, NOT A SAVE =============
+//
+// SelectCommentaryInput re-points the commentary capture immediately and writes
+// nothing to disk. That is what makes the routing panel appear before Save, and
+// it is also the only way the panel COULD appear before Save: the width comes
+// from a pad, a pad comes from an open device, and nothing on this side can
+// negotiate one. The saving is still the Settings form's, on its own Save.
+//
+// IT IS REFUSED WHILE SENDING, and that is a safety property rather than a UX
+// preference. A second proxysrc attaching to a live proxysink silently steals
+// the stream and kills the first — measured, A stopped dead at 5.994 s the
+// instant B attached at 6.007 s — so re-pointing capture under a running send
+// pipeline is a feed that goes quietly dead with every lamp still green. The
+// refusal is Go's, for the reason IsSRTReturnSelected's is Go's: a rule about
+// what is safe right now must not be written twice in two languages. If it ever
+// needs recognising by name rather than showing verbatim, its sentinel belongs
+// beside RETURN_ALREADY_RUNNING above.
+//
+// ===================== AND A DEVICE THAT WILL NOT OPEN IS NOT AN ERROR ======
+//
+// It is a STATE, reported on the "capture" event with a reason. A capture that
+// failed at launch — no card in the machine, a microphone unplugged since the
+// configuration was written, the card held by Premiere — must not stop the
+// application coming up, and on the picture leg it does not even stop the
+// picture: that leg falls back to the slate and the fault goes on the CAMERA
+// lamp. Nothing here throws for it.
+
+/** The Go method names this adapter binds to. One place, so a rename is one edit. */
+const CAPTURE_METHODS = Object.freeze({
+  select: 'SelectCommentaryInput',
+  restart: 'RestartCapture',
+  state: 'GetCaptureState',
+});
+
+/** Derived, not listed again — see RETURN_METHOD_NAMES for the same reasoning. */
+const CAPTURE_METHOD_NAMES = Object.freeze(Object.values(CAPTURE_METHODS));
+
+/**
+ * EventCapture: {picture, commentary, reason, audioDeviceName}, mirroring
+ * app.go's EventCapture constant. The two states are CAPTURE_STATE values;
+ * `reason` names the fault when either is "failed" and is empty otherwise;
+ * `audioDeviceName` is the display name of the device commentary capture is
+ * actually on, which is not always the one the form is showing — the form shows
+ * a selection, this shows what opened.
+ */
+export const EVENT_CAPTURE = 'capture';
+
+/**
+ * CAPTURE_STATE mirrors the four states app.go publishes for each leg. They are
+ * lowercase, unlike SIGNAL_STATE, because they mirror Go's own spelling.
+ *
+ *   off       nothing is built — no source configured for this leg
+ *   opening   the pipeline is being built and the device taken
+ *   live      it is PLAYING and producing
+ *   failed    it could not be built or it died; `reason` says why
+ *
+ * OPENING IS NOT A TRANSIENT WORTH SKIPPING. A card that is held by another
+ * application fails in about 100 us, but one that is merely slow to lock can sit
+ * here for a second or more, and a screen that drew "failed" over it — or drew
+ * nothing at all — would have an operator pulling cables at a pipeline that was
+ * about to come up.
+ */
+export const CAPTURE_STATE = Object.freeze({
+  OFF: 'off',
+  OPENING: 'opening',
+  LIVE: 'live',
+  FAILED: 'failed',
+});
+
+/**
+ * CAPTURE_UNAVAILABLE is what getCaptureState answers when there is nothing to
+ * ask — an older build without the bindings, or a call that failed.
+ *
+ * Every leg is OFF and the reason SAYS which kind of not-knowing this is. The
+ * alternative, a live-looking payload, would paint a running capture over a
+ * build that has none; and an empty reason would leave a screen with an "off"
+ * to explain and nothing to explain it with.
+ */
+export const CAPTURE_UNAVAILABLE = Object.freeze({
+  picture: CAPTURE_STATE.OFF,
+  commentary: CAPTURE_STATE.OFF,
+  reason: 'this build has no always-live capture, so nothing here can report what is open',
+  audioDeviceName: '',
+});
+
+/**
+ * captureAvailable reports whether this build has always-live capture at all.
+ *
+ * ALL THREE, all-or-nothing, by channelMapAvailable's argument and one sharper
+ * than it. SelectCommentaryInput without GetCaptureState re-points the
+ * commentary capture and then has no way to learn that it failed: the operator
+ * picks a microphone, the screen shows the selection taking effect, and the
+ * meter that never moves again is the only evidence anything went wrong.
+ * RestartCapture without the other two is a recovery control for a subsystem
+ * this build cannot describe.
+ *
+ * It is the BUILD's answer, not the machine's. "There is no card in this
+ * machine" is a different fact, it arrives on the "capture" event's reason, and
+ * conflating the two would tell a slate-and-microphone seat that its
+ * application cannot capture.
+ */
+export function captureAvailable() {
+  return CAPTURE_METHOD_NAMES.every(hasBinding);
+}
+
+// --- the fake capture ------------------------------------------------------
+//
+// It comes up at the foot of this file, at MODULE LOAD, which is the whole
+// point: see the header comment. Everything below models the one thing a dev
+// session could not see before — a device being opened, negotiating a width,
+// and being swapped for another one without a session anywhere in sight.
+
+/**
+ * How long the fake spends in "opening". The measured figure on the real card is
+ * 0.1176 s from process start to a negotiated pad, with no consumer, no encoder
+ * and no SRT anywhere in the process. This is longer on purpose: a window that
+ * short is not observable in a browser, and the state a dev session cannot see
+ * is the state whose rendering is never checked.
+ */
+const FAKE_CAPTURE_OPEN_MS = 250;
+
+let fakeCapture = {
+  picture: CAPTURE_STATE.OFF,
+  commentary: CAPTURE_STATE.OFF,
+  reason: '',
+  audioDeviceName: '',
+};
+let fakeCaptureTimer = null;
+
+/**
+ * fakeCommentarySelection is the device capture is POINTED AT, which is not
+ * always the device the configuration names — SelectCommentaryInput does not
+ * save, so between picking a Focusrite and pressing Save these two disagree.
+ *
+ * It exists because RestartCapture has to rebuild the LIVE selection. Rebuilding
+ * from the saved configuration instead would produce the worst version of this
+ * control: an operator picks an interface, it fails to open because it was
+ * asleep, they wake it and press Restart capture, and the application silently
+ * goes back to the device they were trying to leave. Null until something has
+ * been selected, and cleared by a save, which is the moment the configuration
+ * becomes the truth again.
+ */
+let fakeCommentarySelection = null;
+
+/** The commentary input the SAVED configuration names, as (kind, id). */
+function fakeConfiguredCommentaryInput() {
+  // Which of the two id fields applies is decided by the kind, exactly as
+  // audioinput.js's deriveAudioInputEffects decides it in the other direction:
+  // one of them is always cleared, and reading the wrong one is how a seat
+  // captures from somewhere other than the box its configuration names.
+  const kind = String(fakeConfig.audioSourceKind || 'native') === 'decklink' ? 'decklink' : 'native';
+  return {
+    kind,
+    id:
+      kind === 'decklink'
+        ? String(fakeConfig.decklinkPersistentId || '')
+        : String(fakeConfig.audioDeviceId || ''),
+  };
+}
+
+function fakeCaptureState() {
+  return { ...fakeCapture };
+}
+
+function fakePublishCapture(patch) {
+  fakeCapture = { ...fakeCapture, ...patch };
+  fakeEmit(EVENT_CAPTURE, fakeCaptureState());
+}
+
+/**
+ * fakeInputDeviceFor resolves (kind, id) against the fake device table the way
+ * the real capture element resolves it against the machine.
+ *
+ * AN EMPTY ID IS NOT "NO DEVICE" in either family, and the two mean different
+ * things by it: a native seat with no id opens the PLATFORM DEFAULT INPUT
+ * (FAKE_DEFAULT_INPUT_ID), and a decklink seat with no id means THE ONLY CARD,
+ * which is config.go's documented reading of an empty decklinkPersistentId.
+ *
+ * An id that matches nothing returns null, and null is a real answer: it is the
+ * saved-device-not-plugged-in case, which is the single most likely fault at a
+ * seat whose configuration was copied from another machine.
+ */
+function fakeInputDeviceFor(kind, id) {
+  const decklink = kind === 'decklink';
+  const wanted = typeof id === 'string' ? id : '';
+  const family = fakeDevices.filter((d) => d && (d.kind === 'decklink') === decklink);
+  if (wanted === '') {
+    if (decklink) return family.length === 1 ? family[0] : null;
+    return family.find((d) => d.id === FAKE_DEFAULT_INPUT_ID) || family[0] || null;
+  }
+  return family.find((d) => d.id === wanted) || null;
+}
+
+/**
+ * fakeCommentaryUp opens the commentary capture on (kind, id): OPENING now, then
+ * either a negotiated pad or a named failure.
+ *
+ * The width comes from the device entry, not from the kind. That is the shape of
+ * the change: there is no source-kind test anywhere in the routing path any
+ * more, a 16-in CoreAudio device and the card are the same problem, and a fake
+ * that special-cased "decklink means sixteen" would put back the discriminator
+ * this work exists to delete.
+ */
+function fakeCommentaryUp(kind, id) {
+  if (fakeCaptureTimer) {
+    clearTimeout(fakeCaptureTimer);
+    fakeCaptureTimer = null;
+  }
+  fakeCommentarySelection = { kind, id };
+
+  // The per-channel ticker stops FIRST, while fakeCommentaryWidth is still the
+  // outgoing device's: its parting zero-frame has to be as wide as the meters it
+  // is silencing, or a sixteen-row grid is handed a one-entry frame and fifteen
+  // rows keep whatever they last showed. app.go's per-channel zero frame is
+  // sized the same way and for the same reason.
+  stopFakeChannelLevels();
+
+  // Only then does the pad go. The grid must learn that the width is gone BEFORE
+  // it learns the new one — otherwise there is a window in which the last width
+  // published and the device on screen disagree, which is exactly the window the
+  // deviceKey exists to close.
+  fakeCommentaryKey = fakeDeviceKey(kind, id);
+  fakeCommentaryWidth = 0;
+  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
+
+  const device = fakeInputDeviceFor(kind, id);
+  fakePublishCapture({
+    commentary: CAPTURE_STATE.OPENING,
+    reason: '',
+    audioDeviceName: device ? device.name : '',
+  });
+
+  fakeCaptureTimer = setTimeout(() => {
+    fakeCaptureTimer = null;
+    if (!device) {
+      stopFakeLevels();
+      fakePublishCapture({
+        commentary: CAPTURE_STATE.FAILED,
+        reason:
+          'that commentary input is not connected to this machine, so nothing can be captured ' +
+          'from it. Choose another, or plug it in and use Restart capture.',
+        audioDeviceName: '',
+      });
+      return;
+    }
+    fakeCommentaryWidth = fakeClampWidth(device.channels);
+    fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
+    startFakeChannelLevels();
+    startFakeLevels();
+    fakePublishCapture({ commentary: CAPTURE_STATE.LIVE, reason: '', audioDeviceName: device.name });
+  }, FAKE_CAPTURE_OPEN_MS);
+}
+
+/**
+ * fakePictureUp opens the picture capture from the saved video source.
+ *
+ * The SIGNAL follows the picture leg and nothing else. A slate seat reports
+ * UNKNOWN — which is not a fault, it is "this application cannot tell", the
+ * state of every machine with no card in it — and a card seat reports OK. The
+ * old fake reported OK on every fake session regardless, which taught a dev
+ * loop that a slate seat has a green camera lamp.
+ */
+function fakePictureUp() {
+  const card = String(fakeConfig.videoSource || '') === 'decklink';
+  fakePublishCapture({ picture: CAPTURE_STATE.LIVE });
+  fakeSignal = card
+    ? { state: SIGNAL_STATE.OK, flaps: 0 }
+    : { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
+  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
+}
+
+/**
+ * fakeCaptureUp is what the real application does at domReady, and what this
+ * module does at load. It is NOT called from fakeStart, and the absence is
+ * asserted by channelmap.test.js: a fake that stood capture up inside a session
+ * would model the lifetime this change removed.
+ */
+function fakeCaptureUp() {
+  fakePictureUp();
+  const { kind, id } = fakeCommentarySelection || fakeConfiguredCommentaryInput();
+  fakeCommentaryUp(kind, id);
+}
+
+/**
+ * fakeCaptureDown is a teardown: a device change, a restart, or the application
+ * quitting. It is what emits the zero-frames — the meters must fall to silence
+ * rather than freeze at the last level — and it publishes UNKNOWN for the
+ * signal, mirroring app.go's forgetSignal.
+ *
+ * STOP DOES NOT CALL IT, and that is the operator-visible half of this change.
+ */
+function fakeCaptureDown() {
+  if (fakeCaptureTimer) {
+    clearTimeout(fakeCaptureTimer);
+    fakeCaptureTimer = null;
+  }
+  stopFakeLevels();
+  stopFakeChannelLevels();
+  fakeCommentaryWidth = 0;
+  fakeEmit(EVENT_CHANNEL_MAP, fakeChannelMapState());
+  fakeSignal = { state: SIGNAL_STATE.UNKNOWN, flaps: 0 };
+  fakeEmit(EVENT_SIGNAL, { ...fakeSignal });
+  fakePublishCapture({
+    picture: CAPTURE_STATE.OFF,
+    commentary: CAPTURE_STATE.OFF,
+    reason: '',
+    audioDeviceName: '',
+  });
+}
+
+/**
+ * Re-points the commentary capture at a device, immediately, WITHOUT saving.
+ *
+ * The three arguments are exactly deriveAudioInputEffects' three fields, in
+ * config's own order, and the one that does not apply is ignored rather than
+ * having to be omitted — a caller must not have to know which of the two id
+ * fields its kind uses, because that is the knowledge the single picker exists
+ * to remove.
+ *
+ * The routing panel appears on the "channelMap" event that follows, stamped
+ * with this device's key. It is refused while sending; see the section comment.
+ *
+ * @param {string} kind "native" or "decklink"
+ * @param {string} deviceId the platform endpoint id, for a native seat
+ * @param {string} persistentId the card's persistent-id, for a decklink seat
+ * @returns {Promise<void>}
+ */
+export async function selectCommentaryInput(kind, deviceId, persistentId) {
+  const k = kind === 'decklink' ? 'decklink' : 'native';
+  const id = String((k === 'decklink' ? persistentId : deviceId) ?? '');
+  if (hasWails()) {
+    return callGoBound(CAPTURE_METHODS.select, k, String(deviceId ?? ''), String(persistentId ?? ''));
+  }
+  if (fakeSenderRunning) {
+    // The fake refuses it too. A dev session in which the device could be
+    // changed mid-send would be a dev session in which the screen's handling of
+    // the refusal is never once exercised — and the refusal is the guard against
+    // a silently dead feed, so its wording matters more than most.
+    throw new Error(
+      'the commentary input cannot be changed while sending: re-pointing capture under a running ' +
+        'send pipeline takes the feed off air without any lamp changing. Press STOP first.',
+    );
+  }
+  fakeCommentaryUp(k, id);
+}
+
+/**
+ * Tears the capture pipelines down and builds them again.
+ *
+ * This is the ONLY recovery from a capture fault, because the card is held from
+ * launch to quit and there is no release control (A1). It is what an operator
+ * reaches for after plugging the SDI cable back in, after quitting whatever else
+ * took the card, or after connecting the microphone they had forgotten.
+ *
+ * It is a rebuild and not a repair: the picture blanks and the meters fall for
+ * as long as it takes. Off air that is nothing; while sending it is a device
+ * change by another name, and it is refused for the same reason.
+ *
+ * @returns {Promise<void>}
+ */
+export async function restartCapture() {
+  if (hasWails()) return callGoBound(CAPTURE_METHODS.restart);
+  if (fakeSenderRunning) {
+    throw new Error(
+      'capture cannot be restarted while sending: it would take the feed off air without any ' +
+        'lamp changing. Press STOP first.',
+    );
+  }
+  fakeCaptureDown();
+  fakeCaptureUp();
+}
+
+/**
+ * Reads what each capture leg is doing right now:
+ * {picture, commentary, reason, audioDeviceName}.
+ *
+ * NEVER THROWS, for the reason getChannelMap does not: it is called on the
+ * startup path, by a screen whose job is to EXPLAIN a fault, and a rejection
+ * there would replace the explanation with a stack trace. Every way of not
+ * knowing answers CAPTURE_UNAVAILABLE, which says so.
+ *
+ * @returns {Promise<{picture: string, commentary: string, reason: string, audioDeviceName: string}>}
+ */
+export async function getCaptureState() {
+  if (hasWails()) {
+    if (!captureAvailable()) return CAPTURE_UNAVAILABLE;
+    try {
+      const got = await callGoBound(CAPTURE_METHODS.state);
+      return got && typeof got === 'object' ? got : CAPTURE_UNAVAILABLE;
+    } catch {
+      return CAPTURE_UNAVAILABLE;
+    }
+  }
+  return fakeCaptureState();
+}
+
+/** Subscribes to the "capture" event. Returns an unsubscribe function. */
+export function onCapture(cb) {
+  return subscribe(EVENT_CAPTURE, cb);
+}
+
+// ---------------------------------------------------------------------------
+// The fake capture comes up HERE, at module load, and this is the last thing
+// this module does.
+//
+// Last, because fakeCaptureUp reaches back through most of the fake — the
+// device table, the config, the level generators, the pad, the signal — and
+// every one of those is a module-level `let` or `const` that must already be
+// initialised. It is not hoisted for the same reason.
+//
+// Only in a browser: see fakeBrowserSession. A `node --test` import gets the
+// fake's data and none of its clocks, and the suite exits.
+//
+// DEFERRED BY ONE MACROTASK, WHICH IS THIS FAKE'S domReady. The real
+// application builds capture from domReady — the earliest moment
+// NewOverlaySurface can succeed — which is after main.js has mounted every
+// screen and every screen has subscribed. Firing the first "capture",
+// "channelMap" and "signal" events synchronously during THIS module's
+// evaluation would put all three before a single listener existed: the launch
+// state would reach only whoever thought to read it back, and the signal has no
+// getter to read it back with. A subscriber registered while main.js runs is in
+// place by the time this fires.
+// ---------------------------------------------------------------------------
+if (fakeBrowserSession) {
+  setTimeout(fakeCaptureUp, 0);
 }

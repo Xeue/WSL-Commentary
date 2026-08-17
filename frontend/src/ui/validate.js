@@ -112,10 +112,12 @@ function isBlank(v) {
  *
  * The one bound NOT checked is the input channel ceiling against what the pad
  * negotiated, because this function has no pad: MAX_INPUT_CHANNELS is the widest
- * card this application supports, and a map naming a channel a particular card
- * did not negotiate is refused by Go at the moment it is written, with the
- * actual width in the message. Checking a guessed width here would refuse a
- * perfectly good sixteen-channel map on a machine whose card was unplugged.
+ * INPUT this application supports at all, and a map naming a channel a
+ * particular device did not negotiate is refused by Go at the moment it is
+ * written, with the actual width in the message. Checking a guessed width here
+ * would refuse a perfectly good sixteen-channel map on a machine whose card, or
+ * whose interface, was unplugged — and the store this validates holds routings
+ * for devices that are deliberately not connected today.
  *
  * @param {unknown} raw
  * @returns {string} the message, or '' if the routing is acceptable
@@ -123,7 +125,7 @@ function isBlank(v) {
 function channelMapError(raw) {
   if (!Array.isArray(raw)) {
     return 'Channel routing must be a list of contributions, each naming an output, an input ' +
-      'channel and a gain. Leave it out entirely to use the card’s first two channels.';
+      'channel and a gain. Leave it out entirely to use the input’s first two channels.';
   }
 
   const seen = new Set();
@@ -142,9 +144,9 @@ function channelMapError(raw) {
     // operator's numbering, because the number they can check is the one on the
     // embedder.
     if (!isInt(c.input) || c.input < 0 || c.input >= MAX_INPUT_CHANNELS) {
-      return `${at} takes input channel ${Number(c.input) + 1}, and a card presents at most ` +
-        `${MAX_INPUT_CHANNELS}. Channels are counted from 1 on the embedder and from 0 in this ` +
-        'file.';
+      return `${at} takes input channel ${Number(c.input) + 1}, and this application routes at ` +
+        `most ${MAX_INPUT_CHANNELS}. Channels are counted from 1 on the device and from 0 in ` +
+        'this file.';
     }
     if (typeof c.gain !== 'number' || !Number.isFinite(c.gain) || Math.abs(c.gain) > GAIN_LIMIT) {
       return `${at} has a gain of ${c.gain}, and the routing accepts −${GAIN_LIMIT} to ` +
@@ -159,6 +161,40 @@ function channelMapError(raw) {
         'together into a level nobody chose.';
     }
     seen.add(cell);
+  }
+  return '';
+}
+
+/**
+ * channelMapsError checks the whole per-device store: an object keyed
+ * "<capture kind>:<device id>" whose values are routings channelMapError
+ * accepts.
+ *
+ * THE MESSAGE NAMES THE DEVICE, and that is the reason this wrapper exists
+ * rather than a loop at the call site. The store holds routings for devices that
+ * are not selected and may not even be plugged in, so "Contribution 3 takes
+ * input channel 17…" with no device on it sends the operator to the grid in
+ * front of them — which is a different device's, is perfectly valid, and shows
+ * nothing wrong. The key is quoted verbatim because it is what a hand-editor
+ * would search config.json for.
+ *
+ * @param {unknown} raw
+ * @returns {string} the message, or '' if every device's routing is acceptable
+ */
+function channelMapsError(raw) {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return 'Channel routing must be a set of routings, one per capture device. Leave it out ' +
+      'entirely to use each device’s first two channels.';
+  }
+  for (const key of Object.keys(raw)) {
+    const map = raw[key];
+    // A null routing is ABSENT, not invalid. Go unmarshals it to a nil slice,
+    // which is exactly "nobody has chosen for that device" — so refusing it here
+    // would make a file unsavable over a value the application it is saved for
+    // reads as the normal state.
+    if (map === undefined || map === null) continue;
+    const message = channelMapError(map);
+    if (message) return `Channel routing for "${key}": ${message}`;
   }
   return '';
 }
@@ -436,10 +472,10 @@ export function validateConfig(config) {
       '(e.g. 2747401380). Choose the card from the microphone list above.';
   }
 
-  // THE CARD'S CHANNEL ROUTING. Absent or empty is VALID and is the normal state
-  // — it means nobody has chosen, and Go resolves it to the card's first two
-  // embedded channels, which is exactly what this application sent before the
-  // routing screen existed.
+  // THE CAPTURE DEVICES' CHANNEL ROUTING, one per device. Absent or empty is
+  // VALID and is the normal state — an absent key means nobody has chosen for
+  // that device, and Go resolves it to the first two input channels, which is
+  // exactly what this application sent before the routing screen existed.
   //
   // The grid upstairs is INCAPABLE of producing an invalid map: it is drawn from
   // the negotiated width, its crosspoints are a set, and it cannot express two
@@ -454,10 +490,12 @@ export function validateConfig(config) {
   // The map is REFUSED WHOLE and never trimmed, which mirrors gst.MixMatrix's
   // refusals. Dropping the offending entry would save a routing the operator did
   // not write, and the entry most likely to be wrong is the one carrying the
-  // commentator.
-  if (config.decklinkChannelMap !== undefined && config.decklinkChannelMap !== null) {
-    const message = channelMapError(config.decklinkChannelMap);
-    if (message) errors.decklinkChannelMap = message;
+  // commentator. ONE bad device's routing refuses the whole field for the same
+  // reason: this form saves the store whole, so trimming one device's entry out
+  // of it is deleting that device's routing rather than fixing it.
+  if (config.channelMaps !== undefined && config.channelMaps !== null) {
+    const message = channelMapsError(config.channelMaps);
+    if (message) errors.channelMaps = message;
   }
 
   // The RETURN path's key length. Same three values, a different endpoint, and

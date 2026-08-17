@@ -238,28 +238,51 @@ func TestChannelMapPayloadCopiesTheMapItPublishes(t *testing.T) {
 	// would let a queued event change after it was queued — a routing screen
 	// showing a state that never existed.
 	m := gst.ChannelMap{{Output: gst.OutputLeft, Input: 2, Gain: 1}}
-	payload := channelMapPayloadFrom(16, m)
+	payload := channelMapPayloadFrom("decklink:2747401380", 16, m)
 
 	m[0].Gain = 0.1
 	if payload.Map[0].Gain != 1 {
 		t.Error("the payload aliases the caller's map; a later live re-route would rewrite an " +
 			"event that had already been published")
 	}
+
+	// AND THE WIDTH IS STAMPED WITH THE DEVICE IT WAS MEASURED ON. The routing
+	// screen keys its grid on this, and a payload that dropped it would leave the
+	// grid hidden on every seat — the gate cannot match a device it was not told
+	// about. Spelled out here rather than built from config.AudioDeviceKey, so
+	// that a change to that spelling has to be made deliberately in both places
+	// instead of agreeing with itself.
+	if payload.DeviceKey != "decklink:2747401380" {
+		t.Errorf("the payload carried device key %q, want the one it was published for",
+			payload.DeviceKey)
+	}
+	if payload.InputChannels != 16 {
+		t.Errorf("the payload carried width %d, want 16", payload.InputChannels)
+	}
 }
 
 func TestSenderOptsCarriesTheRoutingAndBothNewCallbacks(t *testing.T) {
 	a, _ := newTestApp(t)
 
+	// A store holding TWO devices' routings, with the key spelled out rather than
+	// asked for: senderOpts must reach the one belonging to the device this
+	// configuration captures from, and a test that built its key with the same
+	// call the code under test uses would agree with any spelling at all.
 	cfg := config.Defaults()
-	cfg.DeckLinkChannelMap = []config.ChannelContribution{
-		{Output: gst.OutputLeft, Input: 4, Gain: 1},
+	cfg.AudioSourceKind = config.AudioSourceDeckLink
+	cfg.DeckLinkPersistentID = "2747401380"
+	cfg.ChannelMaps = map[string][]config.ChannelContribution{
+		"decklink:2747401380": {{Output: gst.OutputLeft, Input: 4, Gain: 1}},
+		"native:usb-mic-1":    {{Output: gst.OutputLeft, Input: 0, Gain: 1}},
 	}
 
 	opts := a.senderOpts(cfg, "")
 
 	if len(opts.Pipeline.ChannelMap) != 1 || opts.Pipeline.ChannelMap[0].Input != 4 {
-		t.Errorf("PipelineOpts.ChannelMap = %+v, want the saved routing; without it a card "+
-			"starts on channels 1 and 2 whatever the operator saved", opts.Pipeline.ChannelMap)
+		t.Errorf("PipelineOpts.ChannelMap = %+v, want the routing saved for the CARD; without it "+
+			"a card starts on channels 1 and 2 whatever the operator saved — and picking the "+
+			"wrong device's entry would start it on somebody else's microphone",
+			opts.Pipeline.ChannelMap)
 	}
 	// All three hooks, because each one is a whole feature that is inert without
 	// it: no OnChannelLevels is a routing grid with dead meters, and no OnSignal

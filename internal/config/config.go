@@ -48,8 +48,17 @@ type Tile struct {
 	H int `json:"h"`
 }
 
-// ChannelContribution is one cell of a DeckLink card's routing: one of its
-// embedded input channels reaching one side of the commentary feed, at one gain.
+// ChannelContribution is one cell of a capture device's routing: one of its
+// input channels reaching one side of the commentary feed, at one gain.
+//
+// It is DEVICE-NEUTRAL and always was in shape; what changed is that it is now
+// device-neutral in use as well. It described a DeckLink card's embedded
+// channels while the card was the only unpositioned source this application
+// captured from; a Focusrite or an RME presents the same problem in the same
+// shape (a CoreAudio source can never publish a positioned channel-mask above
+// two channels — gstosxcoreaudio.c sets layout = NULL for every source), and a
+// stereo or mono device is a routing decision too: flipping a reversed pair is
+// {left<-2, right<-1} and dual mono is {left<-1, right<-1}.
 //
 // It is the PERSISTED form of internal/gst's ChannelContribution, and the field
 // names and json tags are IDENTICAL to that type's on purpose — the same
@@ -70,10 +79,11 @@ type ChannelContribution struct {
 	// the AAC encoder is pinned to a stereo pair.
 	Output int `json:"output"`
 
-	// Input is the ZERO-BASED index of the card's input channel. Channel 1 on
-	// the operator's embedder is Input 0 here; the +1 belongs to the UI and is
-	// done in exactly one place there, because a conversion applied twice is
-	// a commentator routed one channel along from where they are.
+	// Input is the ZERO-BASED index of the capture device's input channel.
+	// Channel 1 on the operator's embedder or interface is Input 0 here; the +1
+	// belongs to the UI and is done in exactly one place there, because a
+	// conversion applied twice is a commentator routed one channel along from
+	// where they are.
 	Input int `json:"input"`
 
 	// Gain is the linear coefficient, and audioconvert HARD-CLAMPS it to
@@ -368,41 +378,82 @@ type Config struct {
 	// card nothing can take it away mid-match.
 	DeckLinkPersistentID string `json:"decklinkPersistentId"`
 
-	// DeckLinkChannelMap is which of the card's embedded audio channels reach
-	// the left and right of the commentary feed, and at what gain. It is read
-	// only when AudioSourceKind is "decklink"; a native seat has no unpositioned
-	// channels to route and the whole field is inert.
+	// ChannelMaps is which of a capture device's input channels reach the left
+	// and right of the commentary feed, and at what gain — ONE ROUTING PER
+	// DEVICE, keyed by the device it belongs to.
+	//
+	// # THE KEY
+	//
+	// "<capture kind>:<device id>": "decklink:2747401380" for a card,
+	// "native:BF568F24-731B-41DB-932E-AC7E260BC71A" for a CoreAudio or WASAPI
+	// endpoint. That spelling is not arbitrary — it is byte-for-byte the
+	// <option> value the commentary-input picker already builds for the same
+	// device (frontend/src/ui/audioinput.js, encodeAudioInput), so the two sides
+	// cannot drift into keying the same device two ways. The kind is one of two
+	// known words, neither containing a colon, and the id after the FIRST
+	// separator is carried VERBATIM: a device id may contain colons and nothing
+	// above internal/gst ever parses one. AudioDeviceKey is where this side
+	// spells it, and it is the only place that may.
+	//
+	// # WHY THIS IS A MAP. IT IS FORCED, NOT TIDYING-UP
+	//
+	// It replaces a single "decklinkChannelMap" slot, and what forces the
+	// replacement is always-live capture. The routing grid narrows to the width
+	// the capture pad has NEGOTIATED, and with capture live from launch that
+	// width follows whichever device is selected — so selecting a 2-channel USB
+	// microphone to check something and then pressing Save on an unrelated field
+	// would write a 2-wide grid over the card's 16-wide routing. Silently, with
+	// a commentator's channel assignment in it, from a screen that was not
+	// showing the card at all.
+	//
+	// No guard at the call site fixes that, and the reason is exactly why the
+	// shape had to change: a single slot cannot say WHICH DEVICE its contents
+	// belong to, so every reader and every writer of it would have to agree, out
+	// of band, about a fact written down nowhere. Keyed by the device the
+	// question does not arise, because a save under one key cannot reach another.
 	//
 	// # THE ABSENT VALUE IS NOT SILENCE, AND MUST NEVER BE MATERIALISED
 	//
-	// An empty or missing map means "NOBODY HAS CHOSEN", and internal/gst
-	// resolves that to input 1 on the left and input 2 on the right at unity —
-	// which is bit-for-bit what this application already sent from a card
-	// configured for two channels, so a seat whose operator never opens the
-	// routing screen hears exactly what it heard before the screen existed.
+	// A key that is not present means "NOBODY HAS CHOSEN FOR THAT DEVICE", and
+	// internal/gst resolves that to input 1 on the left and input 2 on the right
+	// at unity — bit-for-bit what this application already sent, so a seat whose
+	// operator never opens the routing screen hears exactly what it heard before
+	// the screen existed.
 	//
 	// A well-meaning migration that wrote that default out explicitly would
 	// freeze TODAY'S default into every config file on every machine, and the
-	// next change to it would silently not reach any of them. Leave the field
-	// absent. Nothing here defaults it, there is no EffectiveDeckLinkChannelMap,
-	// and that is deliberate: the resolution belongs to the one package that
-	// knows the negotiated channel count to resolve it against.
+	// next change to it would silently not reach any of them. Leave the key
+	// absent. Nothing here defaults it, there is no EffectiveChannelMaps, and
+	// that is deliberate: the resolution belongs to the one package that knows
+	// the negotiated channel count to resolve it against. CurrentChannelMap is a
+	// LOOKUP that returns nil for an absent key, and is not a resolver.
 	//
-	// It is the one field in this struct carrying omitempty, and that is the
-	// same decision said in the encoder: a seat that has never routed anything
-	// writes a config.json byte-identical to the one it writes today, rather than
-	// growing a "decklinkChannelMap": null nobody chose. Reading is unaffected —
-	// absent, null and [] are the same nil slice and the same meaning.
+	// It is the one field in this struct carrying omitempty, for the reason its
+	// predecessor carried it: a seat that has never routed anything writes a
+	// config.json with no such key at all rather than growing a
+	// "channelMaps": null nobody chose. Reading is unaffected — absent, null and
+	// {} are all an empty map and all mean the same thing.
 	//
 	// # Why this is MACHINE state
 	//
-	// It describes which XLR on which embedder carries the commentator in THIS
-	// room — a property of the building's wiring, not of the facility being
-	// covered. It is classified in internal/presets/fields.go beside
-	// audioSourceKind and decklinkPersistentId, and for a sharper version of
-	// their reason: a preset carrying a routing would silently move somebody's
-	// microphone from a configuration screen, in a different building, mid-match.
-	DeckLinkChannelMap []ChannelContribution `json:"decklinkChannelMap,omitempty"`
+	// It describes which XLR on which embedder — or which input of which
+	// interface — carries the commentator in THIS room: a property of the
+	// building's wiring, not of the facility being covered. It is classified in
+	// internal/presets/fields.go beside audioSourceKind and
+	// decklinkPersistentId, and for a sharper version of their reason: a preset
+	// carrying a routing would silently move somebody's microphone from a
+	// configuration screen, in a different building, mid-match. The keys make
+	// travelling worse rather than safer — they name devices the receiving
+	// machine does not have, so an arriving map would be filed against hardware
+	// nobody there can see.
+	//
+	// # THE KEY THIS REPLACED
+	//
+	// "decklinkChannelMap", a bare array, read only when audioSourceKind was
+	// "decklink". Load migrates a non-empty one exactly once; migrateChannelMaps
+	// says where it lands and why that is not always the currently selected
+	// device.
+	ChannelMaps map[string][]ChannelContribution `json:"channelMaps,omitempty"`
 
 	// DeckLinkPreviewEnabled turns on the OPERATOR'S OWN CONFIDENCE MONITOR: a
 	// small live picture of what the card is capturing, rendered on this screen,
@@ -988,7 +1039,62 @@ func Load() (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("config: parsing %s: %w", path, err)
 	}
+	migrateChannelMaps(cfg, data)
 	return cfg, nil
+}
+
+// migrateChannelMaps adopts a pre-ChannelMaps "decklinkChannelMap" array into
+// the per-device store, once, on load. It is a no-op for every configuration
+// written by this build or later.
+//
+// The legacy key has no Config field any more, so the whole-document Unmarshal
+// above ignores it and the struct tag inside this function is the ONE place the
+// retired spelling still exists.
+//
+// # WHERE IT LANDS, WHICH IS NOT ALWAYS THE SELECTED DEVICE
+//
+// Under the DECKLINK key for this machine — "decklink:" plus
+// decklinkPersistentId — and not under whatever the seat currently captures
+// from. The old field's NAME is its device stamp: it was read only when
+// audioSourceKind was "decklink", so a DeckLink routing is the only thing it can
+// ever have held.
+//
+// On the seat this migration exists for — one that captures from the card — the
+// two are the same key and the distinction costs nothing. On a seat that has
+// since moved to a microphone, the old array was INERT, and keying it under that
+// microphone would ACTIVATE a card's routing against a two-channel device: a
+// 16-wide grid onto a 2-wide pad, which is the exact corruption the per-device
+// store exists to prevent and would be a poor thing for the migration itself to
+// do. Parked under the card's key it stays inert, and it is there again the
+// moment the seat goes back to the card.
+//
+// # WHAT MAKES IT SAFE TO RUN ON EVERY LOAD
+//
+// It fires only when ChannelMaps is nil — absent, or an explicit null. A file
+// that already carries "channelMaps", INCLUDING an empty {}, has been written by
+// a build that knows about devices, and its silence about a device is a real
+// answer ("nobody has chosen for that one") rather than an absence to be filled
+// from a retired key. So the first Save after this runs drops the legacy key and
+// the migration can never fire again.
+//
+// A "decklinkChannelMap" that is not an array is IGNORED rather than reported.
+// The key has no field left to be wrong about, the whole-document parse above
+// has already succeeded without it, and refusing to load a commentary position's
+// configuration over a key this build no longer has is not a trade worth making
+// at the start of a match.
+func migrateChannelMaps(cfg *Config, data []byte) {
+	if cfg.ChannelMaps != nil {
+		return
+	}
+	var legacy struct {
+		Map []ChannelContribution `json:"decklinkChannelMap"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil || len(legacy.Map) == 0 {
+		return
+	}
+	cfg.ChannelMaps = map[string][]ChannelContribution{
+		AudioDeviceKeyFor(AudioSourceDeckLink, cfg.DeckLinkPersistentID): legacy.Map,
+	}
 }
 
 // Save writes the configuration atomically to Path(), creating the directory if
@@ -1181,6 +1287,70 @@ func (c *Config) EffectiveAudioSourceKind() string {
 		return s
 	}
 	return DefaultAudioSourceKind
+}
+
+// AudioDeviceKeySeparator divides the capture kind from the device id in a
+// ChannelMaps key. It matches frontend/src/ui/audioinput.js's VALUE_SEPARATOR,
+// which is the same character for the same reason: the two halves must be
+// splittable, and only the FIRST occurrence divides them, because a device id
+// may legitimately contain colons and is never parsed by anything above
+// internal/gst.
+const AudioDeviceKeySeparator = ":"
+
+// AudioDeviceKeyFor builds the ChannelMaps key for one (capture kind, device
+// id) pair.
+//
+// An UNRECOGNISED kind normalises to the default here — the one place in this
+// package that does that rather than passing an unknown value through for
+// Validate to refuse. It has to: this is a KEY, and Go and the frontend must
+// arrive at the same string for the same device or a saved routing is filed
+// under a name nothing will ever look up again. The frontend's
+// normaliseAudioSourceKind already reads anything it does not recognise as
+// "native"; a Go side that spelled it any other way would lose a commentator's
+// channel assignment silently, on a configuration Validate is about to refuse
+// anyway.
+//
+// An EMPTY id is a real key and not a missing one. "decklink:" is the documented
+// normal case — "the only card in this machine" — and "native:" is a seat that
+// has not picked an endpoint yet.
+func AudioDeviceKeyFor(kind, id string) string {
+	switch kind {
+	case AudioSourceNative, AudioSourceDeckLink:
+	default:
+		kind = DefaultAudioSourceKind
+	}
+	return kind + AudioDeviceKeySeparator + strings.TrimSpace(id)
+}
+
+// AudioDeviceKey is the ChannelMaps key of the commentary input THIS
+// configuration names: the capture kind, and the id of the device that kind
+// selects — decklinkPersistentId for a card, audioDeviceId for a platform
+// endpoint.
+//
+// Which of the two id fields is read follows the kind and never the other way
+// round, for the reason audioinput.js's deriveAudioInputEffects clears the one
+// that does not apply: a stale id beside the other kind is two answers to one
+// question, and a key built from the wrong half would file the routing against
+// hardware this seat is not capturing from.
+func (c *Config) AudioDeviceKey() string {
+	kind := c.EffectiveAudioSourceKind()
+	id := c.AudioDeviceID
+	if c.UsesDeckLinkAudio() {
+		id = c.DeckLinkPersistentID
+	}
+	return AudioDeviceKeyFor(kind, id)
+}
+
+// CurrentChannelMap returns the routing saved for the commentary input this
+// configuration names, or nil when nobody has chosen one for that device.
+//
+// It is a LOOKUP and not a resolver. Nil is the answer for an absent key and it
+// must stay nil all the way to internal/gst, which is the only package that
+// knows the negotiated width to resolve "nobody has chosen" against — see the
+// ChannelMaps field comment for why materialising the default anywhere on this
+// side would freeze today's default into every config file on every machine.
+func (c *Config) CurrentChannelMap() []ChannelContribution {
+	return c.ChannelMaps[c.AudioDeviceKey()]
 }
 
 // UsesDeckLinkAudio reports whether commentary audio is captured from a

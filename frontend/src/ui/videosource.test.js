@@ -26,10 +26,13 @@
  *    capture on a machine with no card is not-negotiated (-4) in about 100
  *    microseconds, naming neither the device nor the cause.
  *
- * 4. A PREVIEW TOGGLE THAT LOOKS BROKEN. It only takes effect at START, because
- *    switching it live was measured to take the ON-AIR leg to 0 fps permanently
- *    with the pipeline still reporting PLAYING. A control that appears to do
- *    nothing, with no reason beside it, is a control an operator presses again.
+ * 4. A PREVIEW TOGGLE THAT LOOKS BROKEN. It takes effect when it is saved, and
+ *    only off air, because splicing the branch into a live pipeline was measured
+ *    to take the ON-AIR leg to 0 fps permanently with the pipeline still
+ *    reporting PLAYING — and the pipeline it would be spliced into is now
+ *    PLAYING from launch to quit, so a rebuild is the only way the toggle is
+ *    honoured. A control that appears to do nothing, with no reason beside it,
+ *    is a control an operator presses again.
  *
  * ======================= WHY SOME OF THIS READS SOURCE ======================
  *
@@ -61,6 +64,7 @@ import {
   describeToAir,
   describeCardAvailability,
   describePreviewBox,
+  PICTURE_CAPTURE,
   deriveCameraLamp,
   PREVIEW_AT_START_CAVEAT,
   describeCardOptionRefusal,
@@ -380,7 +384,20 @@ test('the preview caveat is the two facts an operator acts on, and nothing else'
   // a control that appears to do nothing is a control they press again, and that
   // it does not touch the transmitted feed, because that is the fear a preview
   // beside an on-air path creates.
-  assert.match(PREVIEW_AT_START_CAVEAT, /START/, 'it must name the button');
+  //
+  // WHEN IT TAKES EFFECT HAS CHANGED, AND THIS ASSERTION WITH IT. It used to
+  // require the word START, because the preview branch was built when a session
+  // started and there was no earlier moment at which the tick box could mean
+  // anything. The picture capture is built at launch now and rebuilt when this
+  // field is saved, so START is not what applies it and an assertion demanding
+  // that word would pin a sentence that is no longer true. What the operator
+  // still needs is the same two facts, and the first of them is now the SAVE.
+  assert.match(PREVIEW_AT_START_CAVEAT, /save/i, 'it must name the moment it takes effect');
+  assert.ok(
+    !/\bSTART\b/.test(PREVIEW_AT_START_CAVEAT),
+    'and must not send the operator to a button that no longer applies it: the preview appears ' +
+      'when capture is rebuilt, which is before anything is sent',
+  );
   assert.match(
     PREVIEW_AT_START_CAVEAT,
     /changes nothing that is transmitted/i,
@@ -531,17 +548,72 @@ test('both host-only setters are declared in the remote allowlist', () => {
   }
 });
 
-test('the preview box explains itself in the one state the page cannot know', () => {
-  // The page cannot learn from Go whether a preview branch was built this
-  // session — it is decided at START and there is no event for it — so the
-  // caption covers both, and the opaque native window covers the caption when
-  // there is a picture.
-  assert.match(describePreviewBox(false), /press START/i);
-  assert.match(describePreviewBox(true), /STOP and START/i);
-  assert.match(describePreviewBox(true), /not in this session/i);
-  for (const running of [true, false]) {
-    assert.match(describePreviewBox(running), /^PREVIEW/, 'and say what the black box IS');
+test('the preview box explains itself from the CAPTURE state, never from a button', () => {
+  // ===================== REWRITTEN, AND THE REWRITE IS THE CHANGE ============
+  //
+  // This test used to assert that the caption said "press START" off air and
+  // "STOP and START to see it" during a session, and both were right while the
+  // preview was a branch of the session's own pipeline: pressing START was
+  // literally what filled the box in.
+  //
+  // The picture capture is built at launch and held until the application quits
+  // now, so the box fills in before anything is sent and stays filled after
+  // STOP. Left as it was, this test would have pinned an instruction to press a
+  // button that changes nothing about this box — beside a black rectangle whose
+  // real reason is one of the four below.
+  //
+  // What has NOT changed is the state the page cannot know: capture being live
+  // does not prove a preview BRANCH was built, because the build retries without
+  // one when the surface will not attach and no event reports the branch itself.
+  // That is the case the last assertion covers.
+  assert.match(describePreviewBox(PICTURE_CAPTURE.OPENING), /opening/i);
+  assert.match(describePreviewBox(PICTURE_CAPTURE.FAILED), /did not open/i);
+  assert.match(
+    describePreviewBox(PICTURE_CAPTURE.FAILED),
+    /alerts/i,
+    'the reason is Go\'s own sentence and it is long: it goes to the column, and this box says ' +
+      'where to look. A 16:9 box 120 px tall cannot hold it',
+  );
+  assert.match(
+    describePreviewBox(PICTURE_CAPTURE.LIVE),
+    /no picture is being painted/i,
+    'capture live with the caption still visible is the one state the page cannot explain from an ' +
+      'event, so it says so rather than showing an unexplained black box',
+  );
+  assert.match(describePreviewBox(PICTURE_CAPTURE.OFF), /not being captured/i);
+
+  for (const state of [...Object.values(PICTURE_CAPTURE), undefined, null, 'nonsense']) {
+    assert.match(describePreviewBox(state), /^PREVIEW/, 'and say what the black box IS');
+    assert.ok(
+      !/\bSTART\b/.test(describePreviewBox(state)),
+      `"${describePreviewBox(state)}" sends the operator to START, which no longer fills this box`,
+    );
   }
+});
+
+test('the four capture states are one vocabulary, spelled the same in three places', () => {
+  // videosource.js keeps its own copy so that it stays pure — no backend, no
+  // DOM, so node --test drives every rule in it with nothing installed — which
+  // is the same arrangement channelmap.js's SIGNAL_STATE has and carries the
+  // same risk: a private copy of a vocabulary can drift into matching no event
+  // that ever arrives, and the failure is silent. A caption stuck on "the card
+  // is not being captured" over a live picture is what that looks like.
+  const backend = ui('backend.js');
+  for (const [name, value] of Object.entries(PICTURE_CAPTURE)) {
+    assert.match(
+      backend,
+      new RegExp(`${name}: '${value}'`),
+      `backend.js's CAPTURE_STATE must spell ${name} as "${value}"`,
+    );
+  }
+
+  // THE THIRD PLACE IS app.go, WHICH MINTS THEM, and it is deliberately not
+  // asserted here yet: the bindings have not landed, so the assertion would fail
+  // this gate today and a conditional one would pass vacuously for ever, which is
+  // the worse of the two. It belongs beside the rest of the seam's Go-side drift
+  // guards in capture.test.js — the pattern is meters.test.js's
+  // `assert.match(appGo, /EventLevels = "levels"/)` — and it is owed the moment
+  // EventCapture exists.
 });
 
 // ---------------------------------------------------------------------------
@@ -824,13 +896,16 @@ test('the CAMERA lamp is on the main screen, beside SENDING and before the switc
   const home = codeOnly(ui('home.js'));
   const names = home.match(/const LAMP_NAMES = \[([^\]]*)\]/);
   assert.ok(names, 'home.js must still declare LAMP_NAMES');
-  const list = names[1].split(',').map((s) => s.trim().replace(/^'|'$/g, ''));
+  const list = names[1]
+    .split(',')
+    .map((s) => s.trim().replace(/^'|'$/g, ''))
+    .filter(Boolean);
   assert.deepEqual(list, [
     'SENDING',
     'LAMP_CAMERA',
     'SWITCHER SEES FEED',
-    'VIDEO',
-    'AUDIO',
+    'SWITCHER VIDEO',
+    'SWITCHER AUDIO',
     'MONITOR',
   ]);
 
@@ -847,6 +922,45 @@ test('the CAMERA lamp is on the main screen, beside SENDING and before the switc
     'app.js must paint the lamp from the video source AND the watchdog — neither alone is an answer',
   );
   assert.match(app, /backend\.onSignal\(\(payload\) => \{/, 'and subscribe to the watchdog');
+});
+
+test('the two switcher lamps say SWITCHER, because this desk now measures itself', () => {
+  // ===================== WHY THE RENAME IS NOT COSMETIC ======================
+  //
+  // VIDEO and AUDIO were unambiguous while nothing on this screen measured this
+  // seat's own video or audio outside a session. Both do now: the input meters
+  // are the commentary capture's and the CAMERA lamp is the card's, and both are
+  // live from launch.
+  //
+  // So a commentator would watch their own meter MOVING beside a lamp reading
+  // "AUDIO — NO STATUS" — a true statement about a quiet telemetry socket, read
+  // by the person in front of it as "this application says my microphone is
+  // dead". They would hunt a fault at the desk, before kick-off, in a rig that
+  // is working.
+  const home = codeOnly(ui('home.js'));
+  const app = codeOnly(ui('app.js'));
+
+  assert.match(app, /home\.lamps\['SWITCHER VIDEO'\]\.update\(video\)/);
+  assert.match(app, /home\.lamps\['SWITCHER AUDIO'\]\.update\(audio\)/);
+  // The old spellings must be gone from BOTH sides, not merely unused on one:
+  // createLampRow keys its lamps by name, so a surviving `home.lamps.AUDIO`
+  // would be an update() on undefined, and a surviving name in LAMP_NAMES would
+  // draw a seventh pill nothing ever paints.
+  for (const stale of [/home\.lamps\.VIDEO\b/, /home\.lamps\.AUDIO\b/]) {
+    assert.equal(stale.test(app), false, `app.js still paints ${stale}`);
+  }
+  const names = home.match(/const LAMP_NAMES = \[([^\]]*)\]/)[1];
+  assert.equal(/'VIDEO'/.test(names), false, 'LAMP_NAMES still holds the bare VIDEO');
+  assert.equal(/'AUDIO'/.test(names), false, 'LAMP_NAMES still holds the bare AUDIO');
+
+  // And the reason is written where the next person to shorten them will read
+  // it, because "SWITCHER VIDEO" is longer than it needs to be for any reason
+  // except this one.
+  assert.match(
+    ui('home.js'),
+    /moving input meter|MOVING INPUT METER/,
+    'home.js must record why the lamps carry the word SWITCHER',
+  );
 });
 
 test('the frontend adds no second hysteresis to the watchdog', () => {
@@ -948,12 +1062,74 @@ test('the preview box is reserved from the configuration and captioned honestly'
     /const reserved = previewBindingsPresent && effects\.wantCard && currentPreviewEnabled/,
     'no bindings, no card selected or no preview asked for must all reserve nothing',
   );
-  assert.match(body, /home\.setPreviewCaption\(describePreviewBox\(running\)\)/);
+  assert.match(body, /home\.setPreviewCaption\(describePreviewBox\(currentCapture\?\.picture\)\)/);
+
+  // ============ THE SURFACE IS WANTED ON THE CONFIGURATION ALONE =============
+  //
+  // It used to be `reserved && running`, because the preview was a branch of the
+  // session's pipeline and there was nothing to show before START. The picture
+  // capture is built at launch and held until the application quits now, so
+  // gating on a session would hide a live preview for the whole of the period
+  // the operator actually uses it in: the setting-up, before anything is sent.
+  assert.match(body, /previewOverlay\.setWanted\(reserved\)/);
+  assert.equal(
+    /running/.test(body),
+    false,
+    'renderPreview must not read the sender state at all: every answer it gives is now a function ' +
+      'of the saved configuration and the capture state',
+  );
+
   // RESERVING IS A LAYOUT CHANGE: .pgm-tile is sized against what is left in the
   // stage, so the commentator's picture has just moved and BOTH surfaces have to
   // be re-measured. An overlay left at yesterday's rectangle is a native window
   // over the controls beside it.
   assert.match(body, /overlay\.sync\(\);\s*previewOverlay\.sync\(\);/);
+
+  // AND THE SENDER EDGE NO LONGER REDRAWS IT. This is the other half of the same
+  // change and it is asserted separately because deleting the call is what makes
+  // the preview survive STOP: a renderPreview on the STOP edge would take the
+  // box away again a frame after capture had filled it.
+  const sender = app.slice(app.indexOf('backend.onSender('));
+  const handler = sender.slice(0, sender.indexOf('\n  });'));
+  assert.equal(
+    /renderPreview\(\)/.test(handler),
+    false,
+    'the sender edge must not touch the preview: it is capture, not a session, that fills the box',
+  );
+});
+
+test('a capture fault reaches the operator as an alert row, and is retired when it clears', () => {
+  // §12: "a capture fault names itself on screen". The column is the only
+  // surface on this screen that may gain and lose rows — the operator's rule is
+  // that nothing which arrives, changes or clears may move the picture — so this
+  // is an alert and never a banner, and home.js's column is fixed-width with its
+  // own scroll.
+  const app = codeOnly(ui('app.js'));
+  assert.match(app, /backend\.onCapture\(\(payload\) => \{/, 'app.js must subscribe to the event');
+  const render = app.slice(app.indexOf('function renderCapture()'));
+  const body = render.slice(0, render.indexOf('\n  }'));
+  assert.ok(body.length > 0, 'app.js must define renderCapture');
+
+  // ONE ROW, RAISED AND RETIRED. The event repeats on every state change and a
+  // device that will not open can produce a run of them, so only a CHANGE of
+  // message is acted on, and the standing row is taken down BY NAME rather than
+  // by clearing a column that holds everything else the operator has not read.
+  assert.match(body, /if \(message === captureAlert\) return;/);
+  assert.match(body, /home\.clearErrorIf\(captureAlert\)/);
+  assert.equal(
+    /home\.clearError\(\)/.test(body),
+    false,
+    'clearing the whole feed to retire one row eats every unrelated alert with it',
+  );
+
+  // The reason is Go's own sentence, passed through rather than reworded: it
+  // names the device and the way out, and a second copy on this side would be a
+  // worse one that drifts.
+  const fault = app.slice(app.indexOf('function describeCaptureFault(capture)'));
+  assert.match(fault.slice(0, fault.indexOf('\n  }')), /capture\.reason/);
+
+  const home = ui('home.js');
+  assert.match(home, /\n    clearErrorIf,/, 'home.js must expose clearErrorIf on the view');
 });
 
 test('the preview box has a home in the stylesheet, and the caption is inside it', () => {

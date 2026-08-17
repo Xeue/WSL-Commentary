@@ -235,9 +235,16 @@ test('home.js draws the meters OUTSIDE the tile — now in the side column', () 
   // that rectangle, as .pgm-stage was.
   assert.match(
     src,
-    /makeRailSection\('Status', lampsEl, metersEl\)/,
+    /makeRailSection\('Status', lampsEl, metersEl, metersNote\)/,
     'the meters container must be built into the side column',
   );
+  // The fourth child is the static line under the meters, and it is in the
+  // column with them for the same reason: it says the input is open from launch
+  // — and therefore that the operating system's recording light is on when
+  // nothing is being sent — which a commentator who reads that light as "I am
+  // live" needs beside the meters rather than in a tooltip. It never changes
+  // text, so it can never move anything.
+  assert.match(src, /metersNote\.className = 'input-meters-note'/);
   assert.ok(
     !/pgmTile\.(?:append|appendChild)\([^)]*metersEl/.test(src),
     'the meters container must never be appended to pgmTile — the native overlay covers that rectangle',
@@ -268,21 +275,51 @@ test('the levels transport exists and the event name matches app.go', () => {
   assert.match(app, /home\.setLevels\(/, 'app.js must forward frames to home.setLevels');
 });
 
-test('the fake backend moves the meters in a dev session and silences them on stop', () => {
-  // npm run dev has no Go side, so the fake must emit the same shaped frames
-  // — moving while the fake session runs, one all-silence frame on stop — or
-  // the meters are only developable against a real build.
+test('the fake backend moves the meters from launch, and STOP does not silence them', () => {
+  // RENAMED FROM "...and silences them on stop", and the rename is the change.
+  //
+  // The meters used to be the send pipeline's, so they began at START and
+  // stopped at STOP. They are the CAPTURE pipeline's now: alevel sits
+  // immediately upstream of a proxysink in a pipeline built at launch and held
+  // until the application quits, so the meters move before anything is sent and
+  // go on moving after it stops. "Everything you were watching stays" is the
+  // operator-facing half of that, and this test asserted the opposite of it.
+  //
+  // npm run dev has no Go side, so the fake must have the same lifetime or the
+  // meters are only developable against a real build — and the specific thing
+  // that would go unnoticed is a screen that clears the meters on the STOP edge,
+  // which would look correct against a fake that cleared them too.
   const backend = ui('backend.js');
   assert.match(backend, /startFakeLevels\(\)/);
   assert.match(backend, /stopFakeLevels\(\)/);
   assert.match(
     backend,
     /fakeEmit\(EVENT_LEVELS, \{\s*peak,/,
-    'the fake must emit {peak, rms} frames while running',
+    'the fake must emit {peak, rms} frames while capture is live',
   );
+
+  // The zero-frame still exists. It moved from the session boundary to the
+  // CAPTURE boundary — a device change, a restart, a quit — which is now the
+  // only moment the microphone actually goes away.
   assert.match(
     backend,
     /peak: \[FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB\]/,
-    'the fake must emit the zero-frame on stop, as app.go does',
+    'a capture teardown must emit the zero-frame, so the meters fall rather than freeze',
+  );
+  const down = backend.slice(backend.indexOf('function fakeCaptureDown()'));
+  assert.match(
+    down.slice(0, down.indexOf('\n}')),
+    /stopFakeLevels\(\);/,
+    'and fakeCaptureDown is what emits it',
+  );
+
+  // The direct assertion: nothing about the meters hangs off the fake session.
+  const stop = backend.slice(backend.indexOf('function fakeStop()'), backend.indexOf('function installFakeConsoleHandle()'));
+  assert.ok(stop.length > 0, 'the slice must have found fakeStop');
+  assert.equal(
+    /stopFakeLevels\(\)|stopFakeChannelLevels\(\)/.test(stop),
+    false,
+    'fakeStop must not silence the meters: the microphone is still open, and a meter that fell to ' +
+      'nothing on STOP would tell a commentator their input had died',
   );
 });

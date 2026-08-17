@@ -28,11 +28,20 @@ import { chooseEvent } from './events.js';
 // The channel table, from the module that enforces it in the Web Audio graph.
 // See the note beside the same import in home.js.
 import { CHANNEL_MODES, normaliseChannelMode } from '../monitor/channels.js';
-// The DeckLink routing grid, its per-channel meters and the card's video lamp.
-// It is a screen inside this screen — see the "DeckLink channel routing" group
-// below for why it is a settings group and not a view of its own, and
-// channelmap.js's header for why the grid is sized the way it is.
-import { createChannelMapView } from './channelmap.js';
+// The routing grid, its per-channel meters and — on a card seat — the video
+// lamp that explains a silent one. It is a screen inside this screen: see the
+// "Channel routing" group below for why it is a settings group and not a view of
+// its own, and channelmap.js's header for why the grid is sized to a WIDTH AND A
+// DEVICE and never to a device kind.
+//
+// inputChannelCount and describeRoutingHeading are imported beside the view
+// because the GATE and the HEADING are this screen's half of that: the group is
+// shown from the width in the last pad report, and the heading is built from it.
+import {
+  createChannelMapView,
+  inputChannelCount,
+  describeRoutingHeading,
+} from './channelmap.js';
 // WHAT THIS POSITION SENDS, and the operator's confidence picture of it. Pure
 // and DOM-free — the wording, the card-present rule and the "which one is going
 // to air" sentence all live there and are driven for real in
@@ -55,14 +64,22 @@ import {
 // the two-controls-one-question failure it removes.
 // AUDIO_SOURCE_NATIVE is deliberately NOT imported: nothing on this screen
 // compares against it any more. The one place that used to — the capture-kind
-// <select>'s option list — is gone, and the one place that still asks a
-// question about the kind (renderChannelMapGroup) asks whether it is the CARD,
-// because that is the only kind with anything extra to show.
+// <select>'s option list — is gone, and the one place that still names a kind
+// (currentAudioDeviceKey) asks which of the two ID FIELDS this kind selects,
+// which is a different question from what may be shown.
+//
+// NOTHING ON THIS SCREEN GATES ANYTHING ON THE KIND ANY MORE, and that is the
+// change rather than an accident of imports. The routing group used to be
+// reachable only from audioSourceKind = decklink; it is now shown for every
+// device that negotiates a width, because a stereo pair arriving the wrong way
+// round and a mono commentator needing both ears are routing decisions too. See
+// renderChannelMapGroup.
 import {
   AUDIO_SOURCE_DECKLINK,
   normaliseAudioSourceKind,
   planAudioInputs,
   deriveAudioInputEffects,
+  encodeAudioInput,
 } from './audioinput.js';
 // THE VIDEO FORMAT, as a list of rasters rather than a box to type one into,
 // and the switcher's own format to judge it against. Pure and DOM-free — the
@@ -122,13 +139,20 @@ function blankConfig() {
     audioDeviceId: '',
     audioSourceKind: 'native',
     decklinkPersistentId: '',
-    // An EMPTY list, not a default map, and the difference is gst.ChannelMap's:
-    // the zero value means "nobody has chosen yet" and RESOLVES to channel 1
-    // left, channel 2 right — bit for bit what every seat carried before this
-    // grid existed. Writing the default out here instead would turn "not chosen"
-    // into "chosen" on every machine that ever opened Settings, after which
-    // nothing could tell an operator whether anyone had set the routing.
-    decklinkChannelMap: [],
+    // ONE ROUTING PER DEVICE, keyed "<capture kind>:<device id>" — exactly the
+    // <option> value the commentary-input picker builds (audioinput.js,
+    // encodeAudioInput) and exactly the key Go builds
+    // (internal/config.AudioDeviceKey). A key spelled two ways is a routing
+    // saved where nothing will look for it again.
+    //
+    // An EMPTY OBJECT, not a default map, and the difference is gst.ChannelMap's:
+    // an absent key means "nobody has chosen yet for that device" and RESOLVES
+    // to channel 1 left, channel 2 right — bit for bit what every seat carried
+    // before this grid existed. Writing the default out here instead would turn
+    // "not chosen" into "chosen" on every machine that ever opened Settings,
+    // after which nothing could tell an operator whether anyone had set the
+    // routing.
+    channelMaps: {},
     headphoneDeviceId: '',
     headphoneEndpointId: '',
     returnMid: 4,
@@ -298,6 +322,18 @@ export function createSettingsView(handlers) {
   // default because somebody pressed Save on an unrelated screen is a way to
   // change what is in their ears without touching a control that says so.
   let carriedReturnSource = normaliseReturnSource(undefined);
+
+  // EVERY OTHER DEVICE'S CHANNEL ROUTING, carried between populate() and
+  // collectConfig() for the same reason returnSource above is: saveConfig
+  // replaces the stored object, and this screen only ever holds ONE device's
+  // grid — the one the capture pad has negotiated.
+  //
+  // Without the carry, plugging in a USB microphone to check something and then
+  // pressing Save on an unrelated field would delete the card's routing, with a
+  // commentator's channel assignment in it, from a screen that was not showing
+  // the card at all. collectChannelMaps writes the visible grid OVER this and
+  // never instead of it.
+  let carriedChannelMaps = {};
 
   // srtReturnPort USED TO BE CARRIED HERE AND MUST NOT BE AGAIN. It has a real
   // control in the Monitor group below, because carrying it is exactly how it
@@ -1904,6 +1940,14 @@ export function createSettingsView(handlers) {
   // this brace: the two guards fail in different directions.
   addHiddenField('coughMuteMode', textInput('f-coughMuteMode'));
 
+  // Whether this build can re-point capture at all. The same all-or-nothing
+  // build axis as channelMapSupported below, and asked for the same reason: an
+  // older build has none of the three bindings, and calling one that is not
+  // there rejects with a message about a missing method rather than about a
+  // microphone. backend.captureAvailable() is the BUILD's answer — "there is no
+  // card in this machine" is a different fact and arrives on the capture event.
+  const captureSupported = backend.usingFakeBackend || backend.captureAvailable();
+
   /**
    * applyAudioInputSelection is the "and then do the correct setup based on what
    * is selected" half. All three fields move together, with the one that no
@@ -1915,10 +1959,6 @@ export function createSettingsView(handlers) {
     fields.audioSourceKind.input.value = effects.audioSourceKind;
     fields.audioDeviceId.input.value = effects.audioDeviceId;
     fields.decklinkPersistentId.input.value = effects.decklinkPersistentId;
-    // The routing grid belongs to the card, so it follows the kind. Called here
-    // rather than listened for, because these fields are hidden inputs and
-    // assigning one from script fires nothing at all.
-    //
     // The note is cleared in the same breath, with `false` for absent: a
     // selection the operator has just made came from the list, so it is by
     // construction present, and any "not connected" line left over from the
@@ -1926,7 +1966,34 @@ export function createSettingsView(handlers) {
     // state is only ever reached by LOADING a configuration, which is
     // renderAudioInput's path.
     renderAudioInputNote(false);
+    // The routing grid follows the DEVICE, so it is re-rendered here rather than
+    // listened for: these are hidden inputs, and assigning one from script fires
+    // nothing at all. It will hide immediately — the width this screen holds
+    // belongs to the device being left — and come back when the new device's
+    // report arrives. See renderChannelMapGroup.
     renderChannelMapGroup();
+    // AND CAPTURE IS RE-POINTED NOW, WITHOUT A SAVE. This is what makes the
+    // routing panel appear as soon as the device is selected rather than at the
+    // next launch: the width can only come from a pad that has negotiated, and
+    // nothing negotiates until the capture is pointed at the device.
+    //
+    // No save, deliberately. Selecting is not committing — the operator can pick
+    // an interface, watch the meters, see it is the wrong one and pick again,
+    // and config.json is untouched throughout. It is Save that commits.
+    if (!captureSupported) return;
+    backend
+      .selectCommentaryInput(
+        effects.audioSourceKind,
+        effects.audioDeviceId,
+        effects.decklinkPersistentId,
+      )
+      // REPORTED, NEVER SWALLOWED, for setChannelMap's reason and one more: the
+      // refusal an operator will actually meet is "not while sending", and a
+      // selection that was refused leaves this form showing a device the
+      // commentary is not coming from.
+      .catch((err) => {
+        setSaveMessage(`Could not switch the commentary input: ${err.message}`, true);
+      });
   }
 
   audioInputSelect.addEventListener('change', applyAudioInputSelection);
@@ -1984,35 +2051,59 @@ export function createSettingsView(handlers) {
     audioInputRow.wrap.classList.toggle('field--absent', absent);
   }
 
-  // --- the DeckLink routing grid ------------------------------------------
+  // --- the routing grid ----------------------------------------------------
   //
   // WHY THIS IS A GROUP ON THIS SCREEN AND NOT A VIEW OF ITS OWN. It is the
-  // second half of the question the group above asks: having said the
-  // commentary arrives on a card, the operator has to say WHICH of the card's
-  // sixteen embedded channels is the commentary. Splitting the two across
-  // screens would put the answer somewhere the question does not lead.
+  // second half of the question the group above asks: having said which device
+  // the commentary arrives on, the operator has to say which of that device's
+  // channels the commentary IS. Splitting the two across screens would put the
+  // answer somewhere the question does not lead.
   //
-  // IT IS ONLY EVER REACHABLE FROM audioSourceKind = decklink, and a seat on a
-  // native device must see this screen exactly as it was before the group
-  // existed. That is one `hidden` on the whole section — [hidden] is
-  // !important in main.css, so it beats .settings-group's display:grid — driven
-  // from the control above and from populate(), never from the device list: a
-  // machine can have a card in it and still capture from a USB microphone.
+  // ============ IT IS NOT GATED ON THE KIND, AND THAT IS THE CHANGE =========
+  //
+  // This group used to be reachable only from audioSourceKind = decklink, and
+  // the comment that stood here said so as a RULE. It was wrong twice over.
+  //
+  // Wrong about the hardware: a card is not the only device that presents
+  // unpositioned multichannel audio. gstosxcoreaudio.c:886-889 sets the layout
+  // to NULL for every CoreAudio source unconditionally, so a Focusrite, an RME
+  // or an aggregate is the same problem in the same shape — measured on this
+  // machine at channels=3,mask=0x0 and channels=16,mask=0x0, identical to the
+  // card's sixteen.
+  //
+  // And wrong about what routing is FOR: the operator's ruling is that the grid
+  // is shown at every width, including 1 and 2. "You may want to flip the
+  // channels on a stereo source, on a mono you may want to route it to be dual
+  // mono etc." Both are already expressible — a flip is {Left<-2, Right<-1} and
+  // dual mono is {Left<-1, Right<-1}, which is what gst.DefaultChannelMap
+  // already produces for a one-channel device — so refusing to draw them was
+  // hiding a control that already worked.
+  //
+  // What the group IS gated on is a negotiated width FOR THE DEVICE THIS FORM IS
+  // SHOWING. See renderChannelMapGroup: that is one `hidden` on the whole
+  // section ([hidden] is !important in main.css, so it beats .settings-group's
+  // display:grid), and it never comes from the device list — a machine can have
+  // a card in it and still capture from a USB microphone.
   //
   // THE MAP IS STILL COLLECTED WHILE THE GROUP IS HIDDEN. collectConfig
-  // replaces the whole document, so a native seat pressing Save on an unrelated
-  // field would otherwise DELETE the routing of a card it simply is not using
-  // today — the same silent data loss the hidden device-id fields exist to
-  // prevent, with a commentator's channel assignment in it.
+  // replaces the whole document, so a seat pressing Save while its device is
+  // still opening would otherwise DELETE that device's routing — the same silent
+  // data loss the hidden device-id fields exist to prevent, with a commentator's
+  // channel assignment in it. What stops the opposite fault — the grid speaking
+  // for a device it is not sized to — is channelMapView.collect()'s own guard.
   const channelMapSupported = backend.usingFakeBackend || backend.channelMapAvailable();
 
   const channelMapHeading = document.createElement('h2');
-  channelMapHeading.textContent = 'DeckLink channel routing';
+  // Replaced by renderChannelMapGroup with the negotiated width and the device,
+  // and never left saying DeckLink: an operator on an interface who reads
+  // "DeckLink channel routing" above their own eight channels concludes the
+  // panel is about somebody else's hardware and stops reading it.
+  channelMapHeading.textContent = describeRoutingHeading(0);
   const channelMapGroup = openGroup(channelMapHeading, 'settings-group--channelmap');
-  // HIDDEN UNTIL A CONFIG SAYS OTHERWISE. renderChannelMapGroup runs on
-  // populate(), which is one await after this screen is built, and a group that
-  // defaulted to visible would flash a DeckLink routing grid onto the screen of
-  // every seat that has never had a card in it.
+  // HIDDEN UNTIL A WIDTH ARRIVES. renderChannelMapGroup runs on populate() and
+  // on every pad report, both of which are at least one await after this screen
+  // is built, and a group that defaulted to visible would flash an empty routing
+  // grid onto every seat's screen once per open.
   channelMapGroup.hidden = true;
 
   // The half of "live" that the grid itself cannot say. channelmap.js's caveat
@@ -2046,63 +2137,216 @@ export function createSettingsView(handlers) {
   });
   currentGroup.appendChild(channelMapView.el);
 
-  // A build with no channel-map bindings says so, rather than showing the
-  // grid's "press START once" line — which would be a lie, because no amount of
-  // starting will make a binding appear. Same all-or-nothing rule as the presets
-  // and picture groups.
+  // A build with no channel-map bindings says so, rather than showing a grid
+  // whose every press is refused. Same all-or-nothing rule as the presets and
+  // picture groups.
+  //
+  // ============ WHY THIS IS NOW A BELT ON A BRACE, AND KEPT ANYWAY ==========
+  //
+  // The old gate was the capture KIND, so a card seat on a bindings-less build
+  // opened this group and read this line. The new gate is a negotiated WIDTH,
+  // and a build with no channel-map bindings has no GetChannelMap to answer one:
+  // it takes backend.getChannelMap's fallback, whose deviceKey is empty and
+  // whose width is zero, for ever. So the group never opens and this line is
+  // never read.
+  //
+  // It is kept rather than deleted, and the alternative is written down because
+  // somebody will propose it: showing the group on an unsupported build so the
+  // line IS read would put a grey paragraph on every seat of that build,
+  // including the slate-and-microphone seats that have no routing question at
+  // all — the "a routing grid flashing onto a seat that never had a card"
+  // fault in a new costume. The three `hidden` writes below stay for the same
+  // reason: they are what stops a future gate change resurrecting a grid whose
+  // every press is refused, and each one costs a line.
   const channelMapUnsupported = document.createElement('p');
   channelMapUnsupported.className = 'field-hint';
   // What the build cannot do, and what it does instead. The reason it cannot —
   // no channel-map bindings — is a fact about how this copy was compiled and is
-  // no use to somebody at a desk; it stays in this comment.
+  // no use to somebody at a desk; it stays in this comment. De-carded with the
+  // rest of this group: the channels are the INPUT's, whatever it is.
   channelMapUnsupported.textContent =
-    'This build cannot route the card’s channels. The capture takes the first two.';
+    'This build cannot route this input’s channels. The capture takes the first two.';
   channelMapUnsupported.hidden = channelMapSupported;
   channelMapView.el.hidden = !channelMapSupported;
   channelMapSaveHint.hidden = !channelMapSupported;
   currentGroup.appendChild(channelMapUnsupported);
 
   /**
-   * renderChannelMapGroup shows or hides the whole group from the capture-kind
-   * control. Called from populate() as well as from the control's own event:
-   * assigning a <select>'s value from script fires neither 'input' nor 'change',
-   * so a screen that only listened would open showing the wrong thing.
+   * currentAudioDeviceKey is the channelMaps key of the device this form would
+   * save right now: the capture kind, and the id that kind selects.
+   *
+   * It is encodeAudioInput because that IS the spelling — the picker already
+   * builds this exact string for every device it lists, and Go builds the same
+   * one in internal/config.AudioDeviceKey. Three places, one grammar, because a
+   * key spelled two ways is a routing filed where nothing will look for it
+   * again: no error, no refusal, just a grid that comes up empty the next
+   * morning with the operator's channels still in the file.
+   *
+   * Built from the three FIELDS collectConfig itself writes, never from the
+   * picker's <select>. A saved-but-absent device stays in those fields while the
+   * <select> has nothing to show for it (see renderAudioInput), and the key must
+   * follow the document being saved rather than the control.
+   *
+   * @returns {string}
    */
-  function renderChannelMapGroup() {
-    const decklink =
-      normaliseAudioSourceKind(fields.audioSourceKind.input.value) === AUDIO_SOURCE_DECKLINK;
-    channelMapGroup.hidden = !decklink;
+  function currentAudioDeviceKey() {
+    const kind = normaliseAudioSourceKind(fields.audioSourceKind.input.value);
+    const id =
+      kind === AUDIO_SOURCE_DECKLINK
+        ? fields.decklinkPersistentId.input.value.trim()
+        : fields.audioDeviceId.input.value.trim();
+    return encodeAudioInput(kind, id);
   }
 
-  // NO LISTENER ON THE KIND FIELD ANY MORE, and its absence is the point.
-  // audioSourceKind is a hidden input now — the commentary-input picker writes
-  // it — and assigning an input's value from script fires neither 'input' nor
-  // 'change', so a listener here would be a group that never opened. The picker
-  // calls this directly instead; see applyAudioInputSelection.
+  /**
+   * adoptChannelMaps normalises whatever config.json offers into a plain object
+   * of arrays. Anything else — null, a list, a string from a hand edit — reads
+   * as "no routing saved anywhere", which is the state every seat starts in and
+   * the only reading that cannot lose one.
+   *
+   * @param {unknown} value
+   * @returns {Record<string, unknown[]>}
+   */
+  function adoptChannelMaps(value) {
+    /** @type {Record<string, unknown[]>} */
+    const out = {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+    for (const [key, map] of Object.entries(value)) {
+      if (Array.isArray(map)) out[key] = map;
+    }
+    return out;
+  }
+
+  /**
+   * collectChannelMaps writes the grid that is on screen into the carried store,
+   * under the key of the device it was drawn for — over every other device's
+   * routing, never instead of it.
+   *
+   * An EMPTY grid REMOVES the key rather than storing []. Absent means "nobody
+   * has chosen" and resolves to the first two input channels; an explicit empty
+   * list says the same thing in a spelling nothing else uses, and would grow a
+   * key in config.json for every device anybody ever glanced at.
+   *
+   * @returns {Record<string, unknown[]>}
+   */
+  function collectChannelMaps() {
+    const maps = { ...carriedChannelMaps };
+    const key = currentAudioDeviceKey();
+    const map = channelMapView.collect();
+    if (map.length > 0) maps[key] = map;
+    else delete maps[key];
+    return maps;
+  }
+
+  /**
+   * channelMapState is the last pad report this screen has seen: a WIDTH and the
+   * DEVICE it belongs to. Held rather than read back, because the gate below has
+   * to answer between reports and getChannelMap is an await.
+   *
+   * Both halves start empty, which is the honest state of a screen that has not
+   * been told anything: the width is zero and the key matches no device, so the
+   * group is hidden and no grid is drawn.
+   */
+  let channelMapState = { inputChannels: 0, deviceKey: '' };
+
+  /**
+   * renderChannelMapGroup shows or hides the whole group, and names it.
+   *
+   * ===================== THE GATE, AND WHY EACH HALF IS THERE ================
+   *
+   *   channelMapSupported   the BUILD can route at all. Nothing on a machine
+   *                         changes this; a missing binding is not a missing
+   *                         device.
+   *   known                 the width this screen holds is for the device this
+   *                         FORM is showing. Without it there is a window
+   *                         between selecting an interface and its pad
+   *                         negotiating in which the grid still holds the
+   *                         previous device's sixteen, and a crosspoint pressed
+   *                         in that window writes a 2x16 matrix onto a
+   *                         two-channel pad — measured on the real card as
+   *                         "streaming stopped, reason error (-5)", the capture
+   *                         chain dead before the next level message.
+   *   width >= 1            something actually negotiated. NOT `> 2`: the
+   *                         operator's ruling is that a stereo flip and a dual
+   *                         mono are routing decisions like any other, so every
+   *                         width the pad reports gets a grid.
+   *
+   * Called from populate(), from the picker's own handler and from every pad
+   * report — the three ways either half can move. It is never called from the
+   * device LIST: a machine can have a card in it and still capture from a USB
+   * microphone.
+   */
+  function renderChannelMapGroup() {
+    const known = channelMapState.deviceKey === currentAudioDeviceKey();
+    const width = known ? inputChannelCount(channelMapState) : 0;
+    channelMapGroup.hidden = !(channelMapSupported && known && width >= 1);
+    // The heading is the width and the device, so the one number that says
+    // whether the right thing opened is readable without counting rows. The
+    // device's name is the picker's own label rather than a second spelling of
+    // it — an id, or a name this screen made up, would be a third name for a
+    // device the operator has already been shown twice.
+    channelMapHeading.textContent = describeRoutingHeading(
+      width,
+      audioInputSelect.selectedOptions?.[0]?.textContent || '',
+    );
+  }
+
+  // NO LISTENER ON THE KIND FIELD, and its absence is the point. audioSourceKind
+  // is a hidden input — the commentary-input picker writes it — and assigning an
+  // input's value from script fires neither 'input' nor 'change', so a listener
+  // here would be a group that never opened. The picker calls this directly
+  // instead; see applyAudioInputSelection.
 
   /**
    * adoptChannelMapState takes GetChannelMap's report, or the "channelMap"
    * event's, and applies it in the order that matters: the WIDTH first, then the
    * map, so the map is rendered against the width it will actually be sent at.
    *
+   * THE REPORT NAMES ITS DEVICE, and a change of device moves the map as well as
+   * the width. The store is per device (config.ChannelMaps), so when capture
+   * comes up on something else the routing under the grid has to come from that
+   * device's entry — otherwise the previous device's map is drawn against the
+   * new device's width, which is a routing nobody chose displayed as if they
+   * had.
+   *
    * A NON-EMPTY map in the report is the one IN FORCE, and it wins over the one
-   * populate() drew from config.json. They are the same on a normal launch; when
-   * they differ it is because somebody routed and did not save, and showing the
-   * saved one would be showing a routing that is not what the commentator is
-   * hearing. An EMPTY map is not adopted, because empty means "nobody has
-   * chosen" — it would overwrite a saved map with the absence of one.
+   * config.json holds. They are the same on a normal launch; when they differ it
+   * is because somebody routed and did not save, and showing the saved one would
+   * be showing a routing that is not what the commentator is hearing. An EMPTY
+   * map is not adopted, because empty means "nobody has chosen" — it would
+   * overwrite a saved map with the absence of one.
    */
   function adoptChannelMapState(state) {
+    const previousKey = channelMapState.deviceKey;
+    const deviceKey = typeof state?.deviceKey === 'string' ? state.deviceKey : '';
+    channelMapState = { inputChannels: state?.inputChannels, deviceKey };
     channelMapView.setPad(state);
-    if (state && Array.isArray(state.map) && state.map.length > 0) {
-      channelMapView.setMap(state.map);
+    if (deviceKey !== previousKey) {
+      channelMapView.setMap(carriedChannelMaps[deviceKey], deviceKey);
     }
+    if (state && Array.isArray(state.map) && state.map.length > 0) {
+      channelMapView.setMap(state.map, deviceKey);
+    }
+    // The group follows the report, which is the half populate() cannot do: a
+    // device opening, failing or being swapped happens long after this screen
+    // was drawn, and R2's whole promise is that the panel appears as soon as the
+    // device is selected rather than at the next launch.
+    renderChannelMapGroup();
   }
 
-  // The pad can negotiate while this screen is open — it does so at START — so
-  // the grid follows the event as well as the open() call. Subscribed here, in
-  // the same place and for the same reason as onStatusKeyCandidates above: the
-  // screen that needs the value is the one that asks for it.
+  // The pad negotiates while this screen is open — at launch, and again every
+  // time the device changes — so the grid follows the event as well as the
+  // open() call. It used to say "it does so at START", which was true of a
+  // capture pipeline built by START; capture is built at launch and held to quit
+  // now, and START negotiates nothing. Subscribed here, in the same place and
+  // for the same reason as onStatusKeyCandidates above: the screen that needs
+  // the value is the one that asks for it.
+  //
+  // SUBSCRIBED AT BUILD, NOT AT OPEN, and that is load-bearing rather than
+  // incidental: the report that matters most arrives while Settings is CLOSED —
+  // the operator picks a device, goes back to the main screen and comes back —
+  // and a subscription made in open() would miss it and show a stale group until
+  // the next report.
   //
   // onChannelLevels, NEVER onLevels: they are two different level elements
   // measuring two different points, and the main screen's pair is downstream of
@@ -2494,8 +2738,23 @@ export function createSettingsView(handlers) {
     // populate/collect pair as everything else all the same — see collectConfig,
     // where NOT restating it would delete a commentator's channel assignment on
     // the next Save. renderChannelMapGroup follows it because assigning the
-    // capture-kind <select> above fires neither 'input' nor 'change'.
-    channelMapView.setMap(config.decklinkChannelMap);
+    // picker's <select> above fires neither 'input' nor 'change'; it will hide
+    // the group until a pad report for this device arrives, which is the
+    // honest state of a screen that has just been handed a configuration and
+    // has not yet been told what negotiated.
+    //
+    // ONE DEVICE'S ROUTING IS DRAWN AND THE REST ARE CARRIED. The grid can only
+    // ever show the device this seat is capturing from — it is sized to the
+    // width that device's pad negotiated — so every other key in the store is
+    // held untouched between here and collectChannelMaps. This must come after
+    // the three device fields above, because the key is built from them.
+    //
+    // THE KEY GOES IN WITH THE MAP, and not as decoration: collect() will not
+    // write a grid back under a device whose map it is not holding, and the only
+    // way it can know which that is, is to be told when the map arrives.
+    carriedChannelMaps = adoptChannelMaps(config.channelMaps);
+    const savedRoutingKey = currentAudioDeviceKey();
+    channelMapView.setMap(carriedChannelMaps[savedRoutingKey], savedRoutingKey);
     renderChannelMapGroup();
     fields.headphoneDeviceId.input.value = config.headphoneDeviceId || '';
     fields[DEVICE_KEY_SRT].input.value = config[DEVICE_KEY_SRT] || '';
@@ -2599,13 +2858,18 @@ export function createSettingsView(handlers) {
       audioDeviceId: fields.audioDeviceId.input.value.trim(),
       audioSourceKind: normaliseAudioSourceKind(fields.audioSourceKind.input.value),
       decklinkPersistentId: fields.decklinkPersistentId.input.value.trim(),
-      // A list of {output, input, gain} naming only channels the capture pad
-      // negotiated, each cell at most once — the grid is incapable of producing
-      // anything else, which is the point of it, because both of those are maps
-      // internal/gst refuses by name. Collected even while the group is hidden:
-      // this form replaces the whole document, so a native-input seat pressing
-      // Save would otherwise delete the routing of the card it uses next week.
-      decklinkChannelMap: channelMapView.collect(),
+      // One routing per device, keyed by the device. Each is a list of
+      // {output, input, gain} naming only channels the capture pad negotiated,
+      // each cell at most once — the grid is incapable of producing anything
+      // else, which is the point of it, because both of those are maps
+      // internal/gst refuses by name.
+      //
+      // Collected even while the group is hidden, and every OTHER device's
+      // routing is carried through: this form replaces the whole document, so a
+      // seat that has plugged in a USB microphone would otherwise delete the
+      // routing of the card it uses next week — and would do it with the card's
+      // grid nowhere on screen. See collectChannelMaps.
+      channelMaps: collectChannelMaps(),
       headphoneDeviceId: fields.headphoneDeviceId.input.value.trim(),
       [DEVICE_KEY_SRT]: fields[DEVICE_KEY_SRT].input.value.trim(),
       // The cough mute's mode. Chosen on the MAIN SCREEN, restated here, for the

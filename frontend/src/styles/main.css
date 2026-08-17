@@ -1622,11 +1622,26 @@ input[type='range'] {
   user-select: none;
 }
 
-/* No session: empty and dimmed, no text clutter. The bars stay in the layout
-   so the picture does not move when a session starts — the same
-   nothing-moves-on-fallback rule the two pictures follow. */
+/* Nothing arriving: dimmed rather than emptied. The bars stay in the layout so
+   nothing moves when audio starts — the same nothing-moves-on-fallback rule the
+   two pictures follow. It is no longer "no session": capture is live from
+   launch, so this is what SILENCE looks like, which is a fault worth seeing at
+   line-up rather than a resting state. */
 .input-meters-idle {
   opacity: 0.35;
+}
+
+/* The static line under the meters. It says the input is open from launch and
+   that the operating system's recording light therefore is too — see home.js,
+   where the words are.
+
+   It wraps, and wrapping costs nothing: it is in the fixed-width column, which
+   scrolls itself, and it never changes text, so it cannot reflow anything. */
+.input-meters-note {
+  margin: 0.45rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
 }
 
 /* ==================================================================== */
@@ -1719,14 +1734,20 @@ input[type='range'] {
 }
 
 /* ==================================================================== */
-/* DECKLINK CHANNEL ROUTING (appended block — see the note below)       */
+/* CHANNEL ROUTING (appended block — see the note below)                */
 /*                                                                      */
-/* The sixteen-in, two-out routing grid inside Settings: ui/            */
-/* channelmap.js builds it, this paints it. It draws only from the      */
-/* :root token set and from the input meters' own fill colours, so it   */
-/* depends on nothing above except those, and it is appended at the END */
-/* of the file for the reason the two blocks before it were — another   */
-/* change was editing the middle of this stylesheet at the same time.   */
+/* The N-in, two-out routing grid inside Settings: ui/channelmap.js     */
+/* builds it, this paints it. It draws only from the :root token set    */
+/* and from the input meters' own fill colours, so it depends on        */
+/* nothing above except those, and it is appended at the END of the     */
+/* file for the reason the two blocks before it were — another change   */
+/* was editing the middle of this stylesheet at the same time.          */
+/*                                                                      */
+/* IT WAS "DECKLINK CHANNEL ROUTING" AND IS NOT ANY MORE. The grid is   */
+/* drawn for every capture device that negotiates a width — a Focusrite */
+/* or an RME is byte-for-byte the same unpositioned multichannel        */
+/* problem as the card — and at every width including 1 and 2. Nothing  */
+/* below may go back to assuming sixteen rows.                          */
 /*                                                                      */
 /* NOTHING HERE CARRIES A THRESHOLD. The meter's zone widths come from  */
 /* meters.js (the mixer's own dB boundaries) and are set inline, as     */
@@ -1736,8 +1757,8 @@ input[type='range'] {
 
 /* Every child owns the whole row. The group holds no ordinary fields —
    the grid, its caveat and its lamps are all composite items — and a
-   350px track would cut the sixteen-row grid in half. `1 / -1` and never
-   `span N`, for the reason the .settings-group rule records. */
+   350px track would cut the grid in half. `1 / -1` and never `span N`,
+   for the reason the .settings-group rule records. */
 .settings-group--channelmap > * {
   grid-column: 1 / -1;
 }
@@ -1792,16 +1813,48 @@ input[type='range'] {
 /* Four columns: the channel number, its meter, and one crosspoint per
    output. The meter column takes the slack, because it is the one the
    operator is watching while somebody talks and the other three are
-   read once. No breakpoint: the grid is sixteen rows of four cells at
-   every width this application supports. */
+   read once. No breakpoint: it is four cells per row at every width.
+
+   IT IS THE ROW COUNT THAT VARIES, from one to gst.MaxInputChannels, and
+   the two ends need different things. At one row the grid must not look
+   like a screen that failed to draw — that is what the mono line under
+   the lamps is for (channelmap.js, describePad) — and nothing here may
+   reserve height it does not have. At the wide end a 32-row grid is
+   about 1,300 px, which pushes the per-output sums, the clip warning and
+   the trim panel off the bottom of the screen: the three things the grid
+   is read WITH. So the grid scrolls itself rather than the form, which
+   keeps everything that explains it in view no matter how wide the
+   device is. 60vh is roughly sixteen rows on a 1080-line screen, so the
+   card seat — today's normal — never scrolls at all. */
 .channelmap-grid {
   display: grid;
   grid-template-columns: 4.5rem minmax(7rem, 1fr) 6.5rem 6.5rem;
   align-items: center;
   gap: 0.3rem 0.6rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  /* Room for the selected cell's outline, which sits 1px outside the
+     border and would otherwise be clipped by the scroll box against the
+     first and last rows. */
+  padding: 2px;
 }
 
+/* The header row STAYS PUT while the rows scroll under it. Without this
+   an operator on a 32-channel interface scrolls to channel 28 and is
+   looking at four unlabelled columns, two of which decide which ear a
+   commentator arrives in — and L and R are the one pair on this screen
+   where guessing wrong is inaudible until somebody complains.
+
+   The background is OPAQUE and is the settings surface's own (--bg;
+   .settings-form paints nothing of its own, so the page shows through),
+   because a transparent sticky cell lets the rows show through the
+   0.3rem gap as they pass underneath. */
 .channelmap-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-bottom: 0.15rem;
+  background: var(--bg);
   font-size: 0.7rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;

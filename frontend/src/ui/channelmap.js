@@ -1,13 +1,29 @@
 /**
- * The DeckLink channel map: the routing grid, the meter beside every input
- * channel, and the card's video-signal lamp.
+ * The channel map: the routing grid, the meter beside every input channel, and
+ * — on a card seat — the video-signal lamp that explains a silent one.
  *
  * Owner: WP-5b. The MODEL is internal/gst/channelmap.go's — this is the screen.
  *
- * A Blackmagic card presents its embedded SDI audio as ONE capture stream of
- * sixteen unpositioned channels (channel-mask=0x0, measured on the UltraStudio
- * 4K Mini). The commentary feed is stereo. Between the two sits an audioconvert
- * mix-matrix, and this file is the operator's end of it: which of the sixteen
+ * ===================== THIS IS NOT A DECKLINK SCREEN =======================
+ *
+ * It was, and the belief is worth killing by name because every second reader
+ * arrives with it. A Blackmagic card presents its embedded SDI audio as ONE
+ * capture stream of sixteen UNPOSITIONED channels (channel-mask=0x0, measured
+ * on the UltraStudio 4K Mini) — but so does every other multichannel capture
+ * device on this platform. gstosxcoreaudio.c:886-889 sets `layout = NULL` for
+ * every source unconditionally, so no CoreAudio device of any width can emit a
+ * positioned mask: a real 3-channel aggregate negotiated channels=3,mask=0x0
+ * and a 16-in interface negotiated channels=16,mask=0x0, identical in shape to
+ * the card's. A Focusrite or an RME is byte-for-byte the same problem.
+ *
+ * And the two narrow widths are routing decisions too, which is why the grid is
+ * drawn at EVERY width the pad negotiates rather than only above two: a stereo
+ * pair arriving the wrong way round is fixed by {Left<-2, Right<-1}, and a mono
+ * commentator reaches both ears by {Left<-1, Right<-1} — which is exactly what
+ * gst.DefaultChannelMap already produces for a one-channel device.
+ *
+ * The commentary feed is stereo. Between the input and it sits an audioconvert
+ * mix-matrix, and this file is the operator's end of it: which input channel
  * arrives on which of the two, and how far each contribution is turned down.
  *
  * ===================== NOTHING HERE IS A SECOND MODEL ======================
@@ -56,6 +72,21 @@
  * explains itself beats a plausible sixteen-row grid whose sixteenth row stops
  * the feed.
  *
+ * ===================== AND WHY IT IS SIZED TO A DEVICE ======================
+ *
+ * The width is not enough on its own, because capture is always live and the
+ * device under it can change while this screen is open. Selecting an interface
+ * while the card is open does not renegotiate instantly, and for the length of
+ * that reopen the last width anybody published is the CARD's sixteen. A grid
+ * that believed it still offered sixteen crosspoints over a two-channel pad
+ * writes a 2x16 matrix on the first press.
+ *
+ * So every pad report is STAMPED WITH THE DEVICE it is about (`deviceKey`,
+ * "<capture kind>:<device id>" — the same string audioinput.js encodes into an
+ * <option> value and internal/config.AudioDeviceKey builds in Go), the grid
+ * rebuilds on a change of EITHER half of that pair, and collect() refuses to
+ * speak for a device whose map it is not holding. See setPad and collect.
+ *
  * ===================== THE HALVES, AND WHY THEY ARE SPLIT ===================
  *
  * Everything above createChannelMapView is pure — plain data in, plain data out,
@@ -99,14 +130,63 @@ import {
  * only stops a garbled report — an older build, a corrupted config, a caps query
  * against a pad that renegotiated underneath us — asking the browser to lay out
  * thousands of rows.
+ *
+ * IT MOVES WHEN GO'S MOVES AND ONLY THEN. Go refuses a matrix wider than its own
+ * bound by name, so a ceiling raised here alone would draw crosspoints whose
+ * every press is refused; a ceiling raised there alone silently CLAMPS a wider
+ * pad to a narrower grid, which is the same wrong-width write in the other
+ * direction. channelmap.test.js reads gst.MaxInputChannels out of that package's
+ * source and asserts this equals it, so the pair is a two-line change and never
+ * a one-line one.
+ *
+ * IT IS 32 AND IT USED TO BE 16, with the measurement on the Go side: a 2x32
+ * mix-matrix passes audio and `level` reports 32 rms entries per message. The
+ * layout follows without a breakpoint — the grid is four cells per row at every
+ * width and scrolls itself past about sixteen rows, with the header row sticky
+ * so the L and R columns stay labelled at channel 28. See main.css.
  */
-export const MAX_INPUT_CHANNELS = 16;
+export const MAX_INPUT_CHANNELS = 32;
+
+/**
+ * captureKindOf reads the KIND half out of a device key — "decklink" from
+ * "decklink:2747401380", "native" from "native:BF568F24-…".
+ *
+ * SPLIT ON THE FIRST COLON AND THE FIRST COLON ONLY, which is the rule Go's
+ * AudioDeviceKeyFor and audioinput.js's encodeAudioInput both follow: a device
+ * id may itself contain colons, and an id carried verbatim is the only spelling
+ * three languages can agree on. Anything unrecognised reads as "native", again
+ * matching both, so a key from a newer build cannot make this screen draw a
+ * card's furniture over a microphone.
+ *
+ * @param {unknown} deviceKey
+ * @returns {string}
+ */
+export function captureKindOf(deviceKey) {
+  if (typeof deviceKey !== 'string') return 'native';
+  const at = deviceKey.indexOf(':');
+  return deviceKey.slice(0, at < 0 ? 0 : at) === 'decklink' ? 'decklink' : 'native';
+}
 
 /**
  * The two output rows, by the names an operator uses. The indices ARE
  * gst.OutputLeft and gst.OutputRight, and they are row indices of the matrix —
  * rows are outputs, columns are inputs, and that is the one thing in this design
  * that fails silently when it is the wrong way round.
+ *
+ * ===================== A TRANSPOSE IS INVISIBLE AT 2x2 =====================
+ *
+ * Which is why this is written down rather than left to be read off the code. At
+ * the width this application ran at for its whole life — two in, two out — the
+ * matrix is square, a transposed one is a legal matrix, GStreamer accepts it
+ * without a word and the only symptom is that left and right are swapped. It
+ * negotiates, it meters, it goes to air.
+ *
+ * The grid is drawn at every width now, so the first NON-SQUARE one — eight in
+ * and two out, on an interface — is where anybody who has the orientation
+ * backwards finds out, and there it does not fail politely: a 8x2 matrix written
+ * where a 2x8 belongs is refused, and audioconvert's refusal is SILENT and
+ * leaves the PREVIOUS matrix in force. So: OUTPUT ROWS, INPUT COLUMNS,
+ * everywhere, and `cells[output][input]` in this file without exception.
  *
  * `short` heads the grid's column; `label` is what the trim panel and every
  * aria-label spell out, because "L" on its own is not an answer to "where does
@@ -258,6 +338,27 @@ export function inputChannelCount(state) {
   const n = Number(state?.inputChannels);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.min(MAX_INPUT_CHANNELS, Math.floor(n));
+}
+
+/**
+ * deviceKeyOf reads WHICH DEVICE a pad report is about, '' for a report that
+ * names none.
+ *
+ * THE EMPTY STRING IS A REAL ANSWER AND IT MUST NOT BE FILLED IN. It is what
+ * getChannelMap answers when it could not ask at all (an older build, a failed
+ * call), and it matches no selection anywhere — every configured seat keys as at
+ * least "native:", including one with no device chosen. So a screen that draws a
+ * grid only while the key it holds is the key of the device on screen draws
+ * nothing for it, which is the correct reading of "we could not ask": inventing
+ * the caller's own key here would turn that into "this device negotiated zero
+ * channels", which is a claim about hardware nobody measured.
+ *
+ * @param {{deviceKey?: unknown}|null|undefined} state
+ * @returns {string}
+ */
+export function deviceKeyOf(state) {
+  const key = state?.deviceKey;
+  return typeof key === 'string' ? key : '';
 }
 
 /**
@@ -416,6 +517,75 @@ export function describeDropped(dropped, channels) {
   );
 }
 
+/**
+ * describePad is the line under the lamps that says where the grid came from,
+ * and at width 1 it is the line that says what a two-row, one-column grid IS.
+ *
+ * THE MONO CASE NEEDS A SENTENCE OF ITS OWN. A 2x1 grid is two buttons in a
+ * column, and two buttons in a column do not look like a routing decision — they
+ * look like a screen that failed to draw. What they actually offer is the choice
+ * between dual mono (both pressed, which is the default and what every mono seat
+ * already had) and a single-sided feed, and half of an audience cannot hear the
+ * second one. So it is stated rather than inferred.
+ *
+ * WIDTH 0 IS NOT "PRESS START" ANY MORE, and the copy that said so is gone with
+ * the design it described. Capture is built at launch and held to quit; a width
+ * of zero now means this input has not negotiated yet — it is opening, or it
+ * failed to open — and pressing START would not change that by one buffer. The
+ * fault itself is named under the picker (renderAudioInputNote) and on the
+ * capture state, which are the places that can say WHICH thing went wrong.
+ *
+ * @param {number} channels the negotiated width
+ * @param {boolean} neverMapped gst.ChannelMap.IsDefault: nobody has chosen yet
+ * @returns {string}
+ */
+export function describePad(channels, neverMapped) {
+  const width = inputChannelCount({ inputChannels: channels });
+  if (width <= 0) {
+    return 'This input has not negotiated a channel count yet, so there is nothing to size a grid from.';
+  }
+  const sized =
+    width === 1
+      ? 'One input channel: route it to both sides to be heard by everyone, or to one for a single-sided feed.'
+      : `Sized from the ${width} channels this capture negotiated.`;
+  if (!neverMapped) return sized;
+  // "Nobody has chosen yet" is a different statement from the routing it draws,
+  // and the difference is the first question asked after a wrong feed. gst's
+  // IsDefault exists for exactly this clause.
+  const untouched =
+    width === 1
+      ? 'Nothing routed yet — the default sends this channel to both sides.'
+      : 'Nothing routed yet — the default is channel 1 left, channel 2 right.';
+  return `${sized} ${untouched}`;
+}
+
+/**
+ * describeRoutingHeading names the routing group from the NEGOTIATED WIDTH and
+ * the device it belongs to, which is what the heading used to assert instead.
+ *
+ * It used to read "DeckLink channel routing" on every seat that could see it,
+ * because only a card seat ever could. Both halves of that are gone: any
+ * multichannel device gets this grid, and a heading naming the wrong hardware is
+ * worse than a generic one — an operator on a Focusrite reads "DeckLink" and
+ * concludes the panel is not about them.
+ *
+ * The width is IN THE HEADING because it is the one number that decides whether
+ * the grid below is the routing they expected. Sixteen crosspoints where two
+ * were expected is a device that opened the wrong way, and it is visible from
+ * across the room in the heading and not in the grid.
+ *
+ * @param {number} channels the negotiated width
+ * @param {string} [deviceName] the picker's own label for the device, if known
+ * @returns {string}
+ */
+export function describeRoutingHeading(channels, deviceName = '') {
+  const width = inputChannelCount({ inputChannels: channels });
+  if (width <= 0) return 'Channel routing';
+  const count = `${width} channel${width === 1 ? '' : 's'}`;
+  const name = typeof deviceName === 'string' ? deviceName.trim() : '';
+  return name === '' ? `Channel routing — ${count}` : `Channel routing — ${name}, ${count}`;
+}
+
 /** joinNumbers renders channel numbers the way a person says them: "3, 7 and 11". */
 function joinNumbers(numbers) {
   const list = numbers.map(String);
@@ -531,9 +701,22 @@ export function describeOutputSummary(summary) {
  * room; no audio on any channel is an embedder, a mute or a microphone, and it
  * is fixed at the position. One lamp covering both would send whoever reads it
  * to the wrong place half the time.
+ *
+ * LAMP_AUDIO LOST THE WORD "CARD" because the grid did: it now reports the
+ * channels of whatever device commentary is captured from, and a lamp reading
+ * CARD AUDIO beside a Focusrite's eight meters is a lamp about a machine that is
+ * not in the path.
+ *
+ * LAMP_VIDEO KEPT IT, and is drawn only on a card seat — see the view's
+ * setPad. It is genuinely about the card and it is genuinely about audio: a
+ * decklinkaudiosrc cannot preroll without a decklinkvideosrc in the same
+ * pipeline, so on a card seat "no video signal" is the explanation for "no audio
+ * on any channel", and the two lamps are read together. On a microphone seat
+ * there is no such coupling and the lamp would be a permanent NOT MEASURED next
+ * to a working input — furniture that teaches an operator to ignore a grey lamp.
  */
 export const LAMP_VIDEO = 'CARD VIDEO';
-export const LAMP_AUDIO = 'CARD AUDIO';
+export const LAMP_AUDIO = 'INPUT AUDIO';
 
 /**
  * SIGNAL_STATE mirrors gst.SignalState EXACTLY, and it is UPPERCASE. The three
@@ -614,24 +797,25 @@ export function deriveSignalLamp(payload) {
 }
 
 /**
- * deriveAudioLamp turns one per-channel levels frame into the CARD AUDIO lamp.
+ * deriveAudioLamp turns one per-channel levels frame into the INPUT AUDIO lamp.
  *
  *   no frame           grey  'NO LEVELS'   nothing is being captured yet
  *   every channel dead amber 'NO AUDIO ON ANY CHANNEL'
  *   otherwise          green 'AUDIO ON n OF m'
  *
  * AMBER, NOT RED, for the silent case, and the choice is not cosmetic. Total
- * silence on the card is also what the end of a session looks like (the
- * zero-frame) and what a rehearsal gap looks like; red would be spent on a state
- * that resolves itself when somebody speaks, and a red lamp that goes green on
- * its own teaches the desk to ignore red. It is a different COLOUR, a different
- * GLYPH and a different NAME from the video lamp beside it, which is the point:
- * no camera and no audio must never be mistaken for one another.
+ * silence is what a rehearsal gap looks like, and what a capture being torn down
+ * and rebuilt looks like (the zero-frame, which is now a DEVICE CHANGE rather
+ * than the end of a session — capture outlives STOP); red would be spent on a
+ * state that resolves itself when somebody speaks, and a red lamp that goes
+ * green on its own teaches the desk to ignore red. It is a different COLOUR, a
+ * different GLYPH and a different NAME from the video lamp beside it, which is
+ * the point: no camera and no audio must never be mistaken for one another.
  *
  * "Live" is measured at the meter's own floor (-60 dBFS, from meters.js) rather
  * than at the digital-silence clamp: a channel sitting at -80 dBFS of noise
  * floor is not a channel with a commentator on it, and counting it would make
- * this lamp green on a card whose sixteen channels are connected to nothing.
+ * this lamp green on an input whose channels are connected to nothing.
  *
  * @param {{peak?: unknown}|null|undefined} frame
  * @param {number} channels the negotiated count, for the "of m"
@@ -671,12 +855,19 @@ export function deriveAudioLamp(frame, channels) {
  * exist.
  *
  * The returned object:
- *   el              the element to append into a settings group
- *   setPad(state)   GetChannelMap's report: sizes the grid, or removes it
- *   setMap(v)       the stored map, from populate()
- *   collect()       the map for collectConfig()
- *   setLevels(f)    one per-channel levels frame; paints the meters and the lamp
- *   setSignal(p)    one "signal" payload; paints the video lamp
+ *   el                   the element to append into a settings group
+ *   setPad(state)        GetChannelMap's report: sizes the grid to a WIDTH AND A
+ *                        DEVICE, or removes it
+ *   setMap(v, deviceKey) the stored map and the device it belongs to
+ *   collect()            the map for collectConfig()
+ *   setLevels(f)         one per-channel levels frame; paints the meters and the lamp
+ *   setSignal(p)         one "signal" payload; paints the video lamp
+ *
+ * BOTH THE PAD AND THE MAP CARRY A DEVICE KEY, and they are two different
+ * questions: the pad's is which device NEGOTIATED, the map's is which device the
+ * routing on screen was LOADED for. They agree in the steady state and disagree
+ * for exactly as long as a device change takes to renegotiate — see collect(),
+ * which is the one place that disagreement can do damage.
  */
 export function createChannelMapView(handlers = {}) {
   const el = document.createElement('div');
@@ -734,6 +925,13 @@ export function createChannelMapView(handlers = {}) {
   /** @type {number[][]} OUTPUTS.length x padChannels; empty when there is no grid */
   let cells = [];
   let padChannels = 0;
+  /**
+   * padKey is the device the WIDTH is about; storedKey the device the MAP is
+   * about. Both are "" until something says otherwise, and "" matches no
+   * configured seat — see deviceKeyOf.
+   */
+  let padKey = '';
+  let storedKey = '';
   /** True while the stored map is the zero value: the default, chosen by nobody. */
   let neverMapped = true;
   /** @type {Array<{meter: object, buttons: object[]}>} one per input channel */
@@ -747,9 +945,18 @@ export function createChannelMapView(handlers = {}) {
 
   /**
    * buildGrid rebuilds the rows for the current pad width. Called only when the
-   * width CHANGES: a rebuild drops the operator's selection and every meter's
-   * DOM node, so doing it on every state change would make the meters flicker at
-   * the levels event's rate.
+   * width or the DEVICE changes: a rebuild drops the operator's selection and
+   * every meter's DOM node, so doing it on every state change would make the
+   * meters flicker at the levels event's rate.
+   *
+   * ON SCREEN IT IS THE OTHER WAY ROUND FROM THE MODEL, deliberately, and this
+   * is the one place the two orientations meet. `cells` is OUTPUT ROWS x INPUT
+   * COLUMNS because the matrix is; the DOM below is one row PER INPUT, with the
+   * two outputs as columns, because an operator reads down a list of channels
+   * looking for the one somebody is talking on — and at 32 channels a grid the
+   * model's way round would be 32 columns wide and unreadable. Every cell is
+   * still addressed `cells[output][input]`; see OUTPUTS on why getting that
+   * backwards is invisible at 2x2 and fatal at 2x8.
    */
   function buildGrid() {
     grid.textContent = '';
@@ -1047,26 +1254,15 @@ export function createChannelMapView(handlers = {}) {
     droppedNote.hidden = text === '';
   }
 
-  /** renderPad draws the line that says where the grid came from. */
+  /**
+   * renderPad draws the line that says where the grid came from, and at width 1
+   * the line that says what the mono case is. The wording is describePad's, up
+   * in the pure half, so `node --test` drives it for real — including the two
+   * narrow widths, which are the ones with the newest copy on them and the least
+   * exercise at a desk.
+   */
   function renderPad() {
-    if (padChannels === 0) {
-      // THE INSTRUCTION SURVIVES; the justification for it does not. An operator
-      // looking at an empty grid needs to know that pressing START once fills it
-      // and that the routing is live thereafter. WHY the grid waits — it is built
-      // from the channels the capture actually NEGOTIATED and never from what the
-      // card advertises, because a map naming a channel the stream does not have
-      // stops the feed dead — is the design of gridFromMap and belongs to whoever
-      // is tempted to build it from the advertised count instead.
-      padNote.textContent = 'Press START once to size this grid. The routing is live after that.';
-      return;
-    }
-    const sized = `Sized from the ${padChannels} channels this capture negotiated.`;
-    // "Nobody has chosen yet" is a different statement from the routing it draws,
-    // and the difference is the first question asked after a wrong feed. gst's
-    // IsDefault exists for exactly this line.
-    padNote.textContent = neverMapped
-      ? `${sized} Nothing routed yet — the default is channel 1 left, channel 2 right.`
-      : sized;
+    padNote.textContent = describePad(padChannels, neverMapped);
   }
 
   // --- meters --------------------------------------------------------------
@@ -1123,18 +1319,32 @@ export function createChannelMapView(handlers = {}) {
   // --- the handles settings.js drives --------------------------------------
 
   /**
-   * setPad takes GetChannelMap's report and sizes the grid from its
-   * inputChannels. A width that has not changed does not rebuild — the report
-   * arrives on an event as well as on open, and rebuilding would drop the
-   * operator's selection while they were using it.
+   * setPad takes GetChannelMap's report and sizes the grid to the width AND the
+   * device in it. A report that changes NEITHER does not rebuild — it arrives on
+   * an event as well as on open, and rebuilding would drop the operator's
+   * selection while they were using it.
+   *
+   * THE DEVICE IS HALF THE KEY AND THE HALF THAT WAS MISSING. Two devices can
+   * negotiate the same width — a stereo microphone and a stereo interface both
+   * report 2 — and a grid that rebuilt only on the number would carry the first
+   * one's routing straight onto the second, silently, at a width where it fits
+   * perfectly and so goes unnoticed. `channels !== padChannels || key !== padKey`
+   * and never just the first.
    */
   function setPad(state) {
     const channels = inputChannelCount(state);
-    if (channels !== padChannels) {
+    const key = deviceKeyOf(state);
+    if (channels !== padChannels || key !== padKey) {
       padChannels = channels;
+      padKey = key;
       adoptStored();
       buildGrid();
     }
+    // The card lamp is furniture on a microphone seat — see LAMP_VIDEO. Driven
+    // from the pad's own key rather than from a kind passed in beside it,
+    // because the key is what the width came stamped with and a second opinion
+    // about which device is open is the drift this stamp exists to remove.
+    lampRow.lamps[LAMP_VIDEO].el.hidden = captureKindOf(padKey) !== 'decklink';
     renderPad();
     renderCells();
     renderSums();
@@ -1142,11 +1352,17 @@ export function createChannelMapView(handlers = {}) {
   }
 
   /**
-   * setMap adopts the stored map, from populate(). It never calls onChange:
-   * loading a configuration is not an operator changing the routing.
+   * setMap adopts the stored map and the device it is the routing OF, from
+   * populate() and from the "channelMap" event. It never calls onChange: loading
+   * a configuration is not an operator changing the routing.
+   *
+   * The key is not decoration — collect() reads it. A caller that omitted it
+   * would be saying "this map belongs to no device", which is exactly the state
+   * collect() refuses to speak for.
    */
-  function setMap(map) {
+  function setMap(map, deviceKey) {
     stored = map ?? null;
+    storedKey = deviceKeyOf({ deviceKey });
     adoptStored();
     renderPad();
     renderCells();
@@ -1157,21 +1373,31 @@ export function createChannelMapView(handlers = {}) {
   /**
    * collect is what collectConfig() saves.
    *
-   * WITH A GRID it returns the map the grid is showing — so a save writes the
-   * routing the operator can see and nothing else, including the narrowing a
-   * shrunken pad forced. WITHOUT one it returns the loaded value untouched: a
-   * seat whose card has never been opened must not have its saved map deleted by
-   * a Save pressed on an unrelated field, which is exactly what collectConfig
-   * does to any field it fails to restate.
+   * WITH A GRID FOR THE DEVICE WHOSE MAP IT IS HOLDING it returns the map the
+   * grid is showing — so a save writes the routing the operator can see and
+   * nothing else, including the narrowing a shrunken pad forced. Otherwise it
+   * returns the loaded value untouched: a seat whose device has never been opened
+   * must not have its saved map deleted by a Save pressed on an unrelated field,
+   * which is exactly what collectConfig does to any field it fails to restate.
    *
-   * A NEVER-MAPPED SEAT SAVES AN EMPTY MAP, not the default it is drawing. Empty
-   * means "nobody has chosen", the Go side resolves it, and writing the default
-   * out would silently convert "not chosen" into "chosen" for every seat that
-   * ever opened this screen — after which the line saying nobody has chosen would
-   * be wrong on every machine.
+   * ===================== THE NOT-MY-DEVICE GUARD =============================
+   *
+   * `padKey === storedKey` is the second half of that, and it is the half a
+   * refusal in Go cannot help with at all. Capture is always live and the device
+   * under it can change while this screen is open; selecting an interface does
+   * not renegotiate instantly, so there is a window in which the grid is still
+   * sized to the PREVIOUS device. A Save landing in that window would write the
+   * old device's routing — narrowed or widened to the old width — under the new
+   * device's key, silently, with a commentator's channel assignment in it.
+   * gst.SetChannelMap validates a LIVE write against InputChannels() and would
+   * refuse it, but nothing validates a config.json.
+   *
+   * When the two disagree the answer is the map as it was loaded, unmodified:
+   * the routing this device already had is always a safe thing to write back,
+   * and it is the only thing on hand that is certainly about it.
    */
   function collect() {
-    if (padChannels > 0) return neverMapped ? [] : mapFromGrid(cells);
+    if (padChannels > 0 && padKey === storedKey) return neverMapped ? [] : mapFromGrid(cells);
     return Array.isArray(stored) ? stored.map((c) => ({ ...c })) : [];
   }
 
@@ -1181,7 +1407,10 @@ export function createChannelMapView(handlers = {}) {
   }
 
   // Draw once at construction so the group is never blank before the first
-  // report arrives.
+  // report arrives. The card lamp starts HIDDEN because padKey starts empty:
+  // showing it and taking it away again on the first report would be a lamp
+  // flashing onto a microphone seat's screen once per open.
+  lampRow.lamps[LAMP_VIDEO].el.hidden = true;
   renderPad();
   renderSums();
   renderTrim();

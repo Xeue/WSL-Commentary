@@ -188,16 +188,27 @@ var MachineFields = []string{
 	// reason: an index into this boot's enumeration order is not an identity, so
 	// it is not a thing that could travel even in principle.
 	"decklinkPersistentId",
-	// WHICH OF THAT CARD'S CHANNELS CARRY THE COMMENTATOR. It is the wiring of
-	// the room this PC is in — which XLR goes to which embedder input — and a
-	// preset carrying it would re-route somebody's microphone in a different
-	// building from a configuration screen, with the routing screen still
-	// showing what the operator there had chosen. The failure is worse than the
-	// two above rather than milder: a wrong capture kind or a wrong card fails
-	// loudly and does not go on air at all, whereas a wrong ROUTING starts
-	// perfectly, shows every lamp green and carries the wrong channel — or
-	// silence — for as long as nobody listens.
-	"decklinkChannelMap",
+	// WHICH OF EACH CAPTURE DEVICE'S CHANNELS CARRY THE COMMENTATOR, keyed by
+	// the device. It is the wiring of the room this PC is in — which XLR goes to
+	// which embedder or interface input — and a preset carrying it would
+	// re-route somebody's microphone in a different building from a
+	// configuration screen, with the routing screen still showing what the
+	// operator there had chosen. The failure is worse than the two above rather
+	// than milder: a wrong capture kind or a wrong card fails loudly and does
+	// not go on air at all, whereas a wrong ROUTING starts perfectly, shows
+	// every lamp green and carries the wrong channel — or silence — for as long
+	// as nobody listens.
+	//
+	// IT REPLACED decklinkChannelMap, A BARE ARRAY, and the new shape makes this
+	// row MORE machine rather than less — worth saying, because a field changing
+	// shape is exactly when somebody re-asks its classification. The keys are
+	// "<capture kind>:<device id>": a card's persistent-id, a CoreAudio UID, a
+	// WASAPI endpoint GUID. So a preset carrying one would not merely deliver
+	// the wrong routing, it would deliver it FILED AGAINST HARDWARE THE
+	// RECEIVING MACHINE HAS NEVER SEEN — audioDeviceId's phantom-endpoint fault
+	// at the top of this table, with a commentator's channel assignment
+	// attached to it.
+	"channelMaps",
 }
 
 // UIFields are the json tags of live-operational choices. Instance-DERIVED is

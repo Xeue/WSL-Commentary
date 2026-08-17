@@ -55,6 +55,14 @@
  * hardware is patched into it. What must not happen is that they find out
  * twenty minutes before kick-off. Go's own pre-flight refuses at START, naming
  * this field and the card; this is the same fact, earlier.
+ *
+ * EARLIER AGAIN, NOW. The card is opened when the application launches and held
+ * until it quits, so a card that is absent, unpatched or held by Premiere is a
+ * named capture fault in the alert column within a second of the window opening
+ * — before anybody has pressed anything. This field's warning is still the
+ * first line of that defence and is the only one that works with the machine
+ * switched off in a rack; what has gone is the world in which START was the
+ * earliest moment a hardware fault could be discovered.
  */
 
 // The two device kinds, from the one module that mirrors internal/gst's
@@ -341,31 +349,48 @@ export function describeCardOptionRefusal() {
  * PREVIEW_AT_START_CAVEAT is the permanent statement beside the preview toggle.
  * It has to be read before the toggle is used rather than discovered after it.
  *
- * IT IS A MEASUREMENT, NOT A DESIGN PREFERENCE, and saying so is the point:
- * "applied at Start" reads like an unfinished feature unless the reason is
- * beside it. Building or tearing the preview branch down on a running pipeline
- * means a set_state(NULL) inside a blocking pad probe, and that was measured to
- * take the ON-AIR leg from 50 fps to 0 — PERMANENTLY, with the pipeline still
- * reporting PLAYING and every lamp in this application still green. There is no
- * version of a live toggle worth that, so the preview is built once, at Start,
+ * IT IS A MEASUREMENT, NOT A DESIGN PREFERENCE, and saying so is the point: a
+ * caveat with no reason beside it reads like an unfinished feature. Building or
+ * tearing the preview branch down on a running pipeline means a set_state(NULL)
+ * inside a blocking pad probe, and that was measured to take the ON-AIR leg from
+ * 50 fps to 0 — PERMANENTLY, with the pipeline still reporting PLAYING and every
+ * lamp in this application still green. There is no version of a live toggle
+ * worth that, so the preview is built once, when the picture capture is built,
  * from the saved configuration.
  *
- * The wording is deliberately in the operator's terms — what to press — rather
- * than the pipeline's. "Applied at Start" is engineering; "press STOP, change
- * it, then START" is an instruction. That order is not arbitrary either: the
- * control is DISABLED while a feed is up, so stopping is genuinely the first
- * thing to do, and Go's own refusal (errPreviewChangeWhileSending) says it in
- * exactly these words.
+ * ================= THE MEASUREMENT STANDS; THE LIFETIME MOVED ===============
+ *
+ * It used to say "takes effect at START", because the branch was a tee off a
+ * pipeline that existed only for the duration of a session. The picture capture
+ * is now built at launch and held until the application quits, so the branch is
+ * decided when CAPTURE is built and the box fills in with no session anywhere in
+ * sight. Saving the toggle rebuilds the picture capture — a whole pipeline to
+ * NULL and back, which is the one safe way to change a branch and is why the
+ * sentence names the save.
+ *
+ * The measurement is not weakened by that; it applies for LONGER. The pipeline
+ * this must never be spliced into is now PLAYING from launch to quit rather than
+ * only while a feed is up, so "rebuild it, never splice it" is the rule for the
+ * whole life of the process. Off air a rebuild costs a blank preview for as long
+ * as it takes; on air it is refused outright, see VIDEO_LEG_WHILE_SENDING.
+ *
+ * THE CONSTANT'S NAME STILL SAYS START AND THE STRING NO LONGER DOES, and that
+ * is deliberate rather than missed: the name is imported by the Settings form as
+ * this field's hint, so it is renamed in the same edit that touches that form
+ * and not before. What the operator READS has to be true today; the identifier
+ * is engineering, and this paragraph is the record that the two disagree on
+ * purpose.
  */
 export const PREVIEW_AT_START_CAVEAT =
-  'Takes effect at START; it changes nothing that is transmitted.';
+  'Takes effect when you save it, off air; it changes nothing that is transmitted.';
 
 // VIDEO_SOURCE_AT_START_CAVEAT WAS HERE and is gone. It was the same rule for
 // the source control, rendered as a second 250-character paragraph beside the
 // first, and it is now said in the only place and at the only moment it can be
 // acted on: VIDEO_LEG_WHILE_SENDING, ON the control, while a feed is up. Off
-// air there is nothing to caveat — changing the source then simply works — so
-// the paragraph was a permanent warning about a transient condition.
+// air there is nothing to caveat — changing the source then rebuilds the
+// picture capture, the preview blanks for a moment and that is the whole cost —
+// so the paragraph was a permanent warning about a transient condition.
 //
 // Its content survives in this file. The stake is what differed from the
 // preview's: changing the preview under a running feed would cost the operator's
@@ -387,9 +412,45 @@ export const PREVIEW_AT_START_CAVEAT =
  * the refusal by pressing would be worse. This is renderPresetButtons' pattern
  * exactly: the refusal is the platform's, and the honest rendering of it is on
  * the control.
+ *
+ * ===================== IT IS NOW A SAFETY PROPERTY, NOT A PREFERENCE ========
+ *
+ * When the video leg lived inside the session, this was a rule about when a
+ * pipeline reads its options. With capture split from the send pipeline it is
+ * something harder: changing either control rebuilds the picture capture, and a
+ * capture rebuild under a running send pipeline hands the send pipeline's
+ * proxysrc a proxysink that has gone. MEASURED on the seam this design is built
+ * on: a second consumer attaching to a live proxysink stopped the first dead —
+ * A ended at 5.994 s the instant B attached at 6.007 s — with no error, no EOS
+ * and nothing on either bus. The feed would go silently dead with every lamp in
+ * this application still green, which is the failure class this whole
+ * application is organised against. Off air the same action is free.
  */
 export const VIDEO_LEG_WHILE_SENDING =
   'Disabled while SENDING. Press STOP, change it, then START.';
+
+/**
+ * PICTURE_CAPTURE mirrors the four states app.go publishes for a capture leg, in
+ * app.go's own lowercase spelling. Only the PICTURE leg is this file's business;
+ * the commentary leg's copy of the same four words is read in app.js.
+ *
+ * DECLARED HERE RATHER THAN IMPORTED, for this file's standing reason: it is
+ * pure, so `node --test` drives every rule in it with nothing installed, and
+ * backend.js is the adapter to a running application. That is exactly the
+ * arrangement channelmap.js's SIGNAL_STATE already has, and it carries the same
+ * obligation — videosource.test.js asserts these four strings against
+ * backend.js's CAPTURE_STATE, because a private copy of a vocabulary is a copy
+ * that can drift into matching no event that ever arrives, and the failure is
+ * silent: a caption stuck on "the card is not being captured" over a live
+ * picture. The third copy is app.go's, which mints them, and it is owed the same
+ * assertion the moment EventCapture exists — see that test.
+ */
+export const PICTURE_CAPTURE = Object.freeze({
+  OFF: 'off',
+  OPENING: 'opening',
+  LIVE: 'live',
+  FAILED: 'failed',
+});
 
 /**
  * describePreviewBox is the caption drawn INSIDE the reserved preview box.
@@ -399,18 +460,47 @@ export const VIDEO_LEG_WHILE_SENDING =
  * The preview is painted by an OPAQUE NATIVE CHILD WINDOW on top of this page,
  * exactly as the SRT return picture is (see overlay.js). So the caption is
  * visible precisely when there is no picture over it, by physics rather than by
- * a flag this side has to keep in step — which is worth having, because the one
- * thing the page genuinely cannot know is whether the Go side built a preview
- * branch this session. A box showing a caption is a box explaining itself; a box
- * showing a picture needs no caption.
+ * a flag this side has to keep in step. A box showing a caption is a box
+ * explaining itself; a box showing a picture needs no caption.
  *
- * @param {boolean} running whether a session is up
+ * ===================== IT NO LONGER SAYS "PRESS START" ======================
+ *
+ * Because pressing START is no longer what fills it in. The picture capture is
+ * built at launch and held until the application quits, so a seat with the card
+ * selected and the preview ticked has its picture BEFORE anything is sent and
+ * still has it after STOP. "PREVIEW — press START" was true when the preview was
+ * a branch of the session's own pipeline; left as it was it would now be an
+ * instruction to press a button that changes nothing about this box, beside a
+ * black rectangle whose real reason is one of the four below.
+ *
+ * So the caption is driven by the CAPTURE state instead, which is the thing that
+ * actually decides whether there is a picture to paint. The `live` case is the
+ * one the page still cannot know and still has to cover honestly: capture being
+ * live does not prove a preview BRANCH was built — the build retries without one
+ * when the surface will not attach — and there is no event that reports the
+ * branch itself. Saying so is better than an empty black box, and far better
+ * than a sentence about a button.
+ *
+ * @param {string|null|undefined} picture the picture leg's PICTURE_CAPTURE state
  * @returns {string}
  */
-export function describePreviewBox(running) {
-  return running
-    ? 'PREVIEW — not in this session. It is built at START, so STOP and START to see it.'
-    : 'PREVIEW — press START.';
+export function describePreviewBox(picture) {
+  switch (picture) {
+    case PICTURE_CAPTURE.OPENING:
+      return 'PREVIEW — opening the card.';
+    case PICTURE_CAPTURE.FAILED:
+      // The reason is Go's own sentence and it is long; it goes to the alert
+      // column, where there is room for it and where it stays until it clears.
+      // This box is 16:9 and about 120 px tall.
+      return 'PREVIEW — the card did not open. The reason is in the alerts.';
+    case PICTURE_CAPTURE.LIVE:
+      return 'PREVIEW — capture is live, but no picture is being painted here.';
+    default:
+      // OFF, and anything this build does not recognise. Not a fault: it is what
+      // a seat reads for the moment between launch and the first capture event,
+      // and what a build with no capture bindings reads for ever.
+      return 'PREVIEW — the card is not being captured.';
+  }
 }
 
 /**

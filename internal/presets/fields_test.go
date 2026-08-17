@@ -103,11 +103,13 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 // this PC captures from, and which card in it — and a preset carrying either
 // would deliver another machine's hardware by post.
 //
-// The seventh MACHINE field is decklinkChannelMap, and it is the sharpest case
-// on the list. The other six fail LOUDLY when they arrive somewhere they are not
-// true — a missing device or an absent card does not go on air at all — whereas
-// a routing from another building starts perfectly, shows every lamp green, and
-// carries the wrong channel or silence until somebody listens.
+// The seventh MACHINE field is channelMaps, and it is the sharpest case on the
+// list. The other six fail LOUDLY when they arrive somewhere they are not true —
+// a missing device or an absent card does not go on air at all — whereas a
+// routing from another building starts perfectly, shows every lamp green, and
+// carries the wrong channel or silence until somebody listens. It was the bare
+// array decklinkChannelMap and is now keyed by device, which does not move the
+// count and does not move the class.
 //
 // The fourth UI field is coughMuteMode: whether the cough control is held down
 // or latched. It is one step FURTHER from the wire than the other three — it
@@ -166,9 +168,11 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 // the cause — so a preset that could carry it would be a fault delivered by
 // post with no return address.
 //
-// decklinkChannelMap is the seventh and it does NOT fail hard, which is why it
-// belongs here most of all: a routing from another building negotiates, starts,
-// and carries the wrong channel — or nothing — behind a screen full of green.
+// channelMaps is the seventh and it does NOT fail hard, which is why it belongs
+// here most of all: a routing from another building negotiates, starts, and
+// carries the wrong channel — or nothing — behind a screen full of green. Its
+// keys are device ids, so an arriving map is also the phantom-endpoint fault at
+// the head of this list with a routing attached.
 //
 // videoSource is the eighth, and it is the one whose classification was actually
 // argued (fields.go records both sides). It is here because the authority for
@@ -179,7 +183,7 @@ func TestEventIDIsDiscoveredAndNeverTravels(t *testing.T) {
 func TestInstanceFieldsExcludeEveryDeviceField(t *testing.T) {
 	for _, tag := range []string{
 		"audioDeviceId", "headphoneDeviceId", "headphoneEndpointId", "slatePath",
-		"audioSourceKind", "decklinkPersistentId", "decklinkChannelMap", "videoSource",
+		"audioSourceKind", "decklinkPersistentId", "channelMaps", "videoSource",
 	} {
 		if slices.Contains(InstanceFields, tag) {
 			t.Errorf("InstanceFields contains %q: a preset carrying it would deliver another "+
@@ -210,7 +214,11 @@ func TestClassify(t *testing.T) {
 		{"slatePath", ClassMachine, true},
 		{"audioSourceKind", ClassMachine, true},
 		{"decklinkPersistentId", ClassMachine, true},
-		{"decklinkChannelMap", ClassMachine, true},
+		{"channelMaps", ClassMachine, true},
+		// The retired spelling. It has no Go field any more — config.Load reads it
+		// only to migrate it — so it must classify as nothing at all, which is what
+		// stops a stale row here quietly matching a key that no longer exists.
+		{"decklinkChannelMap", "", false},
 		{"videoSource", ClassMachine, true},
 		{"returnSource", ClassUI, true},
 		{"returnChannel", ClassUI, true},
@@ -251,17 +259,27 @@ func fullConfig() *config.Config {
 		// the field's whole point and a fixture holding "0" would quietly make
 		// the wrong shape look normal.
 		DeckLinkPersistentID: "0x0000000000AB12CD",
-		HeadphoneDeviceID:    "browser-media-device-hash-1234",
-		HeadphoneEndpointID:  "{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}",
-		ReturnSource:         "webrtc",
-		ReturnChannel:        "left",
-		SRTReturnPort:        40501,
-		SRTReturnPBKeyLen:    32,
-		PictureLatencyMs:     120,
-		ReturnMid:            2,
-		MonitorTile:          config.Tile{X: 10, Y: 360, W: 640, H: 360},
-		ReturnGainDB:         18.5,
-		SlatePath:            `D:\slates\wembley.png`,
+		// A routing under a REAL device key, so TestExtractCarriesOnlyTheWhitelist
+		// has something to fail on. With the field left unset, omitempty means the
+		// marshalled document has no such key at all and the assertion that a
+		// preset never carries one passes without ever being tested.
+		ChannelMaps: map[string][]config.ChannelContribution{
+			"decklink:0x0000000000AB12CD": {
+				{Output: 0, Input: 4, Gain: 1},
+				{Output: 1, Input: 5, Gain: 1},
+			},
+		},
+		HeadphoneDeviceID:   "browser-media-device-hash-1234",
+		HeadphoneEndpointID: "{0.0.0.00000000}.{7a2c1f90-4b3e-4c1a-9d55-0d1b3f8e2a11}",
+		ReturnSource:        "webrtc",
+		ReturnChannel:       "left",
+		SRTReturnPort:       40501,
+		SRTReturnPBKeyLen:   32,
+		PictureLatencyMs:    120,
+		ReturnMid:           2,
+		MonitorTile:         config.Tile{X: 10, Y: 360, W: 640, H: 360},
+		ReturnGainDB:        18.5,
+		SlatePath:           `D:\slates\wembley.png`,
 	}
 }
 

@@ -56,9 +56,15 @@
  * colour last — for a colourblind commentator and for a monochrome monitor a
  * metre away. This indicator is read from further away than any of them, so it
  * carries the same three and adds a fourth: the WORD is a different length and
- * shape in each state ("GOOD", "WORKING", "FAULT", "STANDBY"), and the glyph is
- * the lamp row's own, so somebody who has learnt ● ▲ ✕ ○ on the lamps has
+ * shape in each state ("GOOD", "WORKING", "FAULT", "STANDING BY"), and the glyph
+ * is the lamp row's own, so somebody who has learnt ● ▲ ✕ ○ on the lamps has
  * already learnt this.
+ *
+ * There are TWO SETS of those words — one for a seat that is on air and one for
+ * a seat that is not — and the shape rule holds inside each. Same states, same
+ * levels, same glyphs; red says NOT READY and amber says CHECK before START.
+ * See OVERALL_WORDS_BEFORE_START for why that is a correction and not a
+ * decoration.
  *
  * ========================= AND IT NAMES ITS REASON ==========================
  *
@@ -94,7 +100,7 @@ export const OVERALL = Object.freeze({
 });
 
 /**
- * OVERALL_WORDS is what each state SAYS. Deliberately four words of four
+ * OVERALL_WORDS is what each state SAYS ON AIR. Deliberately four words of four
  * different lengths and no shared prefix: at the distance this is read from,
  * word shape arrives before the letters do.
  */
@@ -108,6 +114,49 @@ export const OVERALL_WORDS = Object.freeze({
   // distance this is read from. It is also the broadcast word for the thing it
   // describes, which is worth more than the four characters it costs.
   [OVERALL.STANDBY]: 'STANDING BY',
+});
+
+/**
+ * OVERALL_WORDS_BEFORE_START is the same four states, said to somebody who is
+ * NOT ON AIR. Same lamps, same reduction, two different words.
+ *
+ * ================= WHY PRE-AIR NEEDS ITS OWN TWO WORDS ======================
+ *
+ * Because red and amber changed meaning underneath this indicator. Until now the
+ * lamps this summarises were all about a session: nothing was captured, measured
+ * or watched until START, so before it the row was grey and this read STANDING
+ * BY. The only pre-air red available was the monitor return.
+ *
+ * Capture is live from launch now. The card is open, the microphone is open, the
+ * signal watchdog is running and the meters are moving before anybody presses
+ * anything — so a card with no cable in it, or a commentary input that did not
+ * open, is a RED LAMP TWENTY MINUTES BEFORE KICK-OFF. That is the state this
+ * whole change exists to surface, and it is the state where the wording has to
+ * be right, because it is the last moment at which anything can be fixed
+ * cheaply.
+ *
+ *   FAULT, pre-air, reads as "something has broken" — and an operator who has
+ *   not started anything reads that as "broken in the application", shrugs, and
+ *   presses START to see. NOT READY is the same red saying the thing they can
+ *   act on: do not go on air yet.
+ *
+ *   WORKING is worse, and it is the one that would actually cost a match. It
+ *   means "this application cannot presently see all of it", which is honest
+ *   mid-session; pre-air, beside a START button, "WORKING" is read as "it is
+ *   working" — the exact opposite. CHECK is an instruction and cannot be read
+ *   as reassurance.
+ *
+ * GOOD and STANDING BY are unchanged, and GOOD is unreachable pre-air anyway:
+ * the SENDING lamp is grey NOT STARTED off air, which is a grey that is not on
+ * the settled list, so case 1 takes it to STANDBY before line 185 can be
+ * reached. That is what stops this reading GOOD on a seat that is merely idle,
+ * and it is why case 1 is untouched by any of this.
+ */
+export const OVERALL_WORDS_BEFORE_START = Object.freeze({
+  [OVERALL.GOOD]: OVERALL_WORDS[OVERALL.GOOD],
+  [OVERALL.WORKING]: 'CHECK',
+  [OVERALL.FAULT]: 'NOT READY',
+  [OVERALL.STANDBY]: OVERALL_WORDS[OVERALL.STANDBY],
 });
 
 /** OVERALL_LEVELS maps each state onto the lamp LEVEL that paints it. */
@@ -145,10 +194,19 @@ const RANK = { [LEVEL.RED]: 3, [LEVEL.AMBER]: 2, [LEVEL.GREEN]: 1, [LEVEL.GREY]:
  *        eye reaches first on the row this summarises.
  * @param {{running?: boolean}} [session] whether a send session is up. Supplied
  *        by the caller from the same sender state that flips the START/STOP
- *        button, so "STANDBY" and "the button says START" cannot disagree.
+ *        button, so "STANDBY" and "the button says START" cannot disagree. It
+ *        also chooses the VOCABULARY — see OVERALL_WORDS_BEFORE_START — which is
+ *        the second thing this argument decides and the reason it is read once,
+ *        at the top, rather than at the one case that used to need it.
  * @returns {{state: string, level: string, text: string, detail: string}}
  */
 export function deriveOverallStatus(entries, session) {
+  // ONE reading of "is a feed up", used by case 1 and by the wording. Two
+  // readings of it would be two places that can disagree about whether this seat
+  // is on air, on the one control that must never say the wrong one.
+  const running = !!session && session.running === true;
+  const build = (state, detail) => buildWith(state, detail, running);
+
   const lamps = (Array.isArray(entries) ? entries : [])
     .filter((e) => e && e.lamp)
     .map((e) => ({
@@ -185,7 +243,10 @@ export function deriveOverallStatus(entries, session) {
   if (greys.length === 0) return build(OVERALL.GOOD, '');
 
   // Case 1: nothing is running. Every grey is "not started", whatever it says.
-  if (!session || session.running !== true) {
+  // UNTOUCHED by the pre-air wording, and it has to stay that way: this is the
+  // line that keeps a merely idle seat off GOOD, because SENDING is grey NOT
+  // STARTED off air and NOT STARTED is not a settled answer.
+  if (!running) {
     return build(OVERALL.STANDBY, '');
   }
 
@@ -196,11 +257,16 @@ export function deriveOverallStatus(entries, session) {
   return build(OVERALL.WORKING, `${unknown[0].name}: ${unknown[0].text}`);
 }
 
-function build(state, detail) {
+/**
+ * buildWith assembles the answer. The STATE and the LEVEL are the same on air
+ * and off it — same lamps, same reduction, same colour — and only the WORD
+ * differs, which is what keeps the two vocabularies from becoming two rules.
+ */
+function buildWith(state, detail, running) {
   return {
     state,
     level: OVERALL_LEVELS[state],
-    text: OVERALL_WORDS[state],
+    text: (running ? OVERALL_WORDS : OVERALL_WORDS_BEFORE_START)[state],
     detail,
   };
 }

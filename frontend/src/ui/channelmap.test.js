@@ -1,7 +1,7 @@
 /**
- * Tests for the DeckLink channel map: the routing arithmetic, the wording that
- * states what the arithmetic costs, the two lamps, and the wiring that puts all
- * of it on the Settings screen.
+ * Tests for the channel map: the routing arithmetic, the wording that states
+ * what the arithmetic costs, the two lamps, and the wiring that puts all of it
+ * on the Settings screen.
  *
  * Run with:  node --test "src/ui/*.test.js"
  *
@@ -66,6 +66,10 @@ import {
   describeGain,
   crosspointLabel,
   inputChannelCount,
+  deviceKeyOf,
+  captureKindOf,
+  describePad,
+  describeRoutingHeading,
   isNeverMapped,
   defaultChannelMap,
   emptyGrid,
@@ -170,8 +174,24 @@ test('the model constants are internal/gst\'s, not a second opinion', () => {
   // and a mirrored number that drifts is exactly how a UI starts refusing maps
   // Go accepts, or offering maps it does not.
   const model = gst('channelmap.go');
-  assert.match(model, /const MaxInputChannels = 16/, 'internal/gst no longer bounds inputs at 16');
-  assert.equal(MAX_INPUT_CHANNELS, 16);
+  // READ OUT OF GO RATHER THAN PINNED AT 16, and the difference matters right
+  // now: §4.3 of the always-live-capture plan raises gst.MaxInputChannels to 32
+  // with the measurement beside it (a 2x32 mix-matrix passes audio and `level`
+  // reports 32 rms entries per message, verified on this machine), and the two
+  // sides must move in the same commit. Pinned at the literal, this test would
+  // have failed on the Go change with a message about the number rather than
+  // about the pair. Read across, it fails on the Go change saying exactly which
+  // other line has to move — and it goes on failing until it does, which is the
+  // whole job: a ceiling raised in Go alone silently CLAMPS a 32-channel pad to
+  // a 16-row grid, and a grid drawn wider than Go's bound has every press
+  // refused.
+  const bound = /const MaxInputChannels = (\d+)/.exec(model);
+  assert.ok(bound, 'internal/gst no longer declares MaxInputChannels');
+  assert.equal(
+    MAX_INPUT_CHANNELS,
+    Number(bound[1]),
+    'channelmap.js\'s MAX_INPUT_CHANNELS must equal gst.MaxInputChannels exactly',
+  );
   assert.match(model, /const ChannelGainLimit = 1\.0/, 'internal/gst no longer clamps gain at unity');
   assert.equal(GAIN_LIMIT, 1);
   assert.match(model, /OutputLeft {2}= 0/);
@@ -223,7 +243,14 @@ test('an empty map means NOBODY HAS CHOSEN, and it draws the default', () => {
 });
 
 test('the grid is always OUTPUT ROWS x the negotiated width', () => {
-  for (const channels of [1, 2, 8, 16]) {
+  // A TRANSPOSE IS INVISIBLE AT 2x2, which is why the non-square widths are in
+  // this list and why 2 alone would prove nothing. At two in and two out the
+  // matrix is square, a transposed one is a legal matrix, GStreamer accepts it
+  // without a word, and the only symptom is that left and right are swapped. The
+  // first non-square width — eight in and two out, on an interface — is where
+  // anybody holding the orientation backwards finds out, and there the refusal
+  // is SILENT and leaves the previous matrix in force.
+  for (const channels of [1, 2, 3, 8, 16, MAX_INPUT_CHANNELS]) {
     for (const grid of [emptyGrid(channels), gridFromMap([], channels).grid, gridFromMap(null, channels).grid]) {
       assert.equal(grid.length, OUTPUTS.length, `${channels}ch: two rows, one per output`);
       for (const row of grid) {
@@ -231,6 +258,11 @@ test('the grid is always OUTPUT ROWS x the negotiated width', () => {
       }
     }
   }
+
+  // And a map round-trips through the grid the same way round it went in: a
+  // contribution on input 6 must not come back on output 6.
+  const wide = [{ output: OUTPUT_RIGHT, input: 6, gain: 0.5 }];
+  assert.deepEqual(mapFromGrid(gridFromMap(wide, 8).grid), wide, 'output and input must not swap');
 });
 
 test('the negotiated count is the only thing that sizes the grid', () => {
@@ -243,7 +275,86 @@ test('the negotiated count is the only thing that sizes the grid', () => {
   for (const nothing of [undefined, null, {}, { inputChannels: 0 }, { inputChannels: -4 }, { inputChannels: 'x' }]) {
     assert.equal(inputChannelCount(nothing), 0, `${JSON.stringify(nothing)} must size no grid at all`);
   }
-  assert.equal(inputChannelCount({ inputChannels: 64 }), MAX_INPUT_CHANNELS, 'a garbled report clamps to the ceiling');
+  assert.equal(
+    inputChannelCount({ inputChannels: MAX_INPUT_CHANNELS * 4 }),
+    MAX_INPUT_CHANNELS,
+    'a garbled report clamps to the ceiling',
+  );
+});
+
+test('a width is only half a report: the device it belongs to is the other half', () => {
+  // THE STAMP IS THE WHOLE GUARD, and the failure it stops is measured. Selecting
+  // an interface while the card is open does not renegotiate instantly; for the
+  // length of that reopen the last width anybody published is the card's sixteen,
+  // and a crosspoint pressed against a two-channel pad writes a 2x16 matrix —
+  // "streaming stopped, reason error (-5)", the capture chain dead before the
+  // next level message, every coefficient in the matrix perfectly legal.
+  assert.equal(deviceKeyOf({ deviceKey: 'decklink:2747401380' }), 'decklink:2747401380');
+  assert.equal(deviceKeyOf({ inputChannels: 16 }), '', 'a report naming no device names none');
+  for (const nothing of [undefined, null, {}, { deviceKey: 7 }, { deviceKey: null }]) {
+    assert.equal(deviceKeyOf(nothing), '', `${JSON.stringify(nothing)} must name no device`);
+  }
+
+  // AN ID MAY CONTAIN COLONS, so the split is on the FIRST one and the rest is
+  // carried verbatim. This is the rule internal/config.AudioDeviceKeyFor and
+  // audioinput.js's encodeAudioInput both follow, and three places spelling one
+  // key two ways is a routing filed where nothing will look for it again.
+  assert.equal(captureKindOf('decklink:2747401380'), 'decklink');
+  assert.equal(captureKindOf('native:{0.0.1.00000000}.{d6ca5cf3}'), 'native');
+  assert.equal(captureKindOf('decklink:a:b:c'), 'decklink', 'only the first colon divides');
+  // An unrecognised kind normalises to native on both sides of the boundary, so
+  // a key from a newer build cannot make this screen draw a card's furniture
+  // over a microphone.
+  for (const odd of ['', 'coreaudio:x', 'DECKLINK:x', 'decklink', undefined, null, 7]) {
+    assert.equal(captureKindOf(odd), 'native', `${String(odd)} must not read as the card`);
+  }
+});
+
+test('the mono case gets a line of its own, because a 2x1 grid does not look like one', () => {
+  // THE OPERATOR'S RULING. The panel is drawn at every width, including 1 and 2:
+  //
+  //   "I think we always show it. You may want to flip the channels on a stereo
+  //    source, on a mono you may want to route it to be dual mono etc"
+  //
+  // At width 1 that is two buttons in a column, and two buttons in a column look
+  // like a screen that failed to draw rather than like a routing decision. What
+  // they actually offer is the choice between both ears and one, and half an
+  // audience cannot hear the second — so it is stated rather than inferred.
+  const mono = describePad(1, true);
+  assert.match(mono, /One input channel/);
+  assert.match(mono, /both sides/, 'the mono line must say what routing to both sides is FOR');
+  assert.equal(
+    /channel 1 left, channel 2 right/.test(mono),
+    false,
+    'the two-channel default is not the default at width 1, and saying so would be a lie',
+  );
+  assert.match(describePad(1, false), /One input channel/);
+  assert.equal(
+    /Nothing routed yet/.test(describePad(1, false)),
+    false,
+    'a seat that has chosen must not be told nobody has',
+  );
+
+  // Two and up keep the sized line, and the never-mapped clause is gst's
+  // IsDefault: "nobody has chosen" is a different statement from the routing on
+  // screen, and the difference is the first question asked after a wrong feed.
+  assert.match(describePad(2, true), /Sized from the 2 channels/);
+  assert.match(describePad(2, true), /channel 1 left, channel 2 right/);
+  assert.equal(describePad(16, false), 'Sized from the 16 channels this capture negotiated.');
+  assert.match(describePad(MAX_INPUT_CHANNELS, false), new RegExp(`${MAX_INPUT_CHANNELS} channels`));
+
+  // WIDTH 0 IS NOT "PRESS START" ANY MORE. Capture is built at launch and held to
+  // quit, so a missing width means this input has not negotiated — it is opening,
+  // or it failed — and pressing START would not change it by one buffer. The
+  // instruction is gone with the design it described.
+  const nothing = describePad(0, true);
+  assert.equal(/START/.test(nothing), false, 'no width is not a thing START can fix any more');
+  assert.match(nothing, /has not negotiated/);
+  assert.equal(
+    /Press START once to size this grid/.test(ui('channelmap.js')),
+    false,
+    'the old copy must be gone from the source too, or the next reader restores it',
+  );
 });
 
 test('a saved map naming channels the pad does not have is NARROWED, and the loss is reported', () => {
@@ -571,6 +682,122 @@ test('the grid is sized from the report and from nothing else', () => {
   );
 });
 
+test('the grid rebuilds on the DEVICE as well as the width, and collects for neither else', () => {
+  const src = ui('channelmap.js');
+  const setPad = src.slice(src.indexOf('  function setPad(state) {'), src.indexOf('  function setMap('));
+  assert.ok(setPad.length > 0, 'channelmap.js must define setPad');
+
+  // TWO DEVICES CAN NEGOTIATE THE SAME WIDTH. A stereo microphone and a stereo
+  // interface both report 2, and a grid that rebuilt only on the number would
+  // carry the first one's routing straight onto the second — silently, at a width
+  // where it fits perfectly and so goes unnoticed. It is the one case where the
+  // width test alone is not merely incomplete but actively wrong.
+  assert.match(
+    setPad,
+    /if \(channels !== padChannels \|\| key !== padKey\)/,
+    'a rebuild must follow either half of (deviceKey, width) moving',
+  );
+  assert.match(setPad, /const key = deviceKeyOf\(state\)/);
+
+  // THE NOT-MY-DEVICE GUARD. Go's SetChannelMap validates a LIVE write against
+  // InputChannels() and refuses one that does not fit, so the write itself is
+  // safe — but nothing validates a config.json. A Save landing in the window
+  // between selecting a device and its pad negotiating would write the PREVIOUS
+  // device's routing under the NEW device's key, with a commentator's channel
+  // assignment in it.
+  const collect = src.slice(src.indexOf('  function collect() {'), src.indexOf('/** setSignal paints'));
+  assert.ok(collect.length > 0, 'channelmap.js must define collect');
+  assert.match(
+    collect,
+    /if \(padChannels > 0 && padKey === storedKey\)/,
+    'the grid may only speak for the device whose map it is holding',
+  );
+  assert.match(
+    collect,
+    /return Array\.isArray\(stored\) \? stored\.map\(\(c\) => \(\{ \.\.\.c \}\)\) : \[\]/,
+    'and when it may not, the answer is the map as it was loaded — untouched, and certainly ' +
+      'about this device',
+  );
+
+  // The map arrives WITH its device, or the guard above has nothing to compare.
+  assert.match(src, /function setMap\(map, deviceKey\)/);
+  assert.match(src, /storedKey = deviceKeyOf\(\{ deviceKey \}\)/);
+});
+
+test('the two lamps are de-carded, and the card one is drawn only on a card seat', () => {
+  // LAMP_AUDIO LOST THE WORD "CARD" because the grid did: it reports the channels
+  // of whatever device commentary is captured from, and a lamp reading CARD AUDIO
+  // beside a Focusrite's eight meters is a lamp about a machine that is not in
+  // the path.
+  assert.equal(/CARD/.test(LAMP_AUDIO), false, 'the audio lamp must not name hardware it is not about');
+  assert.match(LAMP_AUDIO, /AUDIO/);
+
+  // LAMP_VIDEO KEPT IT and is drawn only on a card seat, which is not a leftover
+  // — it is the reason the lamp is in this panel at all. decklinkaudiosrc cannot
+  // preroll without a decklinkvideosrc in the same pipeline, so on a card seat
+  // "no video signal" is the explanation for "no audio on any channel" and the
+  // two lamps are read together. On a microphone seat there is no such coupling,
+  // and a permanent NOT MEASURED beside a working input is furniture that teaches
+  // an operator to ignore a grey lamp.
+  assert.match(LAMP_VIDEO, /CARD/);
+  const src = ui('channelmap.js');
+  assert.match(
+    src,
+    /lampRow\.lamps\[LAMP_VIDEO\]\.el\.hidden = captureKindOf\(padKey\) !== 'decklink'/,
+    'the card lamp must follow the pad’s own device key, not a kind passed in beside it',
+  );
+  // It starts hidden, or it flashes onto every microphone seat's screen once per
+  // open and is taken away again on the first report.
+  assert.match(src, /lampRow\.lamps\[LAMP_VIDEO\]\.el\.hidden = true;/);
+});
+
+test('nothing the routing screen RENDERS says DeckLink any more', () => {
+  // The gate went first and the copy has to follow it, or an operator on an
+  // interface reads a panel that names somebody else's hardware and stops
+  // reading it. Comments are stripped: this file and channelmap.js discuss the
+  // card at length — the measurements are the card's, and the video lamp's whole
+  // justification is the card's — and a guard that the WORD is gone must never be
+  // satisfiable, or breakable, by an explanation of why.
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.equal(
+    /DeckLink|the card’s|the card's/.test(strip(ui('channelmap.js'))),
+    false,
+    'channelmap.js still renders the word DeckLink or "the card\'s" in the routing copy',
+  );
+
+  // validate.js is SLICED to its two routing functions rather than scanned
+  // whole, because the rest of it validates videoSource and audioSourceKind —
+  // where "DeckLink card" is the correct name of a thing the operator is
+  // choosing from a list, and de-carding it would be wrong.
+  const validate = ui('validate.js');
+  const routing = strip(
+    validate.slice(validate.indexOf('function channelMapError('), validate.indexOf('function videoFormatError(')),
+  );
+  assert.ok(routing.length > 0, 'validate.js must define channelMapError');
+  assert.equal(
+    /DeckLink|a card presents|the card’s|the card's/.test(routing),
+    false,
+    'the routing refusals must name the INPUT, not one manufacturer’s hardware',
+  );
+  // And the ceiling in the message is the CONSTANT, never a typed number: it was
+  // "a card presents at most 16" until internal/gst raised gst.MaxInputChannels
+  // to 32, and a refusal quoting a bound the application no longer has is worse
+  // than no refusal — the operator corrects a channel that was already legal.
+  assert.match(routing, /\$\{MAX_INPUT_CHANNELS\}/);
+  assert.equal(/at most 16|at most 32/.test(routing), false, 'the bound must not be typed out');
+
+  // settings.js is not stripped-and-scanned whole for the same reason: it builds
+  // the video-source control too. The routing group's own strings are what
+  // matters.
+  const js = ui('settings.js');
+  assert.equal(
+    /channelMapUnsupported\.textContent =\s*\n?\s*'[^']*card/.test(js),
+    false,
+    'the unsupported hint must say what the INPUT cannot do, whatever the input is',
+  );
+  assert.match(js, /This build cannot route this input’s channels/);
+});
+
 test('the meter idiom is imported, not reimplemented horizontally', () => {
   const src = ui('channelmap.js');
   assert.match(
@@ -606,14 +833,58 @@ test('the caveat is drawn as permanent prose, never as a tooltip', () => {
   );
 });
 
-test('the routing screen is only reachable from a DeckLink input', () => {
+test('the routing screen is reachable from ANY device that negotiates a width', () => {
+  // REWRITTEN, NOT REPAIRED, and the old name is worth keeping in the diff: this
+  // test used to be called "the routing screen is only reachable from a DeckLink
+  // input" and it asserted `channelMapGroup.hidden = !decklink`. That was the
+  // correct guard while a card was the only device that could present
+  // unpositioned multichannel audio to this application — but it never was.
+  // gstosxcoreaudio.c:886-889 sets the layout to NULL for EVERY CoreAudio source
+  // unconditionally, so a Focusrite, an RME or an aggregate negotiates
+  // channels=N,mask=0x0 exactly as the card's sixteen do; measured on this
+  // machine at 3 and at 16.
+  //
+  // And the operator overruled the narrower version of the replacement too. The
+  // plan proposed `width > 2` on the grounds that they had asked for multitrack:
+  //
+  //   "I think we always show it. You may want to flip the channels on a stereo
+  //    source, on a mono you may want to route it to be dual mono etc"
+  //
+  // So the gate is a WIDTH, at 1 and up, and a DEVICE. Not a kind.
   const js = ui('settings.js');
   assert.match(js, /openGroup\(channelMapHeading, 'settings-group--channelmap'\)/);
   assert.match(
     js,
-    /channelMapGroup\.hidden = !decklink/,
-    'the whole group hides for a native input: that seat must see this screen exactly as it was',
+    /channelMapGroup\.hidden = !\(channelMapSupported && known && width >= 1\)/,
+    'the gate is the build, the device and a width of at least one — never the capture kind',
   );
+  assert.equal(
+    /channelMapGroup\.hidden = !decklink/.test(js),
+    false,
+    'gating the routing panel on the card would hide it from every interface that needs it',
+  );
+  const render = js.slice(
+    js.indexOf('function renderChannelMapGroup()'),
+    js.indexOf('// NO LISTENER ON THE KIND FIELD'),
+  );
+  assert.ok(render.length > 0, 'settings.js must define renderChannelMapGroup');
+  // KNOWN IS THE DEVICE STAMP, and it is the half a Go-side refusal cannot buy.
+  // Selecting an interface while the card is open does not renegotiate
+  // instantly; for the length of that reopen the last width published is the
+  // card's sixteen, and a crosspoint pressed against a two-channel pad writes a
+  // 2x16 matrix — measured as "streaming stopped, reason error (-5)" with the
+  // capture chain dead before the next level message.
+  assert.match(
+    render,
+    /const known = channelMapState\.deviceKey === currentAudioDeviceKey\(\)/,
+    'the width must be for the device the FORM is showing, or the grid is a stale one',
+  );
+  assert.match(
+    render,
+    /const width = known \? inputChannelCount\(channelMapState\) : 0/,
+    'an unknown device has no width to draw, whatever number arrived with it',
+  );
+
   // THE GROUP FOLLOWS THE PICKER, NOT A LISTENER ON THE FIELD. audioSourceKind
   // used to be a <select> the operator touched, so a 'change' listener on it was
   // the live link. It is a HIDDEN INPUT now — the one commentary-input picker
@@ -633,8 +904,25 @@ test('the routing screen is only reachable from a DeckLink input', () => {
   assert.match(
     apply,
     /renderChannelMapGroup\(\)/,
-    'the group must follow the picker live: choosing the card is what reveals its routing',
+    'the group must follow the picker live: choosing a device is what reveals its routing',
   );
+  // AND SELECTING RE-POINTS CAPTURE, WITHOUT A SAVE. This is the other half of
+  // "as soon as the device is selected": a width can only come from a pad that
+  // has negotiated, and nothing negotiates until capture is pointed at the
+  // device. A screen that waited for Save would show the panel at the next
+  // launch, which is the state R2 exists to remove.
+  assert.match(
+    apply,
+    /backend\s*\.selectCommentaryInput\(/,
+    'picking a device must re-point capture, or its width never arrives',
+  );
+  assert.equal(
+    /saveConfig|collectConfig/.test(apply),
+    false,
+    'selecting is not committing: the operator must be able to try an interface and pick again',
+  );
+  assert.match(apply, /Could not switch the commentary input/, 'a refusal must be reported, not swallowed');
+
   assert.equal(
     /fields\.audioSourceKind\.input\.addEventListener/.test(js),
     false,
@@ -646,21 +934,76 @@ test('the routing screen is only reachable from a DeckLink input', () => {
     /renderChannelMapGroup\(\)/,
     'assigning a <select> from script fires no event, so populate must call it itself',
   );
+  // AND THE PAD REPORT CALLS IT TOO, which populate cannot cover: a device
+  // opening, failing or being swapped happens long after this screen was drawn.
+  const adopt = js.slice(
+    js.indexOf('function adoptChannelMapState(state)'),
+    js.indexOf('// The pad can negotiate while this screen is open'),
+  );
+  assert.ok(adopt.length > 0, 'settings.js must define adoptChannelMapState');
+  assert.match(
+    adopt,
+    /renderChannelMapGroup\(\)/,
+    'the group must follow the width as well as the picker, or it appears only on a re-open',
+  );
+});
+
+test('the routing heading is built from the width and the device, never from DeckLink', () => {
+  // An operator on a Focusrite who reads "DeckLink channel routing" above their
+  // own eight channels concludes the panel is about somebody else's hardware and
+  // stops reading it. And the width is IN the heading because it is the one
+  // number that says whether the right thing opened — sixteen crosspoints where
+  // two were expected is visible from across the room there, and not in a grid.
+  assert.equal(describeRoutingHeading(0), 'Channel routing');
+  assert.equal(describeRoutingHeading(1), 'Channel routing — 1 channel');
+  assert.equal(describeRoutingHeading(2), 'Channel routing — 2 channels');
+  assert.equal(
+    describeRoutingHeading(8, 'Scarlett 18i20'),
+    'Channel routing — Scarlett 18i20, 8 channels',
+  );
+  // A device with no name yet is a device this screen has not been told about,
+  // not a device called "". The width still earns the heading.
+  assert.equal(describeRoutingHeading(16, '   '), 'Channel routing — 16 channels');
+
+  const js = ui('settings.js');
+  assert.equal(
+    /'DeckLink channel routing'/.test(js),
+    false,
+    'the heading must not be a literal naming one manufacturer’s hardware',
+  );
+  assert.match(
+    js,
+    /channelMapHeading\.textContent = describeRoutingHeading\(/,
+    'settings.js must build the heading rather than restate it',
+  );
 });
 
 test('the map is populated and collected, so a Save cannot silently delete it', () => {
   const js = ui('settings.js');
   const collect = js.slice(js.indexOf('function collectConfig()'), js.indexOf('function clearAllErrors()'));
   const populate = js.slice(js.indexOf('function populate(config)'), js.indexOf('function refreshSecretBadges'));
-  assert.match(populate, /channelMapView\.setMap\(config\.decklinkChannelMap\)/);
-  assert.match(collect, /decklinkChannelMap: channelMapView\.collect\(\)/);
+  // THE STORE IS PER DEVICE and the grid draws exactly one entry of it: the one
+  // belonging to the device this seat captures from. populate reads that entry,
+  // collectConfig writes it back over the others rather than instead of them.
+  assert.match(populate, /carriedChannelMaps = adoptChannelMaps\(config\.channelMaps\)/);
+  assert.match(populate, /const savedRoutingKey = currentAudioDeviceKey\(\)/);
+  // THE KEY GOES IN WITH THE MAP. collect() will not write a grid back under a
+  // device whose map it is not holding (the not-my-device guard), and the only
+  // way it can know which device that is, is to be told when the map arrives.
+  assert.match(
+    populate,
+    /channelMapView\.setMap\(carriedChannelMaps\[savedRoutingKey\], savedRoutingKey\)/,
+    'the map and the device it belongs to must be handed in together',
+  );
+  assert.match(collect, /channelMaps: collectChannelMaps\(\)/);
   // AND IT IS COLLECTED WHILE THE GROUP IS HIDDEN. collectConfig replaces the
-  // whole document, so a native-input seat pressing Save on an unrelated field
-  // would otherwise delete a commentator's channel assignment.
+  // whole document, so a seat whose routing panel is not on screen pressing Save
+  // on an unrelated field would otherwise delete a commentator's channel
+  // assignment.
   assert.equal(
-    /if \(!?decklink\)[\s\S]{0,80}decklinkChannelMap/.test(collect),
+    /if \(!?decklink\)[\s\S]{0,80}channelMaps/.test(collect),
     false,
-    'the map must be collected unconditionally, never only when the group is on screen',
+    'the store must be collected unconditionally, never only when the group is on screen',
   );
 });
 
@@ -736,20 +1079,147 @@ test('the two level events are kept apart, because they measure different points
   );
 });
 
-test('the fake backend brings a card up, so the dev loop can exercise all of it', () => {
+test('the fake backend brings CAPTURE up at load, not a card up at START', () => {
+  // REWRITTEN, not repaired. The previous version of this test asserted that
+  // fakeCardUp() was called from the fake session start and fakeCardDown() from
+  // its stop, which was the correct guard while capture WAS the session: one
+  // pipeline, built at START, destroyed at STOP.
+  //
+  // Capture is now built at launch and held to quit, and the send pipeline is
+  // the only thing START makes. So the old assertions have been inverted rather
+  // than dropped — the fake must bring capture up at MODULE LOAD, and START and
+  // STOP must not touch it. Leaving the old ones passing would have meant the
+  // dev loop could only ever see the routing grid while sending, which is the
+  // exact state R2 exists to remove.
   const backend = ui('backend.js');
-  assert.match(backend, /function fakeCardUp\(\)/);
-  assert.match(backend, /fakeCardUp\(\);/, 'the fake session must negotiate a pad and measure a signal');
-  assert.match(backend, /fakeCardDown\(\);/, 'and take both away on stop: a lamp still green after STOP teaches a bad habit');
+  assert.match(backend, /function fakeCaptureUp\(\)/);
   assert.match(
     backend,
-    /const FAKE_LIVE_CHANNELS = \[\d+, \d+\];/,
+    /if \(fakeBrowserSession\) \{\s*setTimeout\(fakeCaptureUp, 0\);/,
+    'the fake capture must come up at module load: meters, pad, signal and preview before START. ' +
+      'One macrotask late, which is this fake’s domReady — see capture.test.js for why that is not ' +
+      'the same as "at load, whenever"',
+  );
+
+  // ...and only in a browser. node --test imports this module with no window,
+  // and a ticker started there would hang the suite rather than fail it.
+  assert.match(backend, /const fakeBrowserSession = usingFakeBackend && typeof window !== 'undefined';/);
+
+  // START AND STOP MUST NOT OWN CAPTURE. Sliced rather than searched whole,
+  // because the names appear all over the fake and what matters is which
+  // function calls them.
+  const start = backend.slice(backend.indexOf('function fakeStart()'), backend.indexOf('function fakeStop()'));
+  const stop = backend.slice(backend.indexOf('function fakeStop()'), backend.indexOf('function installFakeConsoleHandle()'));
+  assert.ok(start.length > 0 && stop.length > 0, 'the slices must have found both functions');
+  for (const [what, src] of [['fakeStart', start], ['fakeStop', stop]]) {
+    assert.equal(
+      /fakeCaptureUp\(\)|fakeCaptureDown\(\)|startFakeLevels\(\)|stopFakeLevels\(\)|startFakeChannelLevels\(\)|stopFakeChannelLevels\(\)/.test(src),
+      false,
+      `${what} must not build or tear down capture: meters, the negotiated width, the routing and ` +
+        'the signal all survive STOP, and a fake that took them away would agree with the product ' +
+        'this change replaced',
+    );
+  }
+
+  // The teardown still exists — it is what a device change, a restart and a
+  // quit do — and it is still what emits the zero-frames.
+  assert.match(backend, /function fakeCaptureDown\(\)/);
+  assert.match(
+    backend,
+    /peak: \[FAKE_LEVELS_SILENCE_DB, FAKE_LEVELS_SILENCE_DB\]/,
+    'a capture teardown must silence the meters rather than freeze them at the last level',
+  );
+
+  // Only SOME channels carry audio, and no two of them move together. The first
+  // is the find-the-commentator interaction; the second is the matrix, where a
+  // transpose is invisible at 2x2 and identical channels would make a flipped
+  // map look exactly like a correct one on the programme meter they feed.
+  assert.match(
+    backend,
+    /const FAKE_LIVE_CHANNELS = \[\d+(?:, \d+)+\];/,
     'only some fake channels may carry audio — a fake where all sixteen moved together would let ' +
       'the find-the-commentator interaction break unnoticed',
   );
-  assert.match(backend, /inputChannels: 0,/, 'the fake must start with no negotiated pad, as InputChannels() does');
+  assert.match(
+    backend,
+    /const FAKE_CHANNEL_PHASE_STEPS = \d+;/,
+    'each fake input channel needs its own phase, or a transposed matrix passes unnoticed',
+  );
+  assert.match(
+    backend,
+    /function fakeProgrammePeaksAt\(step\)/,
+    'the programme meter must be the per-channel frame reduced THROUGH the map in force, which is ' +
+      'where alevel sits — otherwise the routing grid has no visible effect in a dev session',
+  );
+
+  // The device model reaches every width the matrix was measured working at.
+  const table = backend.slice(backend.indexOf('const FAKE_DEVICES = ['), backend.indexOf('FAKE_DEFAULT_INPUT_ID ='));
+  const widths = new Set([...table.matchAll(/channels: (\d+),/g)].map((m) => Number(m[1])));
+  for (const width of [1, 2, 3, 8, 16, 32]) {
+    assert.ok(
+      widths.has(width),
+      `the fake device table must be able to present ${width} channels: the panel is drawn at every ` +
+        'width the pad negotiates, including 1 (dual mono) and 2 (a stereo flip), and 32 is ' +
+        'gst.MaxInputChannels',
+    );
+  }
+
+  // Zero is still reachable and still draws no grid — it is the reopen window of
+  // a device change now, rather than "nobody has pressed START".
+  assert.match(backend, /inputChannels: 0,/, 'not-negotiated must still be expressible');
   assert.match(backend, /setSignal: \(state, flaps\) =>/, 'a real loss is reported once in a match; this is how it is reached');
   assert.match(backend, /setChannelCount: \(channels\) =>/);
+  assert.match(backend, /selectInput: \(kind, id\) =>/, 'the dev loop must be able to change device without a Wails build');
+});
+
+test('the channelMap payload carries the device the width belongs to', () => {
+  // THE STAMP IS THE WHOLE GUARD. Selecting a Focusrite while the card is open
+  // does not re-negotiate instantly, and for the length of that reopen the last
+  // width published is the card's 16. A grid that believed it still offered
+  // sixteen crosspoints over a two-channel pad writes a 2x16 matrix on the first
+  // press — measured on the real card as "streaming stopped, reason error (-5)"
+  // with the capture chain dead before the next level message.
+  //
+  // Go's SetChannelMap refuses a map that does not fit InputChannels(), so the
+  // write itself is safe; what the key buys is that the button is never on
+  // screen, and — the half a refusal cannot help with at all — that a narrowed
+  // grid collected at Save cannot overwrite the other device's saved routing.
+  const backend = ui('backend.js');
+  assert.match(
+    backend,
+    /export const EVENT_CHANNEL_MAP = 'channelMap';/,
+    'the event name is app.go’s and must not drift',
+  );
+
+  // THE GO SIDE IS ASSERTED, NOT ONLY THE FAKE, and that is the half this test
+  // was missing rather than a belt on one it already had. Every assertion below
+  // this point reads backend.js's fake device model, which is written in this
+  // repository to be correct — so the whole suite went green over an app.go that
+  // published no key at all, a real build in which the gate could never match
+  // and the routing panel never appeared on any seat, at any width. The fake
+  // cannot be the witness for a contract whose other end is in Go.
+  assert.match(
+    read(repoRoot, 'app.go'),
+    /DeviceKey\s+string\s+`json:"deviceKey"`/,
+    'app.go’s channelMapPayload must carry the device key: settings.js hides the routing group ' +
+      'until the key in the report equals the key of the device the form is showing, so a payload ' +
+      'without one hides the panel forever',
+  );
+
+  assert.match(backend, /deviceKey: fakeCommentaryKey,/, 'the fake must stamp every payload with its device');
+  assert.match(
+    backend,
+    /\{ inputChannels: 0, map: \[\], isDefault: true, deviceKey: '' \}/,
+    'and the could-not-ask fallback must carry an EMPTY key: it matches no selection, so the grid ' +
+      'draws nothing rather than reading "this device negotiated zero channels"',
+  );
+
+  // The saved routing is per device, for the reason config.ChannelMaps exists:
+  // a single slot cannot say which device its contents belong to, and with
+  // always-live capture a Save made while a stereo microphone is selected would
+  // narrow the card's sixteen-wide routing without saying so.
+  assert.match(backend, /const fakeChannelMaps = new Map\(\);/);
+  assert.match(backend, /fakeChannelMaps\.set\(fakeCommentaryKey, written\);/);
 });
 
 test('every class the routing screen adds is styled, and no threshold lives in the CSS', () => {
@@ -769,10 +1239,31 @@ test('every class the routing screen adds is styled, and no threshold lives in t
   // (the video source and the card preview) failed this assertion with a
   // flex-basis that has nothing to do with a dB scale. main.css's convention is
   // that each late block opens with its own banner, so that is the boundary.
-  const from = sheet.indexOf('DECKLINK CHANNEL ROUTING');
-  const rest = sheet.slice(from);
-  const next = rest.indexOf('/* ====', 1);
-  const block = next > 0 ? rest.slice(0, next) : rest;
+  //
+  // AND THE LOCATOR IS CHECKED BEFORE IT IS USED — TWICE OVER, because it was
+  // wrong in two different ways and both of them passed.
+  //
+  // It read sheet.indexOf('DECKLINK CHANNEL ROUTING') until the banner was
+  // de-carded with the rest of this screen. On a miss indexOf is -1, slice(-1)
+  // is the last CHARACTER of the file, and every assertion below passes on it.
+  // Hence the `> 0`.
+  //
+  // The second was quieter and had been there all along: main.css writes a
+  // banner as one `/* … */` comment PER LINE, so slicing from the banner TEXT
+  // and stopping at the next `/* ====` stopped at the banner's own closing rule
+  // — and the "block" being scanned for a flex-basis was six lines of prose,
+  // with not one CSS rule in it. So the slice starts AFTER the banner closes and
+  // runs to the next appended block's banner, and the assertions below are
+  // asserted against the rules they were written for.
+  const banner = sheet.indexOf('CHANNEL ROUTING (appended block');
+  assert.ok(banner > 0, 'main.css must still carry the routing block’s banner, or this test proves nothing');
+  const bannerEnd = sheet.indexOf('*/', sheet.indexOf('/* ====', banner)) + 2;
+  const next = sheet.indexOf('/* ====', bannerEnd);
+  const block = sheet.slice(bannerEnd, next > 0 ? next : undefined);
+  assert.ok(
+    block.includes('.channelmap-grid {') && block.includes('.channelmap-trim {'),
+    'the slice must reach the routing block’s RULES, not just its banner prose',
+  );
   assert.equal(
     /flex-basis:\s*\d/.test(block),
     false,
@@ -782,5 +1273,33 @@ test('every class the routing screen adds is styled, and no threshold lives in t
     /grid-column:\s*span/.test(block),
     false,
     'a span wider than the track count adds implicit columns rather than clamping',
+  );
+
+  // THE ROW COUNT IS NOW 1..32, and the two ends need different things of the
+  // layout. gst.MaxInputChannels doubled, so a full grid is about 1,300px — it
+  // would push the per-output sums, the clip warning and the trim panel off the
+  // bottom of the screen, which are the three things the grid is read WITH. The
+  // grid scrolls itself rather than the form.
+  assert.match(block, /max-height:\s*60vh/, 'a 32-row grid must scroll itself, not the settings form');
+  assert.match(block, /overflow-y:\s*auto/);
+  // And the header row stays put, or an operator on channel 28 is looking at four
+  // unlabelled columns — two of which decide which ear a commentator arrives in,
+  // where guessing wrong is inaudible until somebody complains.
+  const head = block.slice(block.indexOf('.channelmap-head {'), block.indexOf('.channelmap-name {'));
+  assert.ok(head.length > 0, 'main.css must style .channelmap-head');
+  assert.match(head, /position:\s*sticky/);
+  assert.match(head, /top:\s*0/);
+  assert.match(
+    head,
+    /background:\s*var\(--bg\)/,
+    'a transparent sticky cell lets the rows show through the row gap as they pass underneath',
+  );
+  // NO ROW COUNT ANYWHERE IN THE BLOCK. A height, a repeat() or a minmax sized to
+  // sixteen rows is the advertised width creeping back in through the stylesheet,
+  // which is the one place the pad's report cannot correct it.
+  assert.equal(
+    /repeat\(\s*(?:16|32)\b|grid-template-rows/.test(block),
+    false,
+    'the row count comes from the pad and may never be written into the CSS',
   );
 });
