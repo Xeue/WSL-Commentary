@@ -722,11 +722,17 @@ export function createHomeView(handlers) {
   // It is STATIC. It says the same words in every state, so it can never appear,
   // change or clear — the column's rule — and it names the one control that does
   // answer the question it is about.
-  const metersNote = document.createElement('p');
-  metersNote.className = 'input-meters-note';
-  metersNote.textContent =
-    'Open from launch: the input is live, and its recording light is on, before anything is sent. ' +
-    'The SENDING lamp is what says you are on air.';
+  // NO EXPLANATORY LINE UNDER THE METERS, and this is the second time one has
+  // been removed from this application. There was a sentence here saying the
+  // input is open from launch and that the SENDING lamp is what says you are on
+  // air. The operator: "This doesn't need to be there at all."
+  //
+  // He is right. The meters MOVE or they do not; the SENDING lamp is lit or it
+  // is not. Both facts are already on the screen, permanently, in the two
+  // controls the sentence was describing — so the prose added nothing except
+  // something to read at a commentary position mid-match. If the distinction
+  // between "my microphone is open" and "I am on air" is ever genuinely unclear,
+  // the fix is a clearer lamp, not a paragraph next to it.
 
   // --- the card's confidence preview, at the right edge --------------------
   //
@@ -766,27 +772,31 @@ export function createHomeView(handlers) {
   previewCaption.className = 'preview-caption';
   previewTile.appendChild(previewCaption);
 
-  // THE METERS LIVE BESIDE THE PICTURE, NOT IN THE TRAY.
+  // ONE ROW: PICTURE, PREVIEW, METERS. Left to right, all three side by side.
   //
-  // They were moved into the column with everything else that was not a
-  // picture, and the operator moved them back on sight: "the meters should
-  // still be next to the preview and not in the settings sidebar".
+  // The rework had swept the meters into the settings column, and the operator
+  // moved them back — "the meters should still be next to the preview and not
+  // in the settings sidebar" — and then corrected the shape of the fix as well,
+  // because the first attempt put the preview and the meters in a vertical
+  // stack: "The preview of the video was correct before, being next to the main
+  // video. Now it's sat above the meter? They should all be next to each other
+  // in a line."
   //
-  // He is right, and the rule the rework applied was too broad. The column is
-  // for things you consult — settings, lamps, alerts, the preset. The meters are
-  // not consulted, they are WATCHED, continuously, for the whole match, and they
-  // answer the one question a commentator asks most often: is my microphone
-  // live and at level. A watched instrument belongs in the eyeline with the
-  // picture; putting it in a tray costs a head-turn every time.
+  // So they are three flex siblings of .pgm-stage and not a stack, which is what
+  // the preview and the meters each had before any of this and what their CSS
+  // was written for: the preview is height-led from the stage's own height in
+  // cqh units, and the meters stretch to the stage.
   //
-  // They sit in a side stack with the preview rather than inside it, because the
-  // preview tile is hidden on a seat that has not turned it on and the meters
-  // must be there either way.
-  const stageSide = document.createElement('div');
-  stageSide.className = 'stage-side';
-  stageSide.append(previewTile, metersEl, metersNote);
-
-  pgmStage.append(pgmTile, stageSide);
+  // The meters are here rather than in the column because they are WATCHED,
+  // continuously, for the whole match — they answer the question a commentator
+  // asks most often, which is whether their microphone is live and at level.
+  // The column is for what you go and consult.
+  //
+  // Both are SIBLINGS of .pgm-tile and never children of it. That rectangle is
+  // covered by an opaque native child window, so anything drawn inside it is
+  // invisible exactly when a commentator is mid-match, and two native windows
+  // told to occupy overlapping rectangles simply erase one another.
+  pgmStage.append(pgmTile, previewTile, metersEl);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;

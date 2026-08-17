@@ -236,21 +236,26 @@ test('home.js draws the meters OUTSIDE the tile, beside the picture', () => {
   // of the tile, outside that rectangle, as .pgm-stage was.
   assert.match(
     src,
-    /stageSide\.append\(previewTile, metersEl, metersNote\)/,
+    /pgmStage\.append\(pgmTile, previewTile, metersEl\)/,
     'the meters must stand in the stack beside the picture, with the preview',
   );
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, stageSide\)/,
+    /pgmStage\.append\(pgmTile, previewTile, metersEl\)/,
     'and that stack must be a SIBLING of the tile inside the stage',
   );
-  // The fourth child is the static line under the meters, and it is in the
-  // column with them for the same reason: it says the input is open from launch
-  // — and therefore that the operating system's recording light is on when
-  // nothing is being sent — which a commentator who reads that light as "I am
-  // live" needs beside the meters rather than in a tooltip. It never changes
-  // text, so it can never move anything.
-  assert.match(src, /metersNote\.className = 'input-meters-note'/);
+  // AND NOTHING ELSE IS IN THAT STACK. There was an explanatory line under the
+  // meters — that the input is open from launch, and that the SENDING lamp is
+  // what says you are on air — and the operator had it removed: "This doesn't
+  // need to be there at all."
+  //
+  // The meters move or they do not; the SENDING lamp is lit or it is not. Both
+  // facts were already on the screen in the two controls the sentence described.
+  // This assertion is here so the paragraph does not grow back.
+  assert.ok(
+    !/input-meters-note/.test(src),
+    'no explanatory prose beside the meters — a clearer lamp, never a paragraph',
+  );
   assert.ok(
     !/pgmTile\.(?:append|appendChild)\([^)]*metersEl/.test(src),
     'the meters container must never be appended to pgmTile — the native overlay covers that rectangle',

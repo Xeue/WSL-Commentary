@@ -948,52 +948,16 @@ input[type='range'] {
 /* Start/stop + lamps                                                   */
 /* ------------------------------------------------------------------ */
 
-/* .stage-side is the column of instruments that stands BESIDE the picture:
-   the confidence preview and the input meters.
+/* The three instruments on the stage row — picture, preview, meters — are laid
+   out by their own rules below (.pgm-tile, .preview-tile, .input-meters), which
+   is how it was before the column rework and what the operator restored: "They
+   should all be next to each other in a line."
 
-   It replaces .action-row, which held START next to the lamp row and no longer
-   exists — START moved to the match bar beside the overall indicator, and the
-   lamps moved to the column.
+   There is no wrapper element and no .action-row any more. START moved to the
+   match bar beside the overall indicator and the lamp row moved to the column,
+   so the two no longer travel together. */
 
-   Fixed to its content's width and never growing, because everything it gains
-   it takes from .pgm-tile, and the tile is the commentator's picture. The
-   meters stretch to the stage height inside it; the preview keeps its own
-   clamped 16/9 box. */
-.stage-side {
-  flex: 0 0 auto;
-  align-self: stretch;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 0.4rem;
-  min-width: 0;
-  /* The stage is a size container for the tile's height computation. This child
-     must not become a second one, or the meters below would size against
-     themselves. */
-  container-type: normal;
-}
 
-/* Inside the stack the meters own the leftover height, so they read as a column
-   of instruments rather than a strip pinned to the middle. */
-.stage-side .input-meters {
-  flex: 1 1 auto;
-  min-height: 60px;
-  margin-left: 0;
-}
-
-.stage-side .preview-tile {
-  margin-left: 0;
-  align-self: stretch;
-  /* Width-led here, not height-led: it is in a column now, so its height comes
-     from the ratio and its width from the stack. */
-  height: auto;
-  width: clamp(120px, 24cqw, 260px);
-}
-
-.stage-side .input-meters-note {
-  flex: 0 0 auto;
-  max-width: 26ch;
-}
 
 .lamps {
   display: flex;
@@ -1697,12 +1661,6 @@ input[type='range'] {
 
    It wraps, and wrapping costs nothing: it is in the fixed-width column, which
    scrolls itself, and it never changes text, so it cannot reflow anything. */
-.input-meters-note {
-  margin: 0.45rem 0 0;
-  font-size: 0.72rem;
-  line-height: 1.35;
-  color: var(--text-muted);
-}
 
 /* ==================================================================== */
 /* REMOTE ACCESS (appended block — see the note below before moving it) */

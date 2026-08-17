@@ -414,19 +414,24 @@ test('the match bar is the indicator, START, and the cough controls', () => {
   assert.match(bar, /flex-wrap:\s*nowrap/, 'and never wraps to a second line');
 });
 
-test('the meters and the preview stand together beside the picture', () => {
+test('picture, preview and meters sit in one row', () => {
   const src = codeOnly(home);
   assert.match(
     src,
-    /stageSide\.append\(previewTile, metersEl, metersNote\)/,
+    /pgmStage\.append\(pgmTile, previewTile, metersEl\)/,
     'one stack beside the picture, so the meters are there whether or not the preview is',
   );
-  assert.match(src, /pgmStage\.append\(pgmTile, stageSide\)/);
+  assert.match(src, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
 
-  // It must never take width from the picture on its own initiative.
-  const side = rule('.stage-side');
-  assert.ok(side, 'main.css must style .stage-side');
-  assert.match(side, /flex:\s*0 0 auto/, 'fixed to its content, never growing into the tile');
+  // Neither may take width from the picture on its own initiative.
+  const preview = rule('.preview-tile');
+  assert.match(preview, /flex:\s*0 0 auto/, 'the preview is fixed to its content');
+  const meters = rule('.input-meters');
+  assert.ok(meters, 'main.css must style .input-meters');
+  assert.ok(
+    !/flex:\s*1/.test(meters),
+    'the meters must not grow into the picture',
+  );
 });
 
 test('the muted state is drawn with an outline, which costs no layout', () => {

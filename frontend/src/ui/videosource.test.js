@@ -1066,8 +1066,8 @@ test('the preview is a second native surface, positioned the way the picture alr
   // windows told to occupy overlapping rectangles erase one another and neither
   // side reports anything wrong, so the box the preview overlay is measured
   // from must sit outside the box the picture overlay is measured from.
-  assert.match(home, /stageSide\.append\(previewTile, metersEl, metersNote\)/);
-  assert.match(home, /pgmStage\.append\(pgmTile, stageSide\)/);
+  assert.match(home, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
+  assert.match(home, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
   assert.ok(
     !/pgmTile\.appendChild\(previewTile\)/.test(home),
     'the preview box must never be inside the box the picture overlay is measured from',
@@ -1210,11 +1210,10 @@ test('the preview box has a home in the stylesheet, and the caption is inside it
   // It must not be able to cover the commentator's picture: capped, ratio-locked,
   // and beside the tile rather than over it.
   //
-  // ANCHORED AT THE LINE START, and that is not fussiness. `.stage-side
-  // .preview-tile` sits earlier in the sheet and CONTAINS the string
-  // '.preview-tile {', so an unanchored indexOf silently reads the override and
-  // asserts the base rule's properties against it — a test that passes or fails
-  // on which rule happens to be written first.
+  // ANCHORED AT THE LINE START, and that is not fussiness: it was already wrong
+  // once. Any descendant rule — `.something .preview-tile {` — CONTAINS the
+  // string '.preview-tile {', so an unanchored indexOf silently reads whichever
+  // rule is written first and asserts the base rule's properties against it.
   const at = sheet.indexOf('\n.preview-tile {');
   assert.ok(at > 0, 'main.css must carry a base .preview-tile rule');
   const tile = sheet.slice(at, sheet.indexOf('}', at));
@@ -1222,14 +1221,6 @@ test('the preview box has a home in the stylesheet, and the caption is inside it
   assert.match(tile, /clamp\(/, 'the preview must be capped, not a fraction of an arbitrarily large window');
   assert.ok(!/position:\s*absolute/.test(tile), 'it is a flex sibling of the picture, never laid over it');
 
-  // And in the stack beside the picture it is width-led rather than height-led,
-  // still capped, and still never grows into the tile.
-  const inStack = sheet.slice(
-    sheet.indexOf('.stage-side .preview-tile {'),
-    sheet.indexOf('}', sheet.indexOf('.stage-side .preview-tile {')),
-  );
-  assert.match(inStack, /clamp\(/, 'capped in the stack too');
-  assert.ok(!/position:\s*absolute/.test(inStack));
 });
 
 test('the video source is adopted from every path that adopts a configuration', () => {
