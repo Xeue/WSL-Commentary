@@ -215,28 +215,34 @@ test('the peak-hold is per channel and reset() forgets everything', () => {
 /* Wiring guards                                                             */
 /* ------------------------------------------------------------------------ */
 
-test('home.js draws the meters OUTSIDE the tile — now in the side column', () => {
+test('home.js draws the meters OUTSIDE the tile, beside the picture', () => {
   // The native SRT overlay is an opaque child window covering exactly the
   // tile's rectangle (measurePictureRect measures .pgm-tile), so a meter
   // appended inside the tile is invisible for as long as the good picture is
   // up — precisely when it is needed. The meters must be a SIBLING in
   // .pgm-stage.
   const src = ui('home.js');
-  // WHERE they are has changed; WHY has not. The meters used to sit beside the
-  // tile in .pgm-stage. They now sit in the side column, because the operator
-  // asked for a main area holding the picture, one overall indicator and the
-  // cough controls and nothing else: "The rest can live in some form of settings
-  // tray or something like that."
+  // WHERE they are has moved twice; WHY has never changed. They sat beside the
+  // tile in .pgm-stage, went to the side column with everything else that was
+  // not a picture, and came straight back on the operator's correction: "the
+  // meters should still be next to the preview and not in the settings
+  // sidebar". They are watched continuously for a whole match, and a watched
+  // instrument belongs in the eyeline rather than a tray.
   //
-  // The property this test exists for is untouched by the move and is asserted
-  // below: the meters are never a CHILD of .pgm-tile, because that rectangle is
+  // The property this test exists for survives all of it and is asserted below:
+  // the meters are never a CHILD of .pgm-tile, because that rectangle is
   // covered by an opaque native child window and anything drawn inside it is
-  // invisible exactly when a commentator is mid-match. The column is outside
-  // that rectangle, as .pgm-stage was.
+  // invisible exactly when a commentator is mid-match. .stage-side is a sibling
+  // of the tile, outside that rectangle, as .pgm-stage was.
   assert.match(
     src,
-    /makeRailSection\('Status', lampsEl, metersEl, metersNote\)/,
-    'the meters container must be built into the side column',
+    /stageSide\.append\(previewTile, metersEl, metersNote\)/,
+    'the meters must stand in the stack beside the picture, with the preview',
+  );
+  assert.match(
+    src,
+    /pgmStage\.append\(pgmTile, stageSide\)/,
+    'and that stack must be a SIBLING of the tile inside the stage',
   );
   // The fourth child is the static line under the meters, and it is in the
   // column with them for the same reason: it says the input is open from launch

@@ -364,31 +364,69 @@ test('nothing can collapse the column except the two buttons', () => {
 // The tray, and what is left in the main area
 // ---------------------------------------------------------------------------
 
-test('every tray surface the operator listed is in the column', () => {
+test('what is CONSULTED is in the column', () => {
   // "During the match we only really need an overall status, single green/red
   // indicator and the cough mute buttons. The rest can live in some form of
   // settings tray or something like that."
+  //
+  // The first cut of this took "the rest" literally and swept the meters and
+  // START in with the settings. The operator moved both back on sight, and the
+  // line the corrections draw is not main-area-versus-tray but CONSULTED versus
+  // WATCHED: the column holds what you go and look at, the main area holds what
+  // you keep in your eye.
   const src = codeOnly(home);
   const railAppend = src.slice(src.indexOf('rail.append('), src.indexOf(');', src.indexOf('rail.append(')));
   for (const [what, token] of [
     ['the six lamps', 'lampsEl'],
-    ['the input meters', 'metersEl'],
     ['the device and return controls', 'controls'],
     ['the picture selector', 'sourceGroup'],
-    ['START/STOP', 'actionRow'],
     ['the preset picker', 'presetIndicator'],
   ]) {
     assert.ok(railAppend.includes(token), `${what} must be in the column (${token})`);
   }
+  for (const [what, token, why] of [
+    ['the input meters', 'metersEl',
+      'watched continuously for the whole match — "the meters should still be next to the ' +
+      'preview and not in the settings sidebar"'],
+    ['START/STOP', 'startStopBtn',
+      'it belongs beside the verdict that prompts it — "start should still be in the footer ' +
+      'next to the CHeck status"'],
+  ]) {
+    assert.equal(
+      railAppend.includes(token),
+      false,
+      `${what} must NOT be in the column: ${why}`,
+    );
+  }
 });
 
-test('the match bar is the indicator and the cough controls, and nothing else', () => {
+test('the match bar is the indicator, START, and the cough controls', () => {
   const src = codeOnly(home);
   assert.match(
     src,
-    /matchBar\.append\(overallEl, coughEl\)/,
-    'the operator asked for exactly these two beside the picture',
+    /matchBar\.append\(overallEl, startStopBtn, coughEl\)/,
+    'the verdict, the act it prompts, and the mute — in that reading order',
   );
+  // And it must still not grow. The bar's fixed height is what stops any of
+  // this moving the picture, and START is 64px inside an 84px bar.
+  const bar = rule('.match-bar');
+  assert.match(bar, /height:\s*var\(--match-bar-h\)/, 'the bar stays a fixed height');
+  assert.match(bar, /flex-wrap:\s*nowrap/, 'and never wraps to a second line');
+});
+
+test('the meters and the preview stand together beside the picture', () => {
+  const src = codeOnly(home);
+  assert.match(
+    src,
+    /stageSide\.append\(previewTile, metersEl, metersNote\)/,
+    'one stack beside the picture, so the meters are there whether or not the preview is',
+  );
+  assert.match(src, /pgmStage\.append\(pgmTile, stageSide\)/);
+
+  // It must never take width from the picture on its own initiative.
+  const side = rule('.stage-side');
+  assert.ok(side, 'main.css must style .stage-side');
+  assert.match(side, /flex:\s*0 0 auto/, 'fixed to its content, never growing into the tile');
 });
 
 test('the muted state is drawn with an outline, which costs no layout', () => {

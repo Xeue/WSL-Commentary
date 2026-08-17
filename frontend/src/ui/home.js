@@ -766,10 +766,27 @@ export function createHomeView(handlers) {
   previewCaption.className = 'preview-caption';
   previewTile.appendChild(previewCaption);
 
-  // The stage holds the two PICTURES and nothing else. The meters moved to the
-  // column (see above); everything that is not a picture is either in the match
-  // bar under the stage or in the column beside it.
-  pgmStage.append(pgmTile, previewTile);
+  // THE METERS LIVE BESIDE THE PICTURE, NOT IN THE TRAY.
+  //
+  // They were moved into the column with everything else that was not a
+  // picture, and the operator moved them back on sight: "the meters should
+  // still be next to the preview and not in the settings sidebar".
+  //
+  // He is right, and the rule the rework applied was too broad. The column is
+  // for things you consult — settings, lamps, alerts, the preset. The meters are
+  // not consulted, they are WATCHED, continuously, for the whole match, and they
+  // answer the one question a commentator asks most often: is my microphone
+  // live and at level. A watched instrument belongs in the eyeline with the
+  // picture; putting it in a tray costs a head-turn every time.
+  //
+  // They sit in a side stack with the preview rather than inside it, because the
+  // preview tile is hidden on a seat that has not turned it on and the meters
+  // must be there either way.
+  const stageSide = document.createElement('div');
+  stageSide.className = 'stage-side';
+  stageSide.append(previewTile, metersEl, metersNote);
+
+  pgmStage.append(pgmTile, stageSide);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -1062,9 +1079,13 @@ export function createHomeView(handlers) {
   );
 
   // --- start/stop + lamps -------------------------------------------------
-  const actionRow = document.createElement('div');
-  actionRow.className = 'action-row';
-
+  //
+  // These two no longer travel together and there is no .action-row any more.
+  // START goes to the match bar beside the overall indicator, the lamp row goes
+  // to the column's Status section, and each is appended where it lands rather
+  // than into a shared wrapper — a wrapper appended in one place while its
+  // children are appended in another is how an element silently ends up in
+  // whichever DOM position ran last.
   const startStopBtn = document.createElement('button');
   startStopBtn.type = 'button';
   startStopBtn.className = 'btn btn-primary btn-start';
@@ -1072,8 +1093,6 @@ export function createHomeView(handlers) {
   startStopBtn.addEventListener('click', () => handlers.onStartStop());
 
   const { el: lampsEl, lamps } = createLampRow(LAMP_NAMES);
-
-  actionRow.append(startStopBtn, lampsEl);
 
   // ======================= THE STATUS BANNER IS GONE =========================
   //
@@ -1202,7 +1221,17 @@ export function createHomeView(handlers) {
   latchBtn.addEventListener('click', () => handlers.onMuteLatchToggle());
 
   coughEl.append(coughReadout, pushBtn, latchBtn);
-  matchBar.append(overallEl, coughEl);
+  // START/STOP SITS WITH THE STATUS, and that is the operator's correction:
+  // "start should still be in the footer next to the CHeck status".
+  //
+  // The rework had moved it into the column's Session section on the reasoning
+  // that the match bar is for what you WATCH and the column for what you DO.
+  // That reasoning fails on this one control, because going on air and knowing
+  // whether you are on air are the same question asked twice — the indicator
+  // reads CHECK or NOT READY precisely when the operator's next act is to press
+  // this — and separating a verdict from the action it prompts puts a head-turn
+  // between them at the only moment nobody has one to spare.
+  matchBar.append(overallEl, startStopBtn, coughEl);
 
   // ----- the keyboard bindings -----
   //
@@ -1383,8 +1412,8 @@ export function createHomeView(handlers) {
     railHeader,
     alertsRegion,
     makeRailSection('Cough mute', coughModeGroup),
-    makeRailSection('Session', actionRow, presetIndicator),
-    makeRailSection('Status', lampsEl, metersEl, metersNote),
+    makeRailSection('Session', presetIndicator),
+    makeRailSection('Status', lampsEl),
     makeRailSection('Audio', controls),
     makeRailSection('Picture', sourceGroup),
     railStrip,

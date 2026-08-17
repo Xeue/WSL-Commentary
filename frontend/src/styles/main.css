@@ -91,6 +91,23 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
+  /* ================== THE PAGE DOES NOT SCROLL. AT ALL. ==================
+     #app is 100dvh with overflow:hidden, so there is nothing to scroll TO —
+     and the page still bounced, because WKWebView rubber-bands the DOCUMENT
+     whether or not it has anywhere to go. It is a macOS behaviour and WebView2
+     does not do it, which is why it arrived with the Mac build and not with the
+     layout it looks like it belongs to.
+
+     For a commentator mid-match this is the forbidden class of movement: the
+     operator's rule is that anything causing their video to move is a massive
+     no, and a rubber-band drags the picture with the whole document for as long
+     as a finger rests on a trackpad.
+
+     overflow:hidden gives the document no scrollport, overscroll-behavior:none
+     removes the bounce that survives it, and the rail's own scroller sets
+     `contain` so reaching its end never chains back out to here. */
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 body {
@@ -234,6 +251,11 @@ button {
   /* Its own scroll, so ten alerts and every setting can coexist without either
      pushing the other out of the application. */
   overflow-y: auto;
+  /* And the scroll STOPS HERE. Without this, reaching the end of the column
+     chains the gesture onward to the document, which then rubber-bands and
+     takes the commentator's picture with it — a scroll in the settings tray
+     moving the video is exactly the failure the tray exists to prevent. */
+  overscroll-behavior: contain;
   /* And never a horizontal one: a long word in an alert wraps inside the fixed
      width rather than widening anything. */
   overflow-x: hidden;
@@ -926,13 +948,51 @@ input[type='range'] {
 /* Start/stop + lamps                                                   */
 /* ------------------------------------------------------------------ */
 
-.action-row {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  flex-wrap: wrap;
-  margin: 0 0 0.5rem;
+/* .stage-side is the column of instruments that stands BESIDE the picture:
+   the confidence preview and the input meters.
+
+   It replaces .action-row, which held START next to the lamp row and no longer
+   exists — START moved to the match bar beside the overall indicator, and the
+   lamps moved to the column.
+
+   Fixed to its content's width and never growing, because everything it gains
+   it takes from .pgm-tile, and the tile is the commentator's picture. The
+   meters stretch to the stage height inside it; the preview keeps its own
+   clamped 16/9 box. */
+.stage-side {
   flex: 0 0 auto;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.4rem;
+  min-width: 0;
+  /* The stage is a size container for the tile's height computation. This child
+     must not become a second one, or the meters below would size against
+     themselves. */
+  container-type: normal;
+}
+
+/* Inside the stack the meters own the leftover height, so they read as a column
+   of instruments rather than a strip pinned to the middle. */
+.stage-side .input-meters {
+  flex: 1 1 auto;
+  min-height: 60px;
+  margin-left: 0;
+}
+
+.stage-side .preview-tile {
+  margin-left: 0;
+  align-self: stretch;
+  /* Width-led here, not height-led: it is in a column now, so its height comes
+     from the ratio and its width from the stack. */
+  height: auto;
+  width: clamp(120px, 24cqw, 260px);
+}
+
+.stage-side .input-meters-note {
+  flex: 0 0 auto;
+  max-width: 26ch;
 }
 
 .lamps {
@@ -2507,19 +2567,21 @@ input[type='range'] {
   width: 100%;
 }
 
-/* START/STOP first in the column, full width, and still the biggest control in
-   the application. It is not needed DURING a match — which is why it left the
-   main area — but it is the first thing reached before one. */
-.home-rail .action-row {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 0.7rem;
-  margin: 0;
+/* START in the match bar. Fixed size and never shrinking: the bar is a fixed
+   84px and never wraps, so its children shrink and ellipsise instead of moving
+   the picture — but this one must not, because a START button that has
+   ellipsised is a START button somebody hesitates over. It is 64px tall inside
+   an 84px bar, so it fits without touching --match-bar-h and therefore without
+   moving anything. */
+.match-bar .btn-start {
+  flex: 0 0 auto;
+  min-width: 140px;
 }
 
-.home-rail .btn-start {
-  width: 100%;
-}
+/* START/STOP is NOT in the column. It went back to the match bar beside the
+   overall indicator, on the operator's correction, because the verdict and the
+   action it prompts belong together. The .home-rail .action-row and
+   .home-rail .btn-start rules that used to sit here went with it. */
 
 .home-rail .lamps {
   flex-direction: column;

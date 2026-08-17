@@ -1057,12 +1057,17 @@ test('the preview is a second native surface, positioned the way the picture alr
   // TWO BOXES, NEVER ONE. Two opaque native windows told to occupy overlapping
   // rectangles erase one another, and neither side reports anything wrong.
   const home = codeOnly(ui('home.js'));
-  // The stage holds the two PICTURES and nothing else now: the input meters
-  // moved into the side column when the main area was reduced to the picture,
-  // one overall indicator and the cough controls. What this assertion is FOR is
-  // unchanged and is the second half of the line — the preview box is a sibling
-  // of the tile, never a child of it.
-  assert.match(home, /pgmStage\.append\(pgmTile, previewTile\)/);
+  // The preview box lives in .stage-side beside the picture, with the input
+  // meters, which is where the operator put both back: "the meters should still
+  // be next to the preview and not in the settings sidebar".
+  //
+  // What this assertion is FOR is unchanged and is the second half of the line:
+  // the preview box is never a DESCENDANT of the tile. Two opaque native
+  // windows told to occupy overlapping rectangles erase one another and neither
+  // side reports anything wrong, so the box the preview overlay is measured
+  // from must sit outside the box the picture overlay is measured from.
+  assert.match(home, /stageSide\.append\(previewTile, metersEl, metersNote\)/);
+  assert.match(home, /pgmStage\.append\(pgmTile, stageSide\)/);
   assert.ok(
     !/pgmTile\.appendChild\(previewTile\)/.test(home),
     'the preview box must never be inside the box the picture overlay is measured from',
@@ -1202,12 +1207,29 @@ test('the preview box has a home in the stylesheet, and the caption is inside it
   for (const selector of ['.preview-tile', '.preview-caption', '.field--check']) {
     assert.ok(sheet.includes(selector), `main.css must style ${selector}`);
   }
-  // It must not be able to cover the commentator's picture: sized from the
-  // stage's height, capped, and beside the tile rather than over it.
-  const tile = sheet.slice(sheet.indexOf('.preview-tile {'), sheet.indexOf('}', sheet.indexOf('.preview-tile {')));
+  // It must not be able to cover the commentator's picture: capped, ratio-locked,
+  // and beside the tile rather than over it.
+  //
+  // ANCHORED AT THE LINE START, and that is not fussiness. `.stage-side
+  // .preview-tile` sits earlier in the sheet and CONTAINS the string
+  // '.preview-tile {', so an unanchored indexOf silently reads the override and
+  // asserts the base rule's properties against it — a test that passes or fails
+  // on which rule happens to be written first.
+  const at = sheet.indexOf('\n.preview-tile {');
+  assert.ok(at > 0, 'main.css must carry a base .preview-tile rule');
+  const tile = sheet.slice(at, sheet.indexOf('}', at));
   assert.match(tile, /aspect-ratio:\s*16 \/ 9/);
   assert.match(tile, /clamp\(/, 'the preview must be capped, not a fraction of an arbitrarily large window');
   assert.ok(!/position:\s*absolute/.test(tile), 'it is a flex sibling of the picture, never laid over it');
+
+  // And in the stack beside the picture it is width-led rather than height-led,
+  // still capped, and still never grows into the tile.
+  const inStack = sheet.slice(
+    sheet.indexOf('.stage-side .preview-tile {'),
+    sheet.indexOf('}', sheet.indexOf('.stage-side .preview-tile {')),
+  );
+  assert.match(inStack, /clamp\(/, 'capped in the stack too');
+  assert.ok(!/position:\s*absolute/.test(inStack));
 });
 
 test('the video source is adopted from every path that adopts a configuration', () => {
