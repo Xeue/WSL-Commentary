@@ -283,25 +283,40 @@ func main() {
 		},
 	})
 
+	// A wails.Run failure is reported BEFORE the teardown, because teardown no
+	// longer returns — it ends the process itself on every path (see App.teardown).
+	// The message goes to the LOG FILE as well as stderr: a release build has no
+	// console, and a failure this early — a WebView2 environment that would not
+	// create, say — is otherwise undiagnosable. The exit status is not read by
+	// anything (a GUI process launched from a shortcut), so it is not preserved
+	// through the hard exit below; the diagnosis is.
+	if err != nil {
+		log.Printf("wslcomms: wails.Run returned an error: %v", err)
+		fmt.Fprintln(os.Stderr, "wslcomms:", err)
+	}
+
 	// teardown is idempotent and normally ran under OnShutdown already. It is
 	// repeated here because wails.Run can also return by a path that never fires
 	// OnShutdown — a WebView2 environment that fails to create, or a macOS
 	// single-instance handover, which os.Exit(0)s from inside wails.Run without
-	// unwinding — and because the os.Exit below would skip a deferred call
-	// entirely. On that macOS path teardown is reached only if the exit somehow
-	// does not happen, and there is nothing to tear down anyway; it is idempotent
-	// and cheap, so it stays unconditional rather than growing a special case.
+	// unwinding. On the ordinary close it has already run and force-exited from
+	// inside OnShutdown, so this call is never reached; on the paths that skip
+	// OnShutdown it is what ends the process.
 	//
-	// IT MAY NOT RETURN. A teardown that had to abandon a step ends the process
-	// itself rather than handing an unaccountable thread to the ordinary exit
-	// path; see App.teardown. That is deliberate and it is why nothing below
-	// this line may be load-bearing for anything but the error report.
+	// IT DOES NOT RETURN. teardown ends the process through TerminateProcess on
+	// every path now, not only when it had to abandon a step: ExitProcess over
+	// the GStreamer, D3D11, GPU-driver, WASAPI and COM DLLs this process has
+	// loaded can deadlock in DLL_PROCESS_DETACH even after a clean shutdown, which
+	// is the wslcomms that would not close. See App.teardown and exit_windows.go.
 	app.teardown()
 
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "wslcomms:", err)
-		os.Exit(1)
-	}
+	// Unreachable when teardown ended the process, which is every real path. It is
+	// the backstop for the one path that could fall through — a teardown that was
+	// already run under OnShutdown and so no-ops the second time here — so that the
+	// process still leaves by TerminateProcess rather than dropping off the end of
+	// main into the Go runtime's ExitProcess and the very DLL_PROCESS_DETACH
+	// deadlock teardown exists to avoid.
+	forceExit()
 }
 
 // setWebView2Arguments sets the Chromium command line WebView2 is created with.

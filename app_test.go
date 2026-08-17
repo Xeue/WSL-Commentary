@@ -2340,12 +2340,21 @@ func TestTeardownAbandonsAWedgedStepAndStillRunsTheRest(t *testing.T) {
 	}
 }
 
-// TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned keeps the hard exit
-// rare. It is the last resort for a thread that cannot be accounted for, and a
-// shutdown that stopped everything it was asked to must leave by the ordinary
-// door: Wails still has an error to return to main, and main still has an exit
-// status to set from it.
-func TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned(t *testing.T) {
+// TestTeardownEndsTheProcessEvenOnACleanShutdown pins the exit that stops the
+// wslcomms nobody could close.
+//
+// A clean teardown — every step stopped, nothing abandoned — must STILL end the
+// process itself through the hard exit, rather than returning to let the Go
+// runtime exit normally. The ordinary exit is ExitProcess, which runs
+// DLL_PROCESS_DETACH over the GStreamer, D3D11, GPU-driver, WASAPI and COM DLLs
+// this process has loaded, and that detach can deadlock under the loader lock
+// even when our own teardown was perfectly tidy — measured live as a process
+// left as a single thread stuck in exit, with nvwgf2umx, gstd3d11, dxgi and
+// d3d11 loaded, killed by hand in Task Manager. So the hard exit is the door for
+// EVERY close, not only the one where a step could not be stopped. This test is
+// the inversion of the earlier one that kept the hard exit rare; the live
+// evidence is why it inverted. See App.teardown and exit_windows.go.
+func TestTeardownEndsTheProcessEvenOnACleanShutdown(t *testing.T) {
 	a, _ := newTestApp(t)
 	setConfig(a, srtReturnConfig())
 	silencePump(a)
@@ -2367,9 +2376,10 @@ func TestTeardownDoesNotEndTheProcessWhenNothingWasAbandoned(t *testing.T) {
 
 	a.teardown()
 
-	if got := exits.Load(); got != 0 {
-		t.Errorf("teardown ended the process %d time(s) on a clean shutdown; the hard exit is for a "+
-			"step that could not be stopped, not for every close", got)
+	if got := exits.Load(); got != 1 {
+		t.Errorf("a clean teardown ended the process %d time(s); want exactly 1. ExitProcess over this "+
+			"DLL set can deadlock in DLL_PROCESS_DETACH even after a tidy shutdown, so the hard exit "+
+			"(TerminateProcess) is the door for every close, not only an abandoned one", got)
 	}
 	if ctl.closeCount() == 0 {
 		t.Error("the mixer write path was not closed by a clean teardown")

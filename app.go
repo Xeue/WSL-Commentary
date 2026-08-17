@@ -1951,11 +1951,32 @@ func (a *App) shutdown(_ context.Context) {
 // carries its own budget and an overrun abandons that step rather than the rest
 // of the shutdown; shutdownTimeout is the backstop over the lot.
 //
-// If anything WAS abandoned, this does not return. The window has already gone,
-// a thread is unaccounted for, and a wslcomms left running after a match is a
-// support call — so the process is ended here rather than handed to
-// an exit path that would have to step over that thread. See the file comment
-// and hardExit.
+// # THIS NEVER RETURNS: it ends the process itself, on every path
+//
+// That is a deliberate change from "only when a step was abandoned", and the
+// reason does not depend on anything having gone wrong. It is the hazard
+// exit_windows.go was written for. Once gst.Init has run, this process has the
+// whole bundled GStreamer, D3D11, the GPU user-mode driver, WASAPI and COM
+// loaded, and the ordinary exit — the Go runtime returning from main, which is
+// ExitProcess — runs DLL_PROCESS_DETACH for every one of them under the loader
+// lock. Those detach handlers, and the graphics driver's, can DEADLOCK there
+// even after a completely clean teardown, because our pipelines reaching NULL
+// says nothing about the library and driver threads the DLLs run for themselves.
+//
+// This was measured live, and it is exactly the operator's "I have to kill it in
+// Task Manager": a wslcomms closed normally, every step of this teardown
+// completed, and it was left as a SINGLE thread stuck inside process exit —
+// nvwgf2umx (the NVIDIA D3D11 driver), gstd3d11, dxgi and d3d11 all still loaded,
+// the main thread waiting on the loader lock in DLL_PROCESS_DETACH. So a clean
+// shutdown must leave by the SAME door as an abandoned one: hardExit, which is
+// TerminateProcess, which skips DLL_PROCESS_DETACH entirely.
+//
+// exit_windows.go establishes that nothing durable is lost by that — every write
+// this process makes is synchronous, and the kernel reclaims the audio endpoint,
+// the sockets, the M2L-X fan-out slot and the handles. The clean path writes no
+// log line on the way out, because nothing went wrong; only the abandoned and
+// timed-out paths announce why they gave up. See the file comment, hardExit and
+// exit_windows.go.
 func (a *App) teardown() {
 	a.shutdownOnce.Do(func() {
 		abandoned := make(chan int, 1)
@@ -1967,16 +1988,18 @@ func (a *App) teardown() {
 		defer timer.Stop()
 		select {
 		case n := <-abandoned:
-			if n == 0 {
-				return
+			if n > 0 {
+				log.Printf("wslcomms: shutdown abandoned %d step(s) that would not return; "+
+					"ending the process rather than exiting through them", n)
 			}
-			log.Printf("wslcomms: shutdown abandoned %d step(s) that would not return; "+
-				"ending the process rather than exiting through them", n)
 		case <-timer.C:
 			// The per-step budgets sum to shutdownTimeout, so reaching this is
 			// arithmetic gone wrong rather than work gone slow. Same answer.
 			log.Printf("wslcomms: shutdown did not complete within %s; exiting anyway", shutdownTimeout)
 		}
+		// Every path ends here — a clean shutdown as much as an abandoned one — for
+		// the reason in the doc comment: ExitProcess over this DLL set can deadlock
+		// in DLL_PROCESS_DETACH regardless of how tidy the teardown was.
 		a.hardExit()
 	})
 }
