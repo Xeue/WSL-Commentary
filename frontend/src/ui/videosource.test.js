@@ -1066,8 +1066,8 @@ test('the preview is a second native surface, positioned the way the picture alr
   // windows told to occupy overlapping rectangles erase one another and neither
   // side reports anything wrong, so the box the preview overlay is measured
   // from must sit outside the box the picture overlay is measured from.
-  assert.match(home, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
-  assert.match(home, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
+  assert.match(home, /pgmStage\.append\(pgmTile, metersEl, previewTile\)/);
+  assert.match(home, /pgmStage\.append\(pgmTile, metersEl, previewTile\)/);
   assert.ok(
     !/pgmTile\.appendChild\(previewTile\)/.test(home),
     'the preview box must never be inside the box the picture overlay is measured from',

@@ -158,7 +158,6 @@ button {
   flex-direction: column;
   width: 100%;
   margin: 0 auto;
-  padding: 0 1.25rem 1rem;
 }
 
 /* Settings is a form, and a form reads badly at 3840px. But the pair of caps
@@ -348,7 +347,7 @@ button {
   overflow: hidden;
 }
 
-.view-home.home-rail-collapsed .home-rail > *:not(.rail-strip) {
+.view-home.home-rail-collapsed .home-rail>*:not(.rail-strip) {
   display: none;
 }
 
@@ -401,7 +400,7 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 0.9rem 0;
+  padding: 0.5rem;
   border-bottom: 1px solid var(--border);
 }
 
@@ -1031,10 +1030,12 @@ input[type='range'] {
 }
 
 @keyframes lamp-pulse {
+
   0%,
   100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.4;
   }
@@ -1112,7 +1113,7 @@ input[type='range'] {
    <select> option or one unbreakable hint word would push a track past its
    share and shove the last column off the edge. .control-group carries this on
    the home screen for the same reason. */
-.settings-group > * {
+.settings-group>* {
   min-width: 0;
 }
 
@@ -1121,13 +1122,13 @@ input[type='range'] {
  * `1 / -1` and NEVER `span N`: a span wider than the track count does not clamp
  * to it, it ADDS implicit columns, which would silently turn the 800px window
  * into a two-column grid of 380px tracks. */
-.settings-group > h2,
-.settings-group > h3,
-.settings-group > .suggestions,
-.settings-group > .secrets-hint,
-.settings-group > .tile-grid,
-.settings-group > .preset-picker,
-.settings-group > .preset-preview-summary {
+.settings-group>h2,
+.settings-group>h3,
+.settings-group>.suggestions,
+.settings-group>.secrets-hint,
+.settings-group>.tile-grid,
+.settings-group>.preset-picker,
+.settings-group>.preset-preview-summary {
   grid-column: 1 / -1;
 }
 
@@ -1155,7 +1156,7 @@ input[type='range'] {
    h2 is :first-of-type among its own siblings — and all six group separators
    would disappear at once, silently, leaving one undifferentiated 26-field
    form. */
-.settings-form > .settings-group:first-of-type h2 {
+.settings-form>.settings-group:first-of-type h2 {
   margin-top: 0.3rem;
   padding-top: 0;
   border-top: none;
@@ -1335,7 +1336,7 @@ input[type='range'] {
   background: var(--panel);
 }
 
-.settings-form > .settings-group--presets h2 {
+.settings-form>.settings-group--presets h2 {
   margin-top: 0;
   padding-top: 0;
   border-top: none;
@@ -1350,7 +1351,7 @@ input[type='range'] {
   gap: 0.6rem 1.25rem;
 }
 
-.preset-picker > .field {
+.preset-picker>.field {
   flex: 1 1 22rem;
   min-width: 0;
 }
@@ -1419,7 +1420,7 @@ input[type='range'] {
    tile is a single config value spread across x/y/w/h, so its note describes
    the grid rather than a cell of it. Without this it lands in a 5rem-9rem
    track and wraps into a column two words wide. */
-.tile-grid > .preset-preview-note {
+.tile-grid>.preset-preview-note {
   grid-column: 1 / -1;
   margin: 0;
 }
@@ -1503,6 +1504,7 @@ input[type='range'] {
 /* ------------------------------------------------------------------ */
 
 @media (max-width: 560px) {
+
   .control-group,
   .control-group-return,
   .control-group-channel,
@@ -1554,15 +1556,35 @@ input[type='range'] {
 /* ==================================================================== */
 
 .input-meters {
-  /* Stretch to the stage's height rather than the tile's: the tile's height
-     is computed from its own aspect ratio and CSS cannot cheaply follow it,
-     and a meter slightly taller than the picture costs nothing while a
-     JS-driven height would be one more thing to keep in step on resize. */
-  align-self: stretch;
+  /* THE METERS ARE EXACTLY AS TALL AS THE PICTURE, and that is the operator's
+     instruction: "the metering should match the height of the big monitor".
+
+     They used to stretch to the STAGE instead, on the reasoning that the tile's
+     height comes from its own aspect ratio, that CSS could not cheaply follow
+     it, and that a meter slightly taller than the picture cost nothing. The
+     first two are answered below and the third is simply wrong to the eye: two
+     instruments side by side at different heights read as a misalignment, every
+     time, for the whole match.
+
+     CSS can follow it, because it is the same computation the tile does. The
+     tile is `width: min(100%, 100cqh * ar)` with `aspect-ratio: ar`, so its
+     height is whichever of the two constraints binds:
+
+         height = min(100cqh, 100cqw / ar)
+
+     .pgm-stage is the size container for both terms and the flex parent whose
+     content box `100%` resolves against, so 100cqw and the tile's `100%` are
+     the same length. --tile-ar-num is published onto the stage by applyCrop
+     precisely so this rule can read it; the fallback is 16/9. */
+  align-self: center;
+  height: min(100cqh, calc(100cqw / var(--tile-ar-num, 1.7778)));
   display: flex;
   gap: 4px;
   margin-left: 8px;
   padding: 2px 0;
+  /* No shrinking and no growing: everything this takes it takes from the
+     picture. */
+  flex: 0 0 auto;
 }
 
 .input-meter {
@@ -1583,7 +1605,8 @@ input[type='range'] {
   flex: 1 1 auto;
   width: 10px;
   min-height: 0;
-  background: #10151b; /* the mixer meter's trough colour, same instrument */
+  background: #10151b;
+  /* the mixer meter's trough colour, same instrument */
   border-radius: 3px;
   overflow: hidden;
 }
@@ -1597,7 +1620,7 @@ input[type='range'] {
   overflow: hidden;
 }
 
-.input-meter-seg + .input-meter-seg {
+.input-meter-seg+.input-meter-seg {
   box-shadow: inset 0 -1px 0 #0a0e12;
 }
 
@@ -1777,7 +1800,7 @@ input[type='range'] {
    the grid, its caveat and its lamps are all composite items — and a
    350px track would cut the grid in half. `1 / -1` and never `span N`,
    for the reason the .settings-group rule records. */
-.settings-group--channelmap > * {
+.settings-group--channelmap>* {
   grid-column: 1 / -1;
 }
 
@@ -1893,7 +1916,8 @@ input[type='range'] {
   display: flex;
   height: 10px;
   border-radius: 3px;
-  background: #10151b; /* the mixer meter's trough colour, same instrument */
+  background: #10151b;
+  /* the mixer meter's trough colour, same instrument */
   overflow: hidden;
 }
 
@@ -1906,7 +1930,7 @@ input[type='range'] {
 /* The hairline sits on the LEFT edge of each segment after the first, so
    the -18 and -6 boundaries stay readable as POSITIONS even with the bar
    dark. Left rather than bottom: this bar runs across, not up. */
-.channelmap-meter-seg + .channelmap-meter-seg {
+.channelmap-meter-seg+.channelmap-meter-seg {
   box-shadow: inset 1px 0 0 #0a0e12;
 }
 
@@ -2060,9 +2084,9 @@ input[type='range'] {
 /* Prose that describes the whole group rather than one field, so it takes the
    whole row — `1 / -1` and never `span N`, for the reason the .settings-group
    rule records at length. */
-.settings-group > .video-to-air,
-.settings-group > .video-card-note,
-.settings-group > .preview-sending-note {
+.settings-group>.video-to-air,
+.settings-group>.video-card-note,
+.settings-group>.preview-sending-note {
   grid-column: 1 / -1;
 }
 
@@ -2175,7 +2199,7 @@ input[type='range'] {
   column-gap: 0.5rem;
 }
 
-.field--check > input[type='checkbox'] {
+.field--check>input[type='checkbox'] {
   order: 1;
   flex: 0 0 auto;
   width: 1.05rem;
@@ -2183,15 +2207,15 @@ input[type='range'] {
   accent-color: var(--green);
 }
 
-.field--check > label {
+.field--check>label {
   order: 2;
   font-size: 0.95rem;
   color: var(--text);
 }
 
 /* The hint and the error take the whole width below the box and its label. */
-.field--check > .field-hint,
-.field--check > .field-error {
+.field--check>.field-hint,
+.field--check>.field-error {
   order: 3;
   flex-basis: 100%;
 }
@@ -2306,7 +2330,7 @@ input[type='range'] {
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   background: var(--panel);
-  height: 100%;
+  min-height: 64px;
 }
 
 .overall-glyph {
@@ -2342,6 +2366,10 @@ input[type='range'] {
   overflow: hidden;
   text-overflow: ellipsis;
   min-height: 1.2em;
+}
+
+.overall-detail:empty {
+  display: none;
 }
 
 .overall-green .overall-glyph,

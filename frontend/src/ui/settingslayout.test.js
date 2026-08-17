@@ -44,9 +44,30 @@ const ui = (name) => readFileSync(join(here, name), 'utf8');
 const css = () => readFileSync(join(here, '..', 'styles', 'main.css'), 'utf8');
 
 const js = ui('settings.js');
-const sheet = css();
+const sheet = normaliseCombinators(css());
 
 /** rule(name) returns the declaration block of the first rule whose selector list contains `name`. */
+/**
+ * normaliseCombinators makes selector matching immune to the formatter.
+ *
+ * Prettier (and the operator's editor) rewrite `.a > .b` to `.a>.b`, which is
+ * the same selector and a different string — and every assertion here that
+ * looks a selector up by text broke on a reformat that changed no CSS at all.
+ * A test that fails when someone runs a formatter is a test that trains people
+ * to ignore it, so the sheet is normalised once, here, and the assertions go on
+ * being written the readable way.
+ */
+function normaliseCombinators(text) {
+  return (
+    text
+      .replace(/\s*([>+~])\s*/g, ' $1 ')
+      // ...but not immediately after an opening paren. `:has(>#f-x)` would
+      // otherwise normalise to `:has( > #f-x)`, and the selectors that use a
+      // child combinator inside :has() are matched by their own regex.
+      .replace(/\(\s+/g, '(')
+  );
+}
+
 function rule(sheetText, selector) {
   const i = sheetText.indexOf(selector);
   if (i < 0) return '';

@@ -488,7 +488,7 @@ export function createHomeView(handlers) {
     errorLog.clear();
     renderAlerts();
   });
-  alertsRegion.append(alertsList, alertsClear);
+  alertsRegion.append(alertsClear, alertsList);
 
   // The header's attention marker. It is the ONE thing that has to be legible
   // when the column is collapsed, so it is rendered into both places from the
@@ -772,7 +772,7 @@ export function createHomeView(handlers) {
   previewCaption.className = 'preview-caption';
   previewTile.appendChild(previewCaption);
 
-  // ONE ROW: PICTURE, PREVIEW, METERS. Left to right, all three side by side.
+  // ONE ROW: PICTURE, METERS, PREVIEW. Left to right, all three side by side.
   //
   // The rework had swept the meters into the settings column, and the operator
   // moved them back — "the meters should still be next to the preview and not
@@ -781,6 +781,10 @@ export function createHomeView(handlers) {
   // stack: "The preview of the video was correct before, being next to the main
   // video. Now it's sat above the meter? They should all be next to each other
   // in a line."
+  //
+  // The order is the operator's too: "it goes big montior, metering, little".
+  // The meters sit against the picture they belong to, and the confidence
+  // preview — the smallest and least urgent of the three — takes the outside.
   //
   // So they are three flex siblings of .pgm-stage and not a stack, which is what
   // the preview and the meters each had before any of this and what their CSS
@@ -796,7 +800,7 @@ export function createHomeView(handlers) {
   // covered by an opaque native child window, so anything drawn inside it is
   // invisible exactly when a commentator is mid-match, and two native windows
   // told to occupy overlapping rectangles simply erase one another.
-  pgmStage.append(pgmTile, previewTile, metersEl);
+  pgmStage.append(pgmTile, metersEl, previewTile);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -821,6 +825,12 @@ export function createHomeView(handlers) {
     // width calculation against the container's height wants a bare number.
     pgmTile.style.setProperty('--tile-ar', `${crop.tile.w} / ${crop.tile.h}`);
     pgmTile.style.setProperty('--tile-ar-num', String(crop.aspect));
+    // AND ON THE STAGE, because the meters are told to match the picture's
+    // height and that height is a function of this ratio. A custom property set
+    // on .pgm-tile is readable by the tile and its descendants only; the meters
+    // are its SIBLING. Setting it on the shared parent is what lets one number
+    // drive both, so the two can never disagree about how tall the picture is.
+    pgmStage.style.setProperty('--tile-ar-num', String(crop.aspect));
 
     // Logged, not swallowed: "the picture is in the wrong place" is
     // undiagnosable from a screenshot without both mosaic sizes, and this is

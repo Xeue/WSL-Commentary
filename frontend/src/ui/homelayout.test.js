@@ -49,7 +49,30 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ui = (name) => readFileSync(join(here, name), 'utf8');
-const sheet = readFileSync(join(here, '..', 'styles', 'main.css'), 'utf8');
+/**
+ * normaliseCombinators makes selector matching immune to the formatter.
+ *
+ * Prettier (and the operator's editor) rewrite `.a > .b` to `.a>.b`, which is
+ * the same selector and a different string — and every assertion here that
+ * looks a selector up by text broke on a reformat that changed no CSS at all.
+ * A test that fails when someone runs a formatter is a test that trains people
+ * to ignore it, so the sheet is normalised once, here, and the assertions go on
+ * being written the readable way.
+ */
+function normaliseCombinators(text) {
+  return (
+    text
+      .replace(/\s*([>+~])\s*/g, ' $1 ')
+      // ...but not immediately after an opening paren. `:has(>#f-x)` would
+      // otherwise normalise to `:has( > #f-x)`, and the selectors that use a
+      // child combinator inside :has() are matched by their own regex.
+      .replace(/\(\s+/g, '(')
+  );
+}
+
+const sheet = normaliseCombinators(
+  readFileSync(join(here, '..', 'styles', 'main.css'), 'utf8'),
+);
 const home = ui('home.js');
 const app = ui('app.js');
 
@@ -414,23 +437,43 @@ test('the match bar is the indicator, START, and the cough controls', () => {
   assert.match(bar, /flex-wrap:\s*nowrap/, 'and never wraps to a second line');
 });
 
-test('picture, preview and meters sit in one row', () => {
+test('picture, meters, preview — one row, in that order', () => {
   const src = codeOnly(home);
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, previewTile, metersEl\)/,
+    /pgmStage\.append\(pgmTile, metersEl, previewTile\)/,
     'one stack beside the picture, so the meters are there whether or not the preview is',
   );
-  assert.match(src, /pgmStage\.append\(pgmTile, previewTile, metersEl\)/);
+  assert.match(src, /pgmStage\.append\(pgmTile, metersEl, previewTile\)/);
 
   // Neither may take width from the picture on its own initiative.
   const preview = rule('.preview-tile');
   assert.match(preview, /flex:\s*0 0 auto/, 'the preview is fixed to its content');
   const meters = rule('.input-meters');
   assert.ok(meters, 'main.css must style .input-meters');
+  assert.match(meters, /flex:\s*0 0 auto/, 'the meters must not grow into the picture');
+
+  // "the metering should match the height of the big monitor" — so the meters
+  // compute the SAME height the tile does, from the same two constraints and
+  // the same ratio, rather than stretching to the stage and standing a little
+  // taller than the picture they sit beside.
+  assert.match(
+    meters,
+    /height:\s*min\(100cqh, calc\(100cqw \/ var\(--tile-ar-num/,
+    'the meters must derive the tile height, not the stage height',
+  );
   assert.ok(
-    !/flex:\s*1/.test(meters),
-    'the meters must not grow into the picture',
+    !/align-self:\s*stretch/.test(meters),
+    'stretching is what made them taller than the picture',
+  );
+
+  // And the ratio has to reach them: a custom property set on .pgm-tile is
+  // readable by the tile and its descendants only, and the meters are its
+  // sibling.
+  assert.match(
+    codeOnly(home),
+    /pgmStage\.style\.setProperty\('--tile-ar-num'/,
+    'applyCrop must publish the ratio on the stage, not only on the tile',
   );
 });
 
