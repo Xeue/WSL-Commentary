@@ -1,4 +1,25 @@
-//go:build (dev || production || bindings) && darwin
+//go:build (dev || production) && darwin
+
+// NOT BUILT INTO THE BINDINGS BINARY, and that is load-bearing rather than
+// tidiness. `wails build` compiles a second binary with `-tags bindings`, RUNS
+// it to dump the bound-method metadata, and reads its exit status. Since the
+// teardown began leaving through this door on EVERY path rather than only an
+// abandoned one, that binary SIGKILLed itself after printing its output, and
+// the build failed with:
+//
+//	signal: killed
+//
+// The hazard this file exists for cannot arise there. It is a metadata dump: it
+// never creates an srtsink, so libsrt never registers the destructors described
+// below, and there is no abandoned media thread for a termination hook to race.
+// With this file excluded, `forceExit` keeps its default in app.go — an ordinary
+// os.Exit(0) — and the tool exits cleanly.
+//
+// The Windows twin carries the same exclusion for the same reason, though it
+// never showed the symptom: TerminateProcess(self, 0) reports a clean exit
+// status 0, so a hard exit there is invisible to the tool reading it, while
+// SIGKILL cannot be anything but signalled. Identical bug, one platform able to
+// hide it.
 
 // The one exit this application is allowed to take that macOS cannot refuse.
 //

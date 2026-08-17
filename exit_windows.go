@@ -1,4 +1,14 @@
-//go:build (dev || production || bindings) && windows
+//go:build (dev || production) && windows
+
+// NOT BUILT INTO THE BINDINGS BINARY. `wails build` compiles a second binary
+// with `-tags bindings`, runs it to dump the bound-method metadata and reads
+// its exit status, and a build tool has no business ending through a hard exit:
+// it never creates an srtsink and never loads the driver DLLs whose detach
+// handlers this file exists to skip.
+//
+// It never showed a symptom here — TerminateProcess(self, 0) reports a clean
+// exit status 0 — but the darwin twin could not hide it, and the exclusion is
+// correct on both. See exit_darwin.go for the failure it caused there.
 
 // The one exit this application is allowed to take that Windows cannot refuse.
 //
