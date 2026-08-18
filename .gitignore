@@ -35,3 +35,4 @@ registry.bin
 /cmd/portable/payload.zip
 /build/dist/
 /cmd/portable/rsrc_windows_amd64.syso
+.DS_Store

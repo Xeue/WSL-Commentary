@@ -2706,16 +2706,28 @@ func (a *App) SetSecret(key, value string) error {
 // that consumes its answer, and because its bound (conformFetchTimeout, three
 // seconds) is the only delay it can add to a START.
 func (a *App) Start() error {
+	// ANNOUNCED, AND ITS ANSWER ANNOUNCED, because the silence in between was
+	// undiagnosable from the field.
+	//
+	// A press that did not come up left a log reading: the conform line (this
+	// function's first statement) and then nothing — no error, no send pipeline,
+	// no session. That is the same picture for a refusal that returns quietly, a
+	// blocked lock, and an operator who never pressed the button at all, and
+	// telling those apart cost a round trip to the rig for a fault that was
+	// already on disk.
+	log.Printf("wslcomms: START pressed")
 	a.conformTo.Store(a.conformFormat(a.snapshotConfig()))
 
 	stopDiscovery := a.maybeDiscoverStatusKey()
 	if err := a.startSession(); err != nil {
+		log.Printf("wslcomms: START failed: %v", err)
 		// Nothing is going to come up, so there is nothing to discover. Leaving
 		// it running would spend the whole window watching for a change that
 		// cannot happen and then report a false "nothing matched".
 		stopDiscovery()
 		return err
 	}
+	log.Printf("wslcomms: START accepted; the send session is up")
 	return nil
 }
 
