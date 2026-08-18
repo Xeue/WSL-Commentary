@@ -190,6 +190,10 @@ var pictureRequiredElements = []pictureFactory{
 	{"queue", "coreelements"},
 	{"fakesink", "coreelements"},
 	{"h265parse", "videoparsersbad"},
+	// h264parse comes from the SAME plugin, so this adds no file to the bundle —
+	// it is here so a registry that has lost videoparsersbad is named at Init
+	// rather than discovered as a link failure against an H.264 return feed.
+	{"h264parse", "videoparsersbad"},
 }
 
 // pictureDecoderCandidates is the H.265 decoder, in preference order.
@@ -400,6 +404,22 @@ type picturePipeline struct {
 	// touched from a streaming thread.
 	padMu       sync.Mutex
 	videoLinked bool
+
+	// wantParser is the parser factory the NEXT build should use, learned from
+	// the demuxer's own pad caps on a previous attempt. Empty means "nobody has
+	// seen a video pad yet", and buildLocked's default stands.
+	//
+	// It is guarded by padMu because onPadAdded writes it from a streaming
+	// thread and buildLocked reads it from the retry goroutine.
+	wantParser string
+
+	// builtWith is the parser factory THIS pipeline was actually created with,
+	// stamped by buildLocked. It is deliberately a separate field from
+	// wantParser: between a streaming thread recording what it wants and the
+	// retry rebuilding, the two disagree, and that gap is exactly the window
+	// onPadAdded's comparison runs in. One field would compare a value against
+	// itself and never fire.
+	builtWith string
 
 	// frameReady is closed by the decoder's src-pad probe the moment a decoded
 	// frame appears. It is what Play waits on, and it is recreated for each
@@ -709,6 +729,35 @@ func (p *picturePipeline) drainErrors() {
 	}
 }
 
+// parserFactoryLocked is the parser this build should use: whatever a previous
+// attempt learned from the demuxer's pads, or H.265.
+//
+// H.265 IS THE DEFAULT AND STAYS THE DEFAULT. It is what the switcher has always
+// sent, it is what the 584-frame transport measurement in this file's header was
+// made against, and a first attempt that guesses right costs nothing. A first
+// attempt that guesses wrong now costs exactly one rebuild instead of failing
+// for ever.
+//
+// p.mu is held by buildLocked; padMu is taken here because a streaming thread
+// writes wantParser.
+func (p *picturePipeline) parserFactoryLocked() string {
+	p.padMu.Lock()
+	defer p.padMu.Unlock()
+	if p.wantParser != "" {
+		return p.wantParser
+	}
+	return "h265parse"
+}
+
+// builtParser reports the parser factory the CURRENT pipeline was built with, so
+// onPadAdded can compare it against what the transport turned out to be
+// carrying. Safe from a streaming thread.
+func (p *picturePipeline) builtParser() string {
+	p.padMu.Lock()
+	defer p.padMu.Unlock()
+	return p.builtWith
+}
+
 // buildLocked creates, adds and links everything that can be linked statically.
 // p.mu must be held and p.pipeline must be set.
 //
@@ -725,6 +774,12 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		out     *gogst.Element
 	}
 	var parse gogst.Element
+	// Chosen once, before the specs are assembled, and stamped onto the pipeline
+	// so onPadAdded can tell what it is actually looking at.
+	parserFactory := p.parserFactoryLocked()
+	p.padMu.Lock()
+	p.builtWith = parserFactory
+	p.padMu.Unlock()
 	// The last two come from p.chain, which newPicturePipe resolved against the
 	// registry: d3d11h265dec into d3d11videosink on Windows, vtdec_hw into
 	// glimagesink on macOS. Everything above them is the same factory under the
@@ -733,7 +788,7 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		{"srtsrc", namePicSrc, &p.src},
 		{"tsdemux", namePicDemux, &p.demux},
 		{"queue", namePicQueue, &p.queue},
-		{"h265parse", namePicParse, &parse},
+		{parserFactory, namePicParse, &parse},
 		{p.chain.decoder.factory, namePicDecode, &p.decode},
 		{p.chain.sink.factory, namePicSink, &p.sink},
 	}
@@ -1017,6 +1072,47 @@ func (p *picturePipeline) onPadAdded(pipeline gogst.Pipeline, queuePad gogst.Pad
 			log.Printf("gst: picture monitor: %s is a second video stream; discarding it", name)
 			p.fakeSinkFor(pipeline, pad)
 			return
+		}
+
+		// WHAT THE TRANSPORT IS ACTUALLY CARRYING, read before linking rather
+		// than inferred from the failure afterwards.
+		//
+		// This branch is built around ONE parser, chosen at build time, and a
+		// queue proxies its caps query downstream — so linking an H.264 pad into
+		// a branch parsing H.265 fails with PadLinkNoformat and nothing says
+		// why. Measured in the field, from the operator's own log, every thirty
+		// seconds for eleven minutes:
+		//
+		//	could not link video_0_0041 to picq (PadLinkNoformat)
+		//
+		// while the same feed decoded fine under ffmpeg and under a gst-launch
+		// decodebin, because both of those negotiate whatever arrives.
+		//
+		// So the codec is recorded for the next build and the attempt is failed
+		// with a sentence that names it. The retry that follows is the existing
+		// one; it converges in a single extra attempt, and it self-heals if the
+		// switcher is reconfigured mid-event.
+		if mt := padVideoMediaType(pad); mt != "" {
+			want := pictureParserFor(mt)
+			switch {
+			case want == "":
+				p.padMu.Lock()
+				p.videoLinked = false
+				p.padMu.Unlock()
+				log.Printf("gst: picture monitor: %s carries %s, which this branch cannot show; "+
+					"discarding it", name, mt)
+				p.fakeSinkFor(pipeline, pad)
+				return
+			case want != p.builtParser():
+				p.padMu.Lock()
+				p.videoLinked = false
+				p.wantParser = want
+				p.padMu.Unlock()
+				p.deliver(fmt.Errorf("gst: picture monitor: the transport carries %s and this "+
+					"pipeline was built to parse with %s; rebuilding with %s",
+					mt, p.builtParser(), want))
+				return
+			}
 		}
 
 		if ret := pad.Link(queuePad); ret != gogst.PadLinkOK {

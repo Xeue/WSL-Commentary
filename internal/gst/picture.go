@@ -1045,3 +1045,44 @@ func (m *pictureMonitor) sleep(d time.Duration) bool {
 		return true
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Which video codec the return transport is carrying
+// ---------------------------------------------------------------------------
+
+// pictureParserFor maps a demuxer pad's media type onto the parser that feeds
+// the decoder, or "" for a type this branch cannot show.
+//
+// ===================== WHY THIS IS NOT A decodebin =========================
+//
+// The obvious answer to "the feed changed codec" is to stop naming elements and
+// let decodebin work it out. It is the wrong answer HERE, for three reasons
+// that were measured on this machine rather than assumed:
+//
+//  1. vtdec_hw sits at rank primary+1 (257) and avdec_h264/avdec_h265 at
+//     primary (256). decodebin sorts on rank, so the choice between hardware
+//     VideoToolbox and FFmpeg is one point wide, and a registry change flips it
+//     silently. picture_cgo.go's header argues this at length and it is right.
+//  2. The bundlers refuse to copy anything matching *libav* or *avcodec*, so
+//     avdec is present on a development machine and absent from the installed
+//     one. A decodebin therefore resolves DIFFERENTLY on the two, which is the
+//     specific failure mode of testing one decoder and shipping another.
+//  3. The picture latency was taken from 995 ms to 1.2 ms deliberately (see the
+//     commit of that name). decodebin brings a multiqueue and autoplugged
+//     buffering, and giving that measurement back invisibly is a poor trade for
+//     saving one switch statement.
+//
+// What makes the switch cheap is that the DECODER does not change: measured,
+// vtdec_hw's sink template accepts video/x-h264, video/x-h265 and
+// video/x-prores. Only the parser differs, because the decoder wants
+// stream-format=avc1/hev1 with codec_data and the demuxer emits byte-stream.
+func pictureParserFor(mediaType string) string {
+	switch mediaType {
+	case "video/x-h265":
+		return "h265parse"
+	case "video/x-h264":
+		return "h264parse"
+	default:
+		return ""
+	}
+}

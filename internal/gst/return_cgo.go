@@ -1175,3 +1175,31 @@ func (r *returnPipeline) teardownLocked() error {
 
 	return err
 }
+
+// padVideoMediaType returns a video pad's media type ("video/x-h264"), or ""
+// when the pad carries no video or has not published caps yet.
+//
+// It is padMediaKind's fuller answer, and it lives beside it because it reads
+// exactly the same caps. padMediaKind was only ever asked audio-or-video and
+// threw the codec away — which is why the picture pipeline could not tell an
+// H.264 return feed from an H.265 one, and simply failed to link its video pad
+// every thirty seconds, for ever, while the same transport decoded fine under
+// ffmpeg. See pictureParserFor.
+func padVideoMediaType(pad gogst.Pad) string {
+	caps := pad.GetCurrentCaps()
+	if caps == nil {
+		caps = pad.QueryCaps(nil)
+	}
+	if caps == nil {
+		return ""
+	}
+	s := caps.GetStructure(0)
+	if s == nil {
+		return ""
+	}
+	name := s.GetName()
+	if !strings.HasPrefix(name, "video/") {
+		return ""
+	}
+	return name
+}

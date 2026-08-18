@@ -74,6 +74,9 @@
   /* shorten the picture. Everything in it is a single non-wrapping     */
   /* line and the long forms live in title attributes.                  */
   --match-bar-h: 84px;
+  /* The left edge shared by the title and the picture. One value so the two
+     cannot drift apart; the match bar is deliberately not on it. */
+  --stage-inset: 0.9rem;
 }
 
 /* ------------------------------------------------------------------ */
@@ -400,7 +403,12 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
+  /* Left padding is called out separately from the rest because it is the one
+     edge that has to line up with the picture below it. .view carries no
+     horizontal padding any more, so without this the title sits hard against
+     the window frame while everything under it does not. See --stage-inset. */
   padding: 0.5rem;
+  padding-left: var(--stage-inset);
   border-bottom: 1px solid var(--border);
 }
 
@@ -666,6 +674,13 @@ input[type='range'] {
    after the topbar, the controls and the action row, all of which are
    flex: 0 0 auto. */
 .pgm-stage {
+  /* The same inset as the topbar, so the title and the picture share one left
+     edge. It is left-only and deliberately not a symmetric padding: the stage
+     computes the tile's width from its own height in cqh units, and horizontal
+     padding on a size container comes off that computation on BOTH sides —
+     which would shrink the commentator's picture to buy whitespace it did not
+     ask for. The match bar under it is untouched and keeps its own 0.6rem. */
+  padding-left: var(--stage-inset);
   flex: 1 1 auto;
   /* A floor, not a size. The tile's width is computed from this element's
      height, so a stage squeezed to nothing by a very short window would compute

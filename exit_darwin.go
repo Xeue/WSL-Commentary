@@ -146,9 +146,17 @@ import (
 	"log"
 	"os"
 	"syscall"
+	"testing"
 )
 
 func init() {
+	// NOT UNDER `go test`. The default in app.go carries the argument: teardown
+	// leaves through forceExit on every close now, so installing a real SIGKILL
+	// here would end the test runner the first time any test closed an App. A
+	// test that wants to observe the ending injects App.exitProcess instead.
+	if testing.Testing() {
+		return
+	}
 	forceExit = terminateSelf
 }
 

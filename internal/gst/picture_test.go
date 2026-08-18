@@ -937,3 +937,41 @@ func TestPictureAndReturnDoNotShareTheirLadders(t *testing.T) {
 		t.Fatal("the picture and return ladders are the same slice; they must be independent")
 	}
 }
+
+// TestThePictureBranchParsesWhicheverCodecTheTransportCarries is the regression
+// test for a return feed that decoded everywhere except in this application.
+//
+// FROM THE FIELD, the operator's own log, once every thirty seconds for eleven
+// minutes and then for ever:
+//
+//	gst: picture monitor: attempt 15 failed: ... could not link video_0_0041 to
+//	picq (PadLinkNoformat); retrying in 30s
+//
+// "The same feed decodes locally via ffmpeg or a gst-launch pipeline, but not
+// in the app." Both of those negotiate whatever arrives; this branch was built
+// around h265parse, and picq is a QUEUE — whose sink template is ANY, so the
+// link cannot fail on its own account. gst_pad_link runs a caps query, a queue
+// proxies that query downstream to the parser, and an H.264 pad against an
+// H.265 parser intersects to nothing.
+//
+// The failure mode is the expensive kind: nothing is broken, nothing is
+// unreachable, the transport is healthy, and the application shows the
+// commentator no picture while telling them the truth in a log they are not
+// reading.
+func TestThePictureBranchParsesWhicheverCodecTheTransportCarries(t *testing.T) {
+	for _, c := range []struct {
+		mediaType string
+		want      string
+		why       string
+	}{
+		{"video/x-h265", "h265parse", "what the switcher has always sent, and still the default"},
+		{"video/x-h264", "h264parse", "the feed that broke in the field"},
+		{"video/x-vp9", "", "not something this branch can show; it must be discarded, not linked"},
+		{"video/x-prores", "", "vtdec_hw accepts it but no parser here produces its stream-format"},
+		{"", "", "a pad that has published no caps yet"},
+	} {
+		if got := pictureParserFor(c.mediaType); got != c.want {
+			t.Errorf("pictureParserFor(%q) = %q, want %q — %s", c.mediaType, got, c.want, c.why)
+		}
+	}
+}

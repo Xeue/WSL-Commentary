@@ -486,6 +486,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -1586,7 +1587,32 @@ type App struct {
 // (On macOS not even that survives: SIGKILL means the process is reported as
 // signalled rather than as having exited zero. exit_darwin.go says why that is
 // an acceptable price and why it produces no crash report.)
-var forceExit = func() { os.Exit(0) }
+var forceExit = func() {
+	// UNDER `go test`, ENDING THE PROCESS IS THE ONE THING THIS MUST NOT DO.
+	//
+	// teardown now leaves through here on EVERY close rather than only an
+	// abandoned one, so every test that builds an App and closes it would take
+	// the runner with it. Measured before this guard, on the root package:
+	//
+	//	signal: killed
+	//	FAIL	wslcomms	2.196s
+	//
+	// with no failing test named, because the process died before the runner
+	// could say anything — the worst shape a test failure can take.
+	//
+	// The guard is on the DEFAULT and not on hardExit, and that distinction is
+	// the whole of it: a test that wants to watch the process end injects
+	// App.exitProcess and asserts on its own function, which is exactly what
+	// TestTeardownEndsTheProcessEvenOnACleanShutdown and its two neighbours do.
+	// Guarding hardExit would have short-circuited those before they reached the
+	// injected function, which is how the first attempt at this failed them.
+	if testing.Testing() {
+		log.Printf("wslcomms: the process would end here; returning instead because this is a " +
+			"test binary and no exit was injected")
+		return
+	}
+	os.Exit(0)
+}
 
 // hardExit ends the process. See forceExit and teardown.
 func (a *App) hardExit() {
