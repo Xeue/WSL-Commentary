@@ -975,3 +975,52 @@ func TestThePictureBranchParsesWhicheverCodecTheTransportCarries(t *testing.T) {
 		}
 	}
 }
+
+// TestTheLearnedParserSurvivesTheRebuild is the regression test for the half of
+// the codec fix that did not work the first time.
+//
+// The first version recorded the transport's codec on the PIPELINE struct. The
+// retry does not reuse that object — newPipe builds a fresh one per attempt,
+// which is the point of the retry — so the lesson died with the attempt that
+// learned it and the rebuild guessed H.265 again. From the operator's log, the
+// same sentence twice in a row, with the attempt counter reading 1 both times:
+//
+//	attempt 1 failed: the transport carries video/x-h264 and this pipeline was
+//	built to parse with h265parse; rebuilding with h264parse
+//	attempt 1 failed: the transport carries video/x-h264 and this pipeline was
+//	built to parse with h265parse; rebuilding with h264parse
+//
+// A fix that is only ever exercised across a rebuild has to be tested across a
+// rebuild; testing it within one attempt would have passed on the broken code.
+func TestTheLearnedParserSurvivesTheRebuild(t *testing.T) {
+	pictureParserMu.Lock()
+	saved := pictureLearnedParser
+	pictureLearnedParser = ""
+	pictureParserMu.Unlock()
+	t.Cleanup(func() {
+		pictureParserMu.Lock()
+		pictureLearnedParser = saved
+		pictureParserMu.Unlock()
+	})
+
+	if got := learnedPictureParser(); got != "h265parse" {
+		t.Fatalf("first attempt should build H.265, the codec this switcher has always sent; got %q", got)
+	}
+
+	// An attempt discovers the transport is H.264 and dies. Its pipeline object
+	// dies with it — which is exactly what the process-scoped store is for.
+	learnPictureParser("h264parse")
+
+	if got := learnedPictureParser(); got != "h264parse" {
+		t.Errorf("the rebuild must use what the last attempt learned; got %q. This is the bug: "+
+			"a per-pipeline field is discarded by the retry and the picture never comes up", got)
+	}
+
+	// And it keeps holding, because the retry may take several attempts before
+	// the transport is reachable at all.
+	for i := 0; i < 3; i++ {
+		if got := learnedPictureParser(); got != "h264parse" {
+			t.Fatalf("attempt %d lost the learned parser: %q", i+2, got)
+		}
+	}
+}

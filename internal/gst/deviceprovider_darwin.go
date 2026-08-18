@@ -231,6 +231,60 @@ func configureCaptureSource(src gogst.Element, deviceID string) error {
 	if hasProperty(src, propPersistentID) {
 		return configureDeckLinkSource(src, deviceID)
 	}
+	// ===================== THE STRING ID FIRST, WHERE IT EXISTS ==============
+	//
+	// GStreamer 1.28's osxaudiosrc takes the CoreAudio unique-id DIRECTLY, as a
+	// writable string property, and its own device monitor now prints exactly
+	// that as the way to open a device:
+	//
+	//	gst-launch-1.0 osxaudiosrc unique-id=BuiltInMicrophoneDevice ! ...
+	//
+	// which means the integer `device` property is no longer what the provider
+	// configures. Measured after moving to the official 1.28.6 framework: the
+	// element created by gst_device_create_element reads device = 0, the whole
+	// resolution below correctly refuses to use it, and capture will not open at
+	// all:
+	//
+	//	capture device "BuiltInMicrophoneDevice" (MacBook Pro Microphone)
+	//	resolved to AudioDeviceID 0, which is kAudioObjectUnknown ...
+	//
+	// That refusal is right and stays. What was wrong is asking the question in
+	// the old way when the element offers a better one: a persisted unique-id
+	// handed straight to a property that takes unique-ids cannot resolve to the
+	// wrong device, cannot go stale between enumeration and open, and needs no
+	// enumeration at all.
+	//
+	// WRITABILITY IS THE TEST, NOT EXISTENCE. 1.26 has this property too and it
+	// is READ-ONLY there — hasProperty alone would pass on 1.26 and then fail to
+	// set anything, which is the silent-default failure this file exists to
+	// prevent. propertyIsWritable is the distinction.
+	// WRITE IT AND READ IT BACK, rather than asking whether the property is
+	// writable. go-glib v0.0.2 exposes a ParamSpec's value_type (PropertyType)
+	// but no public accessor for its FLAGS, and the distinction matters: the
+	// property exists in 1.26 as READ-ONLY, reporting which device the element
+	// opened, and exists in 1.28 as writable, choosing one. Existence alone
+	// cannot separate them.
+	//
+	// So the question is asked the way this codebase asks every question whose
+	// wrong answer is silent — by observing the result rather than trusting the
+	// call. If the id reads back, the element took it. If it does not, nothing
+	// was lost and the AudioDeviceID resolution below runs exactly as before.
+	//
+	// On 1.26 the ignored set emits one GLib CRITICAL to the GStreamer log. That
+	// is the whole cost, it is paid once per pipeline open on a version this
+	// build no longer ships, and it buys a path that cannot open the wrong
+	// microphone.
+	if hasProperty(src, propUniqueID) {
+		if err := setStringProperty(src, propUniqueID, deviceID); err == nil {
+			if got, _ := src.ObjectProperty(propUniqueID).(string); got == deviceID {
+				log.Printf("gst: Start: opening CoreAudio device by unique-id %q on %s — the "+
+					"element takes the id directly and read it back, so no AudioDeviceID "+
+					"resolution is needed", deviceID, captureSourceFactory)
+				return nil
+			}
+		}
+	}
+
 	index, err := resolveCaptureDeviceIndex(deviceID)
 	if err != nil {
 		// The dropdown offers DeckLink cards beside the CoreAudio devices, so

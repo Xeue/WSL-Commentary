@@ -1050,6 +1050,59 @@ func (m *pictureMonitor) sleep(d time.Duration) bool {
 // Which video codec the return transport is carrying
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// What the transport turned out to be carrying, remembered ACROSS attempts
+// ---------------------------------------------------------------------------
+
+// pictureParserMu guards pictureLearnedParser.
+var pictureParserMu sync.Mutex
+
+// pictureLearnedParser is the parser factory the demuxer's own pad caps asked
+// for on a previous attempt, or "" when nothing has been learned yet.
+//
+// ================== WHY THIS IS NOT ON THE PIPELINE STRUCT =================
+//
+// It was, and it did not work, and the log said so twice in a row:
+//
+//	attempt 1 failed: the transport carries video/x-h264 and this pipeline was
+//	built to parse with h265parse; rebuilding with h264parse
+//	attempt 1 failed: the transport carries video/x-h264 and this pipeline was
+//	built to parse with h265parse; rebuilding with h264parse
+//
+// The retry does not reuse the pipeline object; newPipe builds a FRESH one per
+// attempt — which is the whole point of the retry, and why the attempt counter
+// reads 1 both times. Anything learned on the struct dies with the attempt that
+// learned it, so the rebuild kept guessing H.265 and the picture never came up.
+//
+// Process scope rather than monitor scope because there is one picture monitor
+// per process and the fact being remembered — which codec this switcher sends —
+// is a property of the transport, not of an attempt or of a window.
+var pictureLearnedParser string
+
+// learnPictureParser records what the transport turned out to be carrying, for
+// the NEXT attempt to build with.
+func learnPictureParser(factory string) {
+	pictureParserMu.Lock()
+	defer pictureParserMu.Unlock()
+	pictureLearnedParser = factory
+}
+
+// learnedPictureParser is what the next build should use: whatever a previous
+// attempt learned, or H.265.
+//
+// H.265 IS THE DEFAULT AND STAYS THE DEFAULT. It is what the switcher has
+// always sent and what this file's 584-frame transport measurement was made
+// against, so a first attempt that guesses right costs nothing — and one that
+// guesses wrong now costs a single rebuild instead of failing for ever.
+func learnedPictureParser() string {
+	pictureParserMu.Lock()
+	defer pictureParserMu.Unlock()
+	if pictureLearnedParser != "" {
+		return pictureLearnedParser
+	}
+	return "h265parse"
+}
+
 // pictureParserFor maps a demuxer pad's media type onto the parser that feeds
 // the decoder, or "" for a type this branch cannot show.
 //

@@ -405,20 +405,10 @@ type picturePipeline struct {
 	padMu       sync.Mutex
 	videoLinked bool
 
-	// wantParser is the parser factory the NEXT build should use, learned from
-	// the demuxer's own pad caps on a previous attempt. Empty means "nobody has
-	// seen a video pad yet", and buildLocked's default stands.
-	//
-	// It is guarded by padMu because onPadAdded writes it from a streaming
-	// thread and buildLocked reads it from the retry goroutine.
-	wantParser string
-
-	// builtWith is the parser factory THIS pipeline was actually created with,
-	// stamped by buildLocked. It is deliberately a separate field from
-	// wantParser: between a streaming thread recording what it wants and the
-	// retry rebuilding, the two disagree, and that gap is exactly the window
-	// onPadAdded's comparison runs in. One field would compare a value against
-	// itself and never fire.
+	// builtWith is the parser factory THIS pipeline was created with, stamped by
+	// buildLocked. What the NEXT one should use lives in pictureLearnedParser,
+	// at process scope, because the retry builds a fresh pipeline object every
+	// attempt and anything kept here dies with the attempt that learned it.
 	builtWith string
 
 	// frameReady is closed by the decoder's src-pad probe the moment a decoded
@@ -741,12 +731,7 @@ func (p *picturePipeline) drainErrors() {
 // p.mu is held by buildLocked; padMu is taken here because a streaming thread
 // writes wantParser.
 func (p *picturePipeline) parserFactoryLocked() string {
-	p.padMu.Lock()
-	defer p.padMu.Unlock()
-	if p.wantParser != "" {
-		return p.wantParser
-	}
-	return "h265parse"
+	return learnedPictureParser()
 }
 
 // builtParser reports the parser factory the CURRENT pipeline was built with, so
@@ -1106,8 +1091,10 @@ func (p *picturePipeline) onPadAdded(pipeline gogst.Pipeline, queuePad gogst.Pad
 			case want != p.builtParser():
 				p.padMu.Lock()
 				p.videoLinked = false
-				p.wantParser = want
 				p.padMu.Unlock()
+				// Recorded at PROCESS scope: the retry builds a fresh pipeline
+				// and would otherwise guess H.265 again, for ever.
+				learnPictureParser(want)
 				p.deliver(fmt.Errorf("gst: picture monitor: the transport carries %s and this "+
 					"pipeline was built to parse with %s; rebuilding with %s",
 					mt, p.builtParser(), want))
