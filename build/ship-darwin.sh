@@ -219,8 +219,46 @@ mkdir -p "$DIST"
 #
 # -tags production, never dev: see the header, and build/darwin/Info.dev.plist.
 export CGO_ENABLED=1
-export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
-export CGO_LDFLAGS="${CGO_LDFLAGS:--framework UniformTypeIdentifiers}"
+# THE FRAMEWORK FIRST, HOMEBREW AS THE FALLBACK, and the reason is the
+# deployment floor rather than taste.
+#
+# Homebrew installs bottles built for the HOST. On a Mac running macOS 26 that
+# makes every GStreamer dylib minos 26.0, the bundler carries them, stage 5
+# honestly raises LSMinimumSystemVersion to match, and the result refuses to
+# launch on Sequoia. Measured over a Homebrew build's payload: 50 of 50 dylibs
+# at minos 26.0, arm64 only. The same measurement over the official
+# GStreamer.framework: minos 11.0, x86_64 + arm64.
+#
+# So a release build compiles and vendors against the framework when it is
+# installed. A developer with only Homebrew still gets a working local build —
+# it is stage 5 that keeps the difference honest, by refusing to describe a
+# 26.0 payload as anything else.
+GST_FW="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+if [ -d "$GST_FW/lib/pkgconfig" ]; then
+    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-$GST_FW/lib/pkgconfig}"
+    export PATH="$GST_FW/bin:$PATH"
+    echo "  gstreamer         $GST_FW (official framework)"
+else
+    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
+    echo "  gstreamer         /opt/homebrew (Homebrew — the deployment floor will follow this host's)"
+fi
+# -headerpad_max_install_names is not optional and the reason is measured.
+#
+# Stage 4 rewrites this binary's load commands to point inside the bundle, and
+# @executable_path/../Frameworks/libfoo.dylib is LONGER than what the linker
+# wrote. Against Homebrew that was free, because its absolute install names
+# (/opt/homebrew/Cellar/gstreamer/1.26.10/lib/...) were longer still. Against
+# the framework the originals are @rpath/libfoo.dylib — short — so the linker
+# reserved almost no room and the rewrite fails part way through:
+#
+#	install_name_tool: changing install names or rpaths can't be redone
+#	because larger updated load commands do not fit
+#
+# It failed on the SIXTH of six, and stage 4 swallowed the error, so the build
+# reported success and produced an application that would have died at launch
+# looking for libintl outside the bundle. Both halves are fixed: the padding is
+# reserved here, and stage 4 now proves its own work instead of counting it.
+export CGO_LDFLAGS="${CGO_LDFLAGS:--framework UniformTypeIdentifiers -Wl,-headerpad_max_install_names}"
 
 # THE FRONTEND IS BUILT HERE, BY HAND, AND wails IS THEN TOLD TO SKIP IT.
 #

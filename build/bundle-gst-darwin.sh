@@ -150,6 +150,45 @@ done
 _CORE="$(gst-inspect-1.0 filesrc 2>/dev/null | grep -E '^[[:space:]]*Filename[[:space:]]+/' | sed 's#.*Filename[[:space:]]*##' || true)"
 [ -n "$_CORE" ] || { echo "Error: gst-inspect-1.0 filesrc found nothing — is GStreamer installed? (brew install gstreamer)" >&2; exit 1; }
 GST_KEG="${GST_KEG:-$(cd "$(dirname "$_CORE")/../.." && pwd -P)}"
+# ── Where the payload comes from, and how its dependencies are spelled ──────
+#
+# TWO SHAPES, because there are two supported sources and they name their
+# dependencies completely differently:
+#
+#   Homebrew          /opt/homebrew/Cellar/...      absolute install names
+#   GStreamer.framework  @rpath/libfoo.dylib        relocatable install names
+#
+# The framework is what a shipped build should use, and the reason is the
+# deployment floor: Homebrew installs bottles built for the HOST, so on a Mac
+# running macOS 26 every dylib it produces is minos 26.0 and the app refuses to
+# launch on Sequoia. Measured, all 50 vendored dylibs of a Homebrew build:
+# minos 26.0, arm64 only. The same measurement over the official framework:
+# minos 11.0, x86_64 + arm64.
+#
+# Both are still supported here. A developer with only Homebrew gets a working
+# local build, and the audit below is what stops one being SHIPPED by accident.
+GST_SRC_PREFIX="${GST_SRC_PREFIX:-$GST_KEG}"
+
+# gst_dep_lines prints the dependencies of a Mach-O file that this bundle must
+# carry: the ones rooted in the source prefix, plus every @rpath name that
+# resolves inside it. /usr/lib and /System/Library are dyld-shared-cache paths
+# present on every Mac and are deliberately not followed.
+gst_dep_lines() {
+    otool -L "$1" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
+        case "$dep" in
+            @rpath/*)
+                # The framework's own libs all sit in one directory, so the
+                # resolution is a lookup rather than a search of every LC_RPATH.
+                cand="$GST_KEG/lib/${dep#@rpath/}"
+                [ -f "$cand" ] && printf '%s\n' "$cand"
+                ;;
+            "$GST_SRC_PREFIX"/*)
+                printf '%s\n' "$dep"
+                ;;
+        esac
+    done
+}
+
 SCANNER_SRC="$GST_KEG/libexec/gstreamer-1.0/gst-plugin-scanner"
 [ -f "$SCANNER_SRC" ] || { echo "Error: gst-plugin-scanner not found at $SCANNER_SRC" >&2; exit 1; }
 
@@ -506,7 +545,7 @@ while [ -s "$QUEUE_FILE" ]; do
         real="$(cd "$(dirname "$item")" && pwd -P)/$(basename "$item")"
         grep -qxF "$real" "$SEEN_FILE" 2>/dev/null && continue
         echo "$real" >> "$SEEN_FILE"
-        otool -L "$real" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -E '^/opt/homebrew' >> "$NEXT_FILE" || true
+        gst_dep_lines "$real" >> "$NEXT_FILE" || true
     done < "$QUEUE_FILE"
     cp "$NEXT_FILE" "$QUEUE_FILE"
 done
@@ -583,7 +622,21 @@ relink_one() {
         *)     install_name_tool -id "@loader_path/$leaf" "$dest" 2>/dev/null || true ;;
     esac
 
-    otool -L "$src" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -E '^/opt/homebrew' | while IFS= read -r old; do
+    # EVERY dependency that this bundle carries gets repointed, whether the
+    # source spelled it absolutely (Homebrew) or as @rpath (the framework).
+    #
+    # An @rpath name is rewritten rather than left alone even though the bundle
+    # could carry an LC_RPATH instead: the load command then says exactly which
+    # file it means, the audit below can prove it, and there is no search order
+    # left for a stray GStreamer elsewhere on the machine to win.
+    otool -L "$src" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r old; do
+        case "$old" in
+            @rpath/*)
+                [ -f "$GST_KEG/lib/${old#@rpath/}" ] || continue
+                ;;
+            "$GST_SRC_PREFIX"/*) ;;
+            *) continue ;;
+        esac
         dep_leaf="$(basename "$old")"
         case "$kind" in
             fw)     new="@loader_path/$dep_leaf" ;;
@@ -593,7 +646,13 @@ relink_one() {
         install_name_tool -change "$old" "$new" "$dest" 2>/dev/null || true
     done || true
 
-    otool -l "$src" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep -E '^/opt/homebrew' | while IFS= read -r rp; do
+    # Every LC_RPATH pointing outside the bundle goes. A surviving one is a
+    # search path into the build host, which is the whole class of bug the
+    # self-contained audit exists to catch.
+    otool -l "$src" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | while IFS= read -r rp; do
+        case "$rp" in
+            @*) continue ;;
+        esac
         install_name_tool -delete_rpath "$rp" "$dest" 2>/dev/null || true
     done || true
 
@@ -628,7 +687,11 @@ echo "==> staged $STAGED Mach-O files"
 if [ -n "$APP_EXE" ]; then
     echo "==> relinking Contents/MacOS/$APP_EXE_NAME"
     HITS=0
-    otool -L "$APP_EXE" | tail -n +2 | awk '{print $1}' | grep -E '^/opt/homebrew' > "$WALK_FILE" || true
+    # Whatever the compiler wrote, in either spelling. A cgo build against the
+    # framework produces @rpath names here exactly as the framework's own libs
+    # carry, and leaving those unrewritten would send dyld looking for
+    # GStreamer outside the bundle.
+    otool -L "$APP_EXE" | tail -n +2 | awk '{print $1}' | grep -E "^(@rpath/|$GST_SRC_PREFIX/)" > "$WALK_FILE" || true
     while IFS= read -r old; do
         [ -n "$old" ] || continue
         leaf="$(basename "$old")"
@@ -637,15 +700,31 @@ if [ -n "$APP_EXE" ]; then
             echo "      The closure walk missed a direct dependency of the app binary." >&2
             exit 1
         fi
-        install_name_tool -change "$old" "@executable_path/../Frameworks/$leaf" "$APP_EXE" 2>/dev/null || true
+        # NOT SWALLOWED. This rewrite is the difference between an application
+        # that launches and a Finder bounce with no message anywhere, and a
+        # `2>/dev/null || true` here hid a load command that did not take —
+        # the script reported six repointed while five had moved.
+        if ! err="$(install_name_tool -change "$old" "@executable_path/../Frameworks/$leaf" "$APP_EXE" 2>&1)"; then
+            echo "FAIL: could not repoint $old in $APP_EXE_NAME:" >&2
+            echo "      $err" >&2
+            exit 1
+        fi
         HITS=$((HITS + 1))
     done < "$WALK_FILE"
-    otool -l "$APP_EXE" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep -E '^/opt/homebrew' > "$WALK_FILE" || true
+    otool -l "$APP_EXE" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep -v '^@' > "$WALK_FILE" || true
     while IFS= read -r rp; do
         [ -n "$rp" ] || continue
         install_name_tool -delete_rpath "$rp" "$APP_EXE" 2>/dev/null || true
     done < "$WALK_FILE"
     echo "    $HITS load commands repointed at ../Frameworks"
+    # PROVED, not counted. The count says how many rewrites were ATTEMPTED; this
+    # says how many landed, which is the only interesting number.
+    left="$(otool -L "$APP_EXE" | tail -n +2 | awk '{print $1}' | grep -E "^(@rpath/|/opt/homebrew|$GST_SRC_PREFIX/)" || true)"
+    if [ -n "$left" ]; then
+        echo "FAIL: $APP_EXE_NAME still links outside the bundle after relinking:" >&2
+        printf '      %s\n' $left >&2
+        exit 1
+    fi
 
     # The bundle, not the file. Handing codesign the MAIN EXECUTABLE of a
     # bundle makes it sign the whole bundle instead — documented behaviour,
@@ -727,8 +806,14 @@ MACHO_COUNT=0
 while IFS= read -r f; do
     file "$f" 2>/dev/null | grep -q 'Mach-O' || continue
     MACHO_COUNT=$((MACHO_COUNT + 1))
-    hit=$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -E '^/opt/homebrew' || true)
-    rp=$(otool -l "$f" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep -E '^/opt/homebrew' || true)
+    # BOTH SPELLINGS ARE FAILURES. A surviving /opt/homebrew name is the
+    # original hazard; a surviving @rpath name is the same hazard wearing the
+    # framework's clothes — it resolves against whatever LC_RPATH is left, and
+    # the whole point of this stage is that nothing outside the bundle is
+    # consulted. The rpath check ignores @loader_path and @executable_path,
+    # which are the bundle-relative ones this script installs on purpose.
+    hit=$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -E "^(@rpath/|/opt/homebrew|$GST_SRC_PREFIX/)" || true)
+    rp=$(otool -l "$f" 2>/dev/null | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep -v '^@' || true)
     if [ -n "$hit$rp" ]; then
         AUDIT_HITS="$AUDIT_HITS
   ${f#"$APP"/}
