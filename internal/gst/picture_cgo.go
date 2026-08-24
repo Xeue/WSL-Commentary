@@ -144,14 +144,15 @@ import (
 // and to be impossible to confuse with the send path's (mux, srtq, slate, asrc,
 // venc, vscale, srtout-N) or the return path's (retsrc, retdemux, ...).
 const (
-	namePicPipeline = "wslcomms-picture"
-	namePicSrc      = "picsrc"   // srtsrc
-	namePicDemux    = "picdemux" // tsdemux
-	namePicQueue    = "picq"     // queue at the head of the video branch
-	namePicParse    = "picparse" // h265parse
-	namePicDecode   = "picdec"   // d3d11h265dec on Windows, vtdec_hw on macOS
-	namePicSink     = "picsink"  // d3d11videosink on Windows, glimagesink on macOS
-	namePicFakeSink = "picfake"  // fakesink for the audio pad
+	namePicPipeline     = "wslcomms-picture"
+	namePicSrc          = "picsrc"      // srtsrc
+	namePicDemux        = "picdemux"    // tsdemux
+	namePicQueue        = "picq"        // queue at the head of the video branch
+	namePicParse        = "picparse"    // h265parse
+	namePicDecode       = "picdec"      // d3d11h265dec on Windows, vtdec_hw on macOS
+	namePicSink         = "picsink"     // d3d11videosink on Windows, glimagesink on macOS
+	namePicFakeSink     = "picfake"     // fakesink for the audio pad
+	namePicPresentQueue = "picpresentq" // leaky queue decoupling a SOFTWARE decoder from the sink
 )
 
 // pictureStateChangeTimeout bounds the asynchronous tail of the picture
@@ -877,6 +878,12 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 	if parserFactory == "h264parse" && p.chain.decoderH264.factory != "" {
 		decoderFactory = p.chain.decoderH264.factory
 	}
+	// A SOFTWARE decoder (avdec_*) needs the picture decoupled from the display
+	// and its corrupt output suppressed; a hardware one needs neither. Decided
+	// once here so the two mitigations below share the same answer, and read
+	// through pictureDecoderIsSoftwareFactory so the measured hardware path is
+	// never touched.
+	softwareDecode := pictureDecoderIsSoftwareFactory(decoderFactory)
 	// The sink comes from p.chain, which newPicturePipe resolved against the
 	// registry: d3d11videosink on Windows, glimagesink on macOS. srtsrc, tsdemux
 	// and queue are the same factory under the same name on both. See
@@ -901,14 +908,63 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		*s.out = el
 	}
 
+	// The present queue, on the SOFTWARE path only. THE POINT is to decouple
+	// decode from display.
+	//
+	// When the sink cannot present as fast as the decoder decodes — an iGPU kept
+	// busy capturing and H.264-encoding for a remote-desktop session is the case
+	// in the field, on a machine whose HEVC hardware decoder the OEM fused off —
+	// the frames back up. Without a buffer here that backlog stalls the decoder,
+	// which stalls the demuxer, which stops srtsrc draining the socket, which
+	// overflows libsrt's receive buffer, which drops COMPRESSED packets; and a
+	// lost NAL shreds every frame that references it until the next keyframe. That
+	// is the "broken/invalid nal ... will be dropped" flood a field log showed.
+	//
+	// This moves the loss to whole DECODED frames: leaky=downstream drops the
+	// OLDEST decoded frame when the queue is full, so a slow display costs frame
+	// RATE, not correctness. The socket keeps draining, the decoder is never
+	// back-pressured, and every frame that IS shown is intact. The buffer is small
+	// so the latency it can add is small. It is software-only because a hardware
+	// decoder outputs GPU memory the sink takes without a copy and never falls
+	// behind, so the queue would be pure latency there.
+	var presentq gogst.Element
+	if softwareDecode {
+		presentq = gogst.ElementFactoryMake("queue", namePicPresentQueue)
+		if presentq == nil {
+			return errors.New("gst: picture monitor: could not create " + namePicPresentQueue)
+		}
+		if !p.pipeline.Add(presentq) {
+			return errors.New("gst: picture monitor: could not add " + namePicPresentQueue + " to the pipeline")
+		}
+		gogst.UtilSetObjectArg(presentq, "leaky", "downstream")
+		gogst.UtilSetObjectArg(presentq, "max-size-buffers", "5")
+		gogst.UtilSetObjectArg(presentq, "max-size-bytes", "0")
+		gogst.UtilSetObjectArg(presentq, "max-size-time", "0")
+
+		// output-corrupt=false: a decoder that HAS lost reference data holds the
+		// last good frame rather than paint the damage. It is the belt to the
+		// present queue's braces — with the socket no longer overflowing there
+		// should be little corruption left — and it is guarded because only the
+		// libav decoders carry the property; the hardware ones do not, and a plain
+		// set would fail on them.
+		if hasProperty(p.decode, "output-corrupt") {
+			p.decode.SetObjectProperty("output-corrupt", false)
+		}
+	}
+
 	// srtsrc to tsdemux is a static link on both sides and is made here. Every
 	// link from the demuxer onwards is dynamic; see onPadAdded.
 	if !p.src.Link(p.demux) {
 		return fmt.Errorf("gst: picture monitor: could not link %s to %s", namePicSrc, namePicDemux)
 	}
 
-	// The video branch, in order. All static pads.
-	video := []gogst.Element{p.queue, parse, p.decode, p.sink}
+	// The video branch, in order. All static pads. The present queue sits between
+	// the decoder and the sink on the software path only; nil drops out.
+	video := []gogst.Element{p.queue, parse, p.decode}
+	if presentq != nil {
+		video = append(video, presentq)
+	}
+	video = append(video, p.sink)
 	for i := 0; i+1 < len(video); i++ {
 		if !video[i].Link(video[i+1]) {
 			return fmt.Errorf("gst: picture monitor: could not link the video branch at element %d "+

@@ -251,6 +251,39 @@ func TestPictureBuildsTheChainItResolved(t *testing.T) {
 	}
 }
 
+// TestPictureDecouplesTheSoftwareDecoderFromTheSink pins the mitigation that
+// makes a software decode survivable on a machine that cannot present as fast as
+// it decodes — in the field, a Dell whose HEVC hardware decoder the OEM fused
+// off, driven over a remote desktop that keeps the iGPU busy.
+//
+// Without the leaky present queue, a slow sink back-pressures the decoder, which
+// stalls the demuxer, which stops srtsrc draining, which overflows libsrt and
+// drops COMPRESSED packets — and a lost NAL shreds the picture. The queue moves
+// the loss to whole decoded frames instead. It is software-only, so this also
+// pins that the choice is made through pictureDecoderIsSoftwareFactory rather
+// than applied to the measured hardware path.
+func TestPictureDecouplesTheSoftwareDecoderFromTheSink(t *testing.T) {
+	fset, file := parseSource(t, pictureCgoSourceFile)
+	body := funcBody(t, fset, file, "picturePipeline", "buildLocked")
+
+	if !strings.Contains(body, "pictureDecoderIsSoftwareFactory(decoderFactory)") {
+		t.Error("buildLocked no longer decides the software path from pictureDecoderIsSoftwareFactory; " +
+			"the present queue and output-corrupt must apply to software decode ONLY, never the " +
+			"measured hardware path")
+	}
+	for _, want := range []string{"namePicPresentQueue", `"leaky"`, `"downstream"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("buildLocked no longer builds the leaky present queue (missing %s). A slow sink "+
+				"will then back-pressure the software decoder into an SRT buffer overflow, which loses "+
+				"compressed data and corrupts the picture instead of dropping clean decoded frames", want)
+		}
+	}
+	if !strings.Contains(body, `"output-corrupt"`) {
+		t.Error("buildLocked no longer sets output-corrupt on the software decoder; a decoder that has " +
+			"lost reference data will paint the damage rather than hold the last good frame")
+	}
+}
+
 // TestPictureSrcStillTakesItsLatencyFromTheOptions guards the other half of the
 // operator's control.
 //
