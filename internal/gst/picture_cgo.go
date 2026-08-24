@@ -146,7 +146,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -982,6 +984,47 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		if hasProperty(p.decode, "output-corrupt") {
 			p.decode.SetObjectProperty("output-corrupt", false)
 		}
+
+		// SLICE threading, not FRAME threading. THIS IS THE FIELD FIX for the torn
+		// picture on a heterogeneous CPU.
+		//
+		// FFmpeg frame threading decodes several frames at once across cores and
+		// reassembles them in order. On a homogeneous CPU that is deterministic and
+		// correct — proven here decoding this exact live stream clean under every
+		// stress (2 cores, 16 threads, CPU contention). On the field machine, an
+		// Intel 120U with 2 fast P-cores and 8 slow E-cores, the reference frame on
+		// a straggling E-core is not ready when a P-core needs it, and libav logs
+		// "Could not find ref with POC" and tears for a GOP until the next IDR —
+		// the exact fault a field log showed, and one that does NOT reproduce on
+		// homogeneous cores. SLICE threading decodes frames IN ORDER, parallelising
+		// only WITHIN a frame, so reference management cannot slip on any core
+		// layout; measured clean and keeping up (no SRT overflow) pinned to 2
+		// cores against the live stream.
+		//
+		// It is overridable so the field machine — the only one that reproduces the
+		// fault — can A/B without a rebuild: WSLCOMMS_PIC_THREAD_TYPE = slice
+		// (default) | frame | auto (GStreamer's default, frame+slice) | any libav
+		// nick; WSLCOMMS_PIC_MAX_THREADS = N caps the worker count.
+		threadType := os.Getenv("WSLCOMMS_PIC_THREAD_TYPE")
+		if threadType == "" {
+			threadType = "slice"
+		}
+		if threadType != "auto" && hasProperty(p.decode, "thread-type") {
+			gogst.UtilSetObjectArg(p.decode, "thread-type", threadType)
+		}
+		if mt := os.Getenv("WSLCOMMS_PIC_MAX_THREADS"); mt != "" {
+			if n, err := strconv.Atoi(mt); err == nil && n > 0 && hasProperty(p.decode, "max-threads") {
+				p.decode.SetObjectProperty("max-threads", int32(n))
+			}
+		}
+		log.Printf("gst: picture monitor: software decode %s: thread-type=%s%s",
+			decoderFactory, threadType,
+			func() string {
+				if mt := os.Getenv("WSLCOMMS_PIC_MAX_THREADS"); mt != "" {
+					return ", max-threads=" + mt
+				}
+				return ""
+			}())
 	}
 
 	// srtsrc to tsdemux is a static link on both sides and is made here. Every

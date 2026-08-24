@@ -282,6 +282,11 @@ func TestPictureDecouplesTheSoftwareDecoderFromTheSink(t *testing.T) {
 		t.Error("buildLocked no longer sets output-corrupt on the software decoder; a decoder that has " +
 			"lost reference data will paint the damage rather than hold the last good frame")
 	}
+	if !strings.Contains(body, `"thread-type"`) {
+		t.Error("buildLocked no longer sets thread-type on the software decoder. FRAME threading tears " +
+			"the picture on a heterogeneous CPU (fast P + slow E cores) with \"Could not find ref\"; " +
+			"SLICE threading decodes frames in order and is the field fix")
+	}
 }
 
 // TestPictureSrcStillTakesItsLatencyFromTheOptions guards the other half of the
