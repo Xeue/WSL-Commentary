@@ -520,6 +520,9 @@ function Get-RuntimeEntries {
             -Why 'FFmpeg libswresample: a transitive dependency of libavcodec, in libgstlibav.dll''s closure (objdump 2026-08-24).'
         New-BundleEntry -Kind Runtime -Names 'libswscale-8.dll', 'libswscale-9.dll', 'swscale-8.dll', 'swscale-9.dll' `
             -Why 'FFmpeg libswscale: a transitive dependency of libavfilter and libavcodec, in libgstlibav.dll''s closure (objdump 2026-08-24).'
+        New-BundleEntry -Kind Runtime -Names 'libbz2.dll', 'libbz2-1.dll', 'bz2.dll' `
+            -Why 'bzip2: libavformat-61.dll imports it (caught by -DependencyReport on the first 1.5.1 build, 2026-08-24). It is NOT an FFmpeg-family name, so the objdump closure walk that seeded this block missed it; the dependency report is the authority, exactly as the header says. bzip2 is permissively licensed and links only the OS plus libwinpthread, already present.' `
+            -Fix 'Ships with the GStreamer mingw runtime because FFmpeg links it. If the name differs (libbz2-1.dll on some builds), add it to the candidate list.'
 
         # -- MinGW runtime, spec section 11 ---------------------------------
         New-BundleEntry -Kind Runtime -Names 'libwinpthread-1.dll' `

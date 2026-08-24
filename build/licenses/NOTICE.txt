@@ -161,6 +161,12 @@ C. PERMISSIVE LICENCES - shipped as DLLs, unmodified
   zlib                            zlib License
     UNVERIFIED - copy the exact notice at Gate B.
 
+  bzip2 (libbz2)                  bzip2 licence (BSD-style, permissive)
+    Ships only because libavformat (the gst-libav decode fallback admitted
+    2026-08-24, section G) links it; caught by bundle-gst.ps1's dependency
+    report. UNVERIFIED - copy the exact notice from the bzip2 source LICENSE
+    at Gate B.
+
   libffi                          MIT
   PCRE2                           BSD-3-Clause
   OpenSSL (libcrypto, libssl)     Apache-2.0
