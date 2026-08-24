@@ -52,13 +52,17 @@ A. LGPL-2.1 COMPONENTS - shipped as shared libraries, unmodified,
     and plugins only: coreelements, typefindfunctions, videoconvertscale,
     audioconvert, audioresample, volume, imagefreeze, png, audioparsers,
     videoparsersbad, wasapi2, mediafoundation, mpegtsmux, mpegtsdemux, srt,
-    d3d11, level, decklink, videorate, deinterlace, proxy.
+    d3d11, level, decklink, videorate, deinterlace, proxy, libav.
     (mpegtsdemux was added for the SRT return monitor, d3d11 for the SRT
     picture, level for the input meters, decklink, videorate and deinterlace
-    for the SDI capture path, volume for the cough mute, and proxy for the
-    capture/send seam - each is recorded in build\bundle-gst.ps1 beside the
-    closed allowlist it extends.)
-    All twenty-one are LGPL-2.1-or-later, the five most recent verified with
+    for the SDI capture path, volume for the cough mute, proxy for the
+    capture/send seam, and libav for the picture's software decode fallback
+    (2026-08-24) - each is recorded in build\bundle-gst.ps1 beside the closed
+    allowlist it extends.)
+    Twenty-one of the twenty-two are LGPL-2.1-or-later; the twenty-second,
+    libav (gst-libav / FFmpeg), is a distinct licence-and-patent question and is
+    covered in section G below, not counted here. Of the LGPL twenty-one, the
+    five most recent were verified with
     gst-inspect rather than assumed: decklink and proxy are gst-plugins-bad,
     videorate and volume are gst-plugins-base and deinterlace is
     gst-plugins-good, and all five report License LGPL. deinterlace's own
@@ -616,12 +620,46 @@ G. DELIBERATE EXCLUSIONS - read this before adding anything to the bundle
     macOS: GStreamer (LGPL) wrappers over an encoder already in the operating
     system. See sections F and F2.
 
-  gst-libav / FFmpeg              EXCLUDED
-    Licensing depends on how it was built and nothing here needs it. Blocked by
-    the same patterns (*libav*, *ffmpeg*, *avcodec* and the rest). This is why
-    avenc_aac, avdec_aac and avdec_h265 appear in no candidate list in this
-    product even though all three are present and avdec_h265 ranks PRIMARY on
-    macOS.
+  gst-libav / FFmpeg    ADMITTED 2026-08-24 - WINDOWS, VIDEO DECODE ONLY
+    This entry used to read EXCLUDED. It was reversed on 2026-08-24, and the
+    reversal is why this section opens by telling you to read it before changing
+    the bundle: the exclusions here are decisions, and a decision can be remade
+    deliberately, in the open, by the owner.
+
+    WHAT CHANGED. Some Windows machines have a GPU/driver that exposes no
+    hardware HEVC decode profile - an older Intel iGPU, or a box on a stale
+    graphics driver - so d3d11h265dec never registers, and the picture had no
+    decoder and no fallback and retried for ever. gst-libav's avdec_h265 (and
+    avdec_h264) decode in software on the CPU, so they are now the picture's
+    LAST-RESORT fallback, tried only after the hardware decoder is found missing.
+    Hardware is still preferred wherever it exists, and the decoder is chosen by
+    explicit name, never by rank - avdec ranks PRIMARY, so a decodebin would pick
+    it over the GPU. See internal/gst/picture_cgo.go.
+
+    WHAT IS AND IS NOT ADMITTED. Only the two VIDEO DECODERS, and only on
+    Windows. avenc_* (the FFmpeg encoders) and avdec_aac (the FFmpeg AAC decoder)
+    stay excluded: the H.264 encode is still mfh264enc and the AAC decode is
+    still mfaacdec, both OS codecs. macOS ships NO libav at all - vtdec (Apple's
+    own, in applemedia) is already its software fallback.
+
+    LICENCE. gst-libav itself is the LGPL-2.1 GStreamer wrapper; the FFmpeg
+    libraries it links (libavcodec / avformat / avutil / avfilter, libswscale,
+    libswresample - the six in section A's Windows list) are as built and shipped
+    by the GStreamer project's own official Windows installer. The owner has
+    accepted this licence posture for an internal, non-redistributed deployment.
+
+    PATENTS. HEVC and H.264 are patent-encumbered, and a SOFTWARE decoder carries
+    that exposure directly, where the hardware path offloads it onto the GPU
+    vendor who already licensed it. The owner has weighed and ACCEPTED that
+    exposure for this internal use. It is a deliberate, recorded risk decision -
+    not an oversight - and it is exactly the kind of thing this section exists to
+    keep visible.
+
+    CONTROL. forbidden-names.ps1 had *libav*, *ffmpeg*, *avcodec*, *avformat*,
+    *avfilter*, *swscale* and *swresample* removed for this; *postproc* (GPL,
+    unneeded) and the x264 / x265 / ugly / AAC patterns stayed. The seven admitted
+    files are named one by one in bundle-gst.ps1's allowlist, which remains the
+    control over exactly what ships.
 
   gst-plugins-ugly                EXCLUDED
     That plugin set exists because of licensing. Blocked by the same patterns.

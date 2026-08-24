@@ -44,6 +44,21 @@ func TestPictureDecoderMatchesTheParserCodec(t *testing.T) {
 		if h265[0].factory != "d3d11h265dec" {
 			t.Errorf("the Windows H.265 decoder is %q, want d3d11h265dec", h265[0].factory)
 		}
+		// The software fallback is present and LAST. On the build host, which has
+		// the hardware decoder, avdec sits behind it; on a machine whose GPU has no
+		// HEVC profile it is the only survivor and is what choosePictureChain
+		// resolves to. A list that lost it leaves such a machine with no decoder at
+		// all — the whole failure this fallback was added to fix. That it comes
+		// last (never before the DXVA decoder) is the Gate A guard's job; this only
+		// proves the bundle actually carries it.
+		if last := h265[len(h265)-1].factory; last != "avdec_h265" {
+			t.Errorf("the last Windows H.265 candidate is %q, want avdec_h265 (the gst-libav software "+
+				"fallback); is libgstlibav.dll in the bundle?", last)
+		}
+		if last := h264[len(h264)-1].factory; last != "avdec_h264" {
+			t.Errorf("the last Windows H.264 candidate is %q, want avdec_h264 (the gst-libav software "+
+				"fallback)", last)
+		}
 	case "darwin":
 		if h264[0].factory != h265[0].factory {
 			t.Errorf("the H.264 decoder %q differs from the H.265 one %q on macOS, but vtdec_hw "+

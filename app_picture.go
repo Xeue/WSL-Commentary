@@ -217,6 +217,13 @@ func (a *App) StartPicture() error {
 		return fmt.Errorf("wslcomms: starting the picture: %w", err)
 	}
 
+	// If this machine has no hardware HEVC decoder the picture is now on the
+	// software path (avdec_h265). Tell the operator once, quietly. It is done
+	// here rather than in the forwarder because it is a property of the build and
+	// the GPU, not of any one connection attempt, and it should be said whether
+	// or not the software decode goes on to keep up.
+	a.maybeNotePictureSoftwareDecode()
+
 	sess := &pictureSession{mon: mon}
 	// The diagnostic is built HERE, from the options actually handed to the
 	// monitor, and captured by the forwarder below. Building it from a fresh
@@ -235,6 +242,33 @@ func (a *App) StartPicture() error {
 	a.pic = sess
 
 	return nil
+}
+
+// maybeNotePictureSoftwareDecode emits the software-decode note at most once for
+// the life of the process, if and only if the picture will decode on the CPU
+// because the machine has no hardware HEVC decoder.
+//
+// It is a NOTE, not an error: the picture works, and on a machine with the
+// headroom it works well — this only explains why the CPU is busier. On a
+// low-powered box it may also be the reason the picture judders, which is exactly
+// the fault that went undiagnosed before the software fallback existed. The once
+// guard is the App's, so stopping and restarting the picture does not repeat it;
+// a fresh process says it again, which is right, because that is a fresh machine
+// being set up. On a build with the hardware decoder present,
+// gst.PictureDecoderIsSoftware returns false and nothing is said.
+func (a *App) maybeNotePictureSoftwareDecode() {
+	software, factory := gst.PictureDecoderIsSoftware()
+	if !software {
+		return
+	}
+	a.pictureSoftwareNoteOnce.Do(func() {
+		a.emitNote(fmt.Sprintf(
+			"This machine has no hardware HEVC decoder, so the picture is being decoded in "+
+				"software (%s). That uses noticeably more CPU and can judder at 1080p50 on a "+
+				"low-powered machine. To get hardware decoding back, update the graphics driver; "+
+				"or set that M2L-X output to H.264, which this machine can decode in hardware.",
+			factory))
+	})
 }
 
 // StopPicture closes the SRT picture and hides the overlay.

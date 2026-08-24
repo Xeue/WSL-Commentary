@@ -81,21 +81,32 @@
 // decoder stream-format=hev1 codec_data, and vtdec_hw negotiated
 // video/x-raw(memory:GLMemory) NV12 straight into the sink's uploader.
 //
-// # No libav, ever
+// # libav is the software fallback, and hardware still comes first
 //
-// The decoder is the platform's hardware one, wrapped by gst-plugins-bad under
-// LGPL: d3d11h265dec is DXVA in the GPU driver, vtdec_hw is VideoToolbox in the
-// operating system. avdec_h265 is present at PRIMARY rank on BOTH the Windows
-// developer machine and this Mac and must never be selected; gst-libav is
-// FFmpeg, which is the same commercial-shipping concern as x264enc, and both
-// bundlers already refuse to copy anything matching *libav* or *avcodec*.
-// Selecting it here would produce an application that works on a development
-// machine and fails to load a plugin on the installed one.
+// The decoder is the platform's HARDWARE one wherever the machine has it, and it
+// is always preferred and always tried first: d3d11h265dec is DXVA in the GPU
+// driver, vtdec_hw is VideoToolbox in the operating system, both wrapped by
+// gst-plugins-bad under LGPL.
 //
-// That is also why the decoder is named rather than left to decodebin. A
-// decodebin on this stream would pick between vtdec_hw at primary+1 and
-// avdec_h265 at primary by rank, which is the right answer today and one
-// registry change away from being the wrong one, silently.
+// What changed on 2026-08-24. Some Windows machines have a GPU/driver that
+// exposes NO hardware HEVC decode profile — an older Intel iGPU, or a box on a
+// stale graphics driver where d3d11 registers d3d11h264dec but not
+// d3d11h265dec — so the picture had nothing to decode the H.265 with and no
+// fallback, and retried for ever. The owner's decision, taken with the licence
+// and the HEVC-patent posture understood and accepted for this internal
+// deployment, is to admit gst-libav (FFmpeg) as a LAST-RESORT SOFTWARE decoder:
+// avdec_h265 for H.265, avdec_h264 for H.264. It is WINDOWS-ONLY here — macOS
+// keeps Apple's own vtdec as its software fallback and never loads libav.
+//
+// THE CHOICE MUST STILL BE BY EXPLICIT NAME, NOT BY RANK, and that is now MORE
+// important rather than less. avdec_h265 ranks PRIMARY on both development
+// machines, so a decodebin — or any "let GStreamer choose" refactor — would pick
+// it OVER the hardware decoder and burn a core on every machine that had a
+// perfectly good media engine sitting idle. So the candidate lists below are
+// ordered hardware-first and the element is named, never negotiated. When the
+// resolved decoder turns out to be a software one, the operator is told ONCE,
+// quietly, through a grey note; see pictureDecoderIsSoftwareFactory and
+// app_picture.go's software-decode note.
 package gst
 
 /*
@@ -196,14 +207,18 @@ var pictureRequiredElements = []pictureFactory{
 	{"h264parse", "videoparsersbad"},
 }
 
-// pictureDecoderCandidates is the H.265 decoder, in preference order.
+// pictureDecoderCandidates is the H.265 decoder, in preference order, hardware
+// first.
 //
-// WINDOWS. d3d11h265dec only: DXVA, in the GPU driver, measured on the live
+// WINDOWS. d3d11h265dec first: DXVA, in the GPU driver, measured on the live
 // M2L-X output at 1178 frames over 25 s on an RTX 5070. mfh265dec is absent on
 // the target because the Windows HEVC video extension is not installed, and
 // requiring the operator to buy it from the Microsoft Store is not a deployment
-// step. There is deliberately no fallback: the only other decoder on that
-// machine is avdec_h265, which is FFmpeg and is forbidden.
+// step. avdec_h265 (gst-libav/FFmpeg) is the SOFTWARE fallback, and it is only
+// reached on a machine whose GPU/driver exposes no hardware HEVC profile so
+// d3d11h265dec never registered — see "libav is the software fallback" in the
+// file header for the decision and its licence/patent posture. It is last, never
+// first, because it decodes on the CPU.
 //
 // macOS. vtdec_hw first — VideoToolbox, hardware only, rank primary+1 (257),
 // from gst-plugins-bad's applemedia plugin, LGPL over a decoder that is part of
@@ -211,20 +226,16 @@ var pictureRequiredElements = []pictureFactory{
 // with alignment=au, which is exactly what h265parse produces from the
 // byte-stream on the wire, and it was driven end to end here.
 //
-// vtdec is the fallback and it is a REAL one rather than a courtesy: it is the
-// same element without the hardware-only flag, at secondary rank, so it can fall
-// back to VideoToolbox's software path on a Mac whose media engine will not take
-// this profile. It is still applemedia, still LGPL, still not FFmpeg. Falling
-// back is logged loudly, because a software HEVC decode of 1080p50 is a
-// different machine load from a hardware one and the operator should be able to
-// find out why the fans came on.
-//
-// avdec_h265 is present at PRIMARY rank on both platforms and appears in neither
-// list. See "No libav, ever" in the file header.
+// vtdec is the macOS fallback and it is a REAL one rather than a courtesy: it is
+// the same element without the hardware-only flag, at secondary rank, so it can
+// fall back to VideoToolbox's software path on a Mac whose media engine will not
+// take this profile. It is still applemedia, still LGPL, still Apple's own and
+// NOT FFmpeg — which is why macOS carries no libav: it already has a software
+// fallback that ships with the OS.
 func pictureDecoderCandidates() []pictureFactory {
 	switch runtime.GOOS {
 	case "windows":
-		return []pictureFactory{{"d3d11h265dec", "d3d11"}}
+		return []pictureFactory{{"d3d11h265dec", "d3d11"}, {"avdec_h265", "libav"}}
 	case "darwin":
 		return []pictureFactory{{"vtdec_hw", "applemedia"}, {"vtdec", "applemedia"}}
 	default:
@@ -247,13 +258,14 @@ func pictureDecoderCandidates() []pictureFactory {
 // d3d11h265dec but from the SAME d3d11 plugin (one libgstd3d11.dll already in the
 // bundle), so this adds no file to ship.
 //
-// avdec_h264 is FFmpeg and is forbidden, exactly as avdec_h265 is; see the file
-// header. There is deliberately no fallback on Windows for the same reason
-// pictureDecoderCandidates has none.
+// avdec_h264 (gst-libav/FFmpeg) is the SOFTWARE fallback for H.264, the twin of
+// avdec_h265 above and admitted by the same decision — last, never first, and
+// only reached when d3d11h264dec did not register. macOS needs none for the same
+// reason pictureDecoderCandidates gives: vtdec is already its software path.
 func pictureDecoderCandidatesH264() []pictureFactory {
 	switch runtime.GOOS {
 	case "windows":
-		return []pictureFactory{{"d3d11h264dec", "d3d11"}}
+		return []pictureFactory{{"d3d11h264dec", "d3d11"}, {"avdec_h264", "libav"}}
 	case "darwin":
 		return []pictureFactory{{"vtdec_hw", "applemedia"}, {"vtdec", "applemedia"}}
 	default:
@@ -298,6 +310,43 @@ func pictureBundler() string {
 		return "build/bundle-gst.ps1"
 	}
 	return "build/bundle-gst-darwin.sh"
+}
+
+// pictureDecoderIsSoftwareFactory reports whether a decoder factory name is one
+// of the SOFTWARE fallbacks — avdec_* (gst-libav/FFmpeg) or vtdec (VideoToolbox's
+// software path). The hardware decoders (d3d11h265dec, d3d11h264dec, vtdec_hw)
+// are not.
+//
+// It is the ONE place that knowledge lives. Two callers depend on it: pick(),
+// which stays silent about a software fallback so it does not log on every
+// reconnect, and PictureDecoderIsSoftware, which tells the operator once. A
+// decoder added to the candidate lists that decodes on the CPU must be named
+// here, or the machine falls to software with nobody told.
+func pictureDecoderIsSoftwareFactory(factory string) bool {
+	return strings.HasPrefix(factory, "avdec_") || factory == "vtdec"
+}
+
+// PictureDecoderIsSoftware reports whether the picture will decode its default
+// (H.265) feed in software because the machine has no hardware HEVC decoder, and
+// the factory that will be used.
+//
+// It is exported for app_picture.go, which calls it once per process to tell the
+// operator — quietly, as a grey note — that this machine has landed on the
+// software path: higher CPU, and on a weak box possibly judder at 1080p50. It
+// reports on the DEFAULT codec (H.265), which is what the switcher sends and the
+// only codec whose decoder is known before a frame arrives; an H.264 feed that
+// also falls to software is the rarer case and is not separately announced.
+//
+// It re-resolves the chain rather than caching, because it is called once and
+// choosePictureChain is a stateless query of the registry that cannot change
+// within a process. Before Init it reports false: nothing can be known yet, and
+// a note about a decoder on a registry that has not loaded would be a guess.
+func PictureDecoderIsSoftware() (bool, string) {
+	if !inited.Load() {
+		return false, ""
+	}
+	chain, _ := choosePictureChain()
+	return pictureDecoderIsSoftwareFactory(chain.decoder.factory), chain.decoder.factory
 }
 
 // pictureChain is the pair of platform-dependent elements one pipeline needs,
@@ -348,9 +397,15 @@ func choosePictureChain() (pictureChain, []string) {
 			if gogst.ElementFactoryFind(c.factory) == nil {
 				continue
 			}
-			if i > 0 {
-				// A fallback was taken. It is a working picture and a worse one,
-				// and the only place that can ever be noticed is here.
+			if i > 0 && !pictureDecoderIsSoftwareFactory(c.factory) {
+				// A NON-software fallback was taken — in practice the macOS
+				// osxvideosink sink. It is a working picture and a worse one, and
+				// this is the only place it can be noticed. The SOFTWARE decoder
+				// fallback (avdec_*, vtdec) is deliberately NOT logged here: it is
+				// chosen afresh on every reconnect, so a log line would repeat for
+				// the life of the match, and the operator is told about it exactly
+				// once through the grey note instead. See
+				// pictureDecoderIsSoftwareFactory and app_picture.go.
 				log.Printf("gst: picture monitor: %s %s is not in this build's GStreamer; "+
 					"falling back to %s (plugin %s), which is a working picture but not the one "+
 					"this path was measured on",

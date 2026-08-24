@@ -11,20 +11,27 @@
 # deliberately no -Force anywhere near this.
 #
 # x264 is the one the specification names (GPL-2.0-or-later; mfh264enc replaces
-# it). The rest are in the same family: GPL, or patent-encumbered, or both, and
-# none of them has any business in this pipeline.
+# it) and it stays forbidden, as do x265, the GPL/patent-encumbered audio codecs
+# and gst-plugins-ugly. gst-libav / FFmpeg is the ONE deliberate exception,
+# admitted 2026-08-24 as the picture's software decode fallback; see the note in
+# the list below.
 
 $ForbiddenPatterns = @(
     '*x264*'        # GPL-2.0-or-later. THE reason this control exists.
     '*x265*'        # GPL-2.0-or-later.
-    '*libav*'       # gst-libav / FFmpeg: licence depends on how it was built. Not ours to assume.
-    '*ffmpeg*'      # as above.
-    '*avcodec*'     # FFmpeg component.
-    '*avformat*'    # FFmpeg component.
-    '*avfilter*'    # FFmpeg component.
-    '*postproc*'    # FFmpeg component, GPL.
-    '*swscale*'     # FFmpeg component.
-    '*swresample*'  # FFmpeg component.
+    # gst-libav / FFmpeg was ADMITTED on 2026-08-24 as the picture's software
+    # HEVC/H.264 decode fallback, for Windows machines whose GPU exposes no
+    # hardware decode profile so d3d11h265dec never registers. The owner took
+    # that decision with the licence and the HEVC-patent posture understood and
+    # accepted for this internal deployment. So *libav*, *ffmpeg*, *avcodec*,
+    # *avformat*, *avfilter*, *swscale* and *swresample* are NO LONGER forbidden:
+    # the seven files libgstlibav.dll needs are named one by one in
+    # bundle-gst.ps1's allowlist, which is the control that still governs exactly
+    # what ships. See internal/gst/picture_cgo.go's "libav is the software
+    # fallback" header and NOTICE.txt.
+    '*postproc*'    # FFmpeg's libpostproc STAYS forbidden: it is GPL, and nothing
+                    # in the decode path needs it - it is not in libgstlibav.dll's
+                    # dependency closure (verified by objdump, 2026-08-24).
     '*ugly*'        # gst-plugins-ugly: the set exists precisely because of licensing.
     '*faac*'        # patent-encumbered AAC encoder. We use the OS: mfaacenc / atenc.
     '*faad*'        # GPL AAC DECODER (gst-plugins-bad). Not a typo for faac above:

@@ -28,7 +28,7 @@
     *** GATE B MUST VERIFY IT AGAINST A REAL GSTREAMER INSTALL. ***
 
     It was written on a machine with no GStreamer installed (Gate B closed), so
-    the exact DLL names and the transitive dependency closure of the twenty-one
+    the exact DLL names and the transitive dependency closure of the twenty-two
     allowlisted plugins could not be computed. Two mechanisms make that
     recoverable rather than fatal:
 
@@ -166,13 +166,22 @@ $ScriptVersion = '1.0.0'
 # describe C++ standard-library internals we do not debug and cannot patch - so
 # they are 31 MB of download and disk for no return. -NoStrip restores the old
 # behaviour and the old band.
+# RE-BANDED 2026-08-24, when gst-libav was added for the picture's software
+# decode fallback. Its seven files are ~19.6 MB unstripped, dominated by
+# libavcodec-61.dll at 14.4 MB - the codecs themselves, mostly real code rather
+# than debug, so stripping recovers far less of it than it does of libstdc++.
+# The stripped max is raised from 40 to 55 MB and the NoStrip max from 80 to 110
+# MB to cover it with the usual slack. This is an ESTIMATE pending a real Gate B
+# run on Windows: if a clean strip comes in well under the new max, tighten it
+# back down to the measured figure plus a margin, the way the 22.9 MB line below
+# the original band was arrived at.
 if ($NoStrip) {
     $ExpectedMinBytes = 40MB
-    $ExpectedMaxBytes = 80MB
+    $ExpectedMaxBytes = 110MB
 }
 else {
     $ExpectedMinBytes = 15MB
-    $ExpectedMaxBytes = 40MB
+    $ExpectedMaxBytes = 55MB
 }
 
 # ---------------------------------------------------------------------------
@@ -241,7 +250,7 @@ function Get-PluginEntries {
         needs it, and every plugin not here was left out because it is not
         needed, is GPL, or drags in a dependency we would then have to ship.
 
-        There have been exactly eight additions since section 3 was written,
+        There have been exactly nine additions since section 3 was written,
         and all are stated here rather than slipped into the list, because that
         is the rule this function exists to enforce on everyone else:
 
@@ -260,18 +269,31 @@ function Get-PluginEntries {
                         updated, which is the drift this paragraph exists to
                         prevent; it is recorded now.
           proxy         the CAPTURE/SEND SEAM, 2026-08-16. See its Why line.
+          libav         the picture's SOFTWARE DECODE FALLBACK, 2026-08-24. See
+                        its Why line, and the reversal below of the note that
+                        used to keep it out.
 
-        One plugin was CONSIDERED and deliberately NOT added:
+        THE libav DECISION WAS REVERSED ON 2026-08-24, AND IT IS RECORDED HERE
+        BECAUSE THIS COMMENT USED TO SAY THE OPPOSITE. It said gst-libav was
+        CONSIDERED and deliberately NOT added - that its FFmpeg licence was not
+        ours to assume, that it was the same concern that keeps x264 out, and
+        that avdec_h265 must never be selected because d3d11h265dec already
+        decodes HEVC on the machine.
 
-          libav       gst-libav is FFmpeg. Its licence depends on how it was
-                      built and is not ours to assume, which is the same
-                      commercial-shipping concern that keeps x264 out and the
-                      reason *libav* and *avcodec* are in $ForbiddenPatterns.
-                      avdec_aac and avdec_h265 both rank primary on the dev
-                      machine and NEITHER may be selected: the AAC decoder is
-                      mfaacdec (mediafoundation) and the HEVC decoder is
-                      d3d11h265dec (d3d11), both LGPL wrappers over decoders
-                      that are already on the machine.
+        That last premise turned out to be false on some machines. A Windows box
+        whose GPU/driver exposes no hardware HEVC profile registers d3d11h264dec
+        but NOT d3d11h265dec, so the picture had no decoder and no fallback and
+        retried for ever - which is exactly what happened in the field. So the
+        owner admitted gst-libav as the picture's LAST-RESORT SOFTWARE decoder
+        (avdec_h265, avdec_h264), with the licence and the HEVC-patent posture
+        understood and accepted for this internal deployment. It is WINDOWS-ONLY:
+        the macOS bundler still ships no libav, because vtdec (Apple's own, in
+        applemedia) is already its software fallback.
+
+        The AAC decode is untouched and stays the OS one (mfaacdec): avdec_aac is
+        NOT admitted, only the two video decoders. See forbidden-names.ps1, where
+        *libav* and the FFmpeg component patterns were removed while *postproc*
+        (GPL, unneeded) and the x264/x265/ugly patterns stayed, and NOTICE.txt.
 
         THE d3d11 DECISION WAS TAKEN ON 2026-08-07 AND IT IS RECORDED HERE
         BECAUSE THIS COMMENT USED TO SAY THE OPPOSITE. It said the return was
@@ -329,7 +351,10 @@ function Get-PluginEntries {
             -Why 'level: the input meters. Sits in the capture chain and posts peak/RMS element messages, so the commentator sees the level of what is ACTUALLY being encoded and sent - not what the browser thinks the microphone is doing. gst-plugins-good, LGPL, 69 KB, no dependency that is not already in this bundle (verified by objdump 2026-08-12).'
         New-BundleEntry -Kind Plugin -Names 'libgstd3d11.dll' `
             -Why 'd3d11h265dec AND d3d11videosink: the commentator''s PICTURE. The programme feed arrives as H.265 1920x1080 50p on an M2L-X output and there is no other way to decode or show it here. mfh265dec is ABSENT on the target (the Windows HEVC extension is not installed and buying it from the Store is not a deployment step) and avdec_h265 is FFmpeg, which $ForbiddenPatterns refuses. d3d11h265dec is DXVA in the GPU driver, wrapped LGPL by gst-plugins-bad; measured on 2026-08-07 decoding 1178 frames in 25 s off port 40501, hardware=true, NV12 1920x1080 50/1. One plugin file supplies both the decoder and the sink, so this single entry is the whole picture path.' `
-            -Fix 'If this file is missing, the machine has a partial GStreamer install: libgstd3d11.dll ships with gst-plugins-bad in every official build. Do NOT substitute libav.'
+            -Fix 'If this file is missing, the machine has a partial GStreamer install: libgstd3d11.dll ships with gst-plugins-bad in every official build. libav does NOT substitute for it - libav has no video sink and no DXVA decoder, only a software one.'
+        New-BundleEntry -Kind Plugin -Names 'libgstlibav.dll' `
+            -Why 'avdec_h265 AND avdec_h264: the picture''s SOFTWARE decode fallback, gst-libav (FFmpeg). Reached ONLY on a Windows machine whose GPU/driver exposes no hardware HEVC (or H.264) DXVA profile - an older Intel iGPU, or a box on a stale graphics driver - so d3d11h265dec never registers and the hardware path has nothing to decode the picture with. Admitted 2026-08-24 by the owner with the licence and the HEVC-patent posture understood and accepted for this internal deployment; see forbidden-names.ps1, NOTICE.txt and internal/gst/picture_cgo.go''s "libav is the software fallback" header. The decoder is chosen by EXPLICIT hardware-first name, never by rank, because avdec_h265 ranks PRIMARY and a decodebin would pick it over the GPU. It pulls in six FFmpeg runtime DLLs (libavcodec/avformat/avutil/avfilter, libswresample, libswscale) - all in Get-RuntimeEntries, all confirmed in libgstlibav.dll''s import closure by objdump 2026-08-24.' `
+            -Fix 'gst-libav ships as libgstlibav.dll in every official GStreamer runtime. A missing FILE means -GstRoot points at a partial install. It is the ONLY *libav* file admitted: do NOT add avenc_* or the audio avdec_* - the AAC decode is the OS one (mfaacdec).'
         New-BundleEntry -Kind Plugin -Names 'libgstdecklink.dll' `
             -Why 'decklinkvideosrc and decklinkaudiosrc: the SDI CAPTURE PATH. A commentary position in a sports facility takes its programme feed off SDI, not off the machine''s own audio stack, and that means a Blackmagic card. One plugin file supplies both the video and the audio source and the device provider that fills the input dropdown. gst-plugins-bad, LGPL (verified by gst-inspect, not assumed). *** IT NEEDS A DRIVER THIS INSTALLER DOES NOT SHIP: Blackmagic DESKTOP VIDEO. That is a user-installed prerequisite in the same class as the WebView2 runtime - see installer.iss and licenses\NOTICE.txt section F3. Without it there is no DeckLinkAPI, so there are no devices and no capture, and the failure is quiet. ***' `
             -Fix 'This file ships with gst-plugins-bad in every official GStreamer build, so a missing FILE means -GstRoot points at a partial install. A file that is PRESENT but whose elements do not appear in gst-inspect means Desktop Video is not installed on this machine, which is a different problem with a different fix.'
@@ -346,7 +371,7 @@ function Get-PluginEntries {
 function Get-RuntimeEntries {
     <#
     .SYNOPSIS
-        The libraries the .exe and the twenty-one plugins link against.
+        The libraries the .exe and the twenty-two plugins link against.
     .DESCRIPTION
         UNVERIFIED - Gate B must confirm every line of this function against a
         real C:\gstreamer\1.0\mingw_x86_64\bin, and against the output of
@@ -435,7 +460,7 @@ function Get-RuntimeEntries {
         New-BundleEntry -Kind Runtime -Names 'gio-2.0-0.dll', 'libgio-2.0-0.dll' `
             -Why 'GIO. GStreamer core and the srt plugin use it.'
         New-BundleEntry -Kind Runtime -Names 'gmodule-2.0-0.dll', 'libgmodule-2.0-0.dll' `
-            -Why 'g_module_open is how GStreamer loads the twenty-one plugins. Without it the registry is empty and nothing works.'
+            -Why 'g_module_open is how GStreamer loads the twenty-two plugins. Without it the registry is empty and nothing works.'
         New-BundleEntry -Kind Runtime -Names 'gthread-2.0-0.dll', 'libgthread-2.0-0.dll' -Optional `
             -Why 'Empty stub since GLib 2.32 but still shipped by some builds. Copied if present.'
         New-BundleEntry -Kind Runtime -Names 'libffi-8.dll', 'libffi-7.dll', 'ffi-8.dll', 'ffi-7.dll' `
@@ -470,6 +495,31 @@ function Get-RuntimeEntries {
             -Why 'mbedTLS, as above.'
         New-BundleEntry -Kind Runtime -Names 'mbedx509.dll', 'libmbedx509.dll' -Optional `
             -Why 'mbedTLS, as above.'
+
+        # -- gst-libav / FFmpeg: the picture's software decode fallback -----
+        # libgstlibav.dll imports libavcodec, libavformat, libavfilter and
+        # libavutil directly, and pulls in libswresample and libswscale
+        # transitively (avcodec -> swresample, avfilter -> swscale). All six were
+        # confirmed in the closure by objdump on 2026-08-24 against the 1.28.5
+        # mingw_x86_64 build, where FFmpeg is major 61/59/10/5/8 (avcodec big at
+        # ~14 MB unstripped - it is the codecs themselves). The soname digit tracks
+        # the FFmpeg major, so each entry carries the next major as a candidate
+        # against a future GStreamer that bumps it. These ship ONLY because the
+        # picture's software fallback needs them; nothing else in the bundle links
+        # FFmpeg. See forbidden-names.ps1 and NOTICE.txt.
+        New-BundleEntry -Kind Runtime -Names 'libavcodec-61.dll', 'libavcodec-62.dll', 'avcodec-61.dll', 'avcodec-62.dll' `
+            -Why 'FFmpeg libavcodec: avdec_h265 and avdec_h264 themselves - the picture''s software decoder.' `
+            -Fix 'Required whenever libgstlibav.dll is bundled. If the soname is neither 61 nor 62, ADD it to the candidate list - do not switch to a wildcard.'
+        New-BundleEntry -Kind Runtime -Names 'libavformat-61.dll', 'libavformat-62.dll', 'avformat-61.dll', 'avformat-62.dll' `
+            -Why 'FFmpeg libavformat: imported DIRECTLY by libgstlibav.dll (objdump 2026-08-24), so it must load or the plugin does not - even though the decode path muxes nothing.'
+        New-BundleEntry -Kind Runtime -Names 'libavutil-59.dll', 'libavutil-60.dll', 'avutil-59.dll', 'avutil-60.dll' `
+            -Why 'FFmpeg libavutil: the base library the other three link, imported directly by libgstlibav.dll.'
+        New-BundleEntry -Kind Runtime -Names 'libavfilter-10.dll', 'libavfilter-11.dll', 'avfilter-10.dll', 'avfilter-11.dll' `
+            -Why 'FFmpeg libavfilter: imported DIRECTLY by libgstlibav.dll (objdump 2026-08-24), so it must be present at load even though avdec uses no filter.'
+        New-BundleEntry -Kind Runtime -Names 'libswresample-5.dll', 'libswresample-6.dll', 'swresample-5.dll', 'swresample-6.dll' `
+            -Why 'FFmpeg libswresample: a transitive dependency of libavcodec, in libgstlibav.dll''s closure (objdump 2026-08-24).'
+        New-BundleEntry -Kind Runtime -Names 'libswscale-8.dll', 'libswscale-9.dll', 'swscale-8.dll', 'swscale-9.dll' `
+            -Why 'FFmpeg libswscale: a transitive dependency of libavfilter and libavcodec, in libgstlibav.dll''s closure (objdump 2026-08-24).'
 
         # -- MinGW runtime, spec section 11 ---------------------------------
         New-BundleEntry -Kind Runtime -Names 'libwinpthread-1.dll' `
@@ -550,7 +600,7 @@ function Assert-ManifestSane {
         'coreelements', 'typefindfunctions', 'videoconvertscale', 'audioconvert',
         'audioresample', 'volume', 'imagefreeze', 'png', 'audioparsers', 'videoparsersbad',
         'wasapi2', 'mediafoundation', 'mpegtsmux', 'mpegtsdemux', 'srt', 'd3d11',
-        'level', 'decklink', 'videorate', 'deinterlace', 'proxy'
+        'level', 'decklink', 'videorate', 'deinterlace', 'proxy', 'libav'
     )
     $actualPlugins = @(
         $Entries | Where-Object { $_.Kind -eq 'Plugin' } | ForEach-Object {
@@ -837,8 +887,8 @@ $entries += Get-RuntimeEntries
 Write-Host "Validating the file list ($($entries.Count) entries)..."
 Assert-ManifestSane -Entries $entries
 Write-Host "  file list OK: no wildcards, no forbidden names, no duplicate destinations,"
-Write-Host "  plugin set equals specification section 3 plus mpegtsdemux, d3d11, level and the"
-Write-Host "  three capture-path plugins (decklink, videorate, deinterlace), exactly."
+Write-Host "  plugin set equals specification section 3 plus its nine recorded additions"
+Write-Host "  (mpegtsdemux, d3d11, level, decklink, videorate, deinterlace, volume, proxy, libav), exactly."
 Write-Host ''
 
 $srcBin = Join-Path $GstRoot 'bin'

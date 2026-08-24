@@ -101,14 +101,15 @@ all default plugin search), `GST_PLUGIN_PATH_1_0=<appdir>\gst\lib\gstreamer-1.0`
 `SetEnvironmentVariableW`, which is what GLib reads, so this crosses the cgo boundary cleanly. A
 GStreamer installation elsewhere on the machine is invisible to the app, and vice versa.
 
-**Plugin allowlist** — an explicit file list, never a directory copy, because a directory copy drags
-GPL `x264enc` and LGPL-plus-patent-encumbered `gst-libav` into a commercial deliverable:
+**Plugin allowlist** — an explicit file list, never a directory copy. A directory copy would drag GPL
+`x264enc` in, and would pull in *all* of `gst-libav` — the encoders included — where this product now
+admits only its two software video *decoders* (see the `libav` note below):
 `coreelements`, `typefindfunctions`, `videoconvertscale`, `audioconvert`, `audioresample`,
 **`volume`**, `imagefreeze`, `png`, `audioparsers`, `videoparsersbad`, `wasapi2`, `mediafoundation`,
 `mpegtsmux`, **`mpegtsdemux`**, `srt`, **`d3d11`**, **`level`**, **`decklink`**, **`videorate`**,
-**`deinterlace`**, **`proxy`** — twenty-one.
+**`deinterlace`**, **`proxy`**, **`libav`** — twenty-two.
 
-Eight of those twenty-one were added after this section was first written, and they are marked here
+Nine of those twenty-two were added after this section was first written, and they are marked here
 rather than folded in silently, because `build\bundle-gst.ps1` **throws** when its file list and this
 paragraph disagree: adding a plugin is a specification change, so the two move together or the build
 stops. `mpegtsdemux` is the return monitor's demuxer, `d3d11` the picture's HEVC decoder and video
@@ -132,6 +133,18 @@ reasoned from that: `proxysink`/`proxysrc` are pure GstElement plumbing with no 
 framework behind them. **That `libgstproxy.dll` exists in the official MinGW build is UNVERIFIED from
 the macOS host this was written on**; `gst-inspect-1.0 proxysink` on the Windows build host is what
 settles it, and a missing non-optional plugin is a hard failure in `bundle-gst.ps1`, not a quiet one.
+
+`libav` is the ninth, added on 2026-08-24 for the picture's **software HEVC/H.264 decode fallback**. A
+Windows machine whose GPU exposes no hardware HEVC profile registers `d3d11h264dec` but not
+`d3d11h265dec`, so the picture had no decoder and no fallback and retried for ever; `avdec_h265` /
+`avdec_h264` (gst-libav / FFmpeg) decode in software as the **last resort**, tried only after the
+hardware decoder is found missing and chosen by explicit name so `avdec`'s PRIMARY rank never beats
+the GPU. It is Windows-only — macOS keeps Apple's own `vtdec`. The owner admitted it with the licence
+and the HEVC-patent posture accepted for this internal deployment; `build\forbidden-names.ps1` and
+`build\licenses\NOTICE.txt` §G carry that decision, and it pulls in six FFmpeg runtime DLLs
+(`libavcodec/avformat/avutil/avfilter`, `libswscale`, `libswresample`). Unlike `volume` and `proxy`
+it is **conditional** — a fallback, not on every seat — so there is no staged-by-both-bundlers test
+for it.
 
 One correction to the paragraph above, because it overstates its own guard: `bundle-gst.ps1` does
 **not** read this file. Its `Assert-ManifestSane` compares two PowerShell arrays *inside the script*,
@@ -969,10 +982,13 @@ embedded by `wails build -webview2 embed`. End users need none of this.
 
 `build\bundle-gst.ps1` copies the plugin allowlist plus the core GStreamer, GLib, orc, libpng, OpenSSL
 and libsrt DLLs and the MinGW runtime (`libwinpthread`, `libgcc_s_seh`, `libstdc++`) into `dist\gst\`,
-from an **explicit file list**, and carries a forbidden-pattern list that refuses to copy anything
-matching `*libav*` or `*avcodec*`. It emits `BUNDLE-MANIFEST.txt` and verifies the copied set against
-the expected one, so a plugin silently gained or lost is a build failure rather than a runtime one on
-the installed machine.
+from an **explicit file list**, and carries a forbidden-pattern list that refuses to copy the GPL and
+patent-encumbered plugins (`x264`, `x265`, gst-plugins-ugly, the third-party AAC codecs, `postproc`).
+gst-libav's two software video *decoders* are the one deliberate admission (2026-08-24) — named file
+by file in the allowlist, not swept in — so `*libav*` and the FFmpeg-component patterns were removed
+while the rest stayed; see `build\forbidden-names.ps1` and `build\licenses\NOTICE.txt` §G. It emits
+`BUNDLE-MANIFEST.txt` and verifies the copied set against the expected one, so a plugin silently
+gained or lost is a build failure rather than a runtime one on the installed machine.
 
 Installer: Inno Setup (`build\installer.iss`), per-machine, one feature, no options. Lays down
 `wslcomms.exe`, `gst\`, `slate.png`, the LGPL-2.1 text and a written offer for the corresponding

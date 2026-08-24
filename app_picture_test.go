@@ -542,6 +542,74 @@ func TestPictureDiagnosticIsEmittedOnceAfterThreeFailures(t *testing.T) {
 	}
 }
 
+func TestPictureSoftwareDecodeNoteIsEmittedOnceAsANote(t *testing.T) {
+	// A machine with no hardware HEVC decoder falls to avdec_h265 (software). The
+	// operator is told ONCE, as a NOTE — grey and uncounted, because the picture
+	// works and this only explains the higher CPU — and NOT on every StartPicture,
+	// because the decoder's absence is a fixed property of the GPU. It is a "note"
+	// event, not an "error", so the frontend never counts it as a fault.
+	gst.SetStubPictureSoftwareDecoder("avdec_h265")
+	defer gst.SetStubPictureSoftwareDecoder("")
+
+	a, _ := newTestApp(t)
+	silencePump(a)
+	withFakePicture(a)
+
+	// Two full start/stop cycles. The note must appear on the first and never
+	// again — the once guard is the App's, for the life of the process.
+	for i := 0; i < 2; i++ {
+		if err := a.StartPicture(); err != nil {
+			t.Fatalf("StartPicture() #%d error = %v", i+1, err)
+		}
+		if err := a.StopPicture(); err != nil {
+			t.Fatalf("StopPicture() #%d error = %v", i+1, err)
+		}
+	}
+
+	notes := 0
+	for _, e := range drainPump(a) {
+		if e.name != EventNote {
+			continue
+		}
+		notes++
+		s, ok := e.data.(string)
+		if !ok {
+			t.Fatalf("the %q event carried %T, want a string", EventNote, e.data)
+		}
+		for _, want := range []string{"software", "avdec_h265"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("the software-decode note %q does not name %q", s, want)
+			}
+		}
+	}
+	if notes != 1 {
+		t.Fatalf("the picture emitted %d software-decode notes over two starts, want exactly 1", notes)
+	}
+}
+
+func TestPictureSaysNothingWhenTheDecoderIsHardware(t *testing.T) {
+	// The default stub answer is hardware. No note: a machine that decodes on the
+	// GPU must not be nagged about a software path it is not on.
+	gst.SetStubPictureSoftwareDecoder("")
+
+	a, _ := newTestApp(t)
+	silencePump(a)
+	withFakePicture(a)
+
+	if err := a.StartPicture(); err != nil {
+		t.Fatalf("StartPicture() error = %v", err)
+	}
+	if err := a.StopPicture(); err != nil {
+		t.Fatalf("StopPicture() error = %v", err)
+	}
+
+	for _, e := range drainPump(a) {
+		if e.name == EventNote {
+			t.Fatalf("a hardware-decode machine emitted a note: %v", e.data)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Teardown
 // ---------------------------------------------------------------------------

@@ -29,10 +29,11 @@ const pictureCgoSourceFile = "picture_cgo.go"
 //
 // parseSource parses with mode 0, which does not attach comments to the tree, so
 // printing the file back gives the code alone. That is the property the guards
-// need: picture_cgo.go's header discusses avdec_h265 and decodebin at length,
-// precisely to say they must never be used, and a search over the raw bytes
-// would find those sentences and fail on the documentation that exists to
-// prevent the mistake.
+// need: picture_cgo.go's header discusses decodebin at length, precisely to say
+// it must never be used, and now names avdec_h265/avdec_h264 as the software
+// fallbacks the candidate lists deliberately DO carry — so a search over the raw
+// bytes would find those sentences and could neither prove the decodebin ban nor
+// tell an allowed name in the code from one merely discussed in a comment.
 func pictureCgoCode(t *testing.T, fset *token.FileSet, file *ast.File) string {
 	t.Helper()
 	var buf bytes.Buffer
@@ -118,29 +119,27 @@ func TestPictureSinkQoSIsDecidedAndNotInherited(t *testing.T) {
 	}
 }
 
-// TestPictureNeverSelectsALibavDecoder is the licence guard, and it is the one
-// on this path with a commercial consequence rather than a technical one.
+// TestPictureChoosesDecodersByExplicitNameNotByRank is the guard that keeps the
+// software fallback in its place: last, and never reached by rank.
 //
-// avdec_h265 exists at PRIMARY rank on both development machines — the Windows
-// one and this Mac — so it is not an exotic mistake to make: it is what any
-// decodebin, and any "let GStreamer choose" refactor, would land on. gst-libav
-// is FFmpeg, which is the same concern as x264enc, and both bundlers refuse to
-// copy anything matching *libav* or *avcodec*, so a build that selected it would
-// work on the machine it was written on and fail to load a plugin on the
-// installed one.
-//
-// The candidate lists are therefore explicit factory names, and this asserts
-// that no forbidden one has been added and that the file has not started
-// delegating the choice.
-func TestPictureNeverSelectsALibavDecoder(t *testing.T) {
+// gst-libav was admitted on 2026-08-24 as a software decoder (avdec_h265,
+// avdec_h264) for Windows machines whose GPU exposes no hardware HEVC profile —
+// so avdec_ and libav are now ALLOWED in the code, and this test no longer
+// forbids them. What it still forbids is any element that would let GStreamer
+// CHOOSE a decoder BY RANK. avdec_h265 ranks PRIMARY on both development
+// machines, above d3d11h265dec and vtdec_hw, so a decodebin — or a playbin, or a
+// "let GStreamer choose" refactor — would land on the software decoder OVER the
+// hardware one and burn a core on a machine with an idle media engine. The
+// candidate lists must stay explicit, hardware-first, and named.
+func TestPictureChoosesDecodersByExplicitNameNotByRank(t *testing.T) {
 	fset, file := parseSource(t, pictureCgoSourceFile)
 	src := pictureCgoCode(t, fset, file)
 
-	for _, forbidden := range []string{"avdec_", "libav", "decodebin", "playbin", "uridecodebin"} {
+	for _, forbidden := range []string{"decodebin", "playbin", "uridecodebin"} {
 		if strings.Contains(src, forbidden) {
-			t.Errorf("picture_cgo.go's code (not its comments) names %q. The decoder on this path "+
-				"is chosen by name for a licensing reason, and anything that lets GStreamer choose "+
-				"by rank will choose avdec_h265, which is FFmpeg and is not in the bundle", forbidden)
+			t.Errorf("picture_cgo.go's code (not its comments) names %q. The decoder on this path is "+
+				"chosen by explicit, hardware-first name: avdec_h265 ranks PRIMARY, so anything that "+
+				"lets GStreamer choose by rank picks the software decoder over the GPU's", forbidden)
 		}
 	}
 }
@@ -162,9 +161,10 @@ func TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform(t *testing.T) {
 
 	decoders := funcBody(t, fset, file, "", "pictureDecoderCandidates")
 	if !strings.Contains(decoders, `"d3d11h265dec"`) {
-		t.Error("pictureDecoderCandidates no longer offers d3d11h265dec, which is DXVA and is the " +
-			"only decoder on the Windows target: mfh265dec needs an HEVC extension the operator " +
-			"would have to buy from the Microsoft Store")
+		t.Error("pictureDecoderCandidates no longer offers d3d11h265dec, which is DXVA and the " +
+			"hardware HEVC decoder on the Windows target: mfh265dec needs an HEVC extension the " +
+			"operator would have to buy from the Microsoft Store, and avdec_h265 below it is the " +
+			"software last resort, not a substitute for the GPU path")
 	}
 	hw := strings.Index(decoders, `"vtdec_hw"`)
 	sw := strings.Index(decoders, `"vtdec"`)
@@ -176,6 +176,17 @@ func TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform(t *testing.T) {
 		t.Error("pictureDecoderCandidates offers vtdec before vtdec_hw. That is a software HEVC " +
 			"decode of 1080p50 on a machine that has a media engine sitting idle")
 	}
+	// The Windows software fallback comes AFTER the hardware decoder, never
+	// before. avdec_h265 ranks PRIMARY, so listing it first — or a tidy that
+	// alphabetised the list — would software-decode on every machine that had
+	// d3d11h265dec sitting right there. See the file header.
+	h265hw := strings.Index(decoders, `"d3d11h265dec"`)
+	h265sw := strings.Index(decoders, `"avdec_h265"`)
+	if h265sw >= 0 && (h265hw < 0 || h265sw < h265hw) {
+		t.Error("pictureDecoderCandidates lists avdec_h265 at or before d3d11h265dec. The software " +
+			"decoder must be the LAST resort on Windows: it ranks primary and would otherwise be " +
+			"chosen over the GPU's DXVA decoder")
+	}
 
 	// The H.264 decoder is the Windows half of "parse whichever codec the
 	// transport carries": on Windows H.264 needs d3d11h264dec, a DIFFERENT element
@@ -184,12 +195,15 @@ func TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform(t *testing.T) {
 	decodersH264 := funcBody(t, fset, file, "", "pictureDecoderCandidatesH264")
 	if !strings.Contains(decodersH264, `"d3d11h264dec"`) {
 		t.Error("pictureDecoderCandidatesH264 no longer offers d3d11h264dec. On Windows d3d11h265dec " +
-			"decodes H.265 ONLY, so an H.264 return has no decoder and the video branch cannot link")
+			"decodes H.265 ONLY, so an H.264 return has no hardware decoder and the video branch cannot link")
 	}
-	if strings.Contains(decodersH264, "avdec_h264") {
-		t.Error("pictureDecoderCandidatesH264 offers avdec_h264, which is FFmpeg and is forbidden for " +
-			"the same reason avdec_h265 is — the bundlers refuse to ship it, so it is present on a " +
-			"development machine and absent from the installed one")
+	// The H.264 software fallback, like the H.265 one, comes last — never before
+	// the GPU's own d3d11h264dec.
+	h264hw := strings.Index(decodersH264, `"d3d11h264dec"`)
+	h264sw := strings.Index(decodersH264, `"avdec_h264"`)
+	if h264sw >= 0 && (h264hw < 0 || h264sw < h264hw) {
+		t.Error("pictureDecoderCandidatesH264 lists avdec_h264 at or before d3d11h264dec. The software " +
+			"decoder must be the last resort: it ranks primary and would otherwise be chosen over the GPU's")
 	}
 
 	sinks := funcBody(t, fset, file, "", "pictureSinkCandidates")

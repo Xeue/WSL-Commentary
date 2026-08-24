@@ -917,6 +917,15 @@ export function mountApp(root) {
     home.showError(String(message));
   });
 
+  // The quiet sibling of onError: a "note" event explains something the operator
+  // can see (today, that the picture is decoding in software) without counting
+  // as a fault. It goes in at NOTE severity — grey, uncounted — and is logged at
+  // info, not error, because nothing is wrong.
+  backend.onNote((message) => {
+    console.info('wslcomms: backend note event', message);
+    home.showNote(String(message));
+  });
+
   // The input meters beside the picture: the CAPTURE pipeline's own peak/RMS
   // measurement, taken where it hands the audio to the encoder, at most 20
   // frames a second. They run from launch — the pipeline they belong to is built

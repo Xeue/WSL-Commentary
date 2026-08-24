@@ -121,6 +121,7 @@ func remoteEventNames() []string {
 		EventReturn,
 		EventPicture,
 		EventError,
+		EventNote,
 		EventStatusKeys,
 		EventLevels,
 		EventChannelLevels,

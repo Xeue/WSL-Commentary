@@ -524,6 +524,16 @@ const (
 	// EventError carries a human-readable error string for display.
 	EventError = "error"
 
+	// EventNote carries a human-readable NOTE string: something that explains
+	// what the operator can see but is not a fault. The frontend records it at
+	// alerts.js's NOTE severity — grey, uncounted, not raising the attention
+	// marker — where the "error" event above becomes a counted ALERT. It is a
+	// separate event, rather than a severity flag on EventError, so the choice of
+	// loudness is made once, on the Go side, by which method the caller reaches
+	// for; see emitNote and emitError. Its one use today is the software-decode
+	// note in app_picture.go.
+	EventNote = "note"
+
 	// EventStatusKeys carries []m2lx.StatusKeyCandidate: the switcher_status
 	// nodes that started streaming while our feed was coming up, offered to the
 	// Settings screen as suggestions for a statusKey the operator has not set.
@@ -1324,6 +1334,12 @@ type App struct {
 
 	// pic is the running picture session, or nil when the picture is stopped.
 	pic *pictureSession
+
+	// pictureSoftwareNoteOnce fires the "this machine is decoding the picture in
+	// software" note at most once for the life of the process. The decoder's
+	// availability is a fixed property of the GPU and driver, so telling the
+	// operator again on every StartPicture would be noise; see maybeNotePictureSoftwareDecode.
+	pictureSoftwareNoteOnce sync.Once
 
 	// picViewMu guards picOverlay, picRect and picWantVisible: everything about
 	// WHERE THE PICTURE IS DRAWN, as opposed to whether it is running.
@@ -6920,6 +6936,22 @@ func (a *App) emitError(err error) {
 	}
 	log.Printf("wslcomms: %v", err)
 	a.events.send(EventError, err.Error())
+}
+
+// emitNote publishes msg on the "note" event and logs it once at the same
+// info level everything else here logs at.
+//
+// It is emitError's quieter sibling: the frontend renders a note grey and
+// uncounted, so it explains rather than alarms. The log line is not a warning
+// and does not repeat — callers are expected to emit a note once, not on a loop
+// — so it is the one trace a remote operator's log keeps of a machine that has,
+// say, fallen to a software decoder. An empty msg is dropped, as a nil error is.
+func (a *App) emitNote(msg string) {
+	if msg == "" {
+		return
+	}
+	log.Printf("wslcomms: %s", msg)
+	a.events.send(EventNote, msg)
 }
 
 // ---------------------------------------------------------------------------

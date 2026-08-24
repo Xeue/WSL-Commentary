@@ -100,6 +100,35 @@ func ResetStubPicturePipes() {
 	stubPicturePipes = nil
 }
 
+// stubPictureSoftwareDecoder is the factory PictureDecoderIsSoftware reports, or
+// "" for the hardware answer. Guarded by stubPicMu.
+var stubPictureSoftwareDecoder string
+
+// SetStubPictureSoftwareDecoder makes PictureDecoderIsSoftware report a software
+// decoder named factory — the Gate A stand-in for a machine whose GPU has no
+// hardware HEVC decoder, so the picture falls to avdec_h265. "" restores the
+// hardware answer.
+//
+// Stub build only.
+func SetStubPictureSoftwareDecoder(factory string) {
+	stubPicMu.Lock()
+	defer stubPicMu.Unlock()
+	stubPictureSoftwareDecoder = factory
+}
+
+// PictureDecoderIsSoftware is the stub twin of the cgo function. See
+// picture_cgo.go. At Gate A there is no registry to resolve against, so it
+// reports whatever SetStubPictureSoftwareDecoder was given — hardware (false) by
+// default.
+func PictureDecoderIsSoftware() (bool, string) {
+	stubPicMu.Lock()
+	defer stubPicMu.Unlock()
+	if stubPictureSoftwareDecoder == "" {
+		return false, ""
+	}
+	return true, stubPictureSoftwareDecoder
+}
+
 // Play records the options and succeeds, unless FailNextPlay has queued a
 // failure.
 //

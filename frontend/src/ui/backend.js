@@ -80,6 +80,14 @@ export const EVENT_STATUS = 'status';
 export const EVENT_SENDER = 'sender';
 export const EVENT_ERROR = 'error';
 
+// EventNote: a human-readable NOTE string, mirroring app.go's EventNote ("note")
+// exactly. It is the quiet sibling of EVENT_ERROR — the frontend records it at
+// alerts.js's NOTE severity (grey, uncounted) where an "error" event becomes a
+// counted ALERT. The Go side decides which by choosing emitNote or emitError, so
+// there is no severity flag to parse on this side. Its one use today is the
+// picture's software-decode note.
+export const EVENT_NOTE = 'note';
+
 // EventStatusKeys: a []m2lx.StatusKeyCandidate, emitted while a statusKey
 // discovery is running (app.go, maybeDiscoverStatusKey). Suggestions only —
 // nothing is saved until the operator confirms one on the Settings screen.
@@ -621,6 +629,7 @@ function installFakeConsoleHandle() {
     emitStatus: (status) => fakeEmit(EVENT_STATUS, status),
     emitSender: (state) => fakeEmit(EVENT_SENDER, state),
     emitError: (message) => fakeEmit(EVENT_ERROR, message),
+    emitNote: (message) => fakeEmit(EVENT_NOTE, message),
     setDevices: (list) => {
       fakeDevices = Array.isArray(list) ? list : FAKE_DEVICES.slice();
     },
@@ -1097,6 +1106,15 @@ export function onSender(cb) {
 /** Subscribes to the "error" event, a human-readable string. Returns an unsubscribe function. */
 export function onError(cb) {
   return subscribe(EVENT_ERROR, cb);
+}
+
+/**
+ * Subscribes to the "note" event, a human-readable string. Returns an
+ * unsubscribe function. A note explains rather than warns — the caller records
+ * it at NOTE severity, not ALERT. See EVENT_NOTE.
+ */
+export function onNote(cb) {
+  return subscribe(EVENT_NOTE, cb);
 }
 
 /**
