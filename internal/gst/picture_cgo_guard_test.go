@@ -177,6 +177,21 @@ func TestPictureChoosesTheHardwareDecoderFirstOnEachPlatform(t *testing.T) {
 			"decode of 1080p50 on a machine that has a media engine sitting idle")
 	}
 
+	// The H.264 decoder is the Windows half of "parse whichever codec the
+	// transport carries": on Windows H.264 needs d3d11h264dec, a DIFFERENT element
+	// from the H.265 d3d11h265dec, because that one decodes H.265 only. A build
+	// that forgot it shows an H.265 return and a black screen for an H.264 one.
+	decodersH264 := funcBody(t, fset, file, "", "pictureDecoderCandidatesH264")
+	if !strings.Contains(decodersH264, `"d3d11h264dec"`) {
+		t.Error("pictureDecoderCandidatesH264 no longer offers d3d11h264dec. On Windows d3d11h265dec " +
+			"decodes H.265 ONLY, so an H.264 return has no decoder and the video branch cannot link")
+	}
+	if strings.Contains(decodersH264, "avdec_h264") {
+		t.Error("pictureDecoderCandidatesH264 offers avdec_h264, which is FFmpeg and is forbidden for " +
+			"the same reason avdec_h265 is — the bundlers refuse to ship it, so it is present on a " +
+			"development machine and absent from the installed one")
+	}
+
 	sinks := funcBody(t, fset, file, "", "pictureSinkCandidates")
 	if !strings.Contains(sinks, `"d3d11videosink"`) {
 		t.Error("pictureSinkCandidates no longer offers d3d11videosink")
@@ -211,6 +226,7 @@ func TestPictureBuildsTheChainItResolved(t *testing.T) {
 
 	for _, want := range []string{
 		"p.chain.decoder.factory",
+		"p.chain.decoderH264.factory",
 		"p.chain.sink.factory",
 	} {
 		if !strings.Contains(body, want) {

@@ -232,6 +232,35 @@ func pictureDecoderCandidates() []pictureFactory {
 	}
 }
 
+// pictureDecoderCandidatesH264 is the H.264 decoder, for a transport that turns
+// out to carry H.264 rather than the default H.265.
+//
+// THIS IS THE WINDOWS HALF OF "parse whichever codec the transport carries". The
+// commit of that name made the PARSER follow the transport, which is enough on
+// macOS because vtdec_hw's sink template takes video/x-h264 AND video/x-h265 —
+// the decoder does not change there, and this returns the same candidates as
+// pictureDecoderCandidates so only the parser ever differs. On WINDOWS it is not
+// enough: d3d11h265dec decodes H.265 ONLY, so an H.264 pad parsed by h264parse
+// and handed to it fails to link with PadLinkNoformat — the same silent nothing
+// the parser change fixed on macOS, one element further down. d3d11h264dec is the
+// element that takes h264parse's output. It is a DIFFERENT element from
+// d3d11h265dec but from the SAME d3d11 plugin (one libgstd3d11.dll already in the
+// bundle), so this adds no file to ship.
+//
+// avdec_h264 is FFmpeg and is forbidden, exactly as avdec_h265 is; see the file
+// header. There is deliberately no fallback on Windows for the same reason
+// pictureDecoderCandidates has none.
+func pictureDecoderCandidatesH264() []pictureFactory {
+	switch runtime.GOOS {
+	case "windows":
+		return []pictureFactory{{"d3d11h264dec", "d3d11"}}
+	case "darwin":
+		return []pictureFactory{{"vtdec_hw", "applemedia"}, {"vtdec", "applemedia"}}
+	default:
+		return nil
+	}
+}
+
 // pictureSinkCandidates is the video sink, in preference order.
 //
 // WINDOWS. d3d11videosink only. It takes the decoder's D3D11Memory without a
@@ -279,8 +308,18 @@ func pictureBundler() string {
 // the same decoder and the same sink. A pipeline that silently changed decoder
 // between reconnects would be the hardest possible fault to read in a log.
 type pictureChain struct {
+	// decoder is the decoder for the DEFAULT codec, H.265 — the measured path and
+	// what the switcher sends unless it is reconfigured. It is always required:
+	// the picture cannot run without it, and choosePictureChain reports it missing.
 	decoder pictureFactory
-	sink    pictureFactory
+	// decoderH264 is the decoder used when the transport turns out to carry H.264
+	// instead. On macOS it is the SAME element as decoder (vtdec_hw decodes both);
+	// on Windows it is d3d11h264dec, a different element from the same plugin. It
+	// is resolved once here beside decoder so a build for an H.264 return picks it
+	// rather than looking a factory up on a streaming thread. See
+	// pictureDecoderCandidatesH264 and buildLocked.
+	decoderH264 pictureFactory
+	sink        pictureFactory
 }
 
 // choosePictureChain picks the decoder and the sink, and reports everything this
@@ -329,6 +368,12 @@ func choosePictureChain() (pictureChain, []string) {
 	}
 
 	chain.decoder, _ = pick("decoder", pictureDecoderCandidates())
+	// The H.264 decoder is required too, so that an H.264 return feed is a working
+	// picture rather than a link failure. On the target it is d3d11h264dec from the
+	// same d3d11 plugin as the H.265 one, so this can only ever be missing if the
+	// bundle already failed the H.265 check above — but it is named on its own so a
+	// reader of the error is not left guessing which decoder the bundle lost.
+	chain.decoderH264, _ = pick("H.264 decoder", pictureDecoderCandidatesH264())
 	chain.sink, _ = pick("video sink", pictureSinkCandidates())
 	return chain, missing
 }
@@ -765,16 +810,29 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 	p.padMu.Lock()
 	p.builtWith = parserFactory
 	p.padMu.Unlock()
-	// The last two come from p.chain, which newPicturePipe resolved against the
-	// registry: d3d11h265dec into d3d11videosink on Windows, vtdec_hw into
-	// glimagesink on macOS. Everything above them is the same factory under the
-	// same name on both. See pictureDecoderCandidates and pictureSinkCandidates.
+	// THE DECODER MUST MATCH THE PARSER'S CODEC. On macOS the two are the same
+	// element — vtdec_hw decodes both H.264 and H.265 — which is why making only
+	// the parser follow the transport was enough there. On Windows they are NOT:
+	// p.chain.decoder is d3d11h265dec (H.265 only) and h264parse's output links to
+	// it with nothing, so an H.264 return needs d3d11h264dec, which is
+	// p.chain.decoderH264. Pairing h265parse with the H.265 decoder is the default;
+	// only h264parse switches. p.chain.decoder.factory stays the reference the
+	// resolved-chain guard test looks for.
+	decoderFactory := p.chain.decoder.factory
+	if parserFactory == "h264parse" && p.chain.decoderH264.factory != "" {
+		decoderFactory = p.chain.decoderH264.factory
+	}
+	// The sink comes from p.chain, which newPicturePipe resolved against the
+	// registry: d3d11videosink on Windows, glimagesink on macOS. srtsrc, tsdemux
+	// and queue are the same factory under the same name on both. See
+	// pictureDecoderCandidates, pictureDecoderCandidatesH264 and
+	// pictureSinkCandidates.
 	specs := []spec{
 		{"srtsrc", namePicSrc, &p.src},
 		{"tsdemux", namePicDemux, &p.demux},
 		{"queue", namePicQueue, &p.queue},
 		{parserFactory, namePicParse, &parse},
-		{p.chain.decoder.factory, namePicDecode, &p.decode},
+		{decoderFactory, namePicDecode, &p.decode},
 		{p.chain.sink.factory, namePicSink, &p.sink},
 	}
 	for _, s := range specs {
