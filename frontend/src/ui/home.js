@@ -38,8 +38,7 @@ import {
   describeMuteKey,
   describeMuteMode,
   normaliseMuteMode,
-  isTypingTarget,
-  isSpaceActivated,
+  coughMuteKeyDown,
 } from './cough.js';
 // The CAMERA lamp's name. The lamp's DERIVATION is not here and must not be —
 // this file holds no backend knowledge and no state machine — app.js derives it
@@ -1258,11 +1257,14 @@ export function createHomeView(handlers) {
   // Document-level and capturing, because the operator's hands are not
   // guaranteed to be anywhere near this button, and because the default action
   // has to be suppressed: Space activates whatever is focused and scrolls.
-  // isTypingTarget keeps a passphrase field in Settings from muting the
-  // commentary on every word.
   //
-  // repeat is ignored: holding a key fires keydown at the platform's repeat
-  // rate, and each one would re-issue a mute that is already held.
+  // WHAT to do with each keydown — cancel the default? raise a gesture? — is
+  // coughMuteKeyDown's decision, kept a pure function so the part that has been
+  // got wrong twice is testable without a DOM: the typing-field exclusion, the
+  // focused button that keeps its own Space, and the REPEAT. A held Space must
+  // keep cancelling its default on EVERY repeat, or the page scrolls and the
+  // system key sound loops for as long as the mute is held; the press is raised
+  // on the first edge only. This handler just does what it returns.
   //
   // pushKeyHeld records whether THIS binding owns the current Space press. It
   // decides one thing only: whether the keyup may be cancelled. A <button> is
@@ -1270,20 +1272,12 @@ export function createHomeView(handlers) {
   // what silenced every button in the app — see isSpaceActivated.
   let pushKeyHeld = false;
   function onKeyDown(ev) {
-    if (ev.repeat || ev.altKey || ev.ctrlKey || ev.metaKey) return;
-    if (isTypingTarget(ev.target)) return;
-    if (ev.code === MUTE_KEY_PUSH) {
-      // The focused control already answers to Space: it keeps it. PUSH TO MUTE
-      // is the exception, because its activation is this mute, and because a
-      // click gives one event where a hold needs a press and a release.
-      if (ev.target !== pushBtn && isSpaceActivated(ev.target)) return;
-      ev.preventDefault();
+    const { preventDefault, gesture } = coughMuteKeyDown(ev, ev.target === pushBtn);
+    if (preventDefault) ev.preventDefault();
+    if (gesture === 'press') {
       pushKeyHeld = true;
       handlers.onMutePress();
-      return;
-    }
-    if (ev.code === MUTE_KEY_LATCH) {
-      ev.preventDefault();
+    } else if (gesture === 'latch') {
       handlers.onMuteLatchToggle();
     }
   }

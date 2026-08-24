@@ -40,6 +40,7 @@ import {
   describeMuteMode,
   isTypingTarget,
   isSpaceActivated,
+  coughMuteKeyDown,
   normaliseMuteMode,
   MUTE_KEY_PUSH,
   MUTE_KEY_LATCH,
@@ -581,4 +582,81 @@ test('Space belongs to whatever Space already activates', () => {
   assert.equal(isSpaceActivated(null), false);
   assert.equal(isSpaceActivated(undefined), false);
   assert.equal(isSpaceActivated('not an element'), false);
+});
+
+// ---------------------------------------------------------------------------
+// coughMuteKeyDown — the keydown decision, and the repeat bug it fixes.
+// ---------------------------------------------------------------------------
+
+/** kd builds a fake KeyboardEvent for coughMuteKeyDown. */
+function kd(code, extra = {}) {
+  return {
+    code,
+    repeat: false,
+    altKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    target: { tagName: 'BODY' },
+    ...extra,
+  };
+}
+
+test('a held Space keeps cancelling its default on every repeat — the scroll/beep bug', () => {
+  // THE BUG. Push-to-mute means HOLDING Space, which auto-repeats keydown at the
+  // platform rate. The handler used to `return` on ev.repeat BEFORE it reached
+  // preventDefault, so for as long as the operator held the mute the page
+  // scrolled and Windows played its key sound on a loop.
+  //
+  // The first press mutes; every repeat after it must STILL cancel the default
+  // (so nothing scrolls or sounds) but must NOT raise the press again — the mute
+  // is already held.
+  const first = coughMuteKeyDown(kd(MUTE_KEY_PUSH, { repeat: false }), false);
+  assert.deepEqual(first, { preventDefault: true, gesture: 'press' }, 'the first Space mutes');
+
+  const repeat = coughMuteKeyDown(kd(MUTE_KEY_PUSH, { repeat: true }), false);
+  assert.equal(repeat.preventDefault, true,
+    'a Space repeat must cancel its default, or the page scrolls and the key sound loops');
+  assert.equal(repeat.gesture, null,
+    'a Space repeat must NOT re-issue the press — the mute is already held');
+});
+
+test('a held latch key is suppressed on repeat, toggled on the first edge only', () => {
+  const first = coughMuteKeyDown(kd(MUTE_KEY_LATCH, { repeat: false }), false);
+  assert.deepEqual(first, { preventDefault: true, gesture: 'latch' });
+
+  const repeat = coughMuteKeyDown(kd(MUTE_KEY_LATCH, { repeat: true }), false);
+  assert.equal(repeat.preventDefault, true, 'a held M must not scroll or sound either');
+  assert.equal(repeat.gesture, null, 'a latch flapping at the repeat rate would be unusable');
+});
+
+test('Space belongs to a focused button, and the mute keeps only its own', () => {
+  // A focused <button> is activated by Space: coughMuteKeyDown must leave it its
+  // default (preventDefault false) and raise nothing, EXCEPT the PUSH TO MUTE
+  // button itself, whose activation IS this mute.
+  const onButton = coughMuteKeyDown(kd(MUTE_KEY_PUSH, { target: { tagName: 'BUTTON' } }), false);
+  assert.deepEqual(onButton, { preventDefault: false, gesture: null },
+    'a focused button keeps Space; stealing it is what silenced every button in the app');
+
+  const onPushBtn = coughMuteKeyDown(kd(MUTE_KEY_PUSH, { target: { tagName: 'BUTTON' } }), true);
+  assert.deepEqual(onPushBtn, { preventDefault: true, gesture: 'press' },
+    'the PUSH TO MUTE button is the exception: its activation is this mute');
+});
+
+test('coughMuteKeyDown ignores typing fields, modifiers and other keys', () => {
+  for (const tag of ['INPUT', 'TEXTAREA', 'SELECT']) {
+    assert.deepEqual(
+      coughMuteKeyDown(kd(MUTE_KEY_PUSH, { target: { tagName: tag } }), false),
+      { preventDefault: false, gesture: null },
+      `Space in a ${tag} is a character, not a mute`,
+    );
+  }
+  for (const mod of ['altKey', 'ctrlKey', 'metaKey']) {
+    assert.deepEqual(
+      coughMuteKeyDown(kd(MUTE_KEY_PUSH, { [mod]: true }), false),
+      { preventDefault: false, gesture: null },
+      `${mod}+Space is a shortcut, not a mute`,
+    );
+  }
+  assert.deepEqual(coughMuteKeyDown(kd('KeyJ'), false), { preventDefault: false, gesture: null });
+  assert.deepEqual(coughMuteKeyDown(null, false), { preventDefault: false, gesture: null });
 });

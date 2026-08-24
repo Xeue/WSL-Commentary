@@ -194,6 +194,54 @@ export function isSpaceActivated(target) {
 }
 
 /**
+ * coughMuteKeyDown decides what one keydown means for the cough mute: whether its
+ * DEFAULT must be cancelled, and which gesture (if any) to raise.
+ *
+ * It is pure so this decision — the part that has been got wrong twice — is
+ * testable without a DOM. home.js does exactly what it returns: preventDefault
+ * when told to, then raise the gesture.
+ *
+ * ==================== THE REPEAT BUG THIS ENCODES THE FIX FOR ================
+ *
+ * Push-to-mute means HOLDING Space, and a held key fires keydown at the
+ * platform's repeat rate. The mute is already held, so a repeat must NOT re-issue
+ * it — but its default STILL has to be cancelled on every one. The handler used
+ * to `return` on ev.repeat before it reached preventDefault, so for as long as
+ * the operator held the mute the page scrolled and the system played its key
+ * sound on a loop. So: preventDefault is true on every keydown this control owns,
+ * repeat or not; the GESTURE is raised on the first edge only.
+ *
+ * A key that belongs to something else keeps it: preventDefault is false and the
+ * gesture is null, so the default happens. That is a focused <button> answering
+ * to Space (isSpaceActivated), a text field taking a character (isTypingTarget),
+ * and any modifier combination — Ctrl/Alt/Cmd + Space is a shortcut, not a mute.
+ *
+ * @param {KeyboardEvent} ev
+ * @param {boolean} targetIsPushButton true when ev.target is the PUSH TO MUTE
+ *        button itself, whose own activation IS this mute and so is not left to
+ *        the default the way every other Space-activated control is.
+ * @returns {{preventDefault: boolean, gesture: ('press'|'latch'|null)}}
+ */
+export function coughMuteKeyDown(ev, targetIsPushButton) {
+  const none = { preventDefault: false, gesture: null };
+  if (!ev || ev.altKey || ev.ctrlKey || ev.metaKey) return none;
+  if (isTypingTarget(ev.target)) return none;
+
+  if (ev.code === MUTE_KEY_PUSH) {
+    // The focused control already answers to Space: it keeps it. PUSH TO MUTE is
+    // the exception, because its activation is this mute.
+    if (!targetIsPushButton && isSpaceActivated(ev.target)) return none;
+    return { preventDefault: true, gesture: ev.repeat ? null : 'press' };
+  }
+
+  if (ev.code === MUTE_KEY_LATCH) {
+    return { preventDefault: true, gesture: ev.repeat ? null : 'latch' };
+  }
+
+  return none;
+}
+
+/**
  * MUTE_STATE is the readout's vocabulary — one of these six, never a boolean.
  *
  * FAILED exists because "we could not mute" is not "not muted": the operator has
