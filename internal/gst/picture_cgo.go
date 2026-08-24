@@ -123,6 +123,22 @@ package gst
 static void wslcomms_set_window_handle(gpointer sink, guintptr handle) {
     gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), handle);
 }
+
+// wslcomms_srt_stats_string reads srtsrc's "stats" property and serialises the
+// GstStructure to a string, or returns NULL. The caller frees the result with
+// g_free. It is a thin wrapper for the same reason set_window_handle is: it
+// keeps the g_object_get/gst_structure_to_string/gst_structure_free dance in C,
+// where the ownership rules are legible, rather than open-coded through go-gst's
+// boxed-property binding.
+static gchar* wslcomms_srt_stats_string(gpointer element) {
+    GstStructure *stats = NULL;
+    if (!element) return NULL;
+    g_object_get(G_OBJECT(element), "stats", &stats, NULL);
+    if (!stats) return NULL;
+    gchar *s = gst_structure_to_string(stats);
+    gst_structure_free(stats);
+    return s;
+}
 */
 import "C"
 
@@ -135,6 +151,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	gogst "github.com/go-gst/go-gst/pkg/gst"
 )
@@ -178,6 +195,13 @@ const pictureStateChangeTimeout = 10 * time.Second
 // sender of these errors is a GStreamer streaming thread and must never wait on
 // a Go consumer.
 const pictureErrorBuffer = 8
+
+// pictureStatsInterval is how often srtsrc's receive statistics are written to
+// the log while the picture is playing. Always on, and cheap: reading the stats
+// is one g_object_get. Without them a torn picture is a guess between a slow
+// decoder, a full buffer and a lossy link — so the numbers are logged as
+// EVIDENCE, not inferred.
+const pictureStatsInterval = 2 * time.Second
 
 // pictureFactory is one element factory and the plugin from the bundler's
 // allowlist that provides it, so that a missing element can name the thing the
@@ -542,6 +566,13 @@ type picturePipeline struct {
 	errMu      sync.RWMutex
 	errs       chan error
 	errsClosed bool
+
+	// statsStop stops the SRT stats logger and statsWG waits for it. statsStop is
+	// non-nil only while the logger runs — from Play's success to teardown. The
+	// logger reads p.src, so teardownLocked stops and joins it BEFORE it nils
+	// p.src, and the join is what orders that read before the write.
+	statsStop chan struct{}
+	statsWG   sync.WaitGroup
 }
 
 var _ picturePipe = (*picturePipeline)(nil)
@@ -689,6 +720,7 @@ func (p *picturePipeline) Play(opts PictureOpts) error {
 
 	p.played = true
 	log.Printf("gst: picture monitor: decoding pictures from %s", opts.endpointForLog())
+	p.startStatsLogger()
 	return nil
 }
 
@@ -1460,6 +1492,55 @@ func (p *picturePipeline) drainStartupError() error {
 // Errors returns the asynchronous error channel. See picturePipe.
 func (p *picturePipeline) Errors() <-chan error { return p.errs }
 
+// srtStatsString reads srtsrc's "stats" structure and serialises it, or returns
+// "" if there is nothing to read. Safe from any goroutine: g_object_get on a
+// GStreamer property is internally locked, and p.src is stable for the logger's
+// whole life (teardownLocked joins the logger before it nils p.src).
+func (p *picturePipeline) srtStatsString() string {
+	src := p.src
+	if src == nil {
+		return ""
+	}
+	ptr := gogst.UnsafeElementToGlibNone(src)
+	if ptr == nil {
+		return ""
+	}
+	cs := C.wslcomms_srt_stats_string(C.gpointer(ptr))
+	if cs == nil {
+		return ""
+	}
+	defer C.g_free(C.gpointer(unsafe.Pointer(cs)))
+	return C.GoString(cs)
+}
+
+// startStatsLogger launches the goroutine that writes srtsrc's receive
+// statistics to the log every pictureStatsInterval. It is started once, by Play,
+// after the connection is proven, and stopped by teardownLocked.
+//
+// The stats are the whole point: the cumulative "packets-received-lost",
+// "-retransmitted" and "-dropped" counters answer, from EVIDENCE, whether the
+// link is losing packets and whether SRT is recovering them — the question a
+// torn picture cannot answer on its own.
+func (p *picturePipeline) startStatsLogger() {
+	p.statsStop = make(chan struct{})
+	p.statsWG.Add(1)
+	go func() {
+		defer p.statsWG.Done()
+		ticker := time.NewTicker(pictureStatsInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.statsStop:
+				return
+			case <-ticker.C:
+				if s := p.srtStatsString(); s != "" {
+					log.Printf("gst: picture monitor: srt stats: %s", s)
+				}
+			}
+		}
+	}()
+}
+
 // Close takes the pipeline to NULL and closes the error channel. See
 // picturePipe.
 func (p *picturePipeline) Close() error {
@@ -1482,6 +1563,16 @@ func (p *picturePipeline) Close() error {
 // to draw, and would put a window destroy on a goroutine that does not own the
 // window's message queue.
 func (p *picturePipeline) teardownLocked() error {
+	// Stop the SRT stats logger first and join it, so it is never reading p.src
+	// as the code below sets it to nil. The join is safe — the logger takes no
+	// lock this holds — and it is what orders the logger's last read of p.src
+	// before this function's write of it.
+	if p.statsStop != nil {
+		close(p.statsStop)
+		p.statsWG.Wait()
+		p.statsStop = nil
+	}
+
 	// Raise both flags before touching anything. From here a pad-added callback
 	// returns immediately and the bus handler stops delivering, so nothing on a
 	// streaming thread can add an element to a pipeline that is going away.
