@@ -123,8 +123,8 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 // all is argued. The mute is live state, it is false on every path that begins
 // a session, and it is on none of these four tables on purpose.
 func TestClassificationCounts(t *testing.T) {
-	if got := len(InstanceFields); got != 14 {
-		t.Errorf("len(InstanceFields) = %d, want 14", got)
+	if got := len(InstanceFields); got != 16 {
+		t.Errorf("len(InstanceFields) = %d, want 16", got)
 	}
 	if got := len(MachineFields); got != 8 {
 		t.Errorf("len(MachineFields) = %d, want 8", got)

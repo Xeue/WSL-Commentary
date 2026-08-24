@@ -591,3 +591,130 @@ func TestPictureLatencyRoundTripsThroughTheFile(t *testing.T) {
 		t.Fatalf("pictureLatencyMs came back as %d, want 300", got.PictureLatencyMs)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The SRT return override — a substitute endpoint for a firewalled return.
+// ---------------------------------------------------------------------------
+
+func TestParseSRTReturnOverride(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantPort int
+		wantOK   bool
+	}{
+		{"srt://relay.example.com:40504", "relay.example.com", 40504, true},
+		{"relay.example.com:40504", "relay.example.com", 40504, true},
+		{"relay.example.com", "relay.example.com", 0, true}, // host only: port falls back
+		{"srt://relay.example.com", "relay.example.com", 0, true},
+		{"srt://10.0.0.5:9000/live?x=1", "10.0.0.5", 9000, true}, // path and query ignored
+		{"[2001:db8::1]:40504", "2001:db8::1", 40504, true},      // bracketed IPv6 with port
+		{"  relay.example.com:40504  ", "relay.example.com", 40504, true}, // trimmed
+		{"", "", 0, false},
+		{"srt://", "", 0, false},
+		{"   ", "", 0, false},
+	}
+	for _, c := range cases {
+		host, port, ok := parseSRTReturnOverride(c.in)
+		if ok != c.wantOK || host != c.wantHost || port != c.wantPort {
+			t.Errorf("parseSRTReturnOverride(%q) = (%q, %d, %v), want (%q, %d, %v)",
+				c.in, host, port, ok, c.wantHost, c.wantPort, c.wantOK)
+		}
+	}
+}
+
+func TestReturnOverrideOffLeavesTheReturnOnTheM2LXHost(t *testing.T) {
+	// The whole safety property: with the override off, the return dials exactly
+	// what it dialled before this field existed — the M2L-X host and SRTReturnPort
+	// — even if a relay URL is still saved in the field.
+	c := Config{
+		M2LXHost:                 "https://m2lx.example.com:8443",
+		SRTReturnPort:            40504,
+		SRTReturnOverrideEnabled: false,
+		SRTReturnOverrideURL:     "srt://relay.example.com:9999",
+	}
+	if got := c.EffectiveSRTReturnHost(); got != "m2lx.example.com" {
+		t.Errorf("host = %q, want the derived m2lx.example.com — a saved but OFF override must not move the return", got)
+	}
+	if got := c.EffectiveSRTReturnPort(); got != 40504 {
+		t.Errorf("port = %d, want 40504 (the configured return port)", got)
+	}
+	// And it must never touch the SEND host.
+	if got := c.EffectiveSRTHost(); got != "m2lx.example.com" {
+		t.Errorf("send host = %q, want m2lx.example.com; the override is return-only", got)
+	}
+}
+
+func TestReturnOverrideOnMovesOnlyTheReturn(t *testing.T) {
+	c := Config{
+		M2LXHost:                 "m2lx.example.com",
+		SRTReturnPort:            40504,
+		SRTReturnOverrideEnabled: true,
+		SRTReturnOverrideURL:     "srt://relay.example.com:9000",
+	}
+	if got := c.EffectiveSRTReturnHost(); got != "relay.example.com" {
+		t.Errorf("return host = %q, want relay.example.com", got)
+	}
+	if got := c.EffectiveSRTReturnPort(); got != 9000 {
+		t.Errorf("return port = %d, want the override's 9000", got)
+	}
+	// The send is untouched.
+	if got := c.EffectiveSRTHost(); got != "m2lx.example.com" {
+		t.Errorf("send host = %q, want m2lx.example.com — 'return only' means the send stays put", got)
+	}
+}
+
+func TestReturnOverrideHostOnlyKeepsTheReturnPort(t *testing.T) {
+	// A relay on the same port number as M2L-X needs only a host typed in.
+	c := Config{
+		M2LXHost:                 "m2lx.example.com",
+		SRTReturnPort:            40504,
+		SRTReturnOverrideEnabled: true,
+		SRTReturnOverrideURL:     "relay.example.com",
+	}
+	if got := c.EffectiveSRTReturnHost(); got != "relay.example.com" {
+		t.Errorf("return host = %q, want relay.example.com", got)
+	}
+	if got := c.EffectiveSRTReturnPort(); got != 40504 {
+		t.Errorf("return port = %d, want the configured 40504 (host-only override keeps the port)", got)
+	}
+}
+
+func TestValidateReturn_OverrideOnWithNoHostIsRefused(t *testing.T) {
+	c := validReturnConfigForOverrideTest()
+	c.SRTReturnOverrideEnabled = true
+	c.SRTReturnOverrideURL = "srt://"
+	err := c.ValidateReturn()
+	if err == nil || !strings.Contains(err.Error(), "srtReturnOverrideUrl") {
+		t.Fatalf("ValidateReturn() = %v, want a refusal naming srtReturnOverrideUrl", err)
+	}
+}
+
+func TestValidateReturn_OverrideOnWithHostPasses(t *testing.T) {
+	c := validReturnConfigForOverrideTest()
+	c.SRTReturnOverrideEnabled = true
+	c.SRTReturnOverrideURL = "srt://relay.example.com:40504"
+	if err := c.ValidateReturn(); err != nil {
+		t.Fatalf("ValidateReturn() = %v, want nil for a valid override", err)
+	}
+}
+
+func TestValidateReturn_OverrideOffIgnoresAGarbageURL(t *testing.T) {
+	// Off means ignored: a half-typed relay left in the field must not fail
+	// ValidateReturn, or an operator could not switch it off to get on air.
+	c := validReturnConfigForOverrideTest()
+	c.SRTReturnOverrideEnabled = false
+	c.SRTReturnOverrideURL = "srt://"
+	if err := c.ValidateReturn(); err != nil {
+		t.Fatalf("ValidateReturn() = %v, want nil: an OFF override is not validated", err)
+	}
+}
+
+// validReturnConfigForOverrideTest is a Config whose return fields pass
+// ValidateReturn, so an override test changes exactly one thing.
+func validReturnConfigForOverrideTest() Config {
+	c := *Defaults()
+	c.M2LXHost = "m2lx.example.com"
+	c.ReturnSource = ReturnSourceSRT
+	return c
+}

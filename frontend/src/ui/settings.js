@@ -159,6 +159,8 @@ function blankConfig() {
     returnChannel: 'stereo',
     returnSource: 'webrtc',
     srtReturnPort: 40501,
+    srtReturnOverrideEnabled: false,
+    srtReturnOverrideUrl: '',
     pictureLatencyMs: 120,
     srtReturnPBKeyLen: 0,
     monitorTile: { x: 0, y: 360, w: 640, h: 360 },
@@ -2489,6 +2491,43 @@ export function createSettingsView(handlers) {
     '40501 pgm · 40502 pvw (encrypted) · 40503 cln (encrypted) · 40504+ relays.',
   );
 
+  // --- SRT return override -------------------------------------------------
+  //
+  // A substitute endpoint for the RETURN when the direct UDP path to this M2L-X
+  // output is firewalled on this network. Off — the default — the return dials
+  // the M2L-X host on the port above, exactly as before. On, the picture AND the
+  // SRT audio return both dial the URL instead; the SEND is untouched, because a
+  // blocked return and a blocked send are separate facts. The return's own
+  // encryption (below) travels with it. See config.SRTReturnOverrideURL.
+  addField(
+    'srtReturnOverrideEnabled',
+    'Use a custom return URL',
+    checkboxInput('f-srtReturnOverrideEnabled'),
+    'Off: dial the M2L-X host above. On: send the return to a relay this network can reach.',
+  );
+  fields.srtReturnOverrideEnabled.wrap.classList.add('field--check');
+
+  const srtReturnOverrideUrlInput = textInput('f-srtReturnOverrideUrl');
+  srtReturnOverrideUrlInput.placeholder = 'srt://relay.example.com:40504';
+  addField(
+    'srtReturnOverrideUrl',
+    'Custom return URL',
+    srtReturnOverrideUrlInput,
+    'srt://host:port, or just host to keep the return port. The send is unaffected.',
+  );
+
+  // The URL is editable only while the toggle is on — "default is the M2L-X URL,
+  // toggle to set one". syncReturnOverride is called both on toggle and after a
+  // config load (see setValues), so a saved-but-off relay shows greyed rather
+  // than looking active.
+  function syncReturnOverride() {
+    const on = fields.srtReturnOverrideEnabled.input.checked === true;
+    fields.srtReturnOverrideUrl.input.disabled = !on;
+    fields.srtReturnOverrideUrl.wrap.classList.toggle('field--disabled', !on);
+  }
+  fields.srtReturnOverrideEnabled.input.addEventListener('change', syncReturnOverride);
+  syncReturnOverride();
+
   // HOW MUCH SRT BUFFER THE COMMENTATOR'S PICTURE CARRIES. A real control, for
   // the same reason the port above it is one: it had no field at all until the
   // operator reported the picture running about a second behind the main feed,
@@ -2836,6 +2875,13 @@ export function createSettingsView(handlers) {
     // form that showed 0 would be showing a port the return never dials, and
     // the validator below would then refuse to save the screen it just drew.
     fields.srtReturnPort.input.value = String(config.srtReturnPort || blankConfig().srtReturnPort);
+    // The return override. A real boolean read with .checked, and the URL a plain
+    // string; syncReturnOverride then greys the URL when the toggle is off, so a
+    // saved-but-off relay shows without looking active.
+    fields.srtReturnOverrideEnabled.input.checked = config.srtReturnOverrideEnabled === true;
+    fields.srtReturnOverrideUrl.input.value =
+      typeof config.srtReturnOverrideUrl === 'string' ? config.srtReturnOverrideUrl : '';
+    syncReturnOverride();
     // `||`, not `??`, for the reason above: 0 is what
     // internal/config.EffectivePictureLatencyMs substitutes the default FOR, and
     // every config.json written before this field existed holds 0. Showing 0
@@ -2944,6 +2990,11 @@ export function createSettingsView(handlers) {
       returnMid: Number(fields.returnMid.input.value),
       returnChannel: normaliseChannelMode(fields.returnChannel.input.value),
       srtReturnPort: Number(fields.srtReturnPort.input.value),
+      srtReturnOverrideEnabled: fields.srtReturnOverrideEnabled.input.checked === true,
+      // Trimmed, because a stray space makes the URL fail to parse and the
+      // override silently fall back to the M2L-X host — the exact thing it was
+      // turned on to avoid. ValidateReturn refuses an ON override with no host.
+      srtReturnOverrideUrl: fields.srtReturnOverrideUrl.input.value.trim(),
       pictureLatencyMs: Number(fields.pictureLatencyMs.input.value),
       srtReturnPBKeyLen: Number(fields.srtReturnPBKeyLen.input.value),
       // Carried through from the loaded config, not collected from a control.

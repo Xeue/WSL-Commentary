@@ -479,6 +479,11 @@ export function createReturnPath(io) {
 export const RETURN_OPTS_CONFIG_KEYS = Object.freeze([
   'm2lxHost', // the SRT host is always derived from it — EffectiveSRTHost
   'srtReturnPort',
+  // The return endpoint override, read via EffectiveSRTReturnHost and
+  // EffectiveSRTReturnPort. Toggling it, or editing the URL, must rebuild a
+  // running return so it re-dials the relay rather than the M2L-X host.
+  'srtReturnOverrideEnabled',
+  'srtReturnOverrideUrl',
   'srtLatencyMs',
   'srtReturnPBKeyLen',
   'returnChannel',

@@ -114,8 +114,11 @@ test('INSTANCE_FIELD_LABELS mirrors the Go whitelist exactly', () => {
   // videoBitrateKbps and videoFormatOverride arrived with the conform work: both
   // are properties of the VENUE — its contribution circuit and its switcher's
   // configured raster — rather than of the PC, so both travel in a preset.
+  // srtReturnOverrideEnabled and srtReturnOverrideUrl arrived with the firewalled
+  // return: the relay is treated as part of how the venue is reached, shared by
+  // everyone who loads the preset, by the operator's decision.
   // Growth is a reviewed decision, in fields.go first and here second.
-  assert.equal(jsTags.length, 14, 'the whitelist is 14 INSTANCE fields; growth is a reviewed decision');
+  assert.equal(jsTags.length, 16, 'the whitelist is 16 INSTANCE fields; growth is a reviewed decision');
   for (const { label } of INSTANCE_FIELD_LABELS) {
     assert.ok(label && typeof label === 'string', 'every whitelisted tag needs a screen label');
   }

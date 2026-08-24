@@ -356,12 +356,11 @@ func (a *App) newReturnMonitor() gst.ReturnMonitor {
 // across the Wails boundary.
 func (a *App) returnOpts(cfg *config.Config, passphrase string) gst.ReturnOpts {
 	return gst.ReturnOpts{
-		// EffectiveSRTHost, not SRTHost, and not a field of its own. The return
-		// follows the M2L-X host exactly as the send path does: on every
-		// instance seen so far the SRT listener answers on the same name as the
-		// REST API, and a third host field would be a third thing to get wrong
-		// under pressure for no case anyone has met.
-		Host:      cfg.EffectiveSRTHost(),
+		// EffectiveSRTReturnHost, not EffectiveSRTHost: the return follows the
+		// M2L-X host exactly as the send does UNLESS the return override is on, in
+		// which case only the return (this path and the picture) moves to the
+		// relay and the send stays on the M2L-X host. See config.SRTReturnOverrideURL.
+		Host:      cfg.EffectiveSRTReturnHost(),
 		Port:      cfg.EffectiveSRTReturnPort(),
 		LatencyMs: cfg.SRTLatencyMs,
 

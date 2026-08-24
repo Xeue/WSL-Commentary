@@ -60,6 +60,12 @@ export const INSTANCE_FIELD_LABELS = Object.freeze([
   Object.freeze({ tag: 'statusKey', label: 'Status key' }),
   Object.freeze({ tag: 'srtReturnPort', label: 'SRT return port' }),
   Object.freeze({ tag: 'srtReturnPBKeyLen', label: 'Return key length' }),
+  // The return override travels in the preset by the operator's decision: the
+  // relay for a firewalled return is treated as part of how the venue is reached,
+  // shared by everyone who loads it. The toggle sits beside the URL so a preset
+  // can carry a relay that is saved but off. Same order as internal/presets.
+  Object.freeze({ tag: 'srtReturnOverrideEnabled', label: 'Use a custom return URL' }),
+  Object.freeze({ tag: 'srtReturnOverrideUrl', label: 'Custom return URL' }),
   Object.freeze({ tag: 'pictureLatencyMs', label: 'Picture buffer (ms)' }),
   Object.freeze({ tag: 'returnMid', label: 'Return' }),
   Object.freeze({ tag: 'monitorTile', label: 'Monitor tile' }),

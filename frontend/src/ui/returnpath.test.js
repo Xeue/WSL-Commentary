@@ -650,7 +650,11 @@ test('RETURN_OPTS_CONFIG_KEYS covers every config field app_return.go reads', ()
   // Every cfg.<Something> the function reads, mapped to its config.json key.
   const goToJSON = {
     EffectiveSRTHost: ['m2lxHost'],
-    EffectiveSRTReturnPort: ['srtReturnPort'],
+    // The return's host and port both consult the override before falling back
+    // to the M2L-X host and the configured return port, so both read the two
+    // override keys as well.
+    EffectiveSRTReturnHost: ['m2lxHost', 'srtReturnOverrideEnabled', 'srtReturnOverrideUrl'],
+    EffectiveSRTReturnPort: ['srtReturnPort', 'srtReturnOverrideEnabled', 'srtReturnOverrideUrl'],
     SRTLatencyMs: ['srtLatencyMs'],
     // The RETURN path's key length, not the send path's PBKeyLen. If
     // app_return.go ever reads cfg.PBKeyLen again this table has no entry for

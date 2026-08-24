@@ -108,6 +108,14 @@ var InstanceFields = []string{
 	// Encryption is per output on M2L-X, so this travels with the port or not
 	// at all.
 	"srtReturnPBKeyLen",
+	// A substitute endpoint for the RETURN when the direct UDP path to M2L-X's
+	// output is firewalled. It is an INSTANCE field by the operator's decision:
+	// the relay is treated as part of how this deployment is reached, shared by
+	// everyone who loads the preset, rather than as a per-PC fact like the device
+	// selections. See config.SRTReturnOverrideURL. The toggle travels beside the
+	// URL so a preset can carry a relay that is saved but off.
+	"srtReturnOverrideEnabled",
+	"srtReturnOverrideUrl",
 	// Dominated by the far end's Buffer (msec) on that output.
 	"pictureLatencyMs",
 	// Which transceiver mid is aux1/CLN on that instance.

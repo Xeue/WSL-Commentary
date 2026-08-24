@@ -26,8 +26,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -670,6 +672,38 @@ type Config struct {
 	// inside libsrt as ERROR:UNSECURE with nothing on screen to say so.
 	SRTReturnPBKeyLen int `json:"srtReturnPBKeyLen"`
 
+	// SRTReturnOverrideEnabled turns SRTReturnOverrideURL on. False — the default
+	// — is the ordinary path: the return dials the M2L-X-derived host on
+	// SRTReturnPort exactly as it always has, and SRTReturnOverrideURL is ignored
+	// even if set. The two are separate so an operator can keep a relay address
+	// saved and switch it off without losing it.
+	SRTReturnOverrideEnabled bool `json:"srtReturnOverrideEnabled"`
+
+	// SRTReturnOverrideURL is a substitute endpoint for the RETURN ONLY — the SRT
+	// audio return and the picture, which share one host and port. It is NOT read
+	// by the send path: the contribution feed always dials the M2L-X host.
+	//
+	// # What it is for
+	//
+	// One operator's network firewalls the direct UDP path to M2L-X's OUTPUT
+	// while another's does not, so this cannot be derived from the instance and
+	// cannot sensibly be forced on everyone from the shared preset's m2lxHost.
+	// The operator points this at a relay their network can reach — a host, or a
+	// host and port — and only the return moves. The send is untouched because a
+	// blocked return and a blocked send are separate facts; see
+	// EffectiveSRTReturnHost.
+	//
+	// Form: "srt://host:port", "host:port", or "host". A missing port falls back
+	// to SRTReturnPort, so pointing it at a relay that keeps the same port number
+	// needs only the host. The scheme, any path and any query are ignored. Only
+	// read when SRTReturnOverrideEnabled is true; see parseSRTReturnOverride.
+	//
+	// The RETURN'S OWN encryption travels with it: SRTReturnPBKeyLen and the
+	// stored return passphrase are used against the override exactly as against
+	// M2L-X, so a relay may be encrypted (key length 16/32 with a passphrase) or
+	// plain (key length 0). There is no separate override passphrase.
+	SRTReturnOverrideURL string `json:"srtReturnOverrideUrl"`
+
 	// PictureLatencyMs is srtsrc's latency, in MILLISECONDS, for the PICTURE
 	// monitor — the commentator's programme window. Default 120.
 	//
@@ -1171,6 +1205,60 @@ func (c *Config) EffectiveSRTHost() string {
 	return hostOnly(c.M2LXHost)
 }
 
+// EffectiveSRTReturnHost is the host the RETURN dials — the SRT audio return and
+// the picture. It is EffectiveSRTHost UNLESS the return override is on and names
+// a host, in which case that host wins.
+//
+// It exists so the return can be pointed somewhere other than the M2L-X instance
+// — a relay, for a firewalled network — WITHOUT the send following it. The send
+// keeps calling EffectiveSRTHost directly; only app_return and app_picture were
+// moved onto this one. See SRTReturnOverrideURL.
+func (c *Config) EffectiveSRTReturnHost() string {
+	if c.SRTReturnOverrideEnabled {
+		if host, _, ok := parseSRTReturnOverride(c.SRTReturnOverrideURL); ok {
+			return host
+		}
+	}
+	return c.EffectiveSRTHost()
+}
+
+// parseSRTReturnOverride pulls a host and an optional port out of an override
+// endpoint written as "srt://host:port", "host:port", or "host". A missing or
+// unparseable port comes back as 0, which the caller reads as "use SRTReturnPort".
+// ok is false only when no host can be found — an empty or scheme-only string —
+// which is what ValidateReturn refuses when the override is on.
+//
+// An IPv6 literal must be bracketed for the port form ("[::1]:40504"); the
+// brackets are stripped from the returned host because the srt:// URI builder in
+// internal/gst adds its own.
+func parseSRTReturnOverride(raw string) (host string, port int, ok bool) {
+	s := strings.TrimSpace(raw)
+	// Drop a scheme if present — "srt://" is the one anyone writes, but be liberal.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Drop any path or query; only the authority matters.
+	if i := strings.IndexAny(s, "/?"); i >= 0 {
+		s = s[:i]
+	}
+	if s == "" {
+		return "", 0, false
+	}
+
+	host = s
+	if h, p, err := net.SplitHostPort(s); err == nil {
+		host = h
+		if n, err := strconv.Atoi(p); err == nil {
+			port = n
+		}
+	}
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" {
+		return "", 0, false
+	}
+	return host, port, true
+}
+
 // EffectiveReturnSource returns the configured return path, substituting
 // DefaultReturnSource for an empty value.
 //
@@ -1222,6 +1310,14 @@ func (c *Config) EffectiveCoughMuteMode() string {
 // unlike EffectiveReturnSource this substitution cannot mask a deliberate
 // setting.
 func (c *Config) EffectiveSRTReturnPort() int {
+	// The override wins when it names a port. A host-only override keeps the
+	// configured return port, which is the common case: a relay on the same port
+	// number needs only a host typed in.
+	if c.SRTReturnOverrideEnabled {
+		if _, port, ok := parseSRTReturnOverride(c.SRTReturnOverrideURL); ok && port != 0 {
+			return port
+		}
+	}
 	if c.SRTReturnPort != 0 {
 		return c.SRTReturnPort
 	}
@@ -1474,6 +1570,22 @@ func (c *Config) ValidateReturn() error {
 
 	if p := c.EffectiveSRTReturnPort(); p < 1 || p > 65535 {
 		errs = append(errs, fmt.Errorf("srtReturnPort must be between 1 and 65535, got %d", p))
+	}
+
+	// The return override, checked HERE and not in Validate for the same reason
+	// the whole method is: a return setting must never be a reason the
+	// contribution feed does not go on air. An override that is switched ON but
+	// names no host would silently fall back to the M2L-X host — the very thing
+	// the operator turned it on to avoid — so it is refused with a message that
+	// says what to type. The PORT half needs no check of its own: a bad port in
+	// the override reaches EffectiveSRTReturnPort and is caught by the range check
+	// above, naming the same 1..65535 bound.
+	if c.SRTReturnOverrideEnabled {
+		if _, _, ok := parseSRTReturnOverride(c.SRTReturnOverrideURL); !ok {
+			errs = append(errs, fmt.Errorf(
+				"srtReturnOverrideUrl is switched on but names no host: set it to srt://host:port "+
+					"(or host, to keep the return port), or switch the override off"))
+		}
 	}
 
 	// The PICTURE monitor's SRT latency. Checked here, with the other monitor

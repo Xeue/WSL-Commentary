@@ -547,12 +547,12 @@ func (a *App) pictureOverlay() (gst.PictureOverlay, error) {
 // across the Wails boundary.
 func (a *App) pictureOpts(cfg *config.Config, passphrase string, handle uintptr) gst.PictureOpts {
 	return gst.PictureOpts{
-		// EffectiveSRTHost, not SRTHost, and not a field of its own. The picture
-		// follows the M2L-X host exactly as the send path and the return do: on
-		// every instance seen so far the SRT listener answers on the same name as
-		// the REST API, and a third host field would be a third thing to get
-		// wrong under pressure for no case anyone has met.
-		Host: cfg.EffectiveSRTHost(),
+		// EffectiveSRTReturnHost, not EffectiveSRTHost: the picture follows the
+		// M2L-X host exactly as the send does UNLESS the return override is on, in
+		// which case the picture and the SRT audio return both move to the relay
+		// and the send stays put. The picture is a RETURN, so it takes the return's
+		// host. See config.SRTReturnOverrideURL.
+		Host: cfg.EffectiveSRTReturnHost(),
 
 		// EffectiveSRTReturnPort is 40501: Output 1, src=pgm, the programme
 		// picture. It is the AUDIO return's config field being read for the
