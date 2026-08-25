@@ -22,11 +22,30 @@ package gst
 
 /*
 #include <gst/gst.h>
+
+// wslcomms_diag_replace_buffer is the harness's copy of the app's probe buffer
+// swap (picture_cgo.go): it exists so WSLCOMMS_DIAGNOSE_REINJECT can exercise the
+// exact parameter re-injection surgery on real buffers through a real decoder.
+// cgo preambles are per-file, so the app's static helper is not visible here.
+static void wslcomms_diag_replace_buffer(gpointer info_ptr, gpointer new_buf) {
+    GstPadProbeInfo *info = (GstPadProbeInfo *)info_ptr;
+    GstBuffer *nb = (GstBuffer *)new_buf;
+    GstBuffer *old = GST_PAD_PROBE_INFO_BUFFER(info); // info->data, transfer none
+    if (old) {
+        gst_buffer_copy_into(nb, old,
+            GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS | GST_BUFFER_COPY_META,
+            0, (gsize) -1);
+        gst_buffer_unref(old);
+    }
+    GST_PAD_PROBE_INFO_DATA(info) = nb;
+    info->size = gst_buffer_get_size(nb);
+}
 */
 import "C"
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -211,6 +230,15 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 		return "", err
 	}
 
+	// Optional: exercise the shipping parameter re-injection surgery on real
+	// buffers so WSLCOMMS_DIAGNOSE_REINJECT proves the cgo buffer-replace path
+	// decodes cleanly. Installed on the queue's src pad, exactly like the app.
+	if os.Getenv("WSLCOMMS_DIAGNOSE_REINJECT") != "" {
+		if qsrc := queue.GetStaticPad("src"); qsrc != nil {
+			qsrc.AddProbe(gogst.PadProbeTypeBuffer, diagReinjectProbe(&h265ParamCache{}))
+		}
+	}
+
 	// Dynamic demuxer pads: video to the queue, everything else to its own
 	// fakesink so mpegtsbase never sees a NOT_LINKED pad.
 	var fakeSeq int
@@ -305,6 +333,44 @@ func (d *diag) bufferProbe(st *diagStage) func(gogst.Pad, *gogst.PadProbeInfo) g
 				d.mu.Unlock()
 			}
 		}
+		return gogst.PadProbeOK
+	}
+}
+
+// diagReinjectProbe is the harness's parameter re-injection probe, matching the
+// app's reinjectProbe (picture_cgo.go) so a WSLCOMMS_DIAGNOSE_REINJECT run proves
+// the same cache+rewrite+cgo-replace surgery decodes cleanly on real buffers.
+func diagReinjectProbe(cache *h265ParamCache) func(gogst.Pad, *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	return func(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+		buf := info.GetBuffer()
+		if buf == nil {
+			return gogst.PadProbeOK
+		}
+		defer gogst.UnsafeBufferUnref(buf)
+		mi, ok := buf.Map(gogst.MapRead)
+		if !ok {
+			return gogst.PadProbeOK
+		}
+		out, changed := cache.rewrite(mi.Data())
+		mi.Unmap()
+		if !changed {
+			return gogst.PadProbeOK
+		}
+		nb := gogst.NewBufferAllocate(nil, uint(len(out)), nil)
+		if nb == nil {
+			return gogst.PadProbeOK
+		}
+		wmi, ok := nb.Map(gogst.MapWrite)
+		if !ok {
+			gogst.UnsafeBufferUnref(nb)
+			return gogst.PadProbeOK
+		}
+		copy(wmi.Data(), out)
+		wmi.Unmap()
+		C.wslcomms_diag_replace_buffer(
+			C.gpointer(gogst.UnsafePadProbeInfoToGlibNone(info)),
+			C.gpointer(gogst.UnsafeBufferToGlibFull(nb)),
+		)
 		return gogst.PadProbeOK
 	}
 }
