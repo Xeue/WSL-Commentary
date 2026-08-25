@@ -139,6 +139,28 @@ static gchar* wslcomms_srt_stats_string(gpointer element) {
     gst_structure_free(stats);
     return s;
 }
+
+// wslcomms_probe_replace_buffer swaps the buffer a BUFFER pad probe carries for
+// new_buf, taking over new_buf's ref (passed transfer-full) and releasing the
+// buffer already in the probe. A probe cannot GROW a buffer in place, so when the
+// parameter-set re-injection has spliced VPS/SPS/PPS into a larger buffer, Go
+// allocates the replacement and this writes it into GST_PAD_PROBE_INFO_DATA, from
+// where the pad consumes it when the probe returns OK. Flags, timestamps and meta
+// are copied (NOT memory) so the replacement is indistinguishable downstream from
+// the buffer it stands in for. See reinjectProbe for the ownership dance.
+static void wslcomms_probe_replace_buffer(gpointer info_ptr, gpointer new_buf) {
+    GstPadProbeInfo *info = (GstPadProbeInfo *)info_ptr;
+    GstBuffer *nb = (GstBuffer *)new_buf;
+    GstBuffer *old = GST_PAD_PROBE_INFO_BUFFER(info); // info->data, transfer none
+    if (old) {
+        gst_buffer_copy_into(nb, old,
+            GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS | GST_BUFFER_COPY_META,
+            0, (gsize) -1); // COPY without MEMORY: metadata only, nb keeps its bytes
+        gst_buffer_unref(old); // release the probe's ref on the original
+    }
+    GST_PAD_PROBE_INFO_DATA(info) = nb;
+    info->size = gst_buffer_get_size(nb);
+}
 */
 import "C"
 
@@ -520,6 +542,15 @@ type picturePipeline struct {
 	// frameProbeID is the probe on the decoder's src pad, kept so teardown can
 	// remove it. Zero means none is installed.
 	frameProbeID uint32
+
+	// Parameter-set re-injection. reinjectPad and reinjectProbeID are the probe on
+	// the queue's src pad, kept so teardown can remove it; paramCache is the
+	// per-pipeline SPS/PPS cache it feeds. All three are zero/nil when the probe is
+	// off (WSLCOMMS_PIC_REINJECT_PARAMS=0). See installParamReinject and
+	// h265reinject.go.
+	reinjectPad     gogst.Pad
+	reinjectProbeID uint32
+	paramCache      *h265ParamCache
 
 	// fakeSeq numbers the fakesinks so that no two can ever be given the same
 	// element name. It is an atomic rather than a padMu-guarded counter because
@@ -1083,6 +1114,13 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		return errors.New("gst: picture monitor: could not add the first-frame probe to " + namePicDecode)
 	}
 
+	// Parameter-set re-injection, on the queue's src pad just upstream of
+	// h265parse. See installParamReinject for what it does and why; it is a near
+	// no-op on a machine that never loses the parser state.
+	if err := p.installParamReinject(); err != nil {
+		return err
+	}
+
 	// sync=false. THE SINGLE BIGGEST THING THIS PIPELINE DOES ABOUT LATENCY, and
 	// the whole argument for it — including the measured 993.7 ms it removes, and
 	// the one condition under which it becomes wrong again — is at
@@ -1633,6 +1671,15 @@ func (p *picturePipeline) teardownLocked() error {
 	}
 	p.frameProbeID = 0
 
+	// The parameter re-injection probe, on the same rule and for the same reason:
+	// remove it before the state change, while the queue's src pad still exists and
+	// the ID still names a live probe. RemoveProbe blocks for any in-flight
+	// callback, which is safe from the caller's goroutine.
+	if p.reinjectPad != nil && p.reinjectProbeID != 0 {
+		p.reinjectPad.RemoveProbe(p.reinjectProbeID)
+	}
+	p.reinjectProbeID = 0
+
 	var err error
 	if p.pipeline != nil {
 		stopWatchdog := stateChangeWatchdog("picture monitor: pipeline to NULL")
@@ -1652,6 +1699,8 @@ func (p *picturePipeline) teardownLocked() error {
 	p.demux = nil
 	p.queue = nil
 	p.queuePad = nil
+	p.reinjectPad = nil
+	p.paramCache = nil
 	p.decode = nil
 	p.decSrcPad = nil
 	p.sink = nil
@@ -1672,4 +1721,102 @@ func (p *picturePipeline) teardownLocked() error {
 	p.errMu.Unlock()
 
 	return err
+}
+
+// installParamReinject arms the parameter-set re-injection probe on the queue's
+// src pad — the buffer's last stop before h265parse — unless it is switched off.
+// The probe caches the in-band VPS/SPS/PPS and splices them ahead of every
+// new-picture slice that arrives without them, so h265parse always holds valid
+// picture headers by the time a slice reaches it. The byte logic is in
+// h265reinject.go; this is only the GStreamer plumbing.
+//
+// WHY it exists: on the field machine h265parse loses its latched SPS/PPS state
+// mid-stream, in a pipeline that never rebuilds and never loses picture. From the
+// source that is provable — gst_h265_parse_process_nal drops a full-size slice as
+// "broken/invalid" at exactly one place, the picture-header state gate
+// (VALID_PICTURE_HEADERS = GOT_SPS|GOT_PPS), and those bits are only zeroed by the
+// element's own start(). So the parser is being reset and then tears for a GOP
+// until the next IDR re-seeds it, again and again. Making every picture carry its
+// own parameters means a parser that has just been reset re-validates on the very
+// NEXT picture: a reset costs one frame, not a burst. It is robust to WHATEVER is
+// resetting the parser — a question still open, and one this does not depend on.
+//
+// ON by default. WSLCOMMS_PIC_REINJECT_PARAMS = 0 | off | false | no disables it,
+// for an A/B against the fault without a rebuild. It runs on BOTH decode paths —
+// the fault is at the parser, upstream of the decoder — and on a machine that
+// never loses the state it is a near no-op: the cache warms once at the first IDR
+// and thereafter every picture already carries its sets, so rewrite changes
+// nothing and the original buffer flows on untouched.
+func (p *picturePipeline) installParamReinject() error {
+	switch strings.ToLower(os.Getenv("WSLCOMMS_PIC_REINJECT_PARAMS")) {
+	case "0", "off", "false", "no":
+		log.Printf("gst: picture monitor: parameter re-injection is OFF (WSLCOMMS_PIC_REINJECT_PARAMS)")
+		return nil
+	}
+
+	srcPad := p.queue.GetStaticPad("src")
+	if srcPad == nil {
+		return errors.New("gst: picture monitor: " + namePicQueue + " has no src pad for parameter re-injection")
+	}
+	p.reinjectPad = srcPad
+	p.paramCache = &h265ParamCache{}
+	p.reinjectProbeID = srcPad.AddProbe(gogst.PadProbeTypeBuffer, p.reinjectProbe)
+	if p.reinjectProbeID == 0 {
+		return errors.New("gst: picture monitor: could not add the parameter re-injection probe to " + namePicQueue)
+	}
+	return nil
+}
+
+// reinjectProbe runs on the queue's streaming thread, once per buffer entering
+// h265parse. It maps the buffer, lets the pure-Go cache splice cached parameter
+// sets ahead of any bare picture (h265reinject.go), and ONLY when that changed the
+// bytes replaces the buffer the probe carries with a freshly allocated one holding
+// the rewritten stream. An unchanged buffer — the steady state on a machine that
+// is not losing the parser state — flows on untouched, allocating nothing.
+func (p *picturePipeline) reinjectProbe(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	buf := info.GetBuffer()
+	if buf == nil {
+		return gogst.PadProbeOK
+	}
+	// GetBuffer took its own ref (transfer-none, with a finalizer). Drop it as the
+	// callback returns rather than leave a finalizer to fire at 50 Hz; UnsafeBuffer-
+	// Unref also cancels that finalizer, so this cannot double-free. The buffer
+	// stays alive meanwhile through info->data (unchanged path) or through the
+	// replace helper, which unrefs the original itself (changed path).
+	defer gogst.UnsafeBufferUnref(buf)
+
+	mi, ok := buf.Map(gogst.MapRead)
+	if !ok {
+		return gogst.PadProbeOK
+	}
+	out, changed := p.paramCache.rewrite(mi.Data())
+	mi.Unmap()
+	if !changed {
+		return gogst.PadProbeOK
+	}
+
+	// The rewrite grew the buffer, so it cannot be resized in place: allocate a
+	// replacement, fill it, and swap it into the probe. If anything here fails, pass
+	// the ORIGINAL through rather than drop a picture — a missed injection tears one
+	// GOP; a dropped buffer is worse.
+	nb := gogst.NewBufferAllocate(nil, uint(len(out)), nil)
+	if nb == nil {
+		return gogst.PadProbeOK
+	}
+	wmi, ok := nb.Map(gogst.MapWrite)
+	if !ok {
+		gogst.UnsafeBufferUnref(nb)
+		return gogst.PadProbeOK
+	}
+	copy(wmi.Data(), out)
+	wmi.Unmap()
+
+	// Hand nb into info->data and release the original inside the helper.
+	// UnsafeBufferToGlibFull transfers nb's ref and cancels its finalizer, so nb's
+	// Go wrapper is spent after this and must not be used again.
+	C.wslcomms_probe_replace_buffer(
+		C.gpointer(gogst.UnsafePadProbeInfoToGlibNone(info)),
+		C.gpointer(gogst.UnsafeBufferToGlibFull(nb)),
+	)
+	return gogst.PadProbeOK
 }
