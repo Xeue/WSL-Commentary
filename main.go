@@ -369,7 +369,12 @@ func runDiagnosticAndExit(target string, gstInitErr error) {
 
 // diagnoseURI turns "host:port", a bare host, or a full srt:// URI into the
 // srt://host:port form srtsrc wants, defaulting the port to M2L-X's return port.
+// An existing FILE path is returned unchanged, so a captured .ts replays through
+// filesrc; the file check comes first so a Windows path is never taken for a URI.
 func diagnoseURI(target string) string {
+	if _, err := os.Stat(target); err == nil {
+		return target
+	}
 	s := strings.TrimPrefix(target, "srt://")
 	if i := strings.IndexByte(s, '?'); i >= 0 {
 		s = s[:i]

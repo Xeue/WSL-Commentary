@@ -31,8 +31,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	// An existing file is replayed through filesrc; anything else is an SRT target
+	// (host:port or a full srt:// URI), normalised for srtsrc. The file check must
+	// come first so a Windows path like C:\...\cap.ts is never mistaken for a URI.
 	uri := os.Args[1]
-	if !strings.HasPrefix(uri, "srt://") {
+	if _, err := os.Stat(uri); err != nil && !strings.HasPrefix(uri, "srt://") {
 		if i := strings.IndexByte(uri, '?'); i >= 0 {
 			uri = uri[:i]
 		}

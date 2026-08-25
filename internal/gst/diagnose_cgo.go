@@ -513,8 +513,16 @@ func diagMsgType(t gogst.MessageType) string {
 		return "ELEMENT"
 	case gogst.MessageStateChanged:
 		return "STATE  "
+	case gogst.MessageEOS:
+		return "EOS    "
+	case gogst.MessageQos:
+		return "QOS    "
+	case gogst.MessageStreamStatus:
+		return "STREAM "
+	case gogst.MessageTag:
+		return "TAG    "
 	default:
-		return fmt.Sprintf("MSG(%d)", int(t))
+		return fmt.Sprintf("MSG(0x%x)", uint32(t))
 	}
 }
 
