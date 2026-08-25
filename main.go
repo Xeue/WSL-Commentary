@@ -56,6 +56,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wailsapp/wails/v2"
@@ -235,6 +237,16 @@ func main() {
 			"the bundled GStreamer in %s could not be initialised, so audio cannot be sent: %w", dir, gstInitErr)
 	}
 
+	// Headless pipeline diagnostic. When WSLCOMMS_DIAGNOSE names an SRT target the
+	// app takes the picture pipeline apart stage by stage and exits instead of
+	// opening a window — the field instrument for "where does the picture break".
+	// It runs here, AFTER gst.Init so it uses the bundled GStreamer, and BEFORE
+	// wails.Run so no window, no single-instance lock and no capture leg start. See
+	// internal/gst/diagnose_cgo.go and runDiagnosticAndExit.
+	if target := os.Getenv("WSLCOMMS_DIAGNOSE"); target != "" {
+		runDiagnosticAndExit(target, gstInitErr)
+	}
+
 	app := NewApp(dir, gstInitErr)
 
 	err = wails.Run(&options.App{
@@ -317,6 +329,66 @@ func main() {
 	// main into the Go runtime's ExitProcess and the very DLL_PROCESS_DETACH
 	// deadlock teardown exists to avoid.
 	forceExit()
+}
+
+// runDiagnosticAndExit runs the pipeline dissector against target and exits. It
+// never returns: like the normal shutdown it leaves through forceExit, so the
+// GStreamer, D3D11 and GPU-driver DLLs this process loaded cannot deadlock in
+// DLL_PROCESS_DETACH. The report goes to stdout AND to a file in the log
+// directory, because a portable launched by double-click has no console to read.
+func runDiagnosticAndExit(target string, gstInitErr error) {
+	if gstInitErr != nil {
+		fmt.Fprintln(os.Stderr, "wslcomms: cannot run the diagnostic, GStreamer did not initialise:", gstInitErr)
+		os.Exit(1)
+	}
+	uri := diagnoseURI(target)
+	secs := diagnoseSecs()
+	decoder := os.Getenv("WSLCOMMS_DIAGNOSE_DECODER")
+
+	fmt.Printf("wslcomms: pipeline diagnostic on %s for %ds", uri, secs)
+	if decoder != "" {
+		fmt.Printf(" (decoder %s)", decoder)
+	}
+	fmt.Println("...")
+
+	report, err := gst.RunPipelineDiagnostic(uri, time.Duration(secs)*time.Second, decoder)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wslcomms: diagnostic failed:", err)
+		os.Exit(1)
+	}
+	fmt.Print("\n", report, "\n")
+
+	if dir, derr := applog.DefaultDir(); derr == nil {
+		name := filepath.Join(dir, "diagnose-"+time.Now().UTC().Format("20060102-150405")+".txt")
+		if werr := os.WriteFile(name, []byte(report), 0o644); werr == nil {
+			fmt.Println("wslcomms: report also written to", name)
+		}
+	}
+	forceExit()
+}
+
+// diagnoseURI turns "host:port", a bare host, or a full srt:// URI into the
+// srt://host:port form srtsrc wants, defaulting the port to M2L-X's return port.
+func diagnoseURI(target string) string {
+	s := strings.TrimPrefix(target, "srt://")
+	if i := strings.IndexByte(s, '?'); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimRight(s, "/")
+	if !strings.Contains(s, ":") {
+		s += ":40504"
+	}
+	return "srt://" + s
+}
+
+// diagnoseSecs is the capture length, from WSLCOMMS_DIAGNOSE_SECS or 30.
+func diagnoseSecs() int {
+	if v := os.Getenv("WSLCOMMS_DIAGNOSE_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 30
 }
 
 // setWebView2Arguments sets the Chromium command line WebView2 is created with.
