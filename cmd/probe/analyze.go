@@ -119,6 +119,15 @@ type pidStat struct {
 	firstReal  time.Duration
 	realBySec  map[int]int // second -> real CC errors, for the timeline
 	gapHist    map[int]int // apparent packets skipped -> count
+
+	// PES timestamp monotonicity. A DTS that goes backwards is the measured
+	// M2L-X pipeline-restart failure (cmd/mockm2lx exists to detect it): a
+	// non-monotonic decode timestamp jams the decoder and the picture with it.
+	lastDTS    uint64
+	haveDTS    bool
+	dtsBack    uint64 // times DTS went backwards on this PID
+	dtsBackMax uint64 // largest backward jump seen, 90 kHz units
+	pesStarts  uint64 // PES packets seen (PUSI with a start code)
 }
 
 func newPIDStat(pid int) *pidStat {
@@ -273,9 +282,72 @@ func (a *analyzer) processPacket(pkt []byte, now time.Duration) {
 		a.parsePAT(payload, pusi)
 	case a.pmtPID >= 0 && pid == a.pmtPID:
 		a.parsePMT(payload, pusi)
-	case pid == a.videoPID:
-		a.video.feed(payload, now)
+	default:
+		if ps.streamType >= 0 { // a PMT-named elementary stream
+			a.parsePES(ps, payload, pusi)
+			if pid == a.videoPID {
+				a.video.feed(payload, now)
+			}
+		}
 	}
+}
+
+// parsePES reads a PES packet's optional header at PUSI and tracks decode-
+// timestamp monotonicity for one elementary stream. DTS is preferred (it is the
+// monotonic one; PTS reorders around B-frames); a stream carrying only PTS is
+// tracked on PTS, where the bug being hunted -- a pipeline-restart DTS jumping
+// back by seconds -- still dwarfs any legitimate reorder.
+func (a *analyzer) parsePES(ps *pidStat, payload []byte, pusi bool) {
+	if !pusi || len(payload) < 9 {
+		return
+	}
+	if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+		return
+	}
+	ps.pesStarts++
+	if payload[6]&0xC0 != 0x80 {
+		return // not the standard '10' PES optional-header marker
+	}
+	ptsDTSFlags := (payload[7] >> 6) & 0x03
+	headerDataLength := int(payload[8])
+	hdr := payload[9:]
+	if len(hdr) < headerDataLength {
+		return
+	}
+	var ts uint64
+	switch ptsDTSFlags {
+	case 0x2: // PTS only
+		if len(hdr) < 5 {
+			return
+		}
+		ts = decodeTimestamp(hdr[0:5])
+	case 0x3: // PTS then DTS -- DTS is what decode order uses
+		if len(hdr) < 10 {
+			return
+		}
+		ts = decodeTimestamp(hdr[5:10])
+	default:
+		return
+	}
+	if ps.haveDTS && ts < ps.lastDTS {
+		ps.dtsBack++
+		if d := ps.lastDTS - ts; d > ps.dtsBackMax {
+			ps.dtsBackMax = d
+		}
+	}
+	ps.lastDTS = ts
+	ps.haveDTS = true
+}
+
+// decodeTimestamp reconstructs a 33-bit 90 kHz PTS/DTS from its 5-byte
+// marker-interleaved wire form (ISO/IEC 13818-1 2.4.3.6).
+func decodeTimestamp(b []byte) uint64 {
+	_ = b[4]
+	return uint64(b[0]>>1&0x07)<<30 |
+		uint64(b[1])<<22 |
+		uint64(b[2]>>1&0x7F)<<15 |
+		uint64(b[3])<<7 |
+		uint64(b[4]>>1&0x7F)
 }
 
 // parsePAT records the first program's PMT PID.
@@ -451,6 +523,31 @@ func (a *analyzer) report(target string, dur time.Duration) string {
 		}
 	}
 
+	// PES decode-timestamp monotonicity per elementary stream. A backward DTS is
+	// the measured pipeline-restart failure and jams the decoder.
+	fmt.Fprintf(&b, "\n--- PES decode-timestamp monotonicity ---\n")
+	anyPES := false
+	for _, pid := range pids {
+		ps := a.pids[pid]
+		if ps.pesStarts == 0 {
+			continue
+		}
+		anyPES = true
+		note := "monotonic"
+		if ps.dtsBack > 0 {
+			note = fmt.Sprintf("*** %d BACKWARD step(s), max -%d (%.3fs) ***",
+				ps.dtsBack, ps.dtsBackMax, float64(ps.dtsBackMax)/90000.0)
+		}
+		typ := "-"
+		if ps.streamType >= 0 {
+			typ = streamTypeName(ps.streamType)
+		}
+		fmt.Fprintf(&b, "  0x%04x %-16s PES-packets %d  DTS %s\n", pid, typ, ps.pesStarts, note)
+	}
+	if !anyPES {
+		fmt.Fprintf(&b, "  (no PES headers parsed)\n")
+	}
+
 	// NAL census.
 	fmt.Fprintf(&b, "\n--- HEVC NAL census (video PID) ---\n")
 	fmt.Fprintf(&b, "NAL units   : %d\n", a.video.nalTotal)
@@ -475,6 +572,13 @@ func (a *analyzer) verdict() string {
 	switch {
 	case a.videoPID < 0 || vps == nil:
 		return "No HEVC/H.264 video PID was seen. The PMT never named one, or no data arrived.\n"
+	case vps.dtsBack > 0:
+		return fmt.Sprintf(
+			"The video PID's DECODE TIMESTAMP went BACKWARDS %d time(s) (largest -%.3fs).\n"+
+				"That is the measured pipeline-restart failure -- a non-monotonic DTS jams the\n"+
+				"decoder and the picture with it -- and it is a sender-side problem, not decode.\n"+
+				"(This coexists with the continuity numbers above; both are worth reporting.)\n",
+			vps.dtsBack, float64(vps.dtsBackMax)/90000.0)
 	case vps.ccReal > 0:
 		return fmt.Sprintf(
 			"REAL continuity errors on the video PID: %d unflagged CC holes in %.0fs.\n"+

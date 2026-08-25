@@ -56,12 +56,13 @@ type diagStage struct {
 	buffers uint64
 	bytes   uint64
 	flags   map[string]uint64
-	caps    string           // last caps seen crossing the pad
-	nals    map[uint8]uint64 // non-nil only for the NAL-census stage
+	events  map[string]uint64 // event-type name -> count (CAPS/SEGMENT/FLUSH/GAP/...)
+	caps    string            // last caps seen crossing the pad
+	nals    map[uint8]uint64  // non-nil only for the NAL-census stage
 }
 
 func newDiagStage(name string, censusNALs bool) *diagStage {
-	s := &diagStage{name: name, flags: make(map[string]uint64)}
+	s := &diagStage{name: name, flags: make(map[string]uint64), events: make(map[string]uint64)}
 	if censusNALs {
 		s.nals = make(map[uint8]uint64)
 	}
@@ -191,6 +192,10 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 			return fmt.Errorf("gst: diagnose: %s has no %s pad", el.GetName(), padName)
 		}
 		pad.AddProbe(gogst.PadProbeTypeBuffer, d.bufferProbe(st))
+		// Events both ways: a mid-stream CAPS, SEGMENT, FLUSH or upstream
+		// RECONFIGURE crossing the parser is exactly the kind of thing that could
+		// reset it -- the open question of the tearing investigation.
+		pad.AddProbe(gogst.PadProbeTypeEventBoth, d.eventProbe(st))
 		return nil
 	}
 	if err := tap(src, "src", sRaw); err != nil {
@@ -304,6 +309,23 @@ func (d *diag) bufferProbe(st *diagStage) func(gogst.Pad, *gogst.PadProbeInfo) g
 	}
 }
 
+// eventProbe returns a probe that tallies the event types crossing a pad. A
+// mid-stream CAPS, FLUSH, SEGMENT or upstream RECONFIGURE is a candidate for the
+// h265parse state reset the investigation cannot otherwise explain.
+func (d *diag) eventProbe(st *diagStage) func(gogst.Pad, *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	return func(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+		ev := info.GetEvent()
+		if ev == nil {
+			return gogst.PadProbeOK
+		}
+		name := ev.GetType().String()
+		d.mu.Lock()
+		st.events[name]++
+		d.mu.Unlock()
+		return gogst.PadProbeOK
+	}
+}
+
 // record folds one bus message into the census.
 func (d *diag) record(msg *gogst.Message) {
 	if msg == nil {
@@ -372,6 +394,9 @@ func (d *diag) report(uri string, dur time.Duration, decoder string) string {
 		if st.caps != "" {
 			fmt.Fprintf(&b, "    caps  %s\n", trim(st.caps, 100))
 		}
+		if len(st.events) > 0 {
+			fmt.Fprintf(&b, "    events %s\n", eventSummary(st.events))
+		}
 		if st.nals != nil {
 			fmt.Fprintf(&b, "    NALs  %s\n", nalSummary(st.nals))
 		}
@@ -425,6 +450,19 @@ func flagSummary(flags map[string]uint64) string {
 		return ""
 	}
 	return "  [" + strings.Join(parts, " ") + "]"
+}
+
+func eventSummary(events map[string]uint64) string {
+	names := make([]string, 0, len(events))
+	for n := range events {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, n := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", n, events[n]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func nalSummary(nals map[uint8]uint64) string {

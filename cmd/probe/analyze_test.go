@@ -232,3 +232,50 @@ func TestNALCensusFindsStartCodeSpanningPackets(t *testing.T) {
 		t.Errorf("nalTotal = %d, want 1 across the packet boundary", a.video.nalTotal)
 	}
 }
+
+// encodeTS is decodeTimestamp's inverse: a 33-bit value into its 5-byte,
+// marker-interleaved wire form, with prefix bits the decoder ignores.
+func encodeTS(prefix byte, ts uint64) []byte {
+	return []byte{
+		(prefix << 4) | byte(((ts>>30)&0x07)<<1) | 1,
+		byte(ts >> 22),
+		byte(((ts>>15)&0x7F)<<1) | 1,
+		byte(ts >> 7),
+		byte((ts&0x7F)<<1) | 1,
+	}
+}
+
+// pesWithDTS builds a video PES packet start carrying PTS and DTS.
+func pesWithDTS(pts, dts uint64) []byte {
+	pes := []byte{0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0xC0, 10}
+	pes = append(pes, encodeTS(0x3, pts)...)
+	pes = append(pes, encodeTS(0x1, dts)...)
+	return append(pes, 0x00, 0x00)
+}
+
+func TestDTSBackwardsDetected(t *testing.T) {
+	a := newAnalyzer(zeroClock)
+	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
+	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
+	// Two PES on the video PID with DESCENDING DTS: one backward step of 50000.
+	a.Write(tsPacket(0x0041, 0, true, pesWithDTS(100000, 100000)))
+	a.Write(tsPacket(0x0041, 1, true, pesWithDTS(50000, 50000)))
+	ps := a.pids[0x0041]
+	if ps.dtsBack != 1 {
+		t.Errorf("dtsBack = %d, want 1", ps.dtsBack)
+	}
+	if ps.dtsBackMax != 50000 {
+		t.Errorf("dtsBackMax = %d, want 50000", ps.dtsBackMax)
+	}
+}
+
+func TestDTSForwardIsMonotonic(t *testing.T) {
+	a := newAnalyzer(zeroClock)
+	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
+	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
+	a.Write(tsPacket(0x0041, 0, true, pesWithDTS(50000, 50000)))
+	a.Write(tsPacket(0x0041, 1, true, pesWithDTS(100000, 100000)))
+	if got := a.pids[0x0041].dtsBack; got != 0 {
+		t.Errorf("dtsBack = %d, want 0", got)
+	}
+}
