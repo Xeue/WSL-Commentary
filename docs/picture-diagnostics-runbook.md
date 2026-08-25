@@ -61,6 +61,12 @@ Target = the host:port your COMM-01 picture actually dials (MatchG: `m2lx-wslstu
 - **gstprobe cap.ts clean here** → field-CPU/timing-specific → fix space is decoder choice / concealment / the hybrid CPU.
 - **1.5.5 removes the rare bursts but the persistent tear stays** → confirms two separate faults; focus entirely on the CONTINUITY/decode axis above.
 
-## 5. Env-var A/B matrix (no rebuild)
+## 5b. Verified offline, and the source baseline (2026-08-25)
+
+Both tools were exercised end-to-end against **real M2L-X captures** (no live stream), so they are known-good before the field session:
+- A prior HEVC PGM capture runs clean through the whole dissector: 530 frames in → 530 AUs → **530 decoded frames, 0 CORRUPTED, no broken/invalid, no CONTINUITY** — the clean baseline to diff a field capture against.
+- Every prior M2L-X output capture (H.264 and HEVC, all on video PID 0x0100) shows **0 continuity errors and monotonic DTS**. So the M2L-X *source* produces clean transport streams. COMM-01's ~1/s CONTINUITY mismatches on 0x0041 are therefore **not** normal source behaviour — they are introduced on COMM-01's path, or specific to MatchG's live config. The morning `probe.exe` on the LIVE stream (REAL vs FLAGGED) localises them; comparing a fresh capture from a good machine to one from COMM-01 confirms path-vs-source.
+
+## 5c. Env-var A/B matrix (no rebuild)
 
 `WSLCOMMS_PIC_REINJECT_PARAMS=0` (disable re-injection) · `WSLCOMMS_PIC_THREAD_TYPE=slice|frame|auto` · `WSLCOMMS_PIC_MAX_THREADS=N` · `WSLCOMMS_DIAGNOSE=<host:port|file>` · `WSLCOMMS_DIAGNOSE_SECS=N` · `WSLCOMMS_DIAGNOSE_DECODER=avdec_h265|d3d11h265dec`.
