@@ -1569,7 +1569,18 @@ func (c *Config) ValidateReturn() error {
 	}
 
 	if p := c.EffectiveSRTReturnPort(); p < 1 || p > 65535 {
-		errs = append(errs, fmt.Errorf("srtReturnPort must be between 1 and 65535, got %d", p))
+		// NAMED FOR WHERE THE NUMBER CAME FROM. EffectiveSRTReturnPort resolves the
+		// OVERRIDE's port when the override is on, so a bad port typed into
+		// srtReturnOverrideUrl used to be reported against srtReturnPort — sending
+		// the operator to a field that is perfectly correct while the one they
+		// mistyped sits there looking fine.
+		field := "srtReturnPort"
+		if c.SRTReturnOverrideEnabled {
+			if _, op, ok := parseSRTReturnOverride(c.SRTReturnOverrideURL); ok && op != 0 {
+				field = "the port in srtReturnOverrideUrl"
+			}
+		}
+		errs = append(errs, fmt.Errorf("%s must be between 1 and 65535, got %d", field, p))
 	}
 
 	// The return override, checked HERE and not in Validate for the same reason
@@ -1579,7 +1590,8 @@ func (c *Config) ValidateReturn() error {
 	// the operator turned it on to avoid — so it is refused with a message that
 	// says what to type. The PORT half needs no check of its own: a bad port in
 	// the override reaches EffectiveSRTReturnPort and is caught by the range check
-	// above, naming the same 1..65535 bound.
+	// above — which now names the override rather than srtReturnPort, so the
+	// operator is sent to the field they actually mistyped.
 	if c.SRTReturnOverrideEnabled {
 		if _, _, ok := parseSRTReturnOverride(c.SRTReturnOverrideURL); !ok {
 			errs = append(errs, fmt.Errorf(

@@ -439,7 +439,7 @@ func choosePictureChain() (pictureChain, []string) {
 	pick := func(what string, candidates []pictureFactory) (pictureFactory, bool) {
 		if len(candidates) == 0 {
 			missing = append(missing, fmt.Sprintf(
-				"an H.265 %s: this application has no %s answer for %s", what, what, runtime.GOOS))
+				"no %s: this application has no %s answer for %s", what, what, runtime.GOOS))
 			return pictureFactory{}, false
 		}
 		for i, c := range candidates {
@@ -466,12 +466,12 @@ func choosePictureChain() (pictureChain, []string) {
 		for _, c := range candidates {
 			names = append(names, fmt.Sprintf("%s (plugin %s)", c.factory, c.plugin))
 		}
-		missing = append(missing, fmt.Sprintf("an H.265 %s — none of %s",
+		missing = append(missing, fmt.Sprintf("no %s — none of %s",
 			what, strings.Join(names, " or ")))
 		return pictureFactory{}, false
 	}
 
-	chain.decoder, _ = pick("decoder", pictureDecoderCandidates())
+	chain.decoder, _ = pick("H.265 decoder", pictureDecoderCandidates())
 	// The H.264 decoder is required too, so that an H.264 return feed is a working
 	// picture rather than a link failure. On the target it is d3d11h264dec from the
 	// same d3d11 plugin as the H.265 one, so this can only ever be missing if the
@@ -1751,6 +1751,28 @@ func (p *picturePipeline) installParamReinject() error {
 	switch strings.ToLower(os.Getenv("WSLCOMMS_PIC_REINJECT_PARAMS")) {
 	case "0", "off", "false", "no":
 		log.Printf("gst: picture monitor: parameter re-injection is OFF (WSLCOMMS_PIC_REINJECT_PARAMS)")
+		return nil
+	}
+
+	// HEVC ONLY, and this gate is not caution — without it the probe is actively
+	// destructive on the H.264 return this switcher actually sends.
+	//
+	// h265reinject.go reads a NAL's type as (hdr >> 1) & 0x3F, which is the HEVC
+	// two-byte header. H.264's header is one byte with the type in the low five
+	// bits, so the same arithmetic misreads every one of them. The common ref
+	// P-slice header 0x41 comes out as type 32 — VPS — so on an H.264 feed the
+	// cache fills with slice data at fifty frames a second, and once 0x43/0x45
+	// have also been seen haveParams() arms and rewrite splices arbitrary slice
+	// NALs in front of every picture. That is a decoder fed garbage by the thing
+	// installed to help it.
+	//
+	// builtWith is the parser this pipeline was actually created with, stamped by
+	// buildLocked, so this follows the codec the transport turned out to be
+	// carrying rather than what the build guessed.
+	if got := p.builtParser(); got != "h265parse" {
+		log.Printf("gst: picture monitor: parameter re-injection is OFF: it is HEVC-specific and "+
+			"this pipeline parses with %s. Its NAL reader is the HEVC two-byte header, which "+
+			"misreads every H.264 NAL type", got)
 		return nil
 	}
 

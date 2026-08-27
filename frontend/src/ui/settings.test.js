@@ -776,11 +776,23 @@ test('the return port range matches internal/config.ValidateReturn', () => {
   // Go refuses the same range. Two validators that disagree mean either a Save
   // the form accepts and StartReturn then refuses, or the reverse — and the
   // reverse is the one that reaches an operator as "it just does not connect".
+  //
+  // MATCHED ON THE BOUND, NOT ON THE FIELD NAME. The Go message names whichever
+  // field the number came from — srtReturnPort, or the port inside
+  // srtReturnOverrideUrl when the override supplies it — because reporting a bad
+  // override port against srtReturnPort sent the operator to a field that was
+  // correct. The RANGE is what these two validators have to agree about, so the
+  // range is what this asserts.
   const go = read(repoRoot, 'internal', 'config', 'config.go');
   assert.match(
     go,
-    /srtReturnPort must be between 1 and 65535/,
+    /must be between 1 and 65535/,
     'internal/config no longer bounds the return port at 1..65535',
+  );
+  assert.match(
+    go,
+    /EffectiveSRTReturnPort\(\); p < 1 \|\| p > 65535/,
+    'and it is still the EFFECTIVE port — the resolved one — that is bounded',
   );
 });
 

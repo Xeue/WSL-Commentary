@@ -607,8 +607,8 @@ func TestParseSRTReturnOverride(t *testing.T) {
 		{"relay.example.com:40504", "relay.example.com", 40504, true},
 		{"relay.example.com", "relay.example.com", 0, true}, // host only: port falls back
 		{"srt://relay.example.com", "relay.example.com", 0, true},
-		{"srt://10.0.0.5:9000/live?x=1", "10.0.0.5", 9000, true}, // path and query ignored
-		{"[2001:db8::1]:40504", "2001:db8::1", 40504, true},      // bracketed IPv6 with port
+		{"srt://10.0.0.5:9000/live?x=1", "10.0.0.5", 9000, true},          // path and query ignored
+		{"[2001:db8::1]:40504", "2001:db8::1", 40504, true},               // bracketed IPv6 with port
 		{"  relay.example.com:40504  ", "relay.example.com", 40504, true}, // trimmed
 		{"", "", 0, false},
 		{"srt://", "", 0, false},
