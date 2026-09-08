@@ -167,6 +167,14 @@ func newTestApp(t *testing.T) (*App, *fakeStore) {
 	// installs its own recorder over this one.
 	a.exitProcess = func() {}
 
+	// The real picture monitor LAUNCHES THIS EXECUTABLE as the picture process
+	// (app_picture_child.go), and under `go test` this executable is the test
+	// binary: a StartPicture reached from any test — a reflective sweep of the
+	// bound surface did it — would run the whole suite again in a child, which
+	// would do the same, without end. Every App a test builds therefore gets a
+	// fake monitor by default; the picture tests install their own over it.
+	a.pictureDial = func() gst.PictureMonitor { return newFakePictureMonitor() }
+
 	a.cfgMu.Lock()
 	a.cfg = validConfig()
 	a.cfgMu.Unlock()

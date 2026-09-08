@@ -67,6 +67,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -149,14 +150,39 @@ func newChildPictureMonitor() *childPictureMonitor {
 var _ gst.PictureMonitor = (*childPictureMonitor)(nil)
 
 // defaultPictureChildCommand is this executable, marked as the picture process.
+//
+// It REFUSES when this executable is a Go test binary. A test binary has no
+// main and runs its whole suite when launched, so a picture process made from
+// one would run every test again, including whichever test launched it — a
+// fork bomb, and one that was found the hard way on a Gate B run. The tests
+// install fakes and never come here on purpose; this is the belt for the one
+// that reaches StartPicture by accident.
 func defaultPictureChildCommand() (*exec.Cmd, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("wslcomms: cannot find this executable to launch the picture process: %w", err)
 	}
+	if isGoTestBinary(exe) {
+		return nil, fmt.Errorf("wslcomms: refusing to launch %q as the picture process: it is a test binary, "+
+			"and a test binary launched runs its whole suite; install a pictureDial fake", filepath.Base(exe))
+	}
+	return pictureChildCommand(exe), nil
+}
+
+// pictureChildCommand builds the picture process's command for a given
+// executable: no arguments — the options go on stdin — and the environment
+// with pictureChildEnv set, which is what turns the executable into the child.
+func pictureChildCommand(exe string) *exec.Cmd {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), pictureChildEnv+"=1")
-	return cmd, nil
+	return cmd
+}
+
+// isGoTestBinary reports whether exe is named the way `go test` names the
+// binaries it builds: <package>.test or <package>.test.exe.
+func isGoTestBinary(exe string) bool {
+	base := strings.ToLower(filepath.Base(exe))
+	return strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe")
 }
 
 func (m *childPictureMonitor) States() <-chan gst.PictureState { return m.states }

@@ -328,11 +328,8 @@ func TestChildPictureMonitorReportsALaunchThatFailed(t *testing.T) {
 	}
 }
 
-func TestDefaultPictureChildCommandIsThisExecutableMarkedAsTheChild(t *testing.T) {
-	cmd, err := defaultPictureChildCommand()
-	if err != nil {
-		t.Fatalf("defaultPictureChildCommand() error = %v", err)
-	}
+func TestPictureChildCommandMarksTheChildAndPassesNoArguments(t *testing.T) {
+	cmd := pictureChildCommand(`C:\somewhere\wslcomms.exe`)
 	if len(cmd.Args) != 1 {
 		t.Fatalf("the child is launched with arguments %q; the options go on stdin, not the command line", cmd.Args)
 	}
@@ -344,6 +341,31 @@ func TestDefaultPictureChildCommandIsThisExecutableMarkedAsTheChild(t *testing.T
 	}
 	if !marked {
 		t.Fatalf("the child's environment does not carry %s; it would start as a second application", pictureChildEnv)
+	}
+}
+
+func TestDefaultPictureChildCommandRefusesToLaunchATestBinary(t *testing.T) {
+	// THIS process is a test binary. Launched as the picture process it would
+	// run this whole suite again, in a child that does the same — the fork bomb
+	// a reflective sweep of the bound surface set off once. The launcher must
+	// refuse, and say why, so the next test that reaches StartPicture without
+	// a fake fails loudly instead of filling the machine with test processes.
+	cmd, err := defaultPictureChildCommand()
+	if err == nil {
+		t.Fatalf("defaultPictureChildCommand() built %q inside a test binary; it must refuse", cmd.Args)
+	}
+	if !strings.Contains(err.Error(), "test binary") {
+		t.Fatalf("the refusal %q does not say what was refused", err)
+	}
+	for _, name := range []string{`C:\x\wslcomms.test.exe`, "/tmp/go-build/b001/wslcomms.test", `C:\x\WSLCOMMS.TEST.EXE`} {
+		if !isGoTestBinary(name) {
+			t.Errorf("isGoTestBinary(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{`C:\x\wslcomms.exe`, `C:\x\wslcomms-portable.exe`, "/opt/wslcomms/wslcomms"} {
+		if isGoTestBinary(name) {
+			t.Errorf("isGoTestBinary(%q) = true, want false", name)
+		}
 	}
 }
 

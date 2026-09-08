@@ -1439,9 +1439,16 @@ func TestNoBoundMethodHandsBackTheReturnPassphrase(t *testing.T) {
 			continue
 		}
 		switch m.Name {
-		case "Start", "Stop", "StartReturn", "StopReturn", "ArmMixer", "DisarmMixer":
+		case "Start", "Stop", "StartReturn", "StopReturn", "ArmMixer", "DisarmMixer",
+			"StartPicture", "StopPicture", "RefreshPicture":
 			// State-changing. Not getters, and not worth starting a pipeline
-			// inside an assertion about strings.
+			// inside an assertion about strings. The picture three are worse
+			// than that: StartPicture launches THIS EXECUTABLE as the picture
+			// process, and under `go test` this executable is the test binary,
+			// which runs this test, which launches it again. That fork bomb was
+			// found on a Gate B run (134 test processes); newTestApp now installs
+			// a fake monitor and the launcher refuses a test binary, but the
+			// skip is kept because calling them here proves nothing anyway.
 			continue
 		}
 		for _, out := range v.Method(i).Call(nil) {
