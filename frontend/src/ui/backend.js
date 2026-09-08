@@ -1500,34 +1500,25 @@ export function onReturn(cb) {
 // opposite of what was asked for, and it is why selecting "SRT" used to silence
 // the operator.
 //
-// # SetPictureRect takes CSS PIXELS AND THE DEVICE PIXEL RATIO, in one call
+// # THE PICTURE IS A SEPARATE PROCESS WITH A WINDOW OF ITS OWN
 //
-// gst.PictureRect is in PHYSICAL pixels, and gst.ScaleRect is what converts —
-// on the Go side, from the numbers this call carries. The page cannot send only
-// physical pixels and Go cannot read the factor for itself: GetDpiForWindow is
-// the monitor's scale factor, which equals the WebView's device pixel ratio only
-// at 100% zoom, and Ctrl+scroll on a WebView2 changes one and not the other.
+// It used to be a native child window painted over this page, and this adapter
+// carried its rectangle and its visibility across. Neither exists any more: the
+// picture process makes its own top-level window, the operator puts it where
+// they like, and this page's tile always shows the mosaic. What this adapter
+// carries is start, stop, refresh and state.
 //
-// The two travel together so a rectangle can never be paired with a ratio
-// measured at a different moment. See setPictureRect below.
+// # RefreshPicture is the "it has frozen" button
 //
-// The origin is the client area rather than the screen because the native window
-// is a child of the same top-level window: dragging the window moves both
-// together and needs no report, which is fortunate, because a page cannot
-// observe its own window moving.
-//
-// # SetPictureVisible is not a convenience
-//
-// The overlay is opaque and it is outside the page's stacking context — no
-// z-index reaches it. Anything the page draws over that rectangle is invisible
-// until this is called with false. Settings and the mixer drawer both do.
+// It kills the picture process — however wedged its decoder or its socket may
+// be — and starts a fresh one against the saved configuration. Nothing about
+// the audio or the contribution feed is touched.
 
 /** The Go method names this adapter binds to. One place, so a rename is one edit. */
 const PICTURE_METHODS = Object.freeze({
   start: 'StartPicture',
   stop: 'StopPicture',
-  rect: 'SetPictureRect',
-  visible: 'SetPictureVisible',
+  refresh: 'RefreshPicture',
   state: 'GetPictureState',
 });
 
@@ -1563,11 +1554,11 @@ export const PICTURE_STATE = Object.freeze({
  * pictureAvailable reports whether this build can do the native SRT picture at
  * all.
  *
- * It checks ALL FIVE, for the reason srtReturnAvailable does: every one of them
+ * It checks ALL FOUR, for the reason srtReturnAvailable does: every one of them
  * is called on a path that has already assumed the option was offered. A build
- * with StartPicture but no SetPictureRect would start a receiver and then paint
- * it at whatever rectangle a native default puts it at — an opaque box over the
- * application, which is worse than no picture at all.
+ * with StartPicture but no RefreshPicture would offer a picture with no way to
+ * restart it when it freezes, which is the situation the Refresh button exists
+ * to end.
  */
 export function pictureAvailable() {
   return PICTURE_METHOD_NAMES.every(hasBinding);
@@ -1575,8 +1566,6 @@ export function pictureAvailable() {
 
 let fakePictureState = PICTURE_STATE.STOPPED;
 let fakePictureTimer = null;
-let fakePictureRect = null;
-let fakePictureVisible = false;
 
 function setFakePictureState(next) {
   fakePictureState = next;
@@ -1618,65 +1607,28 @@ export async function startPicture() {
   }, 1200);
 }
 
-/** Stops the receiver, hides the overlay and releases the M2L-X fan-out slot. */
+/** Stops the picture process, closing its window, and releases the M2L-X fan-out slot. */
 export async function stopPicture() {
   if (hasWails()) return callGoBound(PICTURE_METHODS.stop);
   if (fakePictureTimer) {
     clearTimeout(fakePictureTimer);
     fakePictureTimer = null;
   }
-  fakePictureVisible = false;
   setFakePictureState(PICTURE_STATE.STOPPED);
 }
 
 /**
- * Positions the overlay.
+ * Restarts the picture from nothing: the picture process is ended — killed, if
+ * it has wedged — and a fresh one is started against the saved configuration.
+ * A picture that was not running is simply started.
  *
- * ============ IT SENDS CSS PIXELS AND THE RATIO, IN ONE CALL ================
- *
- * Not physical pixels, and this is gst.PictureRect's contract rather than a
- * convenience. Go multiplies, in gst.ScaleRect, and it does so because the
- * factor cannot be read on the Go side without being a DIFFERENT NUMBER
- * MEASURED AT A DIFFERENT MOMENT: GetDpiForWindow is the monitor's scale
- * factor, which equals the WebView's device pixel ratio only at 100% zoom, and
- * Ctrl+scroll changes one and not the other. The page's own ratio is
- * authoritative because the page's own layout is what the rectangle has to line
- * up with.
- *
- * The ratio travels WITH the rectangle, in the same call, so that a rectangle
- * can never be paired with a ratio measured before or after it. That is the
- * whole reason this is not two bindings.
- *
- * overlay.js still computes the physical rectangle. It does not send it: it uses
- * it to decide WHETHER to send — a DPI change with an unchanged CSS box has to
- * re-report, and only the physical rectangle knows that — and it applies the
- * same edge-rounding rule gst.ScaleRect does, so the number in the console line
- * is the number Go will land on.
- *
- * @param {{x: number, y: number, width: number, height: number}} cssRect
- * @param {number} devicePixelRatio  window.devicePixelRatio, as measured
+ * Resolving means the new process is up and its reconnect loop is running, not
+ * that a picture is on screen. Watch the "picture" event for that.
  */
-export async function setPictureRect(cssRect, devicePixelRatio) {
-  const { x, y, width, height } = cssRect || {};
-  if (hasWails()) {
-    return callGoBound(PICTURE_METHODS.rect, x, y, width, height, devicePixelRatio);
-  }
-  fakePictureRect = { x, y, width, height, devicePixelRatio };
-}
-
-/**
- * Shows or hides the overlay without stopping the receiver.
- *
- * Hiding is what Settings and the mixer drawer need: the overlay is opaque and
- * on top of its rectangle whatever the page does, so a screen drawn underneath
- * it is a screen the operator can only read two thirds of. Hiding rather than
- * stopping means coming back from Settings does not re-dial M2L-X.
- *
- * @param {boolean} visible
- */
-export async function setPictureVisible(visible) {
-  if (hasWails()) return callGoBound(PICTURE_METHODS.visible, visible === true);
-  fakePictureVisible = visible === true;
+export async function refreshPicture() {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.refresh);
+  await stopPicture();
+  await startPicture();
 }
 
 /**
@@ -1693,14 +1645,6 @@ export async function getPictureState() {
 /** Subscribes to the "picture" event. Returns an unsubscribe function. */
 export function onPicture(cb) {
   return subscribe(EVENT_PICTURE, cb);
-}
-
-/**
- * The fake overlay's last known geometry, for a dev session in the browser where
- * there is no native window to look at. Diagnostics only; nothing reads it.
- */
-export function fakePictureOverlay() {
-  return { rect: fakePictureRect, visible: fakePictureVisible, state: fakePictureState };
 }
 
 // ---------------------------------------------------------------------------
@@ -2714,12 +2658,14 @@ let fakePreviewVisible = false;
 /**
  * Positions the preview surface.
  *
- * CSS PIXELS AND THE RATIO, IN ONE CALL — identical to setPictureRect, and for
- * the identical reason: gst.ScaleRect multiplies on the Go side because the
- * factor Go could read for itself is a different number measured at a different
- * moment, and the two travel together so a rectangle can never be paired with a
- * ratio from before or after it. See setPictureRect's comment; there is one
- * conversion rule in this application and overlay.js owns it.
+ * CSS PIXELS AND THE RATIO, IN ONE CALL. gst.ScaleRect multiplies on the Go
+ * side, because the factor Go could read for itself — GetDpiForWindow, the
+ * monitor's scale — equals the WebView's device pixel ratio only at 100% zoom,
+ * and Ctrl+scroll on a WebView2 changes one and not the other. The page's own
+ * ratio is authoritative because the page's own layout is what the rectangle
+ * has to line up with, and the two travel together so a rectangle can never be
+ * paired with a ratio from before or after it. There is one conversion rule in
+ * this application and overlay.js owns it.
  *
  * @param {{x: number, y: number, width: number, height: number}} cssRect
  * @param {number} devicePixelRatio  window.devicePixelRatio, as measured
@@ -2751,7 +2697,7 @@ export async function setPreviewVisible(visible) {
 /**
  * The fake preview surface's last known geometry, for a dev session in the
  * browser where there is no native window to look at. Diagnostics only; nothing
- * reads it. Mirrors fakePictureOverlay.
+ * reads it.
  */
 export function fakePreviewSurface() {
   return { rect: fakePreviewRect, visible: fakePreviewVisible };

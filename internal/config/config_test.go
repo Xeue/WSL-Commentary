@@ -754,6 +754,9 @@ func TestEffectiveVideoSourceAndUsesDeckLinkVideo(t *testing.T) {
 		{"   ", VideoSourceSlate, false},
 		{VideoSourceSlate, VideoSourceSlate, false},
 		{VideoSourceDeckLink, VideoSourceDeckLink, true},
+		// Audio-only. It names no card and, unlike the two above, it names no
+		// picture either — SendsVideo is the question it answers, below.
+		{VideoSourceNone, VideoSourceNone, false},
 		// Unrecognised is returned as it stands rather than corrected, for the
 		// reason EffectiveAudioSourceKind gives: Validate reports it by name, and
 		// silently reading it as one of the two would build a leg the operator
@@ -792,6 +795,11 @@ func TestUsesDeckLinkCardCoversAllFourCombinations(t *testing.T) {
 		{VideoSourceSlate, AudioSourceDeckLink, true},
 		{VideoSourceDeckLink, AudioSourceNative, true},
 		{VideoSourceDeckLink, AudioSourceDeckLink, true},
+		// Audio-only, with either commentary source. The card is still wanted
+		// when the COMMENTARY comes off it — the clock companion keeps it alive
+		// even with no picture leg to clock — and not otherwise.
+		{VideoSourceNone, AudioSourceNative, false},
+		{VideoSourceNone, AudioSourceDeckLink, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.video+"+"+tt.audio, func(t *testing.T) {
@@ -827,10 +835,32 @@ func TestValidateNamesTheVideoSourceField(t *testing.T) {
 	if err == nil {
 		t.Fatal("Validate() accepted videoSource \"ndi\"; there is no leg behind it")
 	}
-	for _, want := range []string{"videoSource", "ndi", VideoSourceSlate, VideoSourceDeckLink} {
+	for _, want := range []string{"videoSource", "ndi", VideoSourceSlate, VideoSourceDeckLink, VideoSourceNone} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Validate() error %q does not mention %q; it must name the field, the value "+
 				"that was typed and what is accepted", err, want)
+		}
+	}
+}
+
+// TestSendsVideoIsFalseOnlyForNone pins the one comparison the capture layer
+// and the send pipeline both make. Every other value — including the empty one,
+// which means the slate, and an unrecognised one, which Validate refuses — still
+// sends a picture; only an explicit "none" builds no video leg.
+func TestSendsVideoIsFalseOnlyForNone(t *testing.T) {
+	for _, tt := range []struct {
+		set  string
+		want bool
+	}{
+		{"", true},
+		{VideoSourceSlate, true},
+		{VideoSourceDeckLink, true},
+		{"ndi", true},
+		{VideoSourceNone, false},
+	} {
+		c := &Config{VideoSource: tt.set}
+		if got := c.SendsVideo(); got != tt.want {
+			t.Errorf("Config{VideoSource: %q}.SendsVideo() = %v, want %v", tt.set, got, tt.want)
 		}
 	}
 }

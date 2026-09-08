@@ -52,6 +52,7 @@ import { dirname, join } from 'node:path';
 import {
   VIDEO_SOURCE_SLATE,
   VIDEO_SOURCE_DECKLINK,
+  VIDEO_SOURCE_NONE,
   DEFAULT_VIDEO_SOURCE,
   VIDEO_SOURCE_KEY,
   PREVIEW_KEY,
@@ -105,8 +106,14 @@ test('the two sources are spelled the way internal/config spells them', () => {
     /VideoSourceDeckLink = "decklink"/,
     'internal/config no longer spells the card kind "decklink"',
   );
+  assert.match(
+    go,
+    /VideoSourceNone = "none"/,
+    'internal/config no longer spells the audio-only kind "none"',
+  );
   assert.equal(VIDEO_SOURCE_SLATE, 'slate');
   assert.equal(VIDEO_SOURCE_DECKLINK, 'decklink');
+  assert.equal(VIDEO_SOURCE_NONE, 'none');
 });
 
 test('the default is the slate on both sides of the boundary', () => {
@@ -144,6 +151,11 @@ test('the config keys are the json tags internal/config actually declares', () =
 
 test('normaliseVideoSource falls back to the slate for everything it does not know', () => {
   assert.equal(normaliseVideoSource(VIDEO_SOURCE_DECKLINK), VIDEO_SOURCE_DECKLINK);
+  // Audio-only is the other explicit choice, and like the card it must be
+  // spelled exactly: a case drift here would put the slate back on air.
+  assert.equal(normaliseVideoSource(VIDEO_SOURCE_NONE), VIDEO_SOURCE_NONE);
+  assert.equal(normaliseVideoSource('NONE'), VIDEO_SOURCE_SLATE);
+  assert.equal(normaliseVideoSource('off'), VIDEO_SOURCE_SLATE);
   for (const value of [
     'slate',
     '',
@@ -247,6 +259,47 @@ test('the effects say which of three things goes to air', () => {
   // An unrecognised saved value must be the slate in every one of these, not a
   // fourth state somebody has to interpret.
   assert.equal(deriveVideoSourceEffects('camera', [cardDevice]).toAir, VIDEO_SOURCE_SLATE);
+});
+
+test('audio-only wants no card, is always startable, and sends no picture', () => {
+  // The fourth answer to "what goes to air": nothing, on purpose. It needs no
+  // hardware, so it is startable on a machine with no card, an unread list, or
+  // a card sitting idle — none of which is a fault.
+  for (const devices of [null, [], [nativeDevice], [cardDevice]]) {
+    const e = deriveVideoSourceEffects(VIDEO_SOURCE_NONE, devices);
+    assert.equal(e.source, VIDEO_SOURCE_NONE);
+    assert.equal(e.audioOnly, true);
+    assert.equal(e.wantCard, false, 'audio-only never asks for the card');
+    assert.equal(e.startable, true, `audio-only must be startable with devices=${JSON.stringify(devices)}`);
+    assert.equal(e.toAir, VIDEO_SOURCE_NONE);
+  }
+  // And it is its own state, not the slate wearing a different label: the slate
+  // and the card both report audioOnly false.
+  assert.equal(deriveVideoSourceEffects(VIDEO_SOURCE_SLATE, [cardDevice]).audioOnly, false);
+  assert.equal(deriveVideoSourceEffects(VIDEO_SOURCE_DECKLINK, [cardDevice]).audioOnly, false);
+
+  // The sentence says NO VIDEO goes out, says the encoder is not built (the
+  // whole reason the option exists), and says what the switcher input has to be.
+  const line = describeToAir(deriveVideoSourceEffects(VIDEO_SOURCE_NONE, [cardDevice]));
+  assert.match(line, /AUDIO ONLY/);
+  assert.match(line, /no video is sent/i);
+  assert.match(line, /encoder/i);
+  assert.match(line, /audio-only mic input/i);
+
+  // A card fitted and unused says "no video goes to air", not "the slate goes
+  // to air" — the slate is not being sent either.
+  const idle = describeCardAvailability(deriveVideoSourceEffects(VIDEO_SOURCE_NONE, [cardDevice]));
+  assert.match(idle, /A DeckLink card IS fitted/);
+  assert.match(idle, /no video goes to air/);
+  assert.doesNotMatch(idle, /slate/i);
+  // And nothing at all on a machine with no card: there is nothing to say.
+  assert.equal(describeCardAvailability(deriveVideoSourceEffects(VIDEO_SOURCE_NONE, [nativeDevice])), '');
+
+  // The camera lamp is grey, and it says AUDIO ONLY rather than SLATE, because
+  // SLATE would claim a still picture is on air and nothing is.
+  for (const signal of [undefined, { state: 'OK' }, { state: 'LOST' }]) {
+    assert.deepEqual(deriveCameraLamp(VIDEO_SOURCE_NONE, signal), { level: LEVEL.GREY, text: 'AUDIO ONLY' });
+  }
 });
 
 test('describeToAir names the thing on air and never just the option', () => {
@@ -683,11 +736,12 @@ test('the video source is a <select> of exactly the two sources, first in its gr
   // The options come from the shared table rather than being written out here,
   // so a third option cannot exist on the screen and nowhere else.
   assert.match(js, /VIDEO_SOURCES\.map\(\(s\) => \(\{ value: s\.value, label: s\.label \}\)\)/);
-  assert.equal(VIDEO_SOURCES.length, 2);
+  assert.equal(VIDEO_SOURCES.length, 3);
   assert.deepEqual(
     VIDEO_SOURCES.map((s) => s.value),
-    [VIDEO_SOURCE_SLATE, VIDEO_SOURCE_DECKLINK],
-    'exactly the two sources, slate first — the default is the one an operator lands on',
+    [VIDEO_SOURCE_SLATE, VIDEO_SOURCE_DECKLINK, VIDEO_SOURCE_NONE],
+    'exactly the three sources, slate first — the default is the one an operator lands on; ' +
+      'audio-only last, because it is the one that sends no picture',
   );
 
   // AND THE CONTROL CARRIES NO HINT AT ALL. It used to render both options'
@@ -1150,10 +1204,11 @@ test('the preview box is reserved from the configuration and captioned honestly'
   );
 
   // RESERVING IS A LAYOUT CHANGE: .pgm-tile is sized against what is left in the
-  // stage, so the commentator's picture has just moved and BOTH surfaces have to
+  // stage, so the commentator's picture has just moved and the surface has to
   // be re-measured. An overlay left at yesterday's rectangle is a native window
-  // over the controls beside it.
-  assert.match(body, /overlay\.sync\(\);\s*previewOverlay\.sync\(\);/);
+  // over the controls beside it. (The SRT picture used to be a second surface
+  // re-measured here; it is a window of its own now.)
+  assert.match(body, /previewOverlay\.sync\(\);/);
 
   // AND THE SENDER EDGE NO LONGER REDRAWS IT. This is the other half of the same
   // change and it is asserted separately because deleting the call is what makes

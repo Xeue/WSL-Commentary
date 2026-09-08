@@ -1582,7 +1582,7 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 	}
 	p.seam = seam
 
-	desc := sendDescription(encoderName, opts.AudioBitrateBps)
+	desc := sendDescription(encoderName, opts.AudioBitrateBps, !opts.NoVideo)
 	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
 	element, err := gogst.ParseLaunch(desc)
@@ -1610,11 +1610,17 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 		return abort(err)
 	}
 
-	p.encoder = pipeline.GetByName(nameVideoEncod)
-	if p.encoder == nil {
-		return abort(errNoElement(nameVideoEncod, "there is nothing to encode the picture with"))
+	// The encoder exists only when the pipeline has a video chain. Audio-only
+	// (SendOpts.NoVideo) leaves p.encoder nil, and everything that reads it —
+	// the keyframe request on reconnect, the teardown — already treats nil as
+	// "no encoder" rather than as a fault.
+	if !opts.NoVideo {
+		p.encoder = pipeline.GetByName(nameVideoEncod)
+		if p.encoder == nil {
+			return abort(errNoElement(nameVideoEncod, "there is nothing to encode the picture with"))
+		}
+		applyEncoderProperties(p.encoder, encoderName, opts.VideoBitrateKbps)
 	}
-	applyEncoderProperties(p.encoder, encoderName, opts.VideoBitrateKbps)
 
 	p.srtq = pipeline.GetByName(nameSRTQueue)
 	if p.srtq == nil {
@@ -1721,7 +1727,7 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 	// silence from; the probes have to be in place first or the buffers the
 	// liveness gate is waiting for cross the pads unseen and a healthy seam is
 	// refused. livewatch.go carries the argument and the numbers.
-	p.live, err = attachLiveWatch(pipeline)
+	p.live, err = attachLiveWatch(pipeline, !opts.NoVideo)
 	if err != nil {
 		return abort(err)
 	}
@@ -3208,8 +3214,14 @@ func (p *cgoPipeline) ForceKeyUnit() error {
 	if p.stopped {
 		return errors.New("gst: pipeline is stopped")
 	}
-	if !p.started || p.encoder == nil {
+	if !p.started {
 		return errors.New("gst: pipeline has not been started")
+	}
+	if p.encoder == nil {
+		// Audio-only (SendOpts.NoVideo): there is no encoder and no keyframe to
+		// request. Not an error — the reconnect path that asks for one has
+		// nothing to re-lock the far end's decoder against, which is the point.
+		return nil
 	}
 
 	event := newForceKeyUnitEvent()

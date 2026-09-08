@@ -980,14 +980,13 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // the same reason the mixer six are listed second: so that each group stays
 // legible as one decision.
 //
-// The five picture methods are the twentieth to twenty-fourth, added when SRT
-// became the PICTURE path and documented in the same header. Three of them
-// exist because the picture is a NATIVE CHILD WINDOW painted over the page
-// rather than an element in it: SetPictureRect and SetPictureVisible are the
-// frontend telling an overlay that does not participate in CSS layout where to
-// sit and when to get out of the way, and they are on this surface precisely
-// because there is no other way for the page to say it. They are listed fourth
-// so that group stays legible too.
+// The four picture methods are the next group, added when SRT became the
+// PICTURE path and documented in the same header. The picture is a SEPARATE
+// PROCESS with a window of its own, so there is no rectangle or visibility
+// method for it (there were two while it was an overlay over the page), and
+// RefreshPicture — kill the process, start a fresh one — is the operator's
+// answer to a frozen picture. They are listed fourth so that group stays
+// legible too.
 //
 // The seven preset methods are the next group, added with the M2L-X instance
 // presets and documented in the same header. Four are read-only or rename a
@@ -1066,11 +1065,10 @@ func assertBoundSurface(t *testing.T) {
 		"GetReturnState":      true,
 		"IsSRTReturnSelected": true,
 
-		"StartPicture":      true,
-		"StopPicture":       true,
-		"GetPictureState":   true,
-		"SetPictureRect":    true,
-		"SetPictureVisible": true,
+		"StartPicture":    true,
+		"StopPicture":     true,
+		"RefreshPicture":  true,
+		"GetPictureState": true,
 
 		"ListPresets":               true,
 		"SavePreset":                true,

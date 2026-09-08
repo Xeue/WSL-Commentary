@@ -1,15 +1,17 @@
 //go:build dev || production || bindings
 
-// Tests for the SRT picture's bound surface: the exclusivity guard, the
-// rectangle, the visibility gate, the state forwarding and the teardown order.
+// Tests for the SRT picture's bound surface: the exclusivity guard, the state
+// forwarding, Refresh, the reaping of a picture process that died, and the
+// teardown order.
 //
 // WHAT THESE TESTS DO NOT REACH, stated plainly rather than left to be assumed:
-// nothing here creates a window, and the overlay is a fake throughout. That is
-// deliberate — a unit test that created a real HWND would need a message loop, a
-// parent window and a desktop session, and CI has none of the three — but it
-// means the fake is asserting the CONTRACT of gst.PictureOverlay and not its
-// implementation. Everything in overlay_windows.go below the interface is
-// unproven by this file. See the report.
+// the monitor is a fake throughout, standing in for the picture PROCESS. The
+// parent's half of that process — childPictureMonitor — is tested against a
+// helper process in app_picture_child_test.go; the child's half, with a real
+// window and a real pipeline, is not unit-tested anywhere. The preview's
+// overlay is a fake too: a unit test that created a real HWND would need a
+// message loop, a parent window and a desktop session, and CI has none of the
+// three.
 package main
 
 import (
@@ -148,7 +150,8 @@ func (o *fakeOverlay) closeCount() int {
 
 var _ gst.PictureOverlay = (*fakeOverlay)(nil)
 
-// withFakePicture wires a fake monitor and a fake overlay into the app.
+// withFakePicture wires a fake monitor into the app, in place of the picture
+// process, and a fake overlay in place of the DeckLink preview's surface.
 //
 // It also sets returnSource to webrtc, because that is the configuration this
 // whole work package exists to produce — the audio comes from Kinesis and SRT
@@ -239,13 +242,14 @@ func TestStartAndStopPictureBookkeeping(t *testing.T) {
 	}
 }
 
-func TestStartPictureGivesTheMonitorTheOverlaysHandle(t *testing.T) {
-	// A zero handle makes d3d11videosink open its own top-level window on the
-	// operator's screen. The handle the pipeline is given must be the handle the
-	// overlay actually produced, not a copy of one taken earlier.
+func TestStartPictureGivesTheMonitorTheProgrammePortAndNoWindow(t *testing.T) {
+	// The monitor is the picture PROCESS. It makes its own window, so the
+	// handle this side hands it must be zero — a non-zero one would be a window
+	// of THIS process, which the child cannot render into — and the port must
+	// be Output 1, src=pgm, the programme picture.
 	a, _ := newTestApp(t)
 	silencePump(a)
-	mon, ov := withFakePicture(a)
+	mon, _ := withFakePicture(a)
 
 	if err := a.StartPicture(); err != nil {
 		t.Fatalf("StartPicture() error = %v", err)
@@ -253,9 +257,9 @@ func TestStartPictureGivesTheMonitorTheOverlaysHandle(t *testing.T) {
 	defer a.StopPicture()
 
 	opts, _ := mon.startedWith()
-	if opts.WindowHandle != ov.Handle() {
-		t.Fatalf("the monitor was given handle 0x%x, want the overlay's 0x%x",
-			opts.WindowHandle, ov.Handle())
+	if opts.WindowHandle != 0 {
+		t.Fatalf("the monitor was given window handle 0x%x; the picture process makes its own window "+
+			"and this process has none to give it", opts.WindowHandle)
 	}
 	if opts.Port != config.DefaultSRTReturnPort {
 		t.Errorf("the monitor was given port %d, want %d — Output 1, src=pgm, the programme picture",
@@ -287,187 +291,146 @@ func TestPictureOptsCarryNoSecretIntoTheDiagnostic(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The rectangle
+// Refresh, and a picture process that died on its own
 // ---------------------------------------------------------------------------
 
-func TestSetPictureRectScalesCSSPixelsByThePagesOwnRatio(t *testing.T) {
-	// The operator runs a 3840x2088 window. A rectangle in CSS pixels is not a
-	// rectangle in physical pixels, and the factor is the PAGE's
-	// devicePixelRatio rather than the monitor's DPI — the two differ the moment
-	// anyone touches the WebView zoom.
-	a, _ := newTestApp(t)
-	_, ov := withFakePicture(a)
+// withFreshFakePictures installs a pictureDial that hands out a NEW fake on
+// every call and records them, so a test can see that Refresh built a second
+// monitor rather than restarting the first.
+func withFreshFakePictures(a *App) func() []*fakePictureMonitor {
+	var mu sync.Mutex
+	var made []*fakePictureMonitor
+	a.pictureDial = func() gst.PictureMonitor {
+		m := newFakePictureMonitor()
+		mu.Lock()
+		made = append(made, m)
+		mu.Unlock()
+		return m
+	}
+	a.overlayDial = func() (gst.PictureOverlay, error) { return newFakeOverlay(), nil }
 
-	if err := a.SetPictureRect(16, 80, 960, 540, 1.5); err != nil {
-		t.Fatalf("SetPictureRect() error = %v", err)
-	}
-	got, ok := ov.lastRect()
-	if !ok {
-		t.Fatal("the overlay was never told where to sit")
-	}
-	want := gst.PictureRect{X: 24, Y: 120, W: 1440, H: 810}
-	if got != want {
-		t.Fatalf("the overlay was placed at %v, want %v", got, want)
+	cfg := validConfig()
+	cfg.ReturnSource = config.ReturnSourceWebRTC
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	return func() []*fakePictureMonitor {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]*fakePictureMonitor(nil), made...)
 	}
 }
 
-func TestSetPictureRectBeforeTheWindowExistsIsNotAnError(t *testing.T) {
-	// Called during startup, before Wails has made the window. It is a normal
-	// moment and must not become an error toast; the rectangle is remembered so
-	// that an overlay created later is positioned before it is ever shown.
-	a, _ := newTestApp(t)
-	a.overlayDial = func() (gst.PictureOverlay, error) { return nil, gst.ErrNoHostWindow }
-
-	if err := a.SetPictureRect(0, 0, 100, 100, 1); err != nil {
-		t.Fatalf("SetPictureRect() before the window exists error = %v, want nil", err)
-	}
-
-	// And once the window arrives, the remembered rectangle is applied without
-	// the frontend having to say it again.
-	ov := newFakeOverlay()
-	a.overlayDial = func() (gst.PictureOverlay, error) { return ov, nil }
-
-	a.picViewMu.Lock()
-	_, err := a.pictureOverlayViewLocked()
-	a.picViewMu.Unlock()
-	if err != nil {
-		t.Fatalf("pictureOverlayViewLocked() error = %v", err)
-	}
-	got, ok := ov.lastRect()
-	if !ok || got != (gst.PictureRect{W: 100, H: 100}) {
-		t.Fatalf("a freshly created overlay was placed at %v (set=%v), want the remembered rectangle",
-			got, ok)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// The visibility gate, which is the one that keeps a black box off the mosaic
-// ---------------------------------------------------------------------------
-
-func TestOverlayIsShownOnlyWhenAllThreeConditionsHold(t *testing.T) {
-	// want && showing && the rectangle has area. Each one is a different way the
-	// picture goes wrong:
-	//
-	//	no want     a picture covers the Settings screen
-	//	no showing  a black rectangle covers the FALLBACK MOSAIC, which is the
-	//	            soft picture the commentator is meant to be watching instead
-	//	no area     gstd3d11 resizes a swapchain to nothing
+func TestRefreshPictureStopsTheOldMonitorAndStartsANewOne(t *testing.T) {
+	// The operator's "the picture has frozen" button. It is a real remedy only
+	// if it is a NEW monitor — a new process, a new GStreamer, a new socket, a
+	// new decoder — and not the old one poked; so the old fake must be stopped
+	// and a second fake must be the one running afterwards.
 	a, _ := newTestApp(t)
 	silencePump(a)
-	_, ov := withFakePicture(a)
+	made := withFreshFakePictures(a)
 
-	// Bring the overlay into being with a real rectangle.
-	if err := a.SetPictureRect(0, 0, 640, 360, 1); err != nil {
-		t.Fatalf("SetPictureRect() error = %v", err)
-	}
-
-	cases := []struct {
-		name    string
-		want    bool
-		state   gst.PictureState
-		rect    gst.PictureRect
-		visible bool
-	}{
-		{"nothing asked for, nothing showing", false, gst.PictureStateStopped, gst.PictureRect{W: 640, H: 360}, false},
-		{"asked for but not showing", true, gst.PictureStateConnecting, gst.PictureRect{W: 640, H: 360}, false},
-		{"asked for but backing off", true, gst.PictureStateBackoff, gst.PictureRect{W: 640, H: 360}, false},
-		{"showing but not asked for", false, gst.PictureStateShowing, gst.PictureRect{W: 640, H: 360}, false},
-		{"showing and asked for, but no area", true, gst.PictureStateShowing, gst.PictureRect{}, false},
-		{"all three", true, gst.PictureStateShowing, gst.PictureRect{W: 640, H: 360}, true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			a.picStateMu.Lock()
-			a.lastPicture = c.state
-			a.picStateMu.Unlock()
-
-			a.picViewMu.Lock()
-			a.picWantVisible = c.want
-			a.picRect = c.rect
-			a.applyPictureVisibilityViewLocked()
-			a.picViewMu.Unlock()
-
-			got, ok := ov.lastVisible()
-			if !ok {
-				t.Fatal("the overlay was never told whether to be visible")
-			}
-			if got != c.visible {
-				t.Fatalf("visible = %v, want %v", got, c.visible)
-			}
-		})
-	}
-}
-
-func TestTheOverlayFollowsTheStateBeforeThePageIsTold(t *testing.T) {
-	// The window must be gone by the time the page is told the picture has
-	// stopped. The other order shows the page a state it cannot act on for a
-	// frame, during which a black rectangle sits over the fallback mosaic.
-	a, _ := newTestApp(t)
-	silencePump(a)
-	mon, ov := withFakePicture(a)
-
-	if err := a.SetPictureRect(0, 0, 640, 360, 1); err != nil {
-		t.Fatalf("SetPictureRect() error = %v", err)
-	}
-	if err := a.SetPictureVisible(true); err != nil {
-		t.Fatalf("SetPictureVisible() error = %v", err)
-	}
 	if err := a.StartPicture(); err != nil {
 		t.Fatalf("StartPicture() error = %v", err)
 	}
+	if err := a.RefreshPicture(); err != nil {
+		t.Fatalf("RefreshPicture() error = %v", err)
+	}
+	defer a.StopPicture()
 
-	mon.emit(gst.PictureStateShowing)
-	waitForCond(t, "the overlay to be shown", func() bool {
-		v, ok := ov.lastVisible()
-		return ok && v
+	mons := made()
+	if len(mons) != 2 {
+		t.Fatalf("Refresh built %d monitors in total, want 2: the old one stopped, a fresh one started", len(mons))
+	}
+	mons[0].mu.Lock()
+	oldStopped := mons[0].stopped
+	mons[0].mu.Unlock()
+	if !oldStopped {
+		t.Error("Refresh did not stop the old monitor; two picture processes would be dialling the same output")
+	}
+	if _, started := mons[1].startedWith(); !started {
+		t.Error("Refresh did not start the fresh monitor")
+	}
+	if a.pic == nil || a.pic.mon != mons[1] {
+		t.Error("the running session is not the fresh monitor")
+	}
+
+	// And its states are the ones the page now hears.
+	mons[1].emit(gst.PictureStateShowing)
+	waitForCond(t, "the fresh monitor's state to reach the getter", func() bool {
+		s, _ := a.GetPictureState()
+		return s == gst.PictureStateShowing
 	})
+}
 
-	mon.emit(gst.PictureStateBackoff)
-	waitForCond(t, "the overlay to be hidden when the picture drops", func() bool {
-		v, ok := ov.lastVisible()
-		return ok && !v
-	})
+func TestRefreshPictureStartsAPictureThatWasNotRunning(t *testing.T) {
+	// Nothing to stop is not a failure: the operator pressed Refresh because
+	// they want a picture, and "it was not running" is not a reason to deny
+	// them one.
+	a, _ := newTestApp(t)
+	silencePump(a)
+	made := withFreshFakePictures(a)
 
-	if err := a.StopPicture(); err != nil {
-		t.Fatalf("StopPicture() error = %v", err)
+	if err := a.RefreshPicture(); err != nil {
+		t.Fatalf("RefreshPicture() with nothing running error = %v", err)
+	}
+	defer a.StopPicture()
+
+	if len(made()) != 1 {
+		t.Fatalf("Refresh built %d monitors, want exactly 1", len(made()))
+	}
+	if a.pic == nil {
+		t.Fatal("Refresh left no picture running")
 	}
 }
 
-func TestStopPictureHidesTheOverlayEvenWithNothingRunning(t *testing.T) {
-	// This is the teardown path. An overlay left visible over the page with a
-	// frozen last frame in it is the worst thing this path can leave behind.
+func TestStartPictureReapsASessionWhoseMonitorEnded(t *testing.T) {
+	// The picture process can die without StopPicture — the operator closes
+	// its window, or it crashes — and the parent learns of it only through the
+	// states channel closing. A session in that state is NOT "already running":
+	// the next StartPicture must reap it and start a fresh one, or the operator
+	// is stuck with a dead picture and a button that says it is up.
 	a, _ := newTestApp(t)
 	silencePump(a)
-	_, ov := withFakePicture(a)
+	made := withFreshFakePictures(a)
 
-	if err := a.SetPictureRect(0, 0, 640, 360, 1); err != nil {
-		t.Fatalf("SetPictureRect() error = %v", err)
+	if err := a.StartPicture(); err != nil {
+		t.Fatalf("StartPicture() error = %v", err)
 	}
-	a.picViewMu.Lock()
-	a.picWantVisible = true
-	a.picViewMu.Unlock()
-	a.picStateMu.Lock()
-	a.lastPicture = gst.PictureStateShowing
-	a.picStateMu.Unlock()
-	a.picViewMu.Lock()
-	a.applyPictureVisibilityViewLocked()
-	a.picViewMu.Unlock()
+	first := made()[0]
 
-	if v, _ := ov.lastVisible(); !v {
-		t.Fatal("the overlay is not visible; the precondition of this test does not hold")
+	// The process dies: STOPPED, then the channel closes, with nobody having
+	// called Stop. Marked stopped first so the fake's own Stop — which the reap
+	// calls — does not send on the closed channel.
+	first.mu.Lock()
+	first.stopped = true
+	first.mu.Unlock()
+	first.emit(gst.PictureStateStopped)
+	close(first.states)
+
+	waitForCond(t, "the forwarder to notice the monitor ended", func() bool {
+		a.picMu.Lock()
+		defer a.picMu.Unlock()
+		return a.pic != nil && a.pic.exited.Load()
+	})
+	waitForCond(t, "STOPPED to reach the getter", func() bool {
+		s, _ := a.GetPictureState()
+		return s == gst.PictureStateStopped
+	})
+
+	if err := a.StartPicture(); err != nil {
+		t.Fatalf("StartPicture() after the picture process died error = %v; the dead session was "+
+			"not reaped", err)
 	}
+	defer a.StopPicture()
 
-	// Now the monitor is gone but the state was never updated — which is what a
-	// crash-stopped forwarder would leave behind.
-	a.picStateMu.Lock()
-	a.lastPicture = gst.PictureStateStopped
-	a.picStateMu.Unlock()
-
-	if err := a.StopPicture(); !errors.Is(err, errPictureNotRunning) {
-		t.Fatalf("StopPicture() error = %v, want errPictureNotRunning", err)
+	mons := made()
+	if len(mons) != 2 {
+		t.Fatalf("%d monitors were built, want 2", len(mons))
 	}
-	if v, _ := ov.lastVisible(); v {
-		t.Fatal("StopPicture() left the overlay visible over the page")
+	if a.pic == nil || a.pic.mon != mons[1] {
+		t.Fatal("the running session is not the fresh monitor")
 	}
 }
 
@@ -614,21 +577,21 @@ func TestPictureSaysNothingWhenTheDecoderIsHardware(t *testing.T) {
 // Teardown
 // ---------------------------------------------------------------------------
 
-func TestTeardownStopsThePictureThenDestroysTheWindow(t *testing.T) {
-	// THE ORDER IS FIXED AND IT IS THE ONLY ONE THAT WORKS. The pipeline is
-	// rendering into the window; destroying the window first leaves
-	// d3d11videosink presenting to a handle that no longer names anything, which
-	// is a driver-dependent outcome and not one to find out about during a match.
+func TestTeardownStopsThePictureThenClosesThePreviewSurface(t *testing.T) {
+	// The picture step of the ordered shutdown ends the picture process and,
+	// as a belt, takes the preview surface off the screen — the capture step
+	// that normally does that may have been abandoned rather than waited for.
 	a, _ := newTestApp(t)
 	silencePump(a)
 	mon, ov := withFakePicture(a)
 
-	if err := a.SetPictureRect(0, 0, 640, 360, 1); err != nil {
-		t.Fatalf("SetPictureRect() error = %v", err)
-	}
 	if err := a.StartPicture(); err != nil {
 		t.Fatalf("StartPicture() error = %v", err)
 	}
+	a.prevViewMu.Lock()
+	a.prevOverlay = ov
+	a.prevRunning = true
+	a.prevViewMu.Unlock()
 
 	if err := a.stopPictureForTeardown(); err != nil {
 		t.Fatalf("stopPictureForTeardown() error = %v", err)
@@ -641,10 +604,13 @@ func TestTeardownStopsThePictureThenDestroysTheWindow(t *testing.T) {
 		t.Error("teardown did not stop the monitor")
 	}
 	if ov.closeCount() != 1 {
-		t.Errorf("the overlay window was closed %d times, want exactly 1", ov.closeCount())
+		t.Errorf("the preview surface was closed %d times, want exactly 1", ov.closeCount())
 	}
-	if a.picOverlay != nil {
-		t.Error("teardown left the overlay reference behind; a second teardown would close it again")
+	a.prevViewMu.Lock()
+	left := a.prevOverlay
+	a.prevViewMu.Unlock()
+	if left != nil {
+		t.Error("teardown left the preview surface reference behind; a second teardown would close it again")
 	}
 }
 
@@ -661,10 +627,10 @@ func TestTeardownWithNoPictureStillClosesNothingAndSucceeds(t *testing.T) {
 }
 
 func TestTeardownReportsAnOverlayThatWouldNotClose(t *testing.T) {
-	// The overlay's Close is bounded and returns an error saying it abandoned
-	// its message thread. That error must reach the teardown log rather than
-	// being swallowed: an abandoned window is the only thing in this whole
-	// shutdown that stays on the operator's SCREEN.
+	// The preview surface's Close is bounded and returns an error saying it
+	// abandoned its message thread. That error must reach the teardown log
+	// rather than being swallowed: an abandoned window is the only thing in
+	// this whole shutdown that stays on the operator's SCREEN.
 	//
 	// And it must arrive INSPECTABLE. errors.Join keeps errors.Is working
 	// through it; a fmt.Errorf summary with %v would not, and the sentinel is
@@ -675,9 +641,9 @@ func TestTeardownReportsAnOverlayThatWouldNotClose(t *testing.T) {
 	withFakePicture(a)
 
 	stubborn := &stubbornOverlay{fakeOverlay: *newFakeOverlay()}
-	a.picViewMu.Lock()
-	a.picOverlay = stubborn
-	a.picViewMu.Unlock()
+	a.prevViewMu.Lock()
+	a.prevOverlay = stubborn
+	a.prevViewMu.Unlock()
 
 	err := a.stopPictureForTeardown()
 	if err == nil || !strings.Contains(err.Error(), "ABANDONED") {
@@ -695,7 +661,7 @@ func TestTeardownReportsAnOverlayThatWouldNotClose(t *testing.T) {
 //
 // gst.PictureOverlay.Close is the FIRST Close in this application that returns
 // on a hang instead of hanging. teardownStep used to score any step that
-// returned as finished, so an overlay that gave up on its message thread was
+// returned as finished, so a surface that gave up on its message thread was
 // counted as a clean stop: the abandoned count stayed at zero, teardown took its
 // `n == 0` branch, hardExit was never called and the process left through
 // ExitProcess — which terminates that thread wherever it is (inside
@@ -712,9 +678,9 @@ func TestTeardownEndsTheProcessWhenTheOverlayAbandonedItsThread(t *testing.T) {
 	withFakePicture(a)
 
 	stubborn := &stubbornOverlay{fakeOverlay: *newFakeOverlay()}
-	a.picViewMu.Lock()
-	a.picOverlay = stubborn
-	a.picViewMu.Unlock()
+	a.prevViewMu.Lock()
+	a.prevOverlay = stubborn
+	a.prevViewMu.Unlock()
 
 	exited := make(chan struct{}, 1)
 	a.exitProcess = func() {
@@ -792,7 +758,7 @@ func TestPictureLatencyComesFromItsOwnFieldAndNotTheFeeds(t *testing.T) {
 	cfg.SRTLatencyMs = 2000   // the feed going to air: heavily protected
 	cfg.PictureLatencyMs = 40 // the commentator's monitor: as quick as it goes
 
-	got := a.pictureOpts(cfg, "", 0x1234)
+	got := a.pictureOpts(cfg, "")
 	if got.LatencyMs != 40 {
 		t.Fatalf("the monitor was given LatencyMs = %d, want 40. It is reading the "+
 			"contribution feed's srtLatencyMs (%d) again, which is how the picture came "+
@@ -814,7 +780,7 @@ func TestPictureLatencyFallsBackToTheDefaultOnAnOldConfig(t *testing.T) {
 	cfg.M2LXHost = "m2lx.example.com"
 	cfg.PictureLatencyMs = 0 // what an upgraded installation has on disk
 
-	got := a.pictureOpts(cfg, "", 0x1234)
+	got := a.pictureOpts(cfg, "")
 	if got.LatencyMs != config.DefaultPictureLatencyMs {
 		t.Fatalf("the monitor was given LatencyMs = %d on a config with no picture latency, "+
 			"want the default %d; pictureOpts is reading the field raw instead of through "+

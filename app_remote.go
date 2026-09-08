@@ -48,14 +48,14 @@
 //
 // ===================== HOST-ONLY, AND WHY IT IS PHYSICS =====================
 //
-// The SRT picture is a native child HWND painted by d3d11videosink on the host
-// GPU, outside the DOM (internal/gst/overlay_windows.go). No transport that
-// carries the DOM can carry it, and SetPictureRect takes the CALLING page's CSS
-// rect and devicePixelRatio — a remote browser at another size or DPI would drag
-// the operator's own picture around from its ResizeObserver. So the six picture
-// and SRT-return methods are HostOnly: refused for every remote connection. The
-// remote page gets the WebRTC mosaic and an honest message; it never gets these
-// methods, because the hello frame omits them.
+// The SRT picture is a separate process on the host, decoding on the host GPU
+// into a native window of its own (app_picture_child.go). No transport that
+// carries the DOM can carry it, and starting, stopping or refreshing it opens
+// and closes a window on the operator's screen and takes or releases the M2L-X
+// output's one fan-out slot. So the picture and SRT-return methods are
+// HostOnly: refused for every remote connection. The remote page gets the
+// WebRTC mosaic and an honest message; it never gets these methods, because the
+// hello frame omits them.
 //
 // The two remote-admin methods (GetRemoteState, SetRemoteListener) are HostOnly
 // for a blunter reason: they change WHETHER the listener runs and on WHAT
@@ -345,16 +345,15 @@ var remoteAllowlist = map[string]methodPolicy{
 	// ---- host-only: the native picture/return surface ----
 	// Refused for every connection and omitted from Methods() so the shim never
 	// installs them.
-	"SetPictureRect":    {hostOnly: true},
-	"SetPictureVisible": {hostOnly: true},
-	"StartPicture":      {hostOnly: true},
-	"StopPicture":       {hostOnly: true},
-	"StartReturn":       {hostOnly: true},
-	"StopReturn":        {hostOnly: true},
-	// The DeckLink preview's surface, host-only for exactly the reason the
-	// picture's two are: they move, resize and show an OPAQUE native window on
-	// the screen of whoever is sitting at this machine, over whatever they were
-	// looking at. A seat in another building has no business doing that.
+	"StartPicture":   {hostOnly: true},
+	"StopPicture":    {hostOnly: true},
+	"RefreshPicture": {hostOnly: true},
+	"StartReturn":    {hostOnly: true},
+	"StopReturn":     {hostOnly: true},
+	// The DeckLink preview's surface, host-only because they move, resize and
+	// show an OPAQUE native window on the screen of whoever is sitting at this
+	// machine, over whatever they were looking at. A seat in another building
+	// has no business doing that.
 	"SetPreviewRect":    {hostOnly: true},
 	"SetPreviewVisible": {hostOnly: true},
 

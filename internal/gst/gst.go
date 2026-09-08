@@ -779,6 +779,15 @@ type SendOpts struct {
 	// Zero means DefaultAudioBitrateBps. The two units differ because the two
 	// elements' properties do, on both platforms; see DefaultAudioBitrateBps.
 	AudioBitrateBps int
+
+	// NoVideo builds the send pipeline WITHOUT its video chain: no proxysrc for
+	// the picture, no H.264 encoder, no h264parse, no video queue into the
+	// muxer. The transport stream carries the one AAC track. It must match the
+	// capture layer's plan (CaptureSources.NoVideo), because a video proxysrc
+	// with no proxysink to bind to is a parse that succeeds and a seam that
+	// carries nothing. VideoBitrateKbps is ignored when it is set. See
+	// config.VideoSourceNone.
+	NoVideo bool
 }
 
 // PipelineOpts IS DELETED, and this is where it was.

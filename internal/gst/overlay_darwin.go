@@ -90,8 +90,8 @@
 // So construction asks the real question first — is there an NSApplication and
 // is it running — and answers ErrNoHostWindow when there is not, WITHOUT
 // dispatching anything. That is the same answer the Windows twin gives when
-// EnumWindows finds nothing, it is what App.SetPictureRect already treats as
-// "not yet", and it costs one global read plus one BOOL. A timed wait was the
+// EnumWindows finds nothing, it is what app_picture.go's preview wiring already
+// treats as "no surface this time", and it costs one global read plus one BOOL. A timed wait was the
 // alternative and is worse: it would have to heap-allocate the out-parameter so
 // a late block could not write into a Go frame that had already returned, and it
 // would turn a deterministic answer into a race against a timeout.
@@ -671,9 +671,9 @@ func NewOverlaySurface(title, purpose string) (PictureOverlay, error) {
 	case C.WSLCOMMS_OVERLAY_NO_HOST:
 		return nil, ErrNoHostWindow
 	case C.WSLCOMMS_OVERLAY_NO_MAIN_LOOP:
-		// Wrapped rather than returned bare, so errors.Is still puts this on
-		// SetPictureRect's "not yet, and that is fine" path while the sentence a
-		// reader actually sees is the true one. "The window does not exist yet"
+		// Wrapped rather than returned bare, so errors.Is still lets a caller
+		// treat it as "no host window" while the sentence a reader actually
+		// sees is the true one. "The window does not exist yet"
 		// would be a guess here: we never got far enough to look.
 		return nil, fmt.Errorf("gst: overlay: this process has no running NSApplication, "+
 			"so nothing would service the main queue the %s view has to be created on: %w",
@@ -762,8 +762,8 @@ func (o *overlay) SetVisible(visible bool) error {
 // fields when it wakes, so that a post which overtakes another cannot apply a
 // stale rectangle. There is no equivalent risk here, for two reasons that hold
 // together and are written down because either one changing breaks it. Every
-// caller — SetPictureRect, SetPictureVisible, applyPictureVisibility — holds
-// App.picViewMu across the call, so two applies are never in flight at once;
+// caller — SetPreviewRect, SetPreviewVisible, applyPreviewVisibilityViewLocked —
+// holds App.prevViewMu across the call, so two applies are never in flight at once;
 // and dispatch_async onto a serial queue runs blocks in the order they were
 // submitted. IF ANYTHING EVER CALLS SetRect WITHOUT THAT LOCK, the far side has
 // to start re-reading instead.

@@ -170,12 +170,9 @@ const LAMP_NAMES = [
  *   setReturnMid(mid)                   selects one of the seven buses, 1..7
  *   setReturnChannel(mode)              stereo / left / right
  *   setPictureSource(source)            srt / mosaic — WHICH PICTURE, not audio
- *   setPictureAvailable(available, why) disables the SRT option with a reason
+ *   setPictureAvailable(available, why) disables the SRT option with a reason,
+ *                                       and the Refresh button with it
  *   setPictureState(state)              the native receiver's own status
- *   setPictureOverlaid(on)              whether the native window is ON SCREEN
- *                                       over the tile. The ONLY thing that may
- *                                       suppress the mosaic; see the function.
- *   measurePictureRect()                the reserved box, in CSS pixels
  *   setPreviewReserved(on)              whether the card's confidence preview
  *                                       box exists in the layout at all
  *   setPreviewCaption(text)             the words drawn inside that box, which
@@ -213,7 +210,7 @@ const LAMP_NAMES = [
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
- *   onLevelChange(fraction), onPresetChange(id),
+ *   onPictureRefresh(), onLevelChange(fraction), onPresetChange(id),
  *   onMutePress(), onMuteRelease(), onMuteLatchToggle(),
  * }
  *
@@ -233,17 +230,17 @@ const LAMP_NAMES = [
  * and the operator collapsing the column, both of which are that operator's own
  * hand. See main.css and homelayout.test.js.
  *
- * ===================== THE PICTURE AREA IS NOW A RESERVATION ================
+ * ===================== THE TILE IS THE MOSAIC, ALWAYS =======================
  *
- * The high-quality picture is decoded in Go and painted by a NATIVE CHILD
- * WINDOW over this page — a browser element cannot play SRT. So `.pgm-tile` is
- * two things at once: it is the mosaic's crop box, exactly as it always was, and
- * it is the RECTANGLE the native overlay is told to occupy. Both pictures use
- * the same box on purpose, so that falling back from one to the other does not
- * move a single control on the screen.
+ * The high-quality SRT picture is decoded in Go, in a SEPARATE PROCESS, and
+ * shown in a top-level window of its own that the commentator puts wherever
+ * they like. It is never painted over this page. `.pgm-tile` is the mosaic's
+ * crop box and nothing else, and the badge over it says whether the SRT
+ * picture is up in its own window or the mosaic here is all there is.
  *
- * This file does not talk to Go and does not know the overlay exists. It exposes
- * measurePictureRect(), and app.js does the rest.
+ * The card's confidence PREVIEW is still a native child window painted over
+ * this page — `.preview-tile` reserves its rectangle, measurePreviewRect()
+ * measures it, and app.js does the rest.
  */
 export function createHomeView(handlers) {
   const el = document.createElement('section');
@@ -595,11 +592,10 @@ export function createHomeView(handlers) {
   // and .pgm-tile is sized inside it from the tile's own aspect ratio — height
   // -limited on a wide window, width-limited on a narrow one. See main.css.
   //
-  // TWO PICTURES, ONE BOX. The <video> inside it is the WebRTC mosaic, cropped
-  // to the PGM tile; the native SRT overlay is painted over the same rectangle
-  // from outside the page entirely. Sharing the box is what makes the fallback
-  // invisible as a layout event: when SRT drops, the mosaic underneath is
-  // already the right size and in the right place.
+  // ONE PICTURE IN THIS BOX. The <video> inside it is the WebRTC mosaic,
+  // cropped to the PGM tile, and it is always showing. The high-quality SRT
+  // picture is a separate window in a separate process and never covers it,
+  // so a commentator who loses SRT loses nothing on this page.
   const pgmStage = document.createElement('div');
   pgmStage.className = 'pgm-stage';
   const pgmTile = document.createElement('div');
@@ -610,14 +606,12 @@ export function createHomeView(handlers) {
   videoEl.muted = true; // the mosaic video track carries no audio we want; return audio is separate
   pgmTile.appendChild(videoEl);
 
-  // WHICH PICTURE IS ON SCREEN, said permanently, over the picture.
+  // WHETHER THE SRT PICTURE IS UP, said permanently, over the mosaic.
   //
-  // The two look alike at a glance — the same framing of the same match — and
-  // differ enough in quality that somebody will ask out loud during a match
-  // whether they are looking at the good one. It is drawn INSIDE the tile so
-  // that it is over the mosaic; while the SRT overlay is up the overlay covers
-  // it, which is correct, because the overlay is only ever up when the answer
-  // is "SRT" and there is a second copy of the answer beside the control.
+  // The SRT picture is in its own window, so the question this answers is
+  // whether that window has the good picture in it or whether the mosaic here
+  // is all there is — which is what somebody will ask out loud during a match
+  // when the other window goes dark.
   const pictureBadge = document.createElement('div');
   pictureBadge.className = 'picture-badge';
   pgmTile.appendChild(pictureBadge);
@@ -651,13 +645,12 @@ export function createHomeView(handlers) {
   //
   // ============= OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING =================
   //
-  // The native SRT overlay is an OPAQUE CHILD WINDOW painted over exactly the
-  // tile's rectangle — measurePictureRect measures .pgm-tile and nothing else —
-  // and no z-index in this page reaches above it. Anything drawn inside that
-  // rectangle is invisible for as long as the overlay is up, which is exactly
-  // when a commentator is mid-match and most needs to see their input. So the
-  // meters are never a child of the tile: visible over both pictures, never
-  // under either, and the measured rectangle is untouched.
+  // The tile is the commentator's picture. A meter drawn inside it is a meter
+  // over the match, and the SRT picture was for a long time an opaque native
+  // window over exactly that rectangle, under which anything drawn was
+  // invisible. The picture has its own window now; the meters stay out of the
+  // tile all the same, because the mosaic is what the commentator falls back
+  // to and it must not be behind anything.
   //
   // THEY NOW LIVE IN THE COLUMN, not beside the tile in .pgm-stage. The operator
   // asked for a main area holding the picture, one overall indicator and the
@@ -744,10 +737,9 @@ export function createHomeView(handlers) {
   //
   // ================ IT IS OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING ========
   //
-  // Two opaque native windows must not be told to occupy overlapping
-  // rectangles: whichever is on top simply erases the other, and neither the
-  // page nor Go would report anything wrong. .pgm-tile is measured exactly by
-  // measurePictureRect, so this sits BESIDE it in .pgm-stage — the same
+  // The preview is an opaque native window. Over the tile it would erase the
+  // mosaic — the fallback picture — and neither the page nor Go would report
+  // anything wrong. So it sits BESIDE the tile in .pgm-stage: the same
   // reasoning, and the same place, as the input meters above.
   //
   // ================ THE CAPTION NEEDS NO VISIBILITY FLAG =====================
@@ -1038,12 +1030,30 @@ export function createHomeView(handlers) {
   );
   sourceSegmented.set(DEFAULT_PICTURE_SOURCE);
 
+  // REFRESH: the picture has frozen. The SRT picture is a separate process,
+  // and this ends it — killed, if its decoder or its socket has wedged — and
+  // starts a fresh one against the saved configuration. Nothing about the audio
+  // or the feed changes, which is why it is safe to have on the main screen
+  // mid-match. It is enabled only while SRT is the chosen picture and this
+  // build can drive it; see renderPicture.
+  const refreshBtn = document.createElement('button');
+  refreshBtn.type = 'button';
+  refreshBtn.className = 'btn btn-ghost btn-small picture-refresh';
+  refreshBtn.textContent = 'Refresh';
+  refreshBtn.title =
+    'Restart the SRT picture. The picture window is closed and a fresh one opened, ' +
+    'dialling M2L-X again. The audio and the feed are untouched.';
+  refreshBtn.addEventListener('click', () => handlers.onPictureRefresh());
+
   const sourceGroup = document.createElement('div');
   sourceGroup.className = 'control-group control-group-source';
   const sourceLabel = document.createElement('span');
   sourceLabel.className = 'control-label';
   sourceLabel.textContent = 'Picture';
-  sourceGroup.append(sourceLabel, sourceSegmented.el);
+  const sourceRow = document.createElement('div');
+  sourceRow.className = 'picture-source-row';
+  sourceRow.append(sourceSegmented.el, refreshBtn);
+  sourceGroup.append(sourceLabel, sourceRow);
 
   // THE NOTES UNDER THE CONTROLS ARE GONE, at the operator's request — the
   // paragraph explaining the selected picture (describePictureSource +
@@ -1560,10 +1570,11 @@ export function createHomeView(handlers) {
 
   let currentPictureSource = DEFAULT_PICTURE_SOURCE;
   let currentPictureState = null;
+  let currentPictureAvailable = true;
 
   /**
    * renderPicture draws what the SELECTION and the RECEIVER'S STATE mean: the
-   * badge over the tile and the segmented control.
+   * badge over the tile, the segmented control and the Refresh button.
    *
    * Both feed it, because neither alone says what is on screen: "SRT selected"
    * with the receiver in BACKOFF is a commentator watching the mosaic, and
@@ -1574,10 +1585,9 @@ export function createHomeView(handlers) {
    * setPictureState instead, and the badge over the tile already reports which
    * picture is actually showing.
    *
-   * IT DOES NOT DECIDE WHETHER THE MOSAIC IS SUPPRESSED, and it used to. That
-   * is setPictureOverlaid's job and it answers a different question — is the
-   * native window actually on screen — which the selection cannot answer. See
-   * setPictureOverlaid.
+   * THE MOSAIC IS NEVER SUPPRESSED. The SRT picture is in a window of its own;
+   * nothing on this page is ever covered by it, and there is no class, flag or
+   * rule that hides the <video>.
    */
   function renderPicture() {
     const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
@@ -1587,6 +1597,10 @@ export function createHomeView(handlers) {
     pictureBadge.textContent = showing.text;
     pictureBadge.title = showing.detail;
     pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
+
+    // Refresh restarts the SRT picture and nothing else, so it is only offered
+    // while SRT is the chosen picture and this build can drive it.
+    refreshBtn.disabled = !(effects.wantSRT && currentPictureAvailable);
   }
 
   /** setPictureSource selects which picture the application should try for. */
@@ -1602,7 +1616,9 @@ export function createHomeView(handlers) {
    * silently failing when it is pressed.
    */
   function setPictureAvailable(available, reason) {
-    sourceSegmented.setOptionEnabled(PICTURE_SOURCE_SRT, available !== false, reason);
+    currentPictureAvailable = available !== false;
+    sourceSegmented.setOptionEnabled(PICTURE_SOURCE_SRT, currentPictureAvailable, reason);
+    renderPicture();
   }
 
   /**
@@ -1629,54 +1645,6 @@ export function createHomeView(handlers) {
   }
 
   /**
-   * setPictureOverlaid says whether the native overlay window is ACTUALLY ON
-   * SCREEN over this tile. It is the only thing that may suppress the mosaic.
-   *
-   * ================== IT IS NOT "SRT IS THE CHOSEN SOURCE" ====================
-   *
-   * This used to be driven from renderPicture, off `effects.showingSRT`, and
-   * that is a different fact. The overlay is a native child window and it is
-   * HIDDEN whenever anything must appear above it — the mixer drawer, Settings,
-   * a modal — none of which changes the picture source at all. So opening the
-   * drawer took the native video away and left the mosaic suppressed
-   * underneath, and the commentator got BLACK.
-   *
-   * The rule is one sentence and it has no exceptions: whenever the overlay is
-   * not visible, the mosaic is. The mosaic exists to be the thing underneath,
-   * and something underneath that is hidden is not a fallback.
-   *
-   * app.js is the caller, driven from the overlay controller's own visibility —
-   * the same expression that decides the native SetVisible — so the page and the
-   * window cannot disagree about what is on screen.
-   *
-   * The mosaic is MARKED, not removed. It stays in the document and stays
-   * decoding: a fallback that has to re-establish itself when it is needed is
-   * not one.
-   */
-  function setPictureOverlaid(overlaid) {
-    pgmTile.classList.toggle('pgm-tile-overlaid', overlaid === true);
-  }
-
-  /**
-   * measurePictureRect reports the reserved box in CSS pixels, relative to the
-   * viewport — which is the WebView client area.
-   *
-   * It is deliberately raw: no rounding, no device pixel ratio, no opinion. CSS
-   * pixels and the ratio are what App.SetPictureRect takes — gst.ScaleRect does
-   * the multiplication — and ./overlay.js is the only module on this side that
-   * has anything to say about the conversion. Returns null when the element has
-   * no box to measure, which is what a hidden view looks like.
-   *
-   * @returns {{x: number, y: number, width: number, height: number}|null}
-   */
-  function measurePictureRect() {
-    if (typeof pgmTile.getBoundingClientRect !== 'function') return null;
-    const r = pgmTile.getBoundingClientRect();
-    if (!r || !(r.width > 0) || !(r.height > 0)) return null;
-    return { x: r.left, y: r.top, width: r.width, height: r.height };
-  }
-
-  /**
    * setPreviewReserved decides whether the preview box exists in the layout at
    * all. app.js is the only caller and the only thing that knows the answer: it
    * takes the saved video source, the saved preview flag and whether this build
@@ -1698,7 +1666,7 @@ export function createHomeView(handlers) {
 
   /**
    * measurePreviewRect reports the preview box in CSS pixels, relative to the
-   * viewport — the WebView client area — exactly as measurePictureRect does.
+   * viewport — the WebView client area.
    *
    * Deliberately raw: no rounding, no scaling, no opinion. ./overlay.js is the
    * only module on this side allowed one, and there is one conversion rule in
@@ -1947,13 +1915,13 @@ export function createHomeView(handlers) {
     el,
     videoEl,
     audioEl,
-    // The element whose box the native overlay is told to occupy. app.js
-    // observes it; nothing here knows what it is for.
+    // The mosaic's box. app.js observes it for resizes, because the preview
+    // box beside it is sized from the same stage; nothing here knows that.
     pictureEl: pgmTile,
-    // The SECOND such element, for the card's confidence preview. Two boxes,
-    // two native windows, one mechanism — and they are separate elements
-    // precisely so the two rectangles can never overlap, which would erase one
-    // window with the other and report nothing.
+    // The element whose box the native preview surface is told to occupy. It
+    // is a separate element from the tile precisely so the two rectangles can
+    // never overlap, which would erase the mosaic under the surface and report
+    // nothing.
     previewEl: previewTile,
     // The WRAPPED lamps: same {el, update} shape, same paint, and each update
     // also feeds the one overall indicator. See renderOverall.
@@ -1968,8 +1936,6 @@ export function createHomeView(handlers) {
     setPictureSource,
     setPictureAvailable,
     setPictureState,
-    setPictureOverlaid,
-    measurePictureRect,
     setPreviewReserved,
     setPreviewCaption,
     measurePreviewRect,

@@ -257,8 +257,11 @@ type Config struct {
 	// VideoSource selects WHAT THE VIDEO LEG CARRIES: VideoSourceSlate
 	// ("slate", the default — the still PNG at SlatePath, re-encoded fifty times
 	// a second, which is what this application has transmitted for its whole
-	// life) or VideoSourceDeckLink ("decklink" — live video captured from the
-	// Blackmagic card named by DeckLinkPersistentID).
+	// life), VideoSourceDeckLink ("decklink" — live video captured from the
+	// Blackmagic card named by DeckLinkPersistentID), or VideoSourceNone
+	// ("none" — NO video leg at all: the feed is audio-only, for an M2L-X
+	// router input configured as an audio-only microphone input, and the H.264
+	// encoder is never built, which is the whole point of it — see SendsVideo).
 	//
 	// It is INDEPENDENT of AudioSourceKind, and the independence is the point.
 	// The two legs have genuinely separate failure domains, so all four
@@ -872,6 +875,21 @@ const (
 	// mode=pal against a real 1080p25 input produced 50 clean PAL buffers with
 	// nothing but a warning — a green lamp, a real bitrate and a black picture.
 	VideoSourceDeckLink = "decklink"
+	// VideoSourceNone is NO video leg: the contribution feed is audio-only.
+	//
+	// It exists to spare the machine the encode. The slate leg costs 18.5-23.9 %
+	// of one core (a still picture re-encoded from nothing fifty times a second)
+	// and the card leg 9.3-14.6 %, and on a position whose M2L-X router input is
+	// an audio-only microphone input every one of those cycles buys nothing.
+	// With this set the capture layer builds no picture pipeline and the send
+	// pipeline builds no encoder, no h264parse and no video queue: the muxer
+	// carries the one AAC track and the transport stream has a PMT with a single
+	// elementary stream. It is NOT "the slate with the encoder idle"; the
+	// elements are absent.
+	//
+	// It is NOT the default and must not become one: a position that never
+	// opened the control must keep sending the picture it always has.
+	VideoSourceNone = "none"
 
 	// DefaultVideoSource is VideoSourceSlate, and this is the one default in this
 	// table it would be worst to change. It decides WHAT GOES ON AIR, so moving
@@ -1490,6 +1508,18 @@ func (c *Config) UsesDeckLinkVideo() bool {
 	return c.EffectiveVideoSource() == VideoSourceDeckLink
 }
 
+// SendsVideo reports whether the contribution feed carries a video leg at all.
+//
+// It is false only for VideoSourceNone. It is the question the capture layer and
+// the send pipeline both ask — whether to build the picture pipeline and the
+// encoder — answered once, here, so that "audio-only" is one comparison rather
+// than a string test repeated at each site. Everything that reads it must treat
+// false as "there is no encoder, no video queue and no picture capture" and not
+// as "the slate is being sent quietly".
+func (c *Config) SendsVideo() bool {
+	return c.EffectiveVideoSource() != VideoSourceNone
+}
+
 // UsesDeckLinkCard reports whether EITHER leg needs the Blackmagic card open.
 //
 // It exists because the card is the thing that has to be present, and it is
@@ -1728,10 +1758,10 @@ func (c *Config) Validate() error {
 	// list can be quoted back — not in a function whose whole job is to decide
 	// whether a document is well formed.
 	switch c.EffectiveVideoSource() {
-	case VideoSourceSlate, VideoSourceDeckLink:
+	case VideoSourceSlate, VideoSourceDeckLink, VideoSourceNone:
 	default:
-		errs = append(errs, fmt.Errorf("videoSource must be %q or %q, got %q",
-			VideoSourceSlate, VideoSourceDeckLink, c.VideoSource))
+		errs = append(errs, fmt.Errorf("videoSource must be %q, %q or %q, got %q",
+			VideoSourceSlate, VideoSourceDeckLink, VideoSourceNone, c.VideoSource))
 	}
 
 	// audioDeviceId is required for a NATIVE capture and meaningless for a

@@ -176,6 +176,7 @@ export function mountApp(root) {
     onReturnChange: onReturnChange,
     onReturnChannelChange: onReturnChannelChange,
     onPictureSourceChange: onPictureSourceChange,
+    onPictureRefresh: onPictureRefresh,
     onLevelChange: onLevelChange,
     // Switching instance from the column's Session block. It reuses the SAME
     // apply sequence the Settings preset UI does — no second apply path — see
@@ -290,10 +291,10 @@ export function mountApp(root) {
   //
   // ===================== THE PICTURE COMES FROM SRT ==========================
   //
-  // A native child window, decoding H.265 from M2L-X Output 1 (src=pgm, port
-  // 40501, 1920x1080 50p), painted OVER this page. The frontend's whole job is
-  // to reserve a rectangle, describe it in physical pixels, and say when it must
-  // be hidden.
+  // A SEPARATE PROCESS with a window of its own, decoding H.265 from M2L-X
+  // Output 1 (src=pgm, port 40501, 1920x1080 50p). The frontend's whole job is
+  // to start it, stop it, refresh it when it freezes, and say which picture is
+  // where. This page's tile always shows the mosaic; it is never covered.
   //
   // ===================== THE AUDIO COMES FROM KINESIS ========================
   //
@@ -307,84 +308,19 @@ export function mountApp(root) {
   let currentPictureSource = DEFAULT_PICTURE_SOURCE;
   /** The last "picture" event, or null before one has arrived. */
   let currentPictureState = null;
-  /** Whether this build has the five native picture bindings at all. */
+  /** Whether this build has the four native picture bindings at all. */
   let pictureBindingsPresent = false;
-
-  /**
-   * pictureFault reports a failure of the native picture ONCE, to the console,
-   * and not as a banner.
-   *
-   * The mosaic is still on screen and the commentator still has a picture, so
-   * this is a degradation and not an outage. A red banner for every failed
-   * SetPictureRect against a build that has no such binding is how people learn
-   * to ignore the banner that matters.
-   */
-  let lastPictureFault = '';
-  function pictureFault(err) {
-    const message = String(err?.message || err);
-    if (message === lastPictureFault) return;
-    lastPictureFault = message;
-    console.info('wslcomms: the native picture overlay is not answering:', message);
-  }
-
-  /**
-   * overlay owns the rectangle and the visibility rule. It is pure; everything
-   * effectful is here.
-   *
-   * setRect and setVisible are fire-and-forget with a catch. They cannot be
-   * awaited: they are driven from a ResizeObserver and a resize listener, and a
-   * chain of awaited IPC calls behind a resize is how a window drag turns into a
-   * queue of stale rectangles arriving after the user has stopped moving.
-   */
-  const overlay = createOverlay({
-    measure: () => home.measurePictureRect(),
-    // Read FRESH on every sync rather than captured: a DPI change alters this
-    // number without moving the CSS box by a pixel, and a captured ratio would
-    // keep reporting the old geometry as correct.
-    dpr: () => (typeof window !== 'undefined' && window.devicePixelRatio) || 1,
-    // CSS pixels and the ratio, together, because that is what
-    // App.SetPictureRect takes: gst.ScaleRect multiplies on the Go side, since
-    // the ratio Go could read for itself — GetDpiForWindow — is the monitor's
-    // scale factor and not the WebView's, and Ctrl+scroll moves one without the
-    // other. The physical rectangle is computed here too, but only to decide
-    // whether to send and what to log.
-    setRect: (css, dpr) => {
-      Promise.resolve()
-        .then(() => backend.setPictureRect(css, dpr))
-        .catch(pictureFault);
-    },
-    setVisible: (on) => {
-      Promise.resolve()
-        .then(() => backend.setPictureVisible(on))
-        .catch(pictureFault);
-    },
-    // THE MOSAIC FOLLOWS THE WINDOW, NOT THE SOURCE SELECTION.
-    //
-    // home.js suppresses the mosaic <video> while the native overlay covers it,
-    // and this is the only thing that tells it to. It used to be driven from
-    // `effects.showingSRT` inside home.renderPicture, which is a different fact:
-    // the overlay is hidden whenever something must appear above it — the mixer
-    // drawer, Settings, a modal — and none of those change the source. Opening
-    // the drawer therefore took the native picture away and left the mosaic
-    // suppressed underneath it, and the commentator got BLACK.
-    //
-    // Wired here because overlay.js is where visibility is DECIDED — the same
-    // expression that drives setVisible above — so the page cannot hold a
-    // different opinion about what is on screen.
-    onVisible: (on) => home.setPictureOverlaid(on),
-    log: (message) => console.info(message),
-  });
 
   // --- the card's confidence preview ---------------------------------------
   //
-  // ===================== THE SAME MECHANISM, A SECOND TIME ===================
+  // ===================== THE ONE NATIVE OVERLAY LEFT =========================
   //
   // A native child window painted over this page, positioned from a rectangle
-  // this page reserves — which is exactly what the SRT picture above already is,
-  // so this is a second createOverlay and not a second design. Everything the
-  // overlay controller owns is owned here too: the CSS-pixels-plus-ratio call,
-  // the change detection that keeps a DPI change from being missed, and above
-  // all the SET OF BLOCKING REASONS, so that Settings and the mixer drawer are
+  // this page reserves. The SRT picture used to be a second one of these; it
+  // now lives in a window of its own, in its own process, and this is the only
+  // overlay controller in the page. It owns the CSS-pixels-plus-ratio call, the
+  // change detection that keeps a DPI change from being missed, and above all
+  // the SET OF BLOCKING REASONS, so that Settings and the mixer drawer are
   // never drawn underneath an opaque window.
   //
   // TWO BOXES, NEVER ONE. home.js reserves .preview-tile beside .pgm-tile rather
@@ -439,19 +375,16 @@ export function mountApp(root) {
         .then(() => backend.setPreviewVisible(on))
         .catch(previewFault);
     },
-    // NO onVisible, and that asymmetry with the picture is deliberate. The
-    // picture's callback exists to un-suppress the mosaic underneath it — there
-    // are two pictures sharing one box and exactly one may show. There is
-    // nothing underneath this one but a caption, and a caption under an opaque
-    // window is already invisible, so there is no second state to keep in step.
+    // NO onVisible. There is nothing underneath this window but a caption, and
+    // a caption under an opaque window is already invisible, so there is no
+    // second state to keep in step.
     log: (message) => console.info(message),
   });
 
   /**
    * previewFault reports a failure of the preview surface ONCE, to the console.
    *
-   * Never a banner, and for a stronger version of pictureFault's reason: this is
-   * the operator's own confidence monitor. Nothing about the feed, the audio or
+   * Never a banner: this is the operator's own confidence monitor. Nothing about the feed, the audio or
    * the commentator's picture depends on it, so a red banner for every failed
    * SetPreviewRect against a build without the binding would be teaching people
    * to ignore the banner that matters.
@@ -508,10 +441,9 @@ export function mountApp(root) {
     previewOverlay.setWanted(reserved);
 
     // RESERVING IS A LAYOUT CHANGE, and .pgm-tile is sized against what is left
-    // in the stage — so the commentator's picture has just moved. Both surfaces
-    // are re-measured, the picture's first: an overlay left at yesterday's
-    // rectangle is a native window sitting over the controls beside it.
-    overlay.sync();
+    // in the stage — so the commentator's picture has just moved. The surface
+    // is re-measured: one left at yesterday's rectangle is a native window
+    // sitting over the controls beside it.
     previewOverlay.sync();
   }
 
@@ -633,19 +565,14 @@ export function mountApp(root) {
 
   const mixerHost = createMixerHost({
     mount: mixerMount,
-    // THE DRAWER MUST NEVER BE UNDER THE PICTURE OVERLAY. The overlay is a
-    // native child window: it is opaque, it is outside the page's stacking
-    // context, and no z-index in mixer.css reaches it. A drawer opened
-    // underneath it is a routing matrix an operator can read two thirds of and
-    // click all of.
+    // THE DRAWER MUST NEVER BE UNDER THE PREVIEW SURFACE. It is a native child
+    // window: it is opaque, it is outside the page's stacking context, and no
+    // z-index in mixer.css reaches it. A drawer opened underneath it is a
+    // routing matrix an operator can read most of and click all of.
     //
     // This fires for a drawer closed from inside itself as well — its Close
     // button, the scrim, Escape — none of which app.js is otherwise told about.
     onOpenChange: (open) => {
-      if (open) overlay.block(BLOCK_MIXER);
-      else overlay.unblock(BLOCK_MIXER);
-      // The preview surface is the same hazard with a smaller rectangle: a
-      // routing matrix somebody can read most of and click all of.
       if (open) previewOverlay.block(BLOCK_MIXER);
       else previewOverlay.unblock(BLOCK_MIXER);
     },
@@ -718,19 +645,15 @@ export function mountApp(root) {
     // modal, and one that outlived the screen it was opened from is a write
     // path nobody can see.
     mixerHost.close();
-    // AND IT MUST NOT BE OPENED BEHIND THE PICTURE OVERLAY EITHER. Two separate
-    // reasons are raised, and both have to be released before the picture comes
-    // back: BLOCK_SETTINGS because Settings is on screen, BLOCK_HIDDEN because
-    // the home view — and with it the rectangle the overlay was measured
-    // against — is not. Hiding on one reason and showing on the other's release
-    // is precisely the bug the reason SET exists to make unwritable.
-    overlay.block(BLOCK_SETTINGS);
-    overlay.block(BLOCK_HIDDEN);
-    // AND THE PREVIEW SURFACE, on both reasons, for the identical argument. It
-    // is a second opaque native window outside the page's stacking context, and
-    // a Settings form with a live camera painted over the corner of it is a form
-    // the operator can read most of. Blocked separately rather than by one flag,
-    // so a future window can be added without anything having to be un-shared.
+    // AND IT MUST NOT BE OPENED BEHIND THE PREVIEW SURFACE EITHER. It is an
+    // opaque native window outside the page's stacking context, and a Settings
+    // form with a live camera painted over the corner of it is a form the
+    // operator can read most of. Two separate reasons are raised, and both have
+    // to be released before the surface comes back: BLOCK_SETTINGS because
+    // Settings is on screen, BLOCK_HIDDEN because the home view — and with it
+    // the rectangle the surface was measured against — is not. Hiding on one
+    // reason and showing on the other's release is precisely the bug the reason
+    // SET exists to make unwritable.
     previewOverlay.block(BLOCK_SETTINGS);
     previewOverlay.block(BLOCK_HIDDEN);
     home.el.hidden = true;
@@ -741,20 +664,17 @@ export function mountApp(root) {
   function showHome() {
     settings.el.hidden = true;
     home.el.hidden = false;
-    overlay.unblock(BLOCK_SETTINGS);
-    overlay.unblock(BLOCK_HIDDEN);
     previewOverlay.unblock(BLOCK_SETTINGS);
     previewOverlay.unblock(BLOCK_HIDDEN);
     // Re-measure before painting: the window may have been resized while
-    // Settings was up, and an overlay restored at yesterday's rectangle is a
+    // Settings was up, and a surface restored at yesterday's rectangle is a
     // picture in the wrong place for as long as nothing else moves.
-    overlay.sync();
     previewOverlay.sync();
   }
 
   /**
-   * toggleMixer opens or closes the drawer. The overlay is hidden and restored
-   * by the host's onOpenChange rather than from here, because the drawer can
+   * toggleMixer opens or closes the drawer. The preview surface is hidden and
+   * restored by the host's onOpenChange rather than from here, because the drawer can
    * also close itself — Escape, the scrim, its own Close button — and a hide
    * written at the call site would never see that.
    */
@@ -1331,20 +1251,40 @@ export function mountApp(root) {
 
   /**
    * renderPicture pushes the current selection and the current receiver state
-   * everywhere they are shown, and moves the overlay to match.
-   *
-   * It is the only writer of overlay.setWanted, and what it passes is
-   * `showingSRT` — the selection AND the receiver actually delivering. Not the
-   * selection alone: a receiver in CONNECTING or BACKOFF is running and holding
-   * a fan-out slot, and painting an opaque native window over the page for it
-   * would replace a soft picture of the match with a black rectangle.
+   * everywhere they are shown: the segmented control, the badge over the tile
+   * and the Refresh button's enabled state. Nothing here moves a window — the
+   * SRT picture is in a window of its own, and the mosaic in this tile is never
+   * covered.
    */
   function renderPicture() {
     const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
     home.setPictureSource(effects.source);
     home.setPictureState(effects.wantSRT ? currentPictureState : null);
-    overlay.setWanted(effects.showingSRT);
-    overlay.sync();
+  }
+
+  /**
+   * onPictureRefresh is the Refresh button: the picture process is ended —
+   * killed, if its decoder or its socket has wedged — and a fresh one started
+   * against the saved configuration. It reads the state back afterwards rather
+   * than assuming, because the new process reports its own transitions and the
+   * badge must say what is actually on screen.
+   *
+   * It touches nothing audible, for the reason onPictureSourceChange gives.
+   */
+  async function onPictureRefresh() {
+    if (!pictureBindingsPresent) return;
+    if (currentPictureSource !== PICTURE_SOURCE_SRT) return;
+    try {
+      await backend.refreshPicture();
+      currentPictureState = await backend.getPictureState();
+    } catch (err) {
+      currentPictureState = null;
+      home.showError(
+        `Could not refresh the picture: ${err?.message || err}. ` +
+          'You are watching the multiviewer mosaic; your audio is unaffected.',
+      );
+    }
+    renderPicture();
   }
 
   /**
@@ -1397,7 +1337,7 @@ export function mountApp(root) {
   }
 
   /**
-   * watchPictureRect reports the reserved rectangle whenever it moves.
+   * watchPreviewRect reports the preview's reserved rectangle whenever it moves.
    *
    * Three sources, and all three are needed:
    *
@@ -1410,21 +1350,21 @@ export function mountApp(root) {
    *                    CSS box does not move by a single pixel while every
    *                    physical coordinate in it changes.
    *
-   * There is deliberately NO window-move report. The overlay is a child of the
+   * There is deliberately NO window-move report. The surface is a child of the
    * same top-level window and its rectangle is relative to the client area, so a
    * drag moves both together — which is fortunate, because a page cannot observe
    * its own window being dragged.
    */
-  function watchPictureRect() {
+  function watchPreviewRect() {
     if (typeof window === 'undefined') return;
-    // BOTH SURFACES, from one set of watchers. The preview box is sized from the
-    // same stage the picture box is sized from, so every event that moves one
-    // moves the other; a second ResizeObserver on the preview element would fire
-    // on exactly the occasions this one already does. The one case that is NOT
-    // covered by a resize — the box appearing or disappearing when the setting
-    // changes — is synced explicitly by renderPreview, which is where it happens.
+    // The preview box is sized from the same stage the picture box is sized
+    // from, so the ResizeObserver watches the PICTURE element: every event that
+    // moves one moves the other, and a second observer on the preview element
+    // would fire on exactly the occasions this one already does. The one case
+    // that is NOT covered by a resize — the box appearing or disappearing when
+    // the setting changes — is synced explicitly by renderPreview, which is
+    // where it happens.
     const sync = () => {
-      overlay.sync();
       previewOverlay.sync();
     };
 
@@ -1525,7 +1465,7 @@ export function mountApp(root) {
     // picture out from under somebody would at best cost them a few seconds of
     // reconnect. The tile geometry above IS re-applied, because changing it is
     // the whole point of that field — and it can change the reserved box's
-    // aspect ratio, which the ResizeObserver in watchPictureRect will notice.
+    // aspect ratio, which the ResizeObserver in watchPreviewRect will notice.
     const channel = normaliseChannelMode(config.returnChannel);
     home.setReturnChannel(channel);
     renderHeadphoneList();
@@ -2040,7 +1980,7 @@ export function mountApp(root) {
     // to be, painted wherever a native default puts it, is an opaque box over an
     // application somebody is trying to read.
     showHome();
-    watchPictureRect();
+    watchPreviewRect();
     renderPicture();
 
     if (currentPictureSource === PICTURE_SOURCE_SRT) {

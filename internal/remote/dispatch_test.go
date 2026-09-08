@@ -42,29 +42,27 @@ var fakeKnown = map[string]bool{
 	"SendMixerCommands": true,
 	"SetMixerGolden":    true,
 	// host-only: present so they read "known", but hostOnly refuses them.
-	"SetPictureRect":    true,
-	"SetPictureVisible": true,
-	"StartPicture":      true,
-	"StopPicture":       true,
-	"StartReturn":       true,
-	"StopReturn":        true,
+	"StartPicture":   true,
+	"StopPicture":    true,
+	"RefreshPicture": true,
+	"StartReturn":    true,
+	"StopReturn":     true,
 }
 
-// fakeHostOnly are the six methods that own the host's native overlay geometry
-// and its headphones / SRT slots. They are refused for every connection and
+// fakeHostOnly are the five methods that own the host's picture process, its
+// headphones and its SRT slots. They are refused for every connection and
 // omitted from the hello methods list.
 var fakeHostOnly = map[string]bool{
-	"SetPictureRect":    true,
-	"SetPictureVisible": true,
-	"StartPicture":      true,
-	"StopPicture":       true,
-	"StartReturn":       true,
-	"StopReturn":        true,
+	"StartPicture":   true,
+	"StopPicture":    true,
+	"RefreshPicture": true,
+	"StartReturn":    true,
+	"StopReturn":     true,
 }
 
-// hostOnlyList is the six, for table-driven tests.
+// hostOnlyList is the five, for table-driven tests.
 var hostOnlyList = []string{
-	"SetPictureRect", "SetPictureVisible", "StartPicture", "StopPicture", "StartReturn", "StopReturn",
+	"StartPicture", "StopPicture", "RefreshPicture", "StartReturn", "StopReturn",
 }
 
 // implementedButUnlisted names a method the fake could execute but which is

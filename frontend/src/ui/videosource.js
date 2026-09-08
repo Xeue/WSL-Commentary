@@ -89,6 +89,15 @@ import { deriveSignalLamp } from './channelmap.js';
  */
 export const VIDEO_SOURCE_SLATE = 'slate';
 export const VIDEO_SOURCE_DECKLINK = 'decklink';
+/**
+ * VIDEO_SOURCE_NONE is the AUDIO-ONLY feed (config.VideoSourceNone): no video
+ * leg is built at all — not the slate, not the card, not the encoder behind
+ * either — so the transport stream carries the one AAC track and the machine is
+ * spared the whole H.264 encode. It is for an M2L-X router input configured as
+ * an audio-only microphone input. Like the card it is an explicit choice and
+ * never a fallback: an unrecognised value still becomes the slate.
+ */
+export const VIDEO_SOURCE_NONE = 'none';
 
 /**
  * DEFAULT_VIDEO_SOURCE is the slate, and that is the safe direction rather than
@@ -163,6 +172,10 @@ export const VIDEO_SOURCES = Object.freeze([
     value: VIDEO_SOURCE_DECKLINK,
     label: 'The DeckLink card’s video input',
   }),
+  Object.freeze({
+    value: VIDEO_SOURCE_NONE,
+    label: 'Off — audio only, no video is sent',
+  }),
 ]);
 
 /**
@@ -179,7 +192,9 @@ export const VIDEO_SOURCES = Object.freeze([
  * @returns {string}
  */
 export function normaliseVideoSource(value) {
-  return value === VIDEO_SOURCE_DECKLINK ? VIDEO_SOURCE_DECKLINK : VIDEO_SOURCE_SLATE;
+  if (value === VIDEO_SOURCE_DECKLINK) return VIDEO_SOURCE_DECKLINK;
+  if (value === VIDEO_SOURCE_NONE) return VIDEO_SOURCE_NONE;
+  return VIDEO_SOURCE_SLATE;
 }
 
 /**
@@ -246,6 +261,7 @@ export function countDeckLinkDevices(devices) {
 export function deriveVideoSourceEffects(source, devices) {
   const s = normaliseVideoSource(source);
   const wantCard = s === VIDEO_SOURCE_DECKLINK;
+  const audioOnly = s === VIDEO_SOURCE_NONE;
   const cardKnown = Array.isArray(devices);
   const cardCount = countDeckLinkDevices(devices);
   const cardPresent = cardCount > 0;
@@ -253,14 +269,25 @@ export function deriveVideoSourceEffects(source, devices) {
   return Object.freeze({
     source: s,
     wantCard,
+    // Whether NO video leg is built: the audio-only feed. Distinct from "the
+    // slate goes to air" — nothing goes to air, by choice, and the machine is
+    // spared the encode. It needs no card and is always startable.
+    audioOnly,
     cardKnown,
     cardPresent,
     cardCount,
     startable,
-    // THREE states rather than two, because "the slate goes to air" and "nothing
-    // goes to air and START will fail" are different sentences and only the
-    // second one is something somebody has to act on before kick-off.
-    toAir: !wantCard ? VIDEO_SOURCE_SLATE : startable ? VIDEO_SOURCE_DECKLINK : 'nothing',
+    // FOUR states rather than three now, because "the slate goes to air",
+    // "no video goes to air, deliberately" and "nothing goes to air and START
+    // will fail" are different sentences and only the last is something
+    // somebody has to act on before kick-off.
+    toAir: audioOnly
+      ? VIDEO_SOURCE_NONE
+      : !wantCard
+        ? VIDEO_SOURCE_SLATE
+        : startable
+          ? VIDEO_SOURCE_DECKLINK
+          : 'nothing',
   });
 }
 
@@ -281,6 +308,9 @@ export function describeToAir(effects) {
   // picture from black, and — for the fault case — when it will fail and what to
   // do. The explanatory clauses that used to trail each of them said why the
   // slate exists and how the card is conformed, which is this file's header.
+  if (effects.toAir === VIDEO_SOURCE_NONE) {
+    return 'GOING TO AIR: AUDIO ONLY — no video is sent at all, and the encoder is not built. The switcher input must be an audio-only mic input.';
+  }
   if (effects.toAir === VIDEO_SOURCE_SLATE) {
     return 'GOING TO AIR: THE SLATE — nothing from a card, whatever is plugged into one.';
   }
@@ -321,9 +351,10 @@ export function describeCardAvailability(effects) {
     return 'NO DECKLINK CARD WAS FOUND in this machine.';
   }
   if (!effects.wantCard && effects.cardPresent) {
+    const instead = effects.audioOnly ? 'no video goes to air' : 'the slate goes to air';
     return effects.cardCount === 1
-      ? 'A DeckLink card IS fitted and is not being used: the slate goes to air.'
-      : `${effects.cardCount} DeckLink cards are fitted and none is being used: the slate goes to air.`;
+      ? `A DeckLink card IS fitted and is not being used: ${instead}.`
+      : `${effects.cardCount} DeckLink cards are fitted and none is being used: ${instead}.`;
   }
   return '';
 }
@@ -556,7 +587,13 @@ export function describePreviewBox(picture) {
  * @returns {{level: string, text: string}}
  */
 export function deriveCameraLamp(source, signal) {
-  if (normaliseVideoSource(source) !== VIDEO_SOURCE_DECKLINK) {
+  const s = normaliseVideoSource(source);
+  if (s === VIDEO_SOURCE_NONE) {
+    // Grey, like the slate: there is no camera to watch. The word differs
+    // because "SLATE" would say a still picture is on air, and nothing is.
+    return { level: LEVEL.GREY, text: 'AUDIO ONLY' };
+  }
+  if (s !== VIDEO_SOURCE_DECKLINK) {
     return { level: LEVEL.GREY, text: 'SLATE' };
   }
   return deriveSignalLamp(signal);

@@ -85,6 +85,33 @@ func TestPlanCaptureIsTheFusionRule(t *testing.T) {
 				{Commentary: CommentaryNative},
 			},
 		},
+		{
+			// AUDIO-ONLY. No picture leg of any kind: one pipeline, the commentary.
+			name: "audio-only + CoreAudio: the commentary alone",
+			src:  CaptureSources{AudioDeviceID: "BF568F24", NoVideo: true},
+			want: []CaptureLegs{
+				{Commentary: CommentaryNative},
+			},
+		},
+		{
+			// Audio-only off the card: still one pipeline, and NeedsClockCompanion
+			// is true for it, so the card is kept alive with no picture leg to do
+			// it — the same clock companion the slate row builds.
+			name: "audio-only + card: the commentary alone, clock companion implied",
+			src:  CaptureSources{AudioCaptureID: card, NoVideo: true},
+			want: []CaptureLegs{
+				{Commentary: CommentaryCard},
+			},
+		},
+		{
+			// NoVideo overrides a card id and a preview request: there is nothing
+			// to capture a picture with, so neither is honoured.
+			name: "audio-only overrides a named card and a preview",
+			src:  CaptureSources{VideoCaptureID: card, AudioDeviceID: "BF568F24", Preview: true, NoVideo: true},
+			want: []CaptureLegs{
+				{Commentary: CommentaryNative},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := PlanCapture(tc.src)

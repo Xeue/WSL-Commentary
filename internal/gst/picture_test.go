@@ -364,8 +364,8 @@ func TestOverlayDarwinStillSpellsTheConversionTheSameWay(t *testing.T) {
 	}
 	if !strings.Contains(text, "WSLCOMMS_OVERLAY_NO_MAIN_LOOP") {
 		t.Error("overlay_darwin.go no longer distinguishes 'no main loop' from 'no window'. The " +
-			"caller has to be told ErrNoHostWindow either way so SetPictureRect keeps treating it " +
-			"as 'not yet', but the sentence a reader sees must not claim we looked for a window " +
+			"caller has to be told ErrNoHostWindow either way so it stays recognisable as 'no host " +
+			"window', but the sentence a reader sees must not claim we looked for a window " +
 			"when we never got far enough to look")
 	}
 }

@@ -237,9 +237,9 @@ const (
 	// the application.
 	//
 	// On the create it is milder but real: the same send makes CreateWindowExW
-	// wait on the Wails thread, so NewPictureOverlay's `<-o.created` blocks the
-	// Wails handler that called it — while that handler holds picViewMu, which is
-	// the lock stopPictureForTeardown needs.
+	// wait on the Wails thread, so NewOverlaySurface's `<-o.created` blocks the
+	// caller that asked for it — which holds App.prevViewMu, the lock the
+	// preview's teardown needs.
 	//
 	// Nothing is given up by setting it. WM_PARENTNOTIFY exists so a parent can
 	// react to its children being created, destroyed or clicked; the parent here

@@ -883,7 +883,7 @@ Contract points that are load-bearing rather than detail:
   is gone; the reserved routes are `/__wslremote/ws` and `/__wslremote/shim.js`.
 - **The hello frame's `methods` list is authoritative** — the shim installs exactly those functions
   on `window.go.main.App`, so **host-only methods degrade by OMISSION**, not by a refusal the
-  frontend must be taught. `SetPictureRect`/`SetPictureVisible`/`StartPicture`/`StopPicture`/
+  frontend must be taught. `StartPicture`/`StopPicture`/`RefreshPicture`/
   `StartReturn`/`StopReturn` are host-only: absent from `Methods()` and refused by `Call` for every
   connection (enforced in `app_remote.go`; the package's fake dispatcher mirrors it).
 - **The fan-out never blocks a producer.** Each session has a bounded, drop-oldest event queue with
@@ -938,8 +938,7 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `GetStatusKeyCandidates()` | `[]m2lx.StatusKeyCandidate` | WP-5b | open |
 | `StartPicture()` / `StopPicture()` | `error` | WP-5b | **host-only** |
 | `GetPictureState()` | `gst.PictureState` | WP-5b | open |
-| `SetPictureRect(x,y,w,h,ratio)` | `error` | WP-5b | **host-only** |
-| `SetPictureVisible(visible)` | `error` | WP-5b | **host-only** |
+| `RefreshPicture()` | `error` | WP-5b | **host-only** |
 | `IsSRTReturnSelected()` | `bool` | WP-5b | open |
 | `StartReturn()` / `StopReturn()` | `error` | WP-5b | **host-only** |
 | `GetReturnState()` | `gst.ReturnState` | WP-5b | open |
@@ -1003,8 +1002,8 @@ are the two halves of one control and neither is useful alone.
 The last four are added 2026-08-16 with the DeckLink VIDEO LEG and its confidence monitor, and all
 four are host-only. `SetVideoSource` is the only method on this whole surface that decides WHAT A
 BROADCAST SWITCHER RECEIVES; the preview trio concern an opaque native window on the screen of
-whoever is sitting at this machine, and are host-only for the reason `SetPictureRect` and
-`SetPictureVisible` are.
+whoever is sitting at this machine, and are host-only because they move, resize and show that
+window over whatever that person was looking at.
 
 **HOST-ONLY IS NOT SELF-ENFORCING FOR THE CONFIGURATION-BACKED ONES, and the gap is closed in code
 rather than noted here.** `videoSource`, `decklinkPreviewEnabled`, `audioSourceKind`,

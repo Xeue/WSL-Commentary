@@ -199,7 +199,7 @@ export function describeRect(rect, dpr) {
  * @property {() => number} dpr              window.devicePixelRatio, read fresh
  * @property {(css: object, dpr: number, physical: object) => void} setRect
  *   Called with the CSS rectangle and the ratio it was measured with — which is
- *   what App.SetPictureRect takes, together, in one call — and with the physical
+ *   what App.SetPreviewRect takes, together, in one call — and with the physical
  *   rectangle this module derived from them, for logging and for tests. The IPC
  *   must send the first two: gst.ScaleRect does the multiplication, because the
  *   ratio Go could read for itself is a different number.

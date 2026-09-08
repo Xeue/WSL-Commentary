@@ -132,12 +132,20 @@ type liveWatchProbe struct {
 // feed that has gone silent while every lamp stays green, and a watchdog that
 // silently watches two pads instead of three is worse than none because it is
 // believed.
-func attachLiveWatch(pipeline gogst.Pipeline) (*liveWatch, error) {
+func attachLiveWatch(pipeline gogst.Pipeline, video bool) (*liveWatch, error) {
 	w := &liveWatch{
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
-	for _, name := range []string{nameMuxVideoQueue, nameMuxAudioQueue, nameMuxOutput} {
+	// The video queue is watched only when the send pipeline has one. An
+	// audio-only feed (SendOpts.NoVideo) has no vq, and a watchdog that demanded
+	// it would refuse every audio-only session as "the muxer watchdog has no pad
+	// to watch" — the pad it is missing is one that was never meant to exist.
+	pads := []string{nameMuxAudioQueue, nameMuxOutput}
+	if video {
+		pads = []string{nameMuxVideoQueue, nameMuxAudioQueue, nameMuxOutput}
+	}
+	for _, name := range pads {
 		el := pipeline.GetByName(name)
 		if el == nil {
 			w.detach()

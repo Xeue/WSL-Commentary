@@ -160,12 +160,13 @@ func TestCaptureDescriptionRendersEveryPlannedShape(t *testing.T) {
 	}
 }
 
-// TestSendDescriptionIsInvariant pins the ONE send string.
+// TestSendDescriptionIsInvariant pins the ONE send string with a picture.
 //
-// Two parameters and no third. No device, no slate, no preview, no conform
-// target, no channel map, no mute: every one of those is upstream of the seam and
-// belongs to the capture layer. If a future change needs a third parameter here,
-// something has been put on the wrong side of the seam.
+// No device, no slate, no preview, no conform target, no channel map, no mute:
+// every one of those is upstream of the seam and belongs to the capture layer.
+// The one shape parameter — whether the video chain exists at all — is argued at
+// sendDescription and pinned by TestSendDescriptionAudioOnlyHasNoVideoChain; it
+// says nothing about WHAT the picture is.
 func TestSendDescriptionIsInvariant(t *testing.T) {
 	want := "mpegtsmux name=mux alignment=7 pcr-interval=3600" +
 		" ! queue name=srtq leaky=downstream max-size-buffers=4000\n" +
@@ -183,8 +184,36 @@ func TestSendDescriptionIsInvariant(t *testing.T) {
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! mux."
 
-	if got := sendDescription("vtenc_h264", DefaultAudioBitrateBps); got != want {
+	if got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true); got != want {
 		t.Errorf("sendDescription is not the specified string.\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestSendDescriptionAudioOnlyHasNoVideoChain pins the audio-only string: the
+// muxer, the leaky SRT queue and the commentary chain, and NOTHING of the video
+// chain — no proxysrc for it, no encoder, no h264parse, no video queue. The
+// elements are absent rather than idle: a video proxysrc with no proxysink behind
+// it would bind to nothing and the muxer would wait on a pad that never sees a
+// buffer.
+func TestSendDescriptionAudioOnlyHasNoVideoChain(t *testing.T) {
+	want := "mpegtsmux name=mux alignment=7 pcr-interval=3600" +
+		" ! queue name=srtq leaky=downstream max-size-buffers=4000\n" +
+
+		"proxysrc name=aproxsrc" +
+		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
+		" ! " + aacEncoderFactory + " bitrate=128000" +
+		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
+		" ! queue name=aq max-size-time=1000000000 ! mux."
+
+	got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, false)
+	if got != want {
+		t.Errorf("audio-only sendDescription is not the specified string.\n got: %s\nwant: %s", got, want)
+	}
+	for _, forbidden := range []string{nameVideoProxySrc, nameVideoEncod, "h264parse", nameMuxVideoQueue, "vtenc_h264"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("the audio-only send description still contains %q; the video chain must be "+
+				"absent, not idle:\n%s", forbidden, got)
+		}
 	}
 }
 
@@ -192,8 +221,8 @@ func TestSendDescriptionIsInvariant(t *testing.T) {
 // as an assertion rather than as prose: the string for one seat and the string
 // for another differ in exactly the encoder name and the bitrate.
 func TestSendDescriptionVariesOnlyByItsTwoParameters(t *testing.T) {
-	base := sendDescription("vtenc_h264", 128000)
-	other := sendDescription("mfh264enc", 96000)
+	base := sendDescription("vtenc_h264", 128000, true)
+	other := sendDescription("mfh264enc", 96000, true)
 
 	normalised := strings.Replace(other, "mfh264enc", "vtenc_h264", 1)
 	normalised = strings.Replace(normalised, "bitrate=96000", "bitrate=128000", 1)
@@ -290,7 +319,7 @@ func TestEveryProxysinkHasALeakyQueueInFrontOfIt(t *testing.T) {
 // rather than a failure.
 func TestTheSeamCapsAreIdenticalOnBothSides(t *testing.T) {
 	capture := captureDescription(CaptureLegs{Commentary: CommentaryNative}, goldenConform(), "")
-	send := sendDescription("vtenc_h264", DefaultAudioBitrateBps)
+	send := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true)
 
 	if strings.Count(capture, seamAudioCaps) != 1 {
 		t.Errorf("the commentary capture description does not pin the seam caps exactly once:\n%s",

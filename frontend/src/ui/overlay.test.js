@@ -1,5 +1,6 @@
 /**
- * Tests for the native picture overlay: the rectangle, and what covers it.
+ * Tests for the native overlay controller — now the DeckLink preview's, the SRT
+ * picture having moved to a window of its own: the rectangle, and what covers it.
  *
  * Run with:  node --test "src/ui/*.test.js"
  *
@@ -52,15 +53,11 @@ function codeOnly(src) {
 }
 
 /**
- * mosaicPage models the ONE line of home.js this file's fallback property is
- * about: setPictureOverlaid toggles `pgm-tile-overlaid` on the PGM tile, and
- * main.css hides the mosaic <video> for as long as that class is set.
- *
- * Nothing else about home.js is modelled and nothing else is claimed. home.js
- * needs a DOM this runner does not have — see mixerwiring.test.js on why
- * widening a shim until a test passes stops the shim being evidence — so the
- * fact that home.js is driven by THIS and by nothing else is asserted from its
- * text, in "the wiring" section below.
+ * mosaicPage models a page with something underneath the overlay that must show
+ * whenever the overlay does not — the contract onVisible exists for. The SRT
+ * picture used to be wired this way (setPictureOverlaid on the PGM tile); it is
+ * in a window of its own now and nothing in the application uses onVisible, but
+ * the controller's contract is unchanged and is kept honest here.
  */
 function mosaicPage() {
   const classes = new Set();
@@ -594,67 +591,54 @@ test('a page report that throws is logged, not propagated', () => {
 // The wiring
 // --------------------------------------------------------------------------
 
-test('the mosaic follows the OVERLAY, and home.js has no other way to suppress it', () => {
-  // The two halves of the fix that the property test above cannot see, because
-  // home.js and app.js need a DOM this runner does not have.
-  const home = codeOnly(ui('home.js'));
-
-  // home.js may only set the class from the flag it is given.
-  const setter = home.slice(home.indexOf('function setPictureOverlaid('));
-  assert.ok(setter.length > 0, 'home.js must expose setPictureOverlaid');
-  assert.match(
-    setter.slice(0, setter.indexOf('\n  }')),
-    /classList\.toggle\('pgm-tile-overlaid', overlaid/,
-    'setPictureOverlaid must toggle the class from its argument',
-  );
-
-  // And nowhere else may touch it. This is the actual regression: the class was
-  // toggled inside renderPicture from `effects.showingSRT`, which is the source
-  // selection and not the window.
-  const sites = home.match(/pgm-tile-overlaid/g) || [];
-  assert.equal(sites.length, 1, 'pgm-tile-overlaid must have exactly one call site in home.js');
-  assert.ok(
-    !/pgm-tile-overlaid'?,\s*effects\./.test(home),
-    'the mosaic must never be suppressed on the picture SOURCE: the overlay is also hidden for the ' +
-      'mixer drawer, Settings and modals, and suppressing it then leaves the commentator with black',
-  );
-  assert.ok(
-    !/showingSRT/.test(setter.slice(0, setter.indexOf('\n  }'))),
-    'and setPictureOverlaid must not consult the selection either',
-  );
-
-  // app.js is what connects the two, from the overlay's own visibility.
+test('the SRT picture has no overlay in the page, and the mosaic is never suppressed', () => {
+  // The picture is a separate PROCESS with a window of its own. This page has
+  // exactly one native overlay left — the card's preview — and nothing that
+  // could hide the mosaic <video>: no class, no rule, no setter. A commentator
+  // who loses SRT loses nothing on this page.
   const app = codeOnly(ui('app.js'));
-  assert.match(
-    app,
-    /onVisible:\s*\(on\)\s*=>\s*home\.setPictureOverlaid\(on\)/,
-    'app.js must drive home.setPictureOverlaid from the overlay controller, which is where visibility ' +
-      'is decided — any other source is a second opinion about what is on screen',
-  );
+  assert.equal((app.match(/createOverlay\(/g) || []).length, 1, 'app.js must build exactly one overlay controller: the preview');
+  assert.ok(app.includes('const previewOverlay = createOverlay('), 'and it must be the preview');
+  for (const gone of ['setPictureRect', 'setPictureVisible', 'setPictureOverlaid', 'measurePictureRect']) {
+    assert.ok(!app.includes(gone), `app.js must not call ${gone}: the picture is not painted over the page`);
+  }
+
+  const home = codeOnly(ui('home.js'));
+  for (const gone of ['pgm-tile-overlaid', 'setPictureOverlaid', 'measurePictureRect']) {
+    assert.ok(!home.includes(gone), `home.js must not contain ${gone}: nothing may suppress the mosaic`);
+  }
+  const css = read(here, '..', 'styles', 'main.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(!css.includes('pgm-tile-overlaid'), 'main.css must have no rule that hides the mosaic');
+
+  // And the Refresh button reaches the backend's refresh and nothing else.
+  assert.match(home, /handlers\.onPictureRefresh\(\)/, 'home.js must wire the Refresh button');
+  assert.match(app, /await backend\.refreshPicture\(\)/, 'app.js must call the refresh binding');
+  const backend = codeOnly(ui('backend.js'));
+  assert.match(backend, /refresh: 'RefreshPicture'/, 'backend.js must bind RefreshPicture');
 });
 
-test('app.js blocks the overlay for Settings, on both reasons', () => {
+test('app.js blocks the preview surface for Settings, on both reasons', () => {
   const src = codeOnly(ui('app.js'));
   const show = src.slice(src.indexOf('function showSettings()'), src.indexOf('function showHome()'));
-  assert.ok(show.includes('overlay.block(BLOCK_SETTINGS)'), 'Settings must hide the overlay');
+  assert.ok(show.includes('previewOverlay.block(BLOCK_SETTINGS)'), 'Settings must hide the surface');
   assert.ok(
-    show.includes('overlay.block(BLOCK_HIDDEN)'),
+    show.includes('previewOverlay.block(BLOCK_HIDDEN)'),
     'and so must the home view going away, which is a separate fact with a separate release',
   );
 
   const home = src.slice(src.indexOf('function showHome()'), src.indexOf('function toggleMixer()'));
-  assert.ok(home.includes('overlay.unblock(BLOCK_SETTINGS)'));
-  assert.ok(home.includes('overlay.unblock(BLOCK_HIDDEN)'));
-  assert.ok(home.includes('overlay.sync()'), 'and re-measure, in case the window moved while it was up');
+  assert.ok(home.includes('previewOverlay.unblock(BLOCK_SETTINGS)'));
+  assert.ok(home.includes('previewOverlay.unblock(BLOCK_HIDDEN)'));
+  assert.ok(home.includes('previewOverlay.sync()'), 'and re-measure, in case the window moved while it was up');
 });
 
-test('app.js blocks the overlay while the mixer drawer is open', () => {
+test('app.js blocks the preview surface while the mixer drawer is open', () => {
   const src = codeOnly(ui('app.js'));
   const at = src.indexOf('onOpenChange:');
   assert.ok(at > 0, 'app.js must listen for the drawer opening');
   const handler = src.slice(at, src.indexOf('onStatus:', at));
-  assert.ok(handler.includes('overlay.block(BLOCK_MIXER)'));
-  assert.ok(handler.includes('overlay.unblock(BLOCK_MIXER)'));
+  assert.ok(handler.includes('previewOverlay.block(BLOCK_MIXER)'));
+  assert.ok(handler.includes('previewOverlay.unblock(BLOCK_MIXER)'));
 });
 
 test('the mixer host announces both edges, including a drawer that closes itself', () => {
@@ -684,7 +668,7 @@ test('the mixer host announces both edges, including a drawer that closes itself
 
 test('the overlay rectangle is re-reported on resize, on a box change and on a DPI change', () => {
   const src = codeOnly(ui('app.js'));
-  const fn = src.slice(src.indexOf('function watchPictureRect()'));
+  const fn = src.slice(src.indexOf('function watchPreviewRect()'));
   const body = fn.slice(0, fn.indexOf('\n  }'));
   assert.match(body, /window\.addEventListener\('resize'/, 'the window changing size');
   assert.match(body, /new ResizeObserver\(sync\)\.observe\(home\.pictureEl\)/, 'the box itself changing size');
@@ -711,6 +695,6 @@ test('the conversion to physical pixels happens in exactly one place', () => {
   }
   // home.js measures and does not convert: it hands app.js raw CSS pixels.
   const home = codeOnly(ui('home.js'));
-  assert.match(home, /function measurePictureRect\(\)/);
+  assert.match(home, /function measurePreviewRect\(\)/);
   assert.ok(!home.includes('devicePixelRatio'), 'home.js must have no opinion about device pixels');
 });

@@ -358,18 +358,33 @@ func joinChains(chains []string) string {
 //
 //   - config-interval=-1 puts SPS/PPS in front of every IDR so M2L-X can re-lock
 //     mid-stream.
-func sendDescription(encoderName string, audioBitrateBps int) string {
-	return "" +
+//
+// # The one shape parameter, and why it is not a violation of the seam
+//
+// video is whether the video chain exists AT ALL. It is the third parameter the
+// note above said would mean something was on the wrong side of the seam, and it
+// is not: an audio-only feed (config.VideoSourceNone) has NO picture leg in
+// capture either, so there is no proxysink for a video proxysrc to bind to. A
+// proxysrc with no producer is not "a video chain carrying nothing" — it parses,
+// binds to nil and the muxer waits on a pad that never gets a buffer. So the
+// chain is absent, not idle. Everything about WHAT the picture is stays upstream;
+// this only says whether there is one.
+func sendDescription(encoderName string, audioBitrateBps int, video bool) string {
+	desc := "" +
 		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
-		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
+		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n"
 
-		"proxysrc name=" + nameVideoProxySrc +
-		" ! " + encoderName + " name=" + nameVideoEncod +
-		" ! video/x-h264,profile=high" +
-		" ! h264parse config-interval=-1" +
-		" ! video/x-h264,stream-format=byte-stream,alignment=au" +
-		" ! queue name=" + nameMuxVideoQueue + " max-size-time=1000000000 ! " + nameMux + ".\n" +
+	if video {
+		desc += "" +
+			"proxysrc name=" + nameVideoProxySrc +
+			" ! " + encoderName + " name=" + nameVideoEncod +
+			" ! video/x-h264,profile=high" +
+			" ! h264parse config-interval=-1" +
+			" ! video/x-h264,stream-format=byte-stream,alignment=au" +
+			" ! queue name=" + nameMuxVideoQueue + " max-size-time=1000000000 ! " + nameMux + ".\n"
+	}
 
+	return desc +
 		"proxysrc name=" + nameAudioProxySrc +
 		" ! " + seamAudioCaps +
 		" ! " + aacEncoderFactory + " bitrate=" + strconv.Itoa(audioBitrateBps) +

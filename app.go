@@ -78,12 +78,16 @@
 //	GetReturnState()            gst.ReturnState            caller: WP-5b
 //	IsSRTReturnSelected()       bool                       caller: WP-5b
 //
-// and the five added for the SRT PICTURE, which live in app_picture.go:
+// and the four for the SRT PICTURE, which live in app_picture.go. The picture
+// is a SEPARATE PROCESS with a window of its own (app_picture_child.go), so
+// there is no rectangle or visibility method for it — there used to be two,
+// when it was an overlay painted over the page — and RefreshPicture is the
+// operator's "the picture has frozen" button: kill the process, start a fresh
+// one:
 //
 //	StartPicture() / StopPicture()      error              caller: WP-5b
+//	RefreshPicture()                    error              caller: WP-5b
 //	GetPictureState()                   gst.PictureState   caller: WP-5b
-//	SetPictureRect(x,y,w,h,ratio)       error              caller: WP-5b
-//	SetPictureVisible(visible)          error              caller: WP-5b
 //
 // and the seven added for the M2L-X INSTANCE PRESETS, which live in
 // app_presets.go — the TWENTIETH to TWENTY-SIXTH, recorded in CONTRACT.md's
@@ -110,8 +114,9 @@
 // BROADCAST SWITCHER RECEIVES, which is why it is a method of its own rather
 // than one more field somebody has to remember to guard inside SaveConfig. The
 // other two rectangle methods concern a native window on the screen of whoever
-// is at this machine, and are host-only for the reason SetPictureRect and
-// SetPictureVisible are.
+// is at this machine — they move, resize and show an OPAQUE window over whatever
+// that person was looking at — and a seat in another building has no business
+// doing that, which is why they are host-only.
 //
 // THE FIRST TWO HAVE NO CALLER, DELIBERATELY, and the annotation says so rather
 // than naming one that does not exist. The Settings screen writes both fields
@@ -1313,23 +1318,28 @@ type App struct {
 	// show the RETURN lamp grey while audio was in the commentator's ears.
 	lastReturn gst.ReturnState
 
-	// The SRT PICTURE path takes THREE locks, and the split between them is not
-	// fastidiousness — two of the three arrangements deadlock. The rule is:
+	// The SRT PICTURE path takes TWO locks, in this order and never the other:
 	//
-	//	picMu       →  picViewMu  →  picStateMu
+	//	picMu  →  picStateMu
 	//
-	// taken in that order, never any other, and picMu is the only one ever held
-	// across something that blocks.
+	// picMu is the only one ever held across something that blocks.
 	//
 	// picMu guards pic, the running session. It is held for the whole of
 	// StartPicture and StopPicture, INCLUDING the blocking wait inside
-	// gst.PictureMonitor.Stop and the join of the state-forwarding goroutine.
+	// gst.PictureMonitor.Stop — which for the picture PROCESS is a wait for the
+	// child to exit, bounded and then a kill — and the join of the
+	// state-forwarding goroutine.
 	//
 	// It is a THIRD subsystem lock, not a reuse of retMu, for the reason that
 	// made retMu a second lock rather than a reuse of sessMu: the picture and the
 	// audio return reach different hardware — a GPU decoder and a window against
 	// an audio endpoint — and either can wedge without the other. One lock over
 	// both would mean a StartPicture waiting on a wedged headphone endpoint.
+	//
+	// There used to be a third, picViewMu, guarding an overlay window the
+	// picture was painted into over the page. The picture has its own window in
+	// its own process now and this process holds nothing of its geometry; the
+	// preview's prevViewMu below is the last of that kind.
 	picMu sync.Mutex
 
 	// pic is the running picture session, or nil when the picture is stopped.
@@ -1341,38 +1351,6 @@ type App struct {
 	// operator again on every StartPicture would be noise; see maybeNotePictureSoftwareDecode.
 	pictureSoftwareNoteOnce sync.Once
 
-	// picViewMu guards picOverlay, picRect and picWantVisible: everything about
-	// WHERE THE PICTURE IS DRAWN, as opposed to whether it is running.
-	//
-	// IT IS SEPARATE FROM picMu BECAUSE THE FORWARDING GOROUTINE NEEDS IT WHILE
-	// StopPicture IS HOLDING picMu AND WAITING FOR THAT GOROUTINE TO EXIT. Every
-	// state transition drives the overlay's visibility, so the forwarder touches
-	// these fields on every transition; if they lived under picMu, the first Stop
-	// that arrived while a transition was in flight would deadlock — the Stop
-	// holding picMu waiting on the join, the forwarder waiting on picMu. That is
-	// not hypothetical: it was written that way first and it hung.
-	//
-	// Nothing held under it may block. Every gst.PictureOverlay method records
-	// and posts; see overlay_windows.go's header for why that is the property the
-	// whole design rests on, and overlay_darwin.go for the same property upheld
-	// by a different rule — every Cocoa call must be made on the main thread, so
-	// the darwin overlay dispatches rather than blocking here too.
-	picViewMu sync.Mutex
-
-	// picOverlay is the native child window the picture is rendered into, or nil
-	// before the first layout call. It OUTLIVES pic: the monitor is rebuilt
-	// whenever the configuration changes, and a window destroyed and recreated
-	// underneath a running webview is a z-order fight with nothing to gain. Only
-	// teardown destroys it.
-	picOverlay gst.PictureOverlay
-
-	// picRect is the last rectangle the frontend gave, in PHYSICAL pixels
-	// relative to the window's client area, and picWantVisible is the last
-	// visibility it asked for. Both are kept even when picOverlay is nil, so that
-	// an overlay created later is positioned before it is ever shown.
-	picRect        gst.PictureRect
-	picWantVisible bool
-
 	// picStateMu guards lastPicture. It is the innermost of the three and it is a
 	// leaf: nothing is taken while it is held.
 	picStateMu sync.Mutex
@@ -1383,42 +1361,36 @@ type App struct {
 	// otherwise draw the fallback mosaic over a working high-resolution picture.
 	lastPicture gst.PictureState
 
-	// THE DECKLINK PREVIEW — the operator's own confidence monitor — has its own
-	// trio of these, and the duplication is deliberate rather than a missed
-	// factoring. App holds exactly ONE picOverlay under picViewMu, because the
-	// SRT picture is one surface; the preview is a SECOND, SIMULTANEOUS surface
-	// showing something else. They are on screen at the same time — the
-	// commentator's programme return above, what this position is sending below —
-	// so one handle and one rectangle cannot serve both, and sharing picViewMu
-	// would put the preview's layout calls behind whatever the picture path is
-	// doing.
+	// THE DECKLINK PREVIEW — the operator's own confidence monitor — is the one
+	// native overlay left in this process's window: an opaque child HWND (an
+	// NSView on macOS) painted over the page where the operator sees what this
+	// position is actually sending.
 	//
-	// prevViewMu is picViewMu's twin and obeys the same rule: nothing held under
-	// it may block, and every gst.PictureOverlay method records and posts. The
-	// one ordering it does have is sessMu → prevViewMu, because startSession
-	// builds and releases the surface while holding sessMu; nothing may take them
-	// the other way round, which is why the two bound setters below take
-	// prevViewMu alone and never ask the session anything. It is NOT ordered
-	// against picViewMu, because nothing anywhere takes both — the two surfaces
-	// share no code path, which is what makes a deadlock between them impossible
-	// rather than merely unlikely.
+	// prevViewMu guards everything about WHERE IT IS DRAWN, and the rule is that
+	// nothing held under it may block: every gst.PictureOverlay method records
+	// and posts. The one ordering it has is sessMu → prevViewMu, because the
+	// capture build creates and releases the surface while holding sessMu;
+	// nothing may take them the other way round, which is why the two bound
+	// setters take prevViewMu alone and never ask the session anything. It is
+	// NOT ordered against the picture's locks, because nothing anywhere takes
+	// both — the two share no code path, which is what makes a deadlock between
+	// them impossible rather than merely unlikely.
 	prevViewMu sync.Mutex
 
 	// prevOverlay is the native child window the DeckLink preview renders into,
-	// or nil when there is none. Unlike picOverlay it is created and destroyed
-	// WITH THE SESSION, because the preview is a branch of the contribution
-	// pipeline rather than a monitor of its own: the tee it hangs off exists only
-	// while that pipeline does, and set_state(NULL) inside a blocking pad probe
-	// was MEASURED to take the on-air leg from 50 fps to 0 permanently with the
-	// pipeline still reporting PLAYING. So it is built at Start, from the
+	// or nil when there is none. It is created and destroyed WITH THE CAPTURE,
+	// because the preview is a branch of the capture pipeline rather than a
+	// monitor of its own: the tee it hangs off exists only while that pipeline
+	// does, and set_state(NULL) inside a blocking pad probe was MEASURED to take
+	// the on-air leg from 50 fps to 0 permanently with the pipeline still
+	// reporting PLAYING. So it is built with the capture, from the
 	// configuration, and never attached or detached live.
 	prevOverlay gst.PictureOverlay
 
-	// prevRect and prevWantVisible are the preview's half of what picRect and
-	// picWantVisible are for the picture: the last rectangle the page gave, in
-	// PHYSICAL pixels, and the last visibility it asked for. Both are kept
-	// across sessions so that the overlay built by the next Start is positioned
-	// before it is ever shown.
+	// prevRect is the last rectangle the page gave, in PHYSICAL pixels relative
+	// to the window's client area, and prevWantVisible is the last visibility it
+	// asked for. Both are kept across capture builds so that the overlay built
+	// by the next one is positioned before it is ever shown.
 	prevRect        gst.PictureRect
 	prevWantVisible bool
 
@@ -1490,16 +1462,12 @@ type App struct {
 	muteSeq   float64
 	muteSeqAt time.Time
 
-	// pictureDial builds the picture monitor, and overlayDial builds the native
-	// overlay window. Both are gst's real constructors in the application and
-	// fakes in the tests, which is the only way to exercise the wire-up without a
-	// GPU and without a window. Nil means the real one; see
-	// App.newPictureMonitor and App.newPictureOverlay.
-	//
-	// overlayDial builds the PREVIEW's surface too. One seam serves both because
-	// they are the same type of object created the same way — a native child of
-	// the same host window — and a second dial would be a second thing for a test
-	// to forget to install.
+	// pictureDial builds the picture monitor, and overlayDial builds the
+	// DeckLink preview's native overlay window. Both are real constructors in
+	// the application — the picture process's parent half, and gst's overlay —
+	// and fakes in the tests, which is the only way to exercise the wire-up
+	// without a GPU, without a window and without launching a process. Nil means
+	// the real one; see App.newPictureMonitor and App.newPreviewOverlay.
 	pictureDial func() gst.PictureMonitor
 	overlayDial func() (gst.PictureOverlay, error)
 
@@ -1801,12 +1769,9 @@ func (a *App) domReady(ctx context.Context) {
 	a.retStateMu.Unlock()
 	a.events.send(EventReturn, lastRet)
 
-	// The picture, for the same reason and with one extra consequence. A page
-	// that reloaded mid-match has forgotten that it asked for the overlay, so
-	// picWantVisible is still true on this side while the page believes nothing
-	// is showing. Replaying the state is what lets the page put its own view back
-	// in step; it will call SetPictureRect from its layout code either way, which
-	// is what re-establishes the rectangle.
+	// The picture, for the same reason: the picture process is still running
+	// in its own window across a page reload, and the badge over the mosaic
+	// tile would otherwise say the SRT picture was stopped while it was showing.
 	a.picStateMu.Lock()
 	lastPic := a.lastPicture
 	a.picStateMu.Unlock()
@@ -2560,8 +2525,11 @@ var (
 )
 
 // SetVideoSource chooses WHAT THE VIDEO LEG CARRIES: config.VideoSourceSlate,
-// the still picture this application has always transmitted, or
-// config.VideoSourceDeckLink, live video from the Blackmagic card.
+// the still picture this application has always transmitted;
+// config.VideoSourceDeckLink, live video from the Blackmagic card; or
+// config.VideoSourceNone, no video leg at all — an audio-only feed for an M2L-X
+// router input configured as an audio-only microphone input, which spares the
+// machine the whole H.264 encode.
 //
 // # Why this exists at all when SaveConfig could write the same field
 //
@@ -2598,12 +2566,12 @@ var (
 func (a *App) SetVideoSource(source string) error {
 	s := strings.TrimSpace(source)
 	switch s {
-	case config.VideoSourceSlate, config.VideoSourceDeckLink:
+	case config.VideoSourceSlate, config.VideoSourceDeckLink, config.VideoSourceNone:
 	default:
 		// Named the way config.Validate names it, because the operator may well
 		// meet both messages about the same value and they must agree.
-		return fmt.Errorf("wslcomms: videoSource must be %q or %q, got %q",
-			config.VideoSourceSlate, config.VideoSourceDeckLink, source)
+		return fmt.Errorf("wslcomms: videoSource must be %q, %q or %q, got %q",
+			config.VideoSourceSlate, config.VideoSourceDeckLink, config.VideoSourceNone, source)
 	}
 
 	a.sessMu.Lock()
@@ -2636,7 +2604,7 @@ func (a *App) SetVideoSource(source string) error {
 // it can do is open or close an opaque native window on the screen of whoever is
 // sitting at this machine — over whatever they were looking at — and a seat in
 // another building has no business doing that. It is the same argument that puts
-// SetPictureVisible on the host-only list.
+// SetPreviewVisible on the host-only list.
 //
 // It refuses while sending for the reason SetVideoSource does: the preview is a
 // tee branch of the contribution pipeline, built with it.
@@ -4661,6 +4629,7 @@ func (a *App) buildCaptureSet(cfg *config.Config, plan capturePlan,
 		AudioCaptureID: base.AudioCaptureID,
 		AudioDeviceID:  base.AudioDeviceID,
 		Preview:        base.Preview.Enabled,
+		NoVideo:        base.NoVideo,
 	}) {
 		opts := base
 		opts.Legs = legs
@@ -4986,6 +4955,11 @@ func (a *App) captureOpts(cfg *config.Config, plan capturePlan,
 		AudioCaptureID: plan.AudioCaptureID,
 		VideoCaptureID: plan.VideoCaptureID,
 
+		// Audio-only: no picture leg is planned at all. The plan reduces to the
+		// commentary alone and the send pipeline is built without its video
+		// chain; see config.VideoSourceNone.
+		NoVideo: !cfg.SendsVideo(),
+
 		ConformTo: conform,
 
 		Preview: gst.PreviewOpts{
@@ -5145,6 +5119,10 @@ func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
 			// unset field, so a configuration nobody has touched still encodes
 			// exactly what the on-air build encodes.
 			VideoBitrateKbps: cfg.EffectiveVideoBitrateKbps(),
+			// Audio-only: the send pipeline is built without its video chain, to
+			// match the capture plan that built no picture leg. The bitrate above
+			// is then unused. See config.VideoSourceNone.
+			NoVideo: !cfg.SendsVideo(),
 		},
 		Sink: gst.SinkOpts{
 			Host:       srtHost,

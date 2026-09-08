@@ -19,8 +19,9 @@
 //     `import "C"`, so CGO_ENABLED=0 drops it, and without this file the whole
 //     of package main would stop compiling on the machine the work is done on.
 //     A Gate A build therefore gets an overlay that refuses politely, which is
-//     exactly the state app_picture.go already handles: SetPictureRect treats a
-//     failure to create one as "not yet" and carries on.
+//     exactly the state app_picture.go already handles: startCapturePreview
+//     logs a surface it could not create, tells the operator once, and builds
+//     the capture without it.
 //
 // The build constraint is `!windows && (!darwin || !cgo)` rather than
 // `!windows && !darwin` for that second reason alone. Narrowing it to
@@ -66,9 +67,8 @@ func NewPictureOverlay(title string) (PictureOverlay, error) {
 // showing two of these refusals should say which two things did not appear.
 //
 // The failure is a normal state that app_picture.go already handles —
-// SetPictureRect treats a failure to create an overlay as "not yet" and carries
-// on — and the preview's wiring must handle it the same way, for the same
-// reason. It is deliberately NOT ErrNoHostWindow: there is no window to wait
+// startCapturePreview logs it, tells the operator once, and builds the capture
+// without a preview. It is deliberately NOT ErrNoHostWindow: there is no window to wait
 // for here and there never will be in this build, so a caller that retried on
 // every layout call would retry for ever.
 func NewOverlaySurface(_ string, purpose string) (PictureOverlay, error) {

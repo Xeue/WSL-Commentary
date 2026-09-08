@@ -216,11 +216,10 @@ test('the peak-hold is per channel and reset() forgets everything', () => {
 /* ------------------------------------------------------------------------ */
 
 test('home.js draws the meters OUTSIDE the tile, beside the picture', () => {
-  // The native SRT overlay is an opaque child window covering exactly the
-  // tile's rectangle (measurePictureRect measures .pgm-tile), so a meter
-  // appended inside the tile is invisible for as long as the good picture is
-  // up — precisely when it is needed. The meters must be a SIBLING in
-  // .pgm-stage.
+  // The tile is the commentator's picture — the mosaic, always — and a meter
+  // appended inside it is a meter over the match. (While the SRT picture was
+  // an opaque native window over that rectangle it was also invisible, which is
+  // how this rule was learned.) The meters must be a SIBLING in .pgm-stage.
   const src = ui('home.js');
   // WHERE they are has moved twice; WHY has never changed. They sat beside the
   // tile in .pgm-stage, went to the side column with everything else that was
@@ -258,14 +257,7 @@ test('home.js draws the meters OUTSIDE the tile, beside the picture', () => {
   );
   assert.ok(
     !/pgmTile\.(?:append|appendChild)\([^)]*metersEl/.test(src),
-    'the meters container must never be appended to pgmTile — the native overlay covers that rectangle',
-  );
-  // And the overlay's rectangle is still measured from the tile alone, so
-  // adding the meters cannot have widened what the native window covers.
-  assert.match(
-    src,
-    /pgmTile\.getBoundingClientRect\(\)/,
-    'measurePictureRect must still measure .pgm-tile and nothing else',
+    'the meters container must never be appended to pgmTile — that rectangle is the picture',
   );
 });
 

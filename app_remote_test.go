@@ -115,13 +115,12 @@ func TestRemoteEventNamesCoversEveryEvent(t *testing.T) {
 }
 
 // TestRemoteHostOnlySet pins exactly which methods are host-only, so neither the
-// native-surface six nor the two remote-admin methods can silently gain OR lose
-// that status. The per-client admin methods are gone — there are no clients.
+// picture/return surface nor the two remote-admin methods can silently gain OR
+// lose that status. The per-client admin methods are gone — there are no clients.
 func TestRemoteHostOnlySet(t *testing.T) {
 	want := map[string]bool{
-		// the native picture / SRT-return surface
-		"SetPictureRect": true, "SetPictureVisible": true,
-		"StartPicture": true, "StopPicture": true,
+		// the picture process and the SRT-return surface
+		"StartPicture": true, "StopPicture": true, "RefreshPicture": true,
 		"StartReturn": true, "StopReturn": true,
 		// the DeckLink preview's surface: the same argument as the picture's two
 		"SetPreviewRect": true, "SetPreviewVisible": true,

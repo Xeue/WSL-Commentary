@@ -48,7 +48,7 @@
  * this screen touched two things at once, selecting it silenced the operator.
  */
 
-/** The high-quality path: a native SRT receiver painting over the page. */
+/** The high-quality path: a native SRT receiver in a window of its own. */
 export const PICTURE_SOURCE_SRT = 'srt';
 /** The fallback: the KVS multiviewer mosaic, cropped to the PGM tile. */
 export const PICTURE_SOURCE_MOSAIC = 'mosaic';
@@ -138,8 +138,9 @@ export const PICTURE_SOURCES = Object.freeze([
     value: PICTURE_SOURCE_SRT,
     label: 'High quality (SRT)',
     summary:
-      'The M2L-X programme output at 1920x1080 50p, decoded natively and painted over this window. ' +
-      'This is the dirty PGM feed — what the director is putting to air.',
+      'The M2L-X programme output at 1920x1080 50p, decoded natively and shown in a window of ' +
+      'its own — this tile stays on the mosaic. This is the dirty PGM feed — what the director ' +
+      'is putting to air. Refresh restarts it if it freezes.',
     cost:
       'A real 15 Mbit/s SRT stream from M2L-X Output 1 and one of its fan-out slots. ' +
       'Falls back to the mosaic on its own if it is not delivering.',
@@ -280,8 +281,10 @@ export function describePictureSource(source) {
 export function describePictureShowing(effects, state) {
   if (effects.showingSRT) {
     return {
-      text: 'SRT 1080p',
-      detail: 'The high-quality M2L-X programme picture.',
+      text: 'SRT 1080p — own window',
+      detail:
+        'The high-quality M2L-X programme picture is up, in the picture window. ' +
+        'This tile is the mosaic.',
       good: true,
     };
   }

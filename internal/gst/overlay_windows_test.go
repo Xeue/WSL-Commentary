@@ -194,8 +194,8 @@ func TestWndClassExWIsTheSizeWindowsExpects(t *testing.T) {
 func TestFindHostWindowReportsNoHostRatherThanGuessing(t *testing.T) {
 	// A `go test` binary has no visible unowned top-level window, so this is the
 	// startup case: the frontend asked for the overlay before Wails made the
-	// window. It must come back as ErrNoHostWindow — which SetPictureRect treats
-	// as "not yet" — and NOT as some other window of this process.
+	// window. It must come back as ErrNoHostWindow — a sentinel a caller can
+	// recognise — and NOT as some other window of this process.
 	//
 	// It is also the enumWindowsProc syscall.NewCallback test and the EnumWindows
 	// marshalling test. Both run whatever the answer is.

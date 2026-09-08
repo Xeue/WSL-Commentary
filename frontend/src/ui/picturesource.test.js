@@ -309,8 +309,7 @@ test('backend.js binds the picture calls in one table, separate from the audio o
   for (const [jsName, goName] of [
     ['startPicture', 'StartPicture'],
     ['stopPicture', 'StopPicture'],
-    ['setPictureRect', 'SetPictureRect'],
-    ['setPictureVisible', 'SetPictureVisible'],
+    ['refreshPicture', 'RefreshPicture'],
     ['getPictureState', 'GetPictureState'],
   ]) {
     assert.match(js, new RegExp(`export async function ${jsName}\\(`), `backend.js exports ${jsName}`);
@@ -319,9 +318,8 @@ test('backend.js binds the picture calls in one table, separate from the audio o
 
   // Availability is decided on ALL of them, for the reason srtReturnAvailable
   // is: every one is called on a path that has already assumed the option was
-  // offered. A build with StartPicture but no SetPictureRect would start a
-  // receiver and paint it at a native default — an opaque box over the whole
-  // application, which is worse than no picture at all.
+  // offered. A build with StartPicture but no RefreshPicture would offer a
+  // picture with no way to restart it when it freezes.
   assert.match(
     js,
     /PICTURE_METHOD_NAMES = Object\.freeze\(Object\.values\(PICTURE_METHODS\)\)/,

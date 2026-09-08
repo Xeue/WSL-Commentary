@@ -211,7 +211,7 @@ const captureProbeDescription = "videotestsrc name=vcapsrc is-live=true" +
 // through the string the application actually parses, and a change to it that
 // broke the seam would break this test rather than passing beside it.
 func sendProbeDescription(encoderName string, audioBitrateBps int) string {
-	desc := sendDescription(encoderName, audioBitrateBps)
+	desc := sendDescription(encoderName, audioBitrateBps, true)
 	head, rest, ok := strings.Cut(desc, "\n")
 	if !ok {
 		panic("gst: sendDescription no longer has the muxer chain first; the filesink cannot be " +

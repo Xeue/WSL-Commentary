@@ -221,6 +221,14 @@ type CaptureSources struct {
 	// Preview is whether the operator has asked for the confidence monitor. It
 	// is honoured only on a card picture leg; see CaptureLegs.Preview.
 	Preview bool
+
+	// NoVideo is the audio-only feed: NO picture leg is planned at all. It
+	// overrides VideoCaptureID and Preview — there is nothing to capture a
+	// picture with and nothing to preview — and the plan it produces is the
+	// commentary leg alone. A card commentary still gets its clock companion,
+	// because decklinkaudiosrc cannot preroll without a decklinkvideosrc in the
+	// pipeline whatever is or is not being sent. See config.VideoSourceNone.
+	NoVideo bool
 }
 
 // PlanCapture applies THE FUSION RULE and returns the leg-sets to build, in the
@@ -256,13 +264,24 @@ type CaptureSources struct {
 // contention failure — "Internal data stream error / not-negotiated (-4)" in
 // about 100 microseconds, naming neither the device nor the cause.
 func PlanCapture(src CaptureSources) []CaptureLegs {
-	picture := PictureSlate
-	if src.VideoCaptureID != "" {
-		picture = PictureCard
-	}
 	commentary := CommentaryNative
 	if src.AudioCaptureID != "" {
 		commentary = CommentaryCard
+	}
+
+	// THE AUDIO-ONLY ROW. No picture leg is built — not the slate, not the
+	// card, not the encoder downstream of either — so the plan is one pipeline
+	// carrying the commentary alone. A card commentary keeps its clock
+	// companion through NeedsClockCompanion, exactly as the slate row does,
+	// because the card drives audio capture off its video clock regardless of
+	// whether anybody is sending that video.
+	if src.NoVideo {
+		return []CaptureLegs{{Commentary: commentary}}
+	}
+
+	picture := PictureSlate
+	if src.VideoCaptureID != "" {
+		picture = PictureCard
 	}
 	// The preview is honoured only where there is a tee to hang it off.
 	preview := src.Preview && picture == PictureCard
@@ -318,6 +337,12 @@ type CaptureOpts struct {
 	// persistent-id at its own -1 default, which means "use device-number", which
 	// means whichever card the driver enumerated first.
 	VideoCaptureID string
+
+	// NoVideo is the audio-only feed. It is carried here so that buildCaptureSet
+	// can hand it to PlanCapture unchanged; NewCapture itself reads only Legs,
+	// which the plan has already reduced to the commentary alone. See
+	// CaptureSources.NoVideo.
+	NoVideo bool
 
 	// Preview carries the confidence monitor's window handle and switch. A ZERO
 	// WINDOW HANDLE MEANS THE BRANCH IS NOT RENDERED AT ALL, because an
