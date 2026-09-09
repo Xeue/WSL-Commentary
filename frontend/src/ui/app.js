@@ -1263,28 +1263,70 @@ export function mountApp(root) {
   }
 
   /**
-   * onPictureRefresh is the Refresh button: the picture process is ended —
-   * killed, if its decoder or its socket has wedged — and a fresh one started
-   * against the saved configuration. It reads the state back afterwards rather
-   * than assuming, because the new process reports its own transitions and the
-   * badge must say what is actually on screen.
+   * onPictureRefresh is the Refresh button: it gives WHICHEVER PICTURE IS
+   * ACTIVE a kick from nothing. For the mosaic that is the KVS WebRTC
+   * connection torn down and rebuilt (restartMosaic); for SRT it is the
+   * picture process ended — killed, if its decoder or its socket has wedged —
+   * and a fresh one started. The SRT state is read back afterwards rather than
+   * assumed, because the new process reports its own transitions and the badge
+   * must say what is actually on screen.
    *
-   * It touches nothing audible, for the reason onPictureSourceChange gives.
+   * IT DOES TOUCH THE RETURN AUDIO, deliberately, and this is the one picture
+   * control that may: the mosaic and the headphones are the same peer
+   * connection, a distorted return is the other complaint this button exists
+   * to answer, and the operator is told in the tooltip that the audio drops for
+   * a moment. It never touches the contribution feed.
    */
   async function onPictureRefresh() {
-    if (!pictureBindingsPresent) return;
-    if (currentPictureSource !== PICTURE_SOURCE_SRT) return;
-    try {
-      await backend.refreshPicture();
-      currentPictureState = await backend.getPictureState();
-    } catch (err) {
-      currentPictureState = null;
-      home.showError(
-        `Could not refresh the picture: ${err?.message || err}. ` +
-          'You are watching the multiviewer mosaic; your audio is unaffected.',
-      );
+    const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
+
+    // Which half gets the kick:
+    //
+    //   mosaic chosen                 the mosaic
+    //   SRT chosen and SHOWING        the SRT process
+    //   SRT chosen, not showing       BOTH — the commentator is looking at the
+    //                                 mosaic fallback, and SRT is the thing
+    //                                 that was meant to be there
+    //
+    // and the SRT half only where this build can drive it; a remote tab, whose
+    // picture bindings are pruned, kicks its own mosaic and nothing else.
+    const kickSRT = effects.wantSRT && pictureBindingsPresent;
+    const kickMosaic = !effects.wantSRT || !effects.showingSRT;
+
+    if (kickMosaic) restartMosaic();
+
+    if (kickSRT) {
+      try {
+        await backend.refreshPicture();
+        currentPictureState = await backend.getPictureState();
+      } catch (err) {
+        currentPictureState = null;
+        home.showError(
+          `Could not refresh the picture: ${err?.message || err}. ` +
+            'You are watching the multiviewer mosaic; your audio is unaffected.',
+        );
+      }
     }
     renderPicture();
+  }
+
+  /**
+   * restartMosaic tears the KVS monitor down and builds it again from the
+   * current configuration, fetching fresh credentials on the way. It is what
+   * applyPresetAndRefresh has always done on an instance change; the Refresh
+   * button does it on demand, for a mosaic that has frozen or a return that
+   * has gone wrong — the two are one WebRTC peer connection, so a rebuild
+   * answers both, and costs a moment of silence in the headphones.
+   *
+   * The old monitor is stopped best-effort: a monitor wedged badly enough that
+   * stop() throws is still replaced, because the point is the new one.
+   */
+  function restartMosaic() {
+    if (!currentConfig) return;
+    safeMonitorCall((m) => m.stop());
+    monitor = null;
+    home.lamps.MONITOR.update(deriveMonitorLamp(undefined));
+    setUpMonitor(currentConfig);
   }
 
   /**

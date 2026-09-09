@@ -610,9 +610,17 @@ test('the SRT picture has no overlay in the page, and the mosaic is never suppre
   const css = read(here, '..', 'styles', 'main.css').replace(/\/\*[\s\S]*?\*\//g, '');
   assert.ok(!css.includes('pgm-tile-overlaid'), 'main.css must have no rule that hides the mosaic');
 
-  // And the Refresh button reaches the backend's refresh and nothing else.
+  // And the Refresh button kicks WHICHEVER picture is active: the SRT process
+  // through the backend's refresh, the mosaic by rebuilding the KVS monitor.
   assert.match(home, /handlers\.onPictureRefresh\(\)/, 'home.js must wire the Refresh button');
-  assert.match(app, /await backend\.refreshPicture\(\)/, 'app.js must call the refresh binding');
+  const refresh = app.slice(app.indexOf('async function onPictureRefresh()'));
+  const refreshBody = refresh.slice(0, refresh.indexOf('\n  }'));
+  assert.match(refreshBody, /await backend\.refreshPicture\(\)/, 'the SRT half: the refresh binding');
+  assert.match(refreshBody, /restartMosaic\(\)/, 'the mosaic half: the KVS monitor rebuilt');
+  const restart = app.slice(app.indexOf('function restartMosaic()'));
+  const restartBody = restart.slice(0, restart.indexOf('\n  }'));
+  assert.match(restartBody, /safeMonitorCall\(\(m\) => m\.stop\(\)\)/, 'the old monitor is stopped');
+  assert.match(restartBody, /setUpMonitor\(currentConfig\)/, 'and a new one built from the current config');
   const backend = codeOnly(ui('backend.js'));
   assert.match(backend, /refresh: 'RefreshPicture'/, 'backend.js must bind RefreshPicture');
 });

@@ -1030,19 +1030,22 @@ export function createHomeView(handlers) {
   );
   sourceSegmented.set(DEFAULT_PICTURE_SOURCE);
 
-  // REFRESH: the picture has frozen. The SRT picture is a separate process,
-  // and this ends it — killed, if its decoder or its socket has wedged — and
-  // starts a fresh one against the saved configuration. Nothing about the audio
-  // or the feed changes, which is why it is safe to have on the main screen
-  // mid-match. It is enabled only while SRT is the chosen picture and this
-  // build can drive it; see renderPicture.
+  // REFRESH: the picture has frozen, or the return sounds wrong. This gives
+  // WHICHEVER PICTURE IS ACTIVE a kick from nothing: the mosaic's WebRTC
+  // connection is torn down and rebuilt with fresh credentials — and the
+  // return audio rides on that same connection, so it drops for a moment and
+  // comes back clean — or the SRT picture process is ended (killed, if it has
+  // wedged) and a fresh one started. The contribution feed is never touched,
+  // which is why this is safe to have on the main screen mid-match. app.js
+  // decides which half to kick; see onPictureRefresh there.
   const refreshBtn = document.createElement('button');
   refreshBtn.type = 'button';
   refreshBtn.className = 'btn btn-ghost btn-small picture-refresh';
   refreshBtn.textContent = 'Refresh';
   refreshBtn.title =
-    'Restart the SRT picture. The picture window is closed and a fresh one opened, ' +
-    'dialling M2L-X again. The audio and the feed are untouched.';
+    'Give the picture a kick. Mosaic: reconnects the multiviewer and the return audio with it ' +
+    '(a moment of silence). SRT: closes the picture window and opens a fresh one, dialling M2L-X ' +
+    'again. The feed going to air is never touched.';
   refreshBtn.addEventListener('click', () => handlers.onPictureRefresh());
 
   const sourceGroup = document.createElement('div');
@@ -1598,9 +1601,11 @@ export function createHomeView(handlers) {
     pictureBadge.title = showing.detail;
     pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
 
-    // Refresh restarts the SRT picture and nothing else, so it is only offered
-    // while SRT is the chosen picture and this build can drive it.
-    refreshBtn.disabled = !(effects.wantSRT && currentPictureAvailable);
+    // Refresh kicks whichever picture is active, and the mosaic is always
+    // there to be kicked, so the button is always live. The one thing it
+    // cannot do is restart an SRT picture this build cannot drive; app.js
+    // then kicks the mosaic alone.
+    refreshBtn.disabled = false;
   }
 
   /** setPictureSource selects which picture the application should try for. */
