@@ -3462,8 +3462,9 @@ func stateChangeWatchdog(what string) (stop func()) {
 				return
 			}
 			log.Printf("gst: WATCHDOG: %s has not returned after %s. "+
-				"gst_element_set_state cannot be interrupted; if this repeats, the audio driver "+
-				"or an encoder MFT is wedged and only restarting the application will clear it.",
+				"gst_element_set_state cannot be interrupted; if this repeats, the audio driver, "+
+				"a decoder or an encoder MFT is wedged. For the picture, Refresh restarts its "+
+				"process and clears it; for the feed, only restarting the application will.",
 				what, time.Since(started).Round(time.Second))
 			arm()
 		})

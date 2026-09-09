@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -366,6 +367,65 @@ func TestDefaultPictureChildCommandRefusesToLaunchATestBinary(t *testing.T) {
 		if isGoTestBinary(name) {
 			t.Errorf("isGoTestBinary(%q) = true, want false", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The remembered window placement
+// ---------------------------------------------------------------------------
+
+func TestPicturePlacementRoundTripsThroughItsFile(t *testing.T) {
+	// A Refresh is a new process. The only way the picture comes back where the
+	// operator left it is through this file, so what goes in must come out.
+	redirectAppDataForTest(t)
+	path, err := picturePlacementPath()
+	if err != nil {
+		t.Fatalf("picturePlacementPath() error = %v", err)
+	}
+	if filepath.Base(filepath.Dir(path)) != "WSLComms" {
+		t.Fatalf("the placement file is at %q, want it beside config.json in the WSLComms directory", path)
+	}
+
+	if got := loadPicturePlacement(path); got != nil {
+		t.Fatalf("loadPicturePlacement() on a fresh directory = %+v, want nil (let the shell place it)", *got)
+	}
+
+	want := gst.PictureWindowPlacement{Left: 120, Top: 80, Right: 1080, Bottom: 620, Maximised: true}
+	if err := savePicturePlacement(path, want); err != nil {
+		t.Fatalf("savePicturePlacement() error = %v", err)
+	}
+	got := loadPicturePlacement(path)
+	if got == nil || *got != want {
+		t.Fatalf("loadPicturePlacement() = %+v, want %+v", got, want)
+	}
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the temporary file was left behind (stat error = %v)", err)
+	}
+
+	// Overwritten in place: the next gesture replaces the last, and only the
+	// most recent placement is what the next process should use.
+	want2 := gst.PictureWindowPlacement{Left: 0, Top: 0, Right: 640, Bottom: 360}
+	if err := savePicturePlacement(path, want2); err != nil {
+		t.Fatalf("second savePicturePlacement() error = %v", err)
+	}
+	if got := loadPicturePlacement(path); got == nil || *got != want2 {
+		t.Fatalf("loadPicturePlacement() after a second save = %+v, want %+v", got, want2)
+	}
+}
+
+func TestPicturePlacementIgnoresWhatItCannotRead(t *testing.T) {
+	// An empty path (the config directory could not be resolved) and a file
+	// that is not JSON both mean "no remembered placement", never a refusal to
+	// open the picture.
+	if got := loadPicturePlacement(""); got != nil {
+		t.Fatalf("loadPicturePlacement(\"\") = %+v, want nil", *got)
+	}
+	path := filepath.Join(t.TempDir(), picturePlacementFile)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadPicturePlacement(path); got != nil {
+		t.Fatalf("loadPicturePlacement() on garbage = %+v, want nil", *got)
 	}
 }
 

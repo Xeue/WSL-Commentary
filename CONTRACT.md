@@ -81,7 +81,7 @@ these are the ones that change what a package may assume:
 | `CONTRACT.md` | **WP-0** | this file |
 | `main.go`, `main_nocgo.go`, `app.go`, `exit_windows.go` | **WP-8** | Wails bindings, wire-up, events, lifecycle, the hard-exit path |
 | `app_remote.go` (and `app_remote_test.go`) | **WP-8 — added 2026-08-12, reworked to the fully-open posture 2026-08-12** | the App-side of the LAN bridge: the hand-written allowlist that implements `remote.Dispatcher` (method → host-only; no capability tiers, the listener is unauthenticated), the audit log, mixer arm-ownership routing, the two host-only remote-admin bound methods (`GetRemoteState`, `SetRemoteListener`), and the listener's startup/teardown wiring. The transport it drives is `internal/remote` (WP-REMOTE). |
-| `app_picture.go` | **WP-P** | the SRT picture's bound surface, the native overlay, the `picture` event |
+| `app_picture.go`, `app_picture_child.go` | **WP-P** | the SRT picture's bound surface, the picture PROCESS (parent and child halves), the `picture` event |
 | `app_return.go` | **WP-R** | the SRT audio return's bound surface and the `return` event |
 | `app_mixer.go` | **WP-8** | the mixer drawer's bound surface: snapshot, arm/disarm, send, golden |
 | `app_presets.go`, `internal/presets/`, `frontend/src/ui/presets.js` (and their tests) | **WP-PRESETS** | the M2L-X instance presets: whitelist, file store, credential-scope decorator, bound surface, picker model |
@@ -89,7 +89,7 @@ these are the ones that change what a package may assume:
 | `internal/secrets/` | **WP-1** | Windows Credential Manager: `WSLComms/m2lx`, `WSLComms/srt`, `WSLComms/srtreturn` |
 | `internal/m2lx/` | **WP-2** | sign-in, token refresh, status WebSocket, the snapshot/delta document, 4 s debounce, 15 s staleness |
 | `internal/gst/gst*.go` | **WP-3a** | the contribution pipeline, device monitor, sink swap, **and the stub twin** |
-| `internal/gst/picture*.go`, `overlay_*.go` | **WP-P** | the SRT picture pipeline and the native child window |
+| `internal/gst/picture*.go`, `picturewindow_*.go`, `overlay_*.go` | **WP-P** | the SRT picture pipeline, the picture process's own window, and the preview's native child window |
 | `internal/gst/return*.go` | **WP-R** | the SRT audio return pipeline and `ListOutputDevices` |
 | `internal/sender/` | **WP-3b** | spec §6 in full: timestamp pinning, reconnect state machine, backoff ladder |
 | `internal/kvs/` | **WP-4** | M2L-X → Cognito credential chain |
@@ -739,7 +739,9 @@ take the width from `CaptureOpts.OnInputChannels(deviceKey, width)` and must not
 `PictureMonitor` with `Start(PictureOpts)` / `Stop()` / `States()`, `NewPictureMonitor()`,
 `PictureState` (`stopped` / `connecting` / `showing` / `backoff` — **lowercase**, and those strings
 reach the page), `PictureRect` and `ScaleRect`, `PictureBackoffLadder` / `PictureBackoffCap`, and
-the `PictureOverlay` native child window.
+the `PictureWindow` top-level window the picture process renders into (with `PictureWindowPlacement`,
+remembered across processes so a Refresh puts the window back where it was). `PictureOverlay` is the
+native child window the DeckLink PREVIEW still uses; the picture no longer does.
 
 - **A monitor is single-use.** After `Stop` its state channel is closed; build another.
 - **`Play` waits for a decoded frame, not for `PLAYING`.** `srtsrc` connects lazily on a streaming

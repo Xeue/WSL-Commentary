@@ -24,11 +24,20 @@ type PictureWindow interface {
 	Handle() uintptr
 	Closed() <-chan struct{}
 	Close() error
+	Placement() (PictureWindowPlacement, bool)
+}
+
+// PictureWindowPlacement is where the picture window sits on the desktop. See
+// picturewindow_windows.go; here it is only a shape the picture process can
+// save and load, so that its file format does not depend on the platform.
+type PictureWindowPlacement struct {
+	Left, Top, Right, Bottom int32
+	Maximised                bool
 }
 
 // NewPictureWindow always fails in this build. The message names the platform
 // because it is the platform, not a build option, that is missing the window.
-func NewPictureWindow(_ string) (PictureWindow, error) {
+func NewPictureWindow(_ string, _ *PictureWindowPlacement, _ func(PictureWindowPlacement)) (PictureWindow, error) {
 	return nil, errors.New("gst: the picture's own window is implemented on Windows only; on " +
 		runtime.GOOS + " the picture process has no window to render into yet")
 }

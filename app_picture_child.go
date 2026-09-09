@@ -72,6 +72,7 @@ import (
 	"sync"
 	"time"
 
+	"wslcomms/internal/config"
 	"wslcomms/internal/gst"
 )
 
@@ -183,6 +184,68 @@ func pictureChildCommand(exe string) *exec.Cmd {
 func isGoTestBinary(exe string) bool {
 	base := strings.ToLower(filepath.Base(exe))
 	return strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe")
+}
+
+// ---------------------------------------------------------------------------
+// Where the picture window was: remembered across processes
+// ---------------------------------------------------------------------------
+
+// picturePlacementFile sits beside config.json in %APPDATA%\WSLComms. It is
+// its own file rather than a config field because it is written by the picture
+// PROCESS, on the operator's every drag, and config.json is the application's
+// to write; two processes writing one file is a corrupted file eventually.
+const picturePlacementFile = "picture-window.json"
+
+// picturePlacementPath is %APPDATA%\WSLComms\picture-window.json, resolved the
+// way config.Path resolves config.json so the two always sit together — and so
+// the tests' APPDATA redirection covers this file too.
+func picturePlacementPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("wslcomms: resolving the user config directory: %w", err)
+	}
+	return filepath.Join(dir, config.AppDataDirName, picturePlacementFile), nil
+}
+
+// loadPicturePlacement reads the remembered placement, or returns nil when
+// there is none, the path is empty, or the file is not readable: every one of
+// those means "let the shell place the window", which is not an error.
+func loadPicturePlacement(path string) *gst.PictureWindowPlacement {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var p gst.PictureWindowPlacement
+	if err := json.Unmarshal(data, &p); err != nil {
+		log.Printf("wslcomms: picture process: ignoring an unreadable %s: %v", picturePlacementFile, err)
+		return nil
+	}
+	return &p
+}
+
+// savePicturePlacement writes the placement atomically: to a sibling temp file,
+// then renamed over the real one, so a kill mid-write leaves the previous
+// placement rather than half a file.
+func savePicturePlacement(path string, p gst.PictureWindowPlacement) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (m *childPictureMonitor) States() <-chan gst.PictureState { return m.states }
@@ -481,8 +544,24 @@ func runPictureChildAndExit(gstInitErr error) {
 	}
 
 	// A window of this process's own. Titled so it can be found on a taskbar
-	// full of things during a match.
-	win, err := gst.NewPictureWindow(windowTitle + " — Programme")
+	// full of things during a match, and put back WHERE THE OPERATOR LEFT IT:
+	// a Refresh is a new process, and a picture that came back at a default
+	// position on every press would make the button cost a drag each time.
+	// The placement is remembered by this process on every move, resize,
+	// maximise and restore, so even a kill loses at most the last gesture.
+	placementPath, err := picturePlacementPath()
+	if err != nil {
+		log.Printf("wslcomms: picture process: the window placement will not be remembered: %v", err)
+	}
+	win, err := gst.NewPictureWindow(windowTitle+" — Programme", loadPicturePlacement(placementPath),
+		func(p gst.PictureWindowPlacement) {
+			if placementPath == "" {
+				return
+			}
+			if err := savePicturePlacement(placementPath, p); err != nil {
+				log.Printf("wslcomms: picture process: remembering the window placement: %v", err)
+			}
+		})
 	if err != nil {
 		fatal(err)
 	}

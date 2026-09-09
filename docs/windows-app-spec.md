@@ -424,15 +424,19 @@ the deltas overshoot the nominal setting differences. The *negotiated* latency w
 `GST_DEBUG=srtobject:7` prints it — so this is inferred from end-to-end timing rather than read off
 the socket. See §14.
 
-**The overlay.** The decoded picture goes into a native child window owned by this process, placed
-over the WebView2. The page sends the rectangle it wants **in CSS pixels together with the
-`window.devicePixelRatio` it measured them with**, in one call, and Go multiplies. Reading the DPI on
-the Go side instead would be a different number measured at a different moment:
-`GetDpiForWindow` is the monitor's scale factor, equal to the WebView's device pixel ratio only at
-100% zoom, and Ctrl+scroll changes one and not the other. Edges are rounded rather than position and
-size independently, because truncation shows up as a one-pixel seam against black. The overlay is
-opaque, and is shown only when the page has asked for it **and** there are frames to put in it: a
-black rectangle over the fallback mosaic is worse than the mosaic.
+**The picture window, in its own process (1.6.0).** The decoded picture goes into a top-level window
+owned by a CHILD PROCESS — this same executable relaunched with `WSLCOMMS_PICTURE_CHILD` set — not
+into the application's window. The application hands the child its options (host, port, latency,
+key length, and the passphrase, which travels on stdin and nowhere else) and reads its states back
+as lines; closing the child's stdin ends it, so a parent that dies cannot orphan it. A decoder, a
+GPU driver or a libsrt socket that wedges inside the child is one `TerminateProcess` away from gone,
+with the contribution feed and the audio untouched: the **Refresh** button on the home screen is
+exactly that — stop, kill if it will not stop, start a fresh process. The window is movable,
+resizable and closable by the operator, and it comes back where it was left, because the child
+remembers its placement in `%APPDATA%WSLCommspicture-window.json` on every move, resize,
+maximise and restore. The page never covers or positions it. (Before 1.6.0 the picture was a native
+child window painted over the WebView2, positioned by the page in CSS pixels plus its device pixel
+ratio; that mechanism survives only for the DeckLink preview.)
 
 **The mosaic remains, as the fallback.** SRT is a real network stream to a native decoder; it takes a
 moment to dial, it can be refused, and the M2L-X output can be switched off by somebody else. When it
@@ -825,8 +829,9 @@ describes an encrypted audio return also describes the picture.
 
 ## 10. UI
 
-One window. The picture fills the top: the native SRT overlay when it is showing, the CSS-cropped
-mosaic underneath it otherwise, with the screen saying which. Below it, the device and return
+One application window, plus the picture process's own window when SRT is up. The application
+window's tile always shows the CSS-cropped mosaic, with a badge saying whether the high-resolution
+SRT picture is up in its own window or the mosaic is all there is. Below it, the device and return
 controls, the START/STOP button and the five lamps. A Settings screen (same window, swapped view)
 holds §9 and the mixer drawer.
 
