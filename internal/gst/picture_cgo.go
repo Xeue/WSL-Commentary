@@ -552,6 +552,13 @@ type picturePipeline struct {
 	reinjectProbeID uint32
 	paramCache      *h265ParamCache
 
+	// The transport-packet repair on srtsrc's src pad — tsrepair.go, the fix
+	// for the tear — kept so teardown can remove it, and its running count for
+	// the stats line. Zero/nil when off (WSLCOMMS_PIC_TSREPAIR=0).
+	tsRepairPad     gogst.Pad
+	tsRepairProbeID uint32
+	tsRepairs       atomic.Uint64
+
 	// fakeSeq numbers the fakesinks so that no two can ever be given the same
 	// element name. It is an atomic rather than a padMu-guarded counter because
 	// it is incremented on the demuxer's streaming thread and read nowhere else;
@@ -1121,6 +1128,13 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 		return err
 	}
 
+	// The transport-packet repair, on srtsrc's src pad, upstream of tsdemux.
+	// See tsrepair.go: the muxer's zero-payload packet costs two pictures each
+	// unless it is made compliant before the demuxer counts it.
+	if err := p.installTSRepair(); err != nil {
+		return err
+	}
+
 	// sync=false. THE SINGLE BIGGEST THING THIS PIPELINE DOES ABOUT LATENCY, and
 	// the whole argument for it — including the measured 993.7 ms it removes, and
 	// the one condition under which it becomes wrong again — is at
@@ -1615,7 +1629,8 @@ func (p *picturePipeline) startStatsLogger() {
 				return
 			case <-ticker.C:
 				if s := p.srtStatsString(); s != "" {
-					log.Printf("gst: picture monitor: srt stats: %s", s)
+					log.Printf("gst: picture monitor: srt stats: %s; zero-payload TS packets repaired: %d",
+						s, p.tsRepairs.Load())
 				}
 			}
 		}
@@ -1679,6 +1694,10 @@ func (p *picturePipeline) teardownLocked() error {
 		p.reinjectPad.RemoveProbe(p.reinjectProbeID)
 	}
 	p.reinjectProbeID = 0
+	if p.tsRepairPad != nil && p.tsRepairProbeID != 0 {
+		p.tsRepairPad.RemoveProbe(p.tsRepairProbeID)
+	}
+	p.tsRepairProbeID = 0
 
 	var err error
 	if p.pipeline != nil {
@@ -1701,6 +1720,7 @@ func (p *picturePipeline) teardownLocked() error {
 	p.queuePad = nil
 	p.reinjectPad = nil
 	p.paramCache = nil
+	p.tsRepairPad = nil
 	p.decode = nil
 	p.decSrcPad = nil
 	p.sink = nil
@@ -1747,6 +1767,33 @@ func (p *picturePipeline) teardownLocked() error {
 // never loses the state it is a near no-op: the cache warms once at the first IDR
 // and thereafter every picture already carries its sets, so rewrite changes
 // nothing and the original buffer flows on untouched.
+// installTSRepair puts RepairZeroPayloadPackets on srtsrc's src pad, so that
+// every transport packet is compliant before tsdemux counts it. tsrepair.go
+// has the measurement and the mechanism: forty times a minute the M2L-X muxer
+// emits a packet that claims a payload and has none, tsdemux skips it without
+// advancing its continuity counter, reads the next picture's first packet as
+// a discontinuity, and throws away two pictures. ON by default;
+// WSLCOMMS_PIC_TSREPAIR = 0 | off | false | no disables it for an A/B without
+// a rebuild. It runs on both decode paths — the fault is at the demuxer.
+func (p *picturePipeline) installTSRepair() error {
+	switch strings.ToLower(os.Getenv("WSLCOMMS_PIC_TSREPAIR")) {
+	case "0", "off", "false", "no":
+		log.Printf("gst: picture monitor: transport-packet repair is OFF (WSLCOMMS_PIC_TSREPAIR)")
+		return nil
+	}
+	pad := p.src.GetStaticPad("src")
+	if pad == nil {
+		return errors.New("gst: picture monitor: " + namePicSrc + " has no src pad for the transport-packet repair")
+	}
+	id := pad.AddProbe(gogst.PadProbeTypeBuffer, tsRepairProbe(&p.tsRepairs))
+	if id == 0 {
+		return errors.New("gst: picture monitor: could not add the transport-packet repair probe to " + namePicSrc)
+	}
+	p.tsRepairPad, p.tsRepairProbeID = pad, id
+	log.Printf("gst: picture monitor: transport-packet repair is on (%s:src)", namePicSrc)
+	return nil
+}
+
 func (p *picturePipeline) installParamReinject() error {
 	switch strings.ToLower(os.Getenv("WSLCOMMS_PIC_REINJECT_PARAMS")) {
 	case "0", "off", "false", "no":

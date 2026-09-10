@@ -42,6 +42,7 @@ type DiagnosticResult struct {
 	Stages     []DiagnosticStage
 	Bus        map[string]uint64
 	Errors     []string
+	Repaired   uint64
 }
 
 // Decoded is the decoded-frame count (the last stage), or 0.

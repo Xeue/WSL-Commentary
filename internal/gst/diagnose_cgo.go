@@ -50,6 +50,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gogst "github.com/go-gst/go-gst/pkg/gst"
@@ -99,6 +100,10 @@ type diag struct {
 
 	done     chan struct{} // closed on EOS, so a file replay stops when it ends
 	doneOnce sync.Once
+
+	// repaired counts the transport packets tsRepairProbe rewrote before
+	// tsdemux (tsrepair.go); zero when WSLCOMMS_DIAGNOSE_TSREPAIR=0.
+	repaired atomic.Uint64
 }
 
 // RunPipelineDiagnostic builds and runs the instrumented picture pipeline against
@@ -182,6 +187,10 @@ func RunPipelineDiagnosticResult(uri string, dur time.Duration, decoderFactory s
 		if err := setStringProperty(src, "location", uri); err != nil {
 			return none, fmt.Errorf("gst: diagnose: %w", err)
 		}
+		// Whole packets per buffer, as srtsrc delivers them: the repair probe
+		// below works on a 188-byte grid, and filesrc's default block would
+		// split packets across buffers.
+		gogst.UtilSetObjectArg(src, "blocksize", strconv.Itoa(64*tsRepairPacketSize))
 	} else {
 		// srtsrc configured as the app configures it, so reception is comparable.
 		if err := setStringProperty(src, "uri", uri); err != nil {
@@ -256,6 +265,17 @@ func RunPipelineDiagnosticResult(uri string, dur time.Duration, decoderFactory s
 	}
 	if err := tap(dec, "src", sDec); err != nil {
 		return none, err
+	}
+
+	// The transport-packet repair (tsrepair.go), exactly as the picture path
+	// applies it, so this dissection measures what the application decodes.
+	// WSLCOMMS_DIAGNOSE_TSREPAIR=0 leaves the packets as they came, for the A/B.
+	switch strings.ToLower(os.Getenv("WSLCOMMS_DIAGNOSE_TSREPAIR")) {
+	case "0", "off", "false", "no":
+	default:
+		if spad := src.GetStaticPad("src"); spad != nil {
+			spad.AddProbe(gogst.PadProbeTypeBuffer, tsRepairProbe(&d.repaired))
+		}
 	}
 
 	// Optional: exercise the shipping parameter re-injection surgery on real
@@ -364,6 +384,10 @@ type DiagnosticResult struct {
 
 	// Errors are the bus ERROR messages, verbatim, at most twenty.
 	Errors []string
+
+	// Repaired is how many zero-payload transport packets were made compliant
+	// before tsdemux (tsrepair.go).
+	Repaired uint64
 }
 
 // Decoded is the decoded-frame count (the last stage), or 0.
@@ -406,6 +430,7 @@ func (d *diag) result(uri string, dur, elapsed time.Duration, endedEarly bool, d
 		EndedEarly: endedEarly,
 		Bus:        make(map[string]uint64, len(d.msgs)),
 		Errors:     append([]string(nil), d.errs...),
+		Repaired:   d.repaired.Load(),
 	}
 	for k, v := range d.msgs {
 		res.Bus[k] = v
@@ -583,7 +608,9 @@ func (d *diag) report(uri string, dur, elapsed time.Duration, endedEarly bool, d
 		how = "ended early: end of stream or a pipeline error"
 	}
 	fmt.Fprintf(&b, "ran    : %s of %s requested (%s)\n", elapsed.Round(time.Millisecond), dur.Round(time.Millisecond), how)
-	fmt.Fprintf(&b, "decoder: %s\n\n", decoder)
+	fmt.Fprintf(&b, "decoder: %s\n", decoder)
+	fmt.Fprintf(&b, "repair : zero-payload TS packets made compliant before tsdemux: %d (WSLCOMMS_DIAGNOSE_TSREPAIR=0 to leave them)\n\n",
+		d.repaired.Load())
 
 	fmt.Fprintf(&b, "--- per-stage buffer flow ---\n")
 	for _, st := range d.stages {

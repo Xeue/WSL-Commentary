@@ -38,6 +38,38 @@ local listener; skips the "close the app" wait), `WSLCOMMS_RIG_OUT` (folder inst
 local `gst-launch-1.0 ... srtsink mode=listener` replaying a real HEVC capture: all four readings,
 the zip, Explorer.
 
+## 0b. RESULT — root cause found and fixed (2026-09-10, from the first rig zip, COMM-01)
+
+The four readings on COMM-01 (Core 5 120U, no hardware HEVC, 7.8 GB with 1.4 GB free):
+
+1. Probe: 16.09 Mbit/s, video PID 0x0041 HEVC, **1** real hole in 59 s, 0 flagged, DTS monotonic.
+2. Live, `avdec_h265`: 47.8 fps, **0 CORRUPTED**, but **32 tsdemux continuity mismatches** in 60 s.
+3. File replay, `avdec_h265`: **361 fps flat out** — software decode has 7x headroom; 41 mismatches.
+4. `d3d11h265dec`: not creatable (no hardware decoder, as known).
+
+So the bytes arrive intact, the decoder is fast enough, and yet tsdemux reports a "hole" ~40 times a
+minute in bytes two independent parsers call continuous — and the same replay on the dev box gave
+the identical numbers (252 `Could not find ref`, 2820 of 2955 pictures). The fault travels with the
+bytes and the pipeline, on every machine. Scanning the capture found it: **40 packets on the video
+PID with `adaptation_field_control=0b11` and `adaptation_field_length=183` — a payload flag and
+zero payload bytes** — one before each of 40 pictures' first packet, counted by the muxer, skipped by
+tsdemux, so the next packet reads as a skip; tsdemux's reaction (`gst_ts_demux_handle_packet`) frees
+the finished picture it was holding and ignores the packet starting the next one. Two pictures lost
+per event, then `Could not find ref` until the next IDR (GOP 10 frames = 0.2 s): the grey/green
+garbage that "cleans up at the next keyframe", forty times a minute.
+
+**Fix (1.6.3, `internal/gst/tsrepair.go`):** on `srtsrc`'s src pad, rewrite that packet to length
+182 plus one `0x00` payload byte (a legal trailing zero in Annex B). Proved on COMM-01's bytes through
+the app's own dissector: repair on → 40 repaired, 2896 decoded, 0 reference errors, 0 video
+mismatches; repair off → 2820 decoded, 252 reference errors, 41 mismatches. A/B in the field:
+`WSLCOMMS_PIC_TSREPAIR=0`. The dissector (and so the rig) reports "zero-payload TS packets made
+compliant before tsdemux: N"; the app's srt stats line carries the running count.
+
+What the earlier theories got wrong, for the record: SRT loss (there was none — the stats were right),
+frame threading, parser-state resets (the rare bursts are the JOIN before the first SPS/PPS, ~1.1 s,
+and are benign), the 120U's decode (361 fps), Parsec, memory. The one instrument that could see it was
+the continuity counter read by TWO parsers that disagreed about the same bytes.
+
 ## 1. What we know (evidence, not theory)
 
 - **Symptom:** COMM-01 (Dell Pro 14, Intel Core 5 120U = 2 P + 8 E cores, no hardware HEVC — Dell fused it off; Parsec remote) tears the software-HEVC picture "on and off indefinitely", persistently, never fully losing picture. The SAME MatchG H.265 1080p50 stream decodes clean on the dev box and under every software-avdec stress test there.

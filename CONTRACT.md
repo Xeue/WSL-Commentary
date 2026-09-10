@@ -760,6 +760,22 @@ from the network.
 - **`Stop` does not destroy the window.** The window outlives the monitor.
 - `ErrAbandonedThread` is a sentinel, not a sentence: `App.teardown` tests for it with `errors.Is`
   and ends the process with `TerminateProcess` rather than running DLL detach over a killed thread.
+- **The M2L-X muxer emits a packet tsdemux cannot count, and the picture path repairs it before
+  tsdemux sees it** (`tsrepair.go`, on `srtsrc`'s src pad; `WSLCOMMS_PIC_TSREPAIR=0` for an A/B).
+  Measured 2026-09-10 on COMM-01's own 59 s capture of the MatchG return: forty times a minute, in
+  the packet before a picture's payload_unit_start, the video PID carries
+  `adaptation_field_control=0b11` with `adaptation_field_length=183` — a payload flag and zero
+  payload bytes, which 13818-1 2.4.3.4 forbids — and the muxer advances the continuity counter for
+  it. mpegtspacketizer leaves such a packet with nothing to handle, tsdemux never advances its
+  counter, the next packet reads as `CONTINUITY: Mismatch packet 11, stream 9`, and
+  `gst_ts_demux_handle_packet`'s reaction frees the completed picture it was holding AND ignores the
+  packet that starts the next one: two pictures gone, every picture until the next IDR then fails
+  its reference (`Could not find ref with POC`) and decodes as grey/green garbage. That was the
+  persistent tear, on every laptop, with SRT reporting zero loss because nothing was lost. The repair
+  is two bytes: length 182 and one `0x00` payload byte (`trailing_zero_8bits` in Annex B). Same
+  bytes, same pipeline: 252 reference errors and 2820 of 2955 pictures without it; 0 and 2896 with
+  it (the rest is the join before the first parameter sets). The dissector applies it too and
+  reports the count (`WSLCOMMS_DIAGNOSE_TSREPAIR=0` to leave the packets alone).
 
 ### `internal/gst` — the SRT audio return — WP-R
 `ReturnMonitor` with the same shape, `ReturnState` (`STOPPED` / `CONNECTING` / `PLAYING` /

@@ -180,6 +180,7 @@ type rigDissect struct {
 	Gap        uint64
 	Continuity uint64 // tsdemux CONTINUITY mismatches on the bus
 	Broken     uint64 // h265parse broken/invalid drops on the bus
+	Repaired   uint64 // zero-payload transport packets made compliant before tsdemux (tsrepair.go)
 	Errors     []string
 	Err        string // the dissection itself failed (no decoder, no connection)
 	Report     string // the dissector's own text
@@ -206,6 +207,7 @@ func rigDissectFrom(label, decoder string, res gst.DiagnosticResult) rigDissect 
 		Broken:     res.BusMatching("broken/invalid"),
 		Errors:     res.Errors,
 		Report:     res.Report,
+		Repaired:   res.Repaired,
 	}
 	if len(res.Stages) > 0 {
 		d.Received = res.Stages[0].Buffers
@@ -231,9 +233,9 @@ func (d rigDissect) line() string {
 	}
 	return fmt.Sprintf("%s: decoded %d frames in %s%s = %.1f fps; CORRUPTED frames %d; "+
 		"demux DISCONT %d, GAP %d; tsdemux continuity mismatches %d; h265parse broken/invalid %d; "+
-		"raw buffers %d -> demuxed %d -> parsed AUs %d",
+		"zero-payload packets repaired %d; raw buffers %d -> demuxed %d -> parsed AUs %d",
 		d.Label, d.Decoded, d.Elapsed.Round(time.Millisecond), how, d.FPS(), d.Corrupted,
-		d.Discont, d.Gap, d.Continuity, d.Broken, d.Received, d.Demuxed, d.Parsed)
+		d.Discont, d.Gap, d.Continuity, d.Broken, d.Repaired, d.Received, d.Demuxed, d.Parsed)
 }
 
 // rig is one run.
@@ -808,6 +810,9 @@ func rigFindings(probe *tsprobe.Summary, live, fileAV, fileHW *rigDissect) []str
 		}
 		if live.Broken > 0 {
 			out = append(out, fmt.Sprintf("h265parse dropped %d broken/invalid NALs live (the rare parser-state burst).", live.Broken))
+		}
+		if live.Repaired > 0 {
+			out = append(out, fmt.Sprintf("%d zero-payload transport packets were made compliant before the demuxer in the live run — the M2L-X muxer packet that cost two pictures each before 1.6.3 (tsrepair.go).", live.Repaired))
 		}
 		if live.Decoded > 0 && live.FPS() < rigStreamFPS*0.9 {
 			out = append(out, fmt.Sprintf("Live, the decoder produced %.1f fps over the run against %.0f expected: it fell behind real time.", live.FPS(), rigStreamFPS))
