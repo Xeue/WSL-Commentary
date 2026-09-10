@@ -82,7 +82,7 @@ func TestSeedBuiltinPresets_CreatesTheSevenFacilityInstances(t *testing.T) {
 		}
 		presetFieldString(t, p, "m2lxHost", tc.host)
 		presetFieldString(t, p, "alias", tc.alias)
-		presetFieldString(t, p, "statusKey", "cam4")
+		presetFieldString(t, p, "statusKey", "MIC 1")
 		// Two audio-only outputs per instance since 1.6.2: the same encode to
 		// 40901 and 40902. videoSource "none" is the one machine-classed value
 		// a preset may carry (presets.travelsAsInstance).
