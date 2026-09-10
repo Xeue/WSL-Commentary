@@ -843,6 +843,16 @@ input[type='range'] {
   align-self: flex-start;
 }
 
+/* The two kicks side by side: Refresh picture, Restart monitor — on the card,
+   in the rail group, and on a remote seat's Picture section. */
+.monitor-card-actions,
+.desk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 .control-group-monitor {
   flex: 1 1 100%;
 }

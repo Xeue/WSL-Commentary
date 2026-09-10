@@ -1074,8 +1074,9 @@ func assertBoundSurface(t *testing.T) {
 		"GetReturnState":      true,
 		"IsSRTReturnSelected": true,
 
-		"RestartMonitor":  true,
-		"GetMonitorState": true,
+		"RestartMonitor":        true,
+		"RefreshMonitorPicture": true,
+		"GetMonitorState":       true,
 
 		"ListPresets":               true,
 		"SavePreset":                true,

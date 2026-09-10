@@ -182,6 +182,7 @@ func TestSeedBuiltinPresets_UpgradesUneditedBuiltinValuesAndKeepsEdits(t *testin
 		t.Fatalf("Load matchg: %v", err)
 	}
 	old.Fields["srtPort"] = json.RawMessage(`40004`)
+	old.Fields["statusKey"] = json.RawMessage(`"cam4"`)
 	delete(old.Fields, "srtSecondPort")
 	delete(old.Fields, "videoSource")
 	if err := presets.Save(old); err != nil {
@@ -193,6 +194,7 @@ func TestSeedBuiltinPresets_UpgradesUneditedBuiltinValuesAndKeepsEdits(t *testin
 		t.Fatalf("Load matchh: %v", err)
 	}
 	edited.Fields["srtPort"] = json.RawMessage(`41234`)
+	edited.Fields["statusKey"] = json.RawMessage(`"cam9"`)
 	delete(edited.Fields, "srtSecondPort")
 	if err := presets.Save(edited); err != nil {
 		t.Fatalf("Save matchh with an operator's port: %v", err)
@@ -207,6 +209,9 @@ func TestSeedBuiltinPresets_UpgradesUneditedBuiltinValuesAndKeepsEdits(t *testin
 	presetFieldInt(t, g, "srtPort", 40901)
 	presetFieldInt(t, g, "srtSecondPort", 40902)
 	presetFieldString(t, g, "videoSource", "none")
+	// The status key moved from the router input to the first mic input on
+	// 2026-09-10; a preset still saying cam4 follows, one the operator set does not.
+	presetFieldString(t, g, "statusKey", "MIC 1")
 
 	h, err := presets.Load("matchh")
 	if err != nil {
@@ -214,4 +219,5 @@ func TestSeedBuiltinPresets_UpgradesUneditedBuiltinValuesAndKeepsEdits(t *testin
 	}
 	presetFieldInt(t, h, "srtPort", 41234)
 	presetFieldInt(t, h, "srtSecondPort", 40902)
+	presetFieldString(t, h, "statusKey", "cam9")
 }

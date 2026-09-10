@@ -313,7 +313,7 @@ func TestTheMonitorReachesTheAllowlistAndNothingHostOnly(t *testing.T) {
 	if _, ok := v.(*config.Config); !ok {
 		t.Fatalf("GetConfig over the link returned %T", v)
 	}
-	if _, err := a.monitorDispatch(context.Background(), "RestartMonitor", nil); err == nil ||
+	if _, err := a.monitorDispatch(context.Background(), "StopReturn", nil); err == nil ||
 		!strings.Contains(err.Error(), "host-only") {
 		t.Fatalf("a host-only method was reachable from the monitor: err = %v", err)
 	}
@@ -463,4 +463,35 @@ func waitForCond(t *testing.T, what string, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestRefreshMonitorPictureKicksARunningMonitorAndOpensAClosedOne(t *testing.T) {
+	a, _ := newTestApp(t)
+	silencePump(a)
+	made := withFakeMonitors(a)
+
+	// Nothing running: the refresh opens a monitor, the kick from further back.
+	if err := a.RefreshMonitorPicture(); err != nil {
+		t.Fatalf("RefreshMonitorPicture() with no monitor: %v", err)
+	}
+	waitForCond(t, "a monitor to be running", func() bool {
+		return len(made()) == 1 && a.GetMonitorState().Process == monitorProcessRunning
+	})
+
+	// Running: the refresh is an event to its page — and no second process.
+	if err := a.RefreshMonitorPicture(); err != nil {
+		t.Fatalf("RefreshMonitorPicture() with a monitor: %v", err)
+	}
+	waitForCond(t, "the refresh event to reach the monitor", func() bool {
+		for _, n := range made()[0].sentNames() {
+			if n == EventMonitorRefresh {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(50 * time.Millisecond)
+	if n := len(made()); n != 1 {
+		t.Fatalf("%d monitors launched, want 1: a refresh is an event, not a restart", n)
+	}
 }

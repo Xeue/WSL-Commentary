@@ -221,6 +221,7 @@ export function mountApp(root) {
     onMuteLatchToggle: () => coughMute.toggleLatch(),
     onCoughModeChange: onCoughModeChange,
     onRestartMonitor: onRestartMonitor,
+    onRefreshDeskPicture: onRefreshDeskPicture,
   };
   const home = monitorMode
     ? createMonitorView(viewHandlers)
@@ -879,6 +880,29 @@ export function mountApp(root) {
     } catch (err) {
       home.showError(`Could not restart the PGM monitor: ${err?.message || err}`);
     }
+  }
+
+  /**
+   * onRefreshDeskPicture is the "Refresh picture" button OUTSIDE the monitor
+   * window — this window's card, a remote seat's browser: the desk's PGM
+   * monitor is asked to run its own Refresh (an event to its page, see
+   * App.RefreshMonitorPicture), or is opened if it is not running.
+   */
+  async function onRefreshDeskPicture() {
+    try {
+      await backend.refreshMonitorPicture();
+    } catch (err) {
+      home.showError(`Could not refresh the PGM monitor's picture: ${err?.message || err}`);
+    }
+  }
+
+  // The desk's, or a remote seat's, "Refresh picture" arrives HERE, in the
+  // monitor window only (App.RefreshMonitorPicture sends it over the link),
+  // and runs exactly this window's own Refresh button.
+  if (monitorMode) {
+    backend.onMonitorRefresh(() => {
+      onPictureRefresh();
+    });
   }
 
   backend.onSender((state) => {

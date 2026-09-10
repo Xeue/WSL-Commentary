@@ -1734,6 +1734,7 @@ export function fakePictureOverlay() {
 const MONITOR_METHODS = Object.freeze({
   state: 'GetMonitorState',
   restart: 'RestartMonitor',
+  refresh: 'RefreshMonitorPicture',
 });
 const MONITOR_METHOD_NAMES = Object.freeze(Object.values(MONITOR_METHODS));
 
@@ -1783,6 +1784,29 @@ export async function restartMonitor() {
 /** Subscribes to the "monitor" event. Returns an unsubscribe function. */
 export function onMonitor(cb) {
   return subscribe(EVENT_MONITOR, cb);
+}
+
+/**
+ * The "monitorRefresh" event: App.RefreshMonitorPicture asking the PGM
+ * monitor window to run its own Refresh. It reaches the monitor window only
+ * (app_monitor.go EventMonitorRefresh); the fake backend raises it locally.
+ */
+export const EVENT_MONITOR_REFRESH = 'monitorRefresh';
+
+/** Subscribes to the "monitorRefresh" event. Returns an unsubscribe function. */
+export function onMonitorRefresh(cb) {
+  return subscribe(EVENT_MONITOR_REFRESH, cb);
+}
+
+/**
+ * Asks the PGM monitor window to refresh its picture — the same kick as its
+ * own Refresh button (the mosaic reconnected, the SRT picture restarted,
+ * whichever is showing) — from this window or a remote seat. A monitor that
+ * is not running is opened instead. Nothing about the feed is touched.
+ */
+export async function refreshMonitorPicture() {
+  if (hasWails()) return callGoBound(MONITOR_METHODS.refresh);
+  fakeEmit(EVENT_MONITOR_REFRESH, {});
 }
 
 /**

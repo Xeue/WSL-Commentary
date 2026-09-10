@@ -195,7 +195,8 @@ export const LAMP_NAMES = [
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
- *   onPictureRefresh(), onRestartMonitor(), onLevelChange(fraction), onPresetChange(id),
+ *   onPictureRefresh(), onRestartMonitor(), onRefreshDeskPicture(), onLevelChange(fraction),
+ *   onPresetChange(id),
  *   onMutePress(), onMuteRelease(), onMuteLatchToggle(),
  * }
  *
@@ -600,15 +601,25 @@ export function createHomeView(handlers, viewOpts = {}) {
   const monitorCardText = document.createElement('p');
   monitorCardText.className = 'monitor-card-text';
   monitorCardText.textContent =
-    'The programme picture, the return audio and the input meters are in the PGM Monitor window, ' +
-    'with its own Refresh button. If that window has frozen or stopped answering, restart it here: ' +
-    'it is closed and reopened, and the feed going to air is not touched.';
+    'The programme picture, the return audio and the input meters are in the PGM Monitor window. ' +
+    'Refresh picture asks that window to refresh — the mosaic or the SRT picture, whichever is ' +
+    'showing. If the window has frozen or stopped answering, restart it: it is closed and reopened. ' +
+    'The feed going to air is not touched either way.';
+  const refreshDeskBtn = document.createElement('button');
+  refreshDeskBtn.type = 'button';
+  refreshDeskBtn.className = 'btn btn-ghost monitor-refresh-desk';
+  refreshDeskBtn.textContent = 'Refresh picture';
+  refreshDeskBtn.title = 'The same as the Refresh button in the PGM Monitor window.';
+  refreshDeskBtn.addEventListener('click', () => handlers.onRefreshDeskPicture());
   const restartBtn = document.createElement('button');
   restartBtn.type = 'button';
   restartBtn.className = 'btn btn-primary monitor-restart';
   restartBtn.textContent = 'Restart monitor';
   restartBtn.addEventListener('click', () => handlers.onRestartMonitor());
-  monitorCard.append(monitorCardTitle, monitorCardState, monitorCardText, restartBtn);
+  const monitorCardActions = document.createElement('div');
+  monitorCardActions.className = 'monitor-card-actions';
+  monitorCardActions.append(refreshDeskBtn, restartBtn);
+  monitorCard.append(monitorCardTitle, monitorCardState, monitorCardText, monitorCardActions);
 
   const previewTile = document.createElement('div');
   previewTile.className = 'preview-tile';
@@ -692,12 +703,52 @@ export function createHomeView(handlers, viewOpts = {}) {
   monitorGroup.className = 'control-group control-group-monitor';
   const monitorGroupState = document.createElement('span');
   monitorGroupState.className = 'control-label monitor-group-state';
+  const monitorGroupRefresh = document.createElement('button');
+  monitorGroupRefresh.type = 'button';
+  monitorGroupRefresh.className = 'btn btn-ghost btn-small monitor-refresh-desk';
+  monitorGroupRefresh.textContent = 'Refresh picture';
+  monitorGroupRefresh.title = 'The same as the Refresh button in the PGM Monitor window.';
+  monitorGroupRefresh.addEventListener('click', () => handlers.onRefreshDeskPicture());
   const monitorGroupBtn = document.createElement('button');
   monitorGroupBtn.type = 'button';
   monitorGroupBtn.className = 'btn btn-ghost btn-small monitor-restart';
   monitorGroupBtn.textContent = 'Restart monitor';
   monitorGroupBtn.addEventListener('click', () => handlers.onRestartMonitor());
-  monitorGroup.append(monitorGroupState, monitorGroupBtn);
+  const monitorGroupActions = document.createElement('div');
+  monitorGroupActions.className = 'desk-actions';
+  monitorGroupActions.append(monitorGroupRefresh, monitorGroupBtn);
+  monitorGroup.append(monitorGroupState, monitorGroupActions);
+
+  // THE REMOTE SEAT'S KICK. A seat in another building that sees the desk's
+  // picture go wrong can refresh it — App.RefreshMonitorPicture, an event to
+  // the PGM Monitor window's page, its own Refresh button pressed from afar —
+  // or restart that window outright. Inline mode only: in the application's
+  // own window the card and the group above carry the same two buttons.
+  const deskGroup = document.createElement('div');
+  deskGroup.className = 'control-group control-group-desk';
+  const deskLabel = document.createElement('span');
+  deskLabel.className = 'control-label';
+  deskLabel.textContent = "The desk's PGM monitor";
+  const deskRefresh = document.createElement('button');
+  deskRefresh.type = 'button';
+  deskRefresh.className = 'btn btn-ghost btn-small monitor-refresh-desk';
+  deskRefresh.textContent = 'Refresh desk picture';
+  deskRefresh.title =
+    "Ask the desk's PGM Monitor window to refresh its picture: the same as its own Refresh button. " +
+    'The feed going to air is not touched.';
+  deskRefresh.addEventListener('click', () => handlers.onRefreshDeskPicture());
+  const deskRestart = document.createElement('button');
+  deskRestart.type = 'button';
+  deskRestart.className = 'btn btn-ghost btn-small monitor-restart';
+  deskRestart.textContent = 'Restart desk monitor';
+  deskRestart.title =
+    "Close and reopen the desk's PGM Monitor window, for when it has frozen or stopped answering. " +
+    'The feed going to air is not touched.';
+  deskRestart.addEventListener('click', () => handlers.onRestartMonitor());
+  const deskActions = document.createElement('div');
+  deskActions.className = 'desk-actions';
+  deskActions.append(deskRefresh, deskRestart);
+  deskGroup.append(deskLabel, deskActions);
 
   const startStopBtn = document.createElement('button');
   startStopBtn.type = 'button';
@@ -1023,7 +1074,7 @@ export function createHomeView(handlers, viewOpts = {}) {
     makeRailSection('Session', presetIndicator),
     makeRailSection('Status', lampsEl),
     makeRailSection('Audio', controls),
-    panel ? makeRailSection('Picture', panel.pictureGroup) : makeRailSection('PGM monitor', monitorGroup),
+    panel ? makeRailSection('Picture', panel.pictureGroup, deskGroup) : makeRailSection('PGM monitor', monitorGroup),
     railStrip,
   );
 

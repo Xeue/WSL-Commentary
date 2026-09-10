@@ -559,6 +559,17 @@ type picturePipeline struct {
 	tsRepairProbeID uint32
 	tsRepairs       atomic.Uint64
 
+	// The catch-up (catchup.go): the probe on picq's src pad that drops to the
+	// next keyframe when the decoder falls behind, the queue's native handle
+	// for the fill read, and the totals for the stats line. Zero/nil when off
+	// (WSLCOMMS_PIC_CATCHUP=0).
+	catchUp         *catchUp
+	catchUpQueue    unsafe.Pointer
+	catchUpPad      gogst.Pad
+	catchUpProbeID  uint32
+	catchUpDropped  atomic.Uint64
+	catchUpEpisodes atomic.Uint64
+
 	// fakeSeq numbers the fakesinks so that no two can ever be given the same
 	// element name. It is an atomic rather than a padMu-guarded counter because
 	// it is incremented on the demuxer's streaming thread and read nowhere else;
@@ -1124,6 +1135,12 @@ func (p *picturePipeline) buildLocked(opts PictureOpts) error {
 	// Parameter-set re-injection, on the queue's src pad just upstream of
 	// h265parse. See installParamReinject for what it does and why; it is a near
 	// no-op on a machine that never loses the parser state.
+	// The catch-up, on the same pad, and FIRST: probes run in the order they
+	// were added, and an access unit being dropped must not be rewritten on
+	// its way out. See catchup.go for why the picture must never fall behind.
+	if err := p.installCatchUp(); err != nil {
+		return err
+	}
 	if err := p.installParamReinject(); err != nil {
 		return err
 	}
@@ -1629,8 +1646,8 @@ func (p *picturePipeline) startStatsLogger() {
 				return
 			case <-ticker.C:
 				if s := p.srtStatsString(); s != "" {
-					log.Printf("gst: picture monitor: srt stats: %s; zero-payload TS packets repaired: %d",
-						s, p.tsRepairs.Load())
+					log.Printf("gst: picture monitor: srt stats: %s; zero-payload TS packets repaired: %d; catch-up: skipped %d access units in %d episodes",
+						s, p.tsRepairs.Load(), p.catchUpDropped.Load(), p.catchUpEpisodes.Load())
 				}
 			}
 		}
@@ -1690,6 +1707,10 @@ func (p *picturePipeline) teardownLocked() error {
 	// remove it before the state change, while the queue's src pad still exists and
 	// the ID still names a live probe. RemoveProbe blocks for any in-flight
 	// callback, which is safe from the caller's goroutine.
+	if p.catchUpPad != nil && p.catchUpProbeID != 0 {
+		p.catchUpPad.RemoveProbe(p.catchUpProbeID)
+	}
+	p.catchUpProbeID = 0
 	if p.reinjectPad != nil && p.reinjectProbeID != 0 {
 		p.reinjectPad.RemoveProbe(p.reinjectProbeID)
 	}
@@ -1721,6 +1742,9 @@ func (p *picturePipeline) teardownLocked() error {
 	p.reinjectPad = nil
 	p.paramCache = nil
 	p.tsRepairPad = nil
+	p.catchUpPad = nil
+	p.catchUpQueue = nil
+	p.catchUp = nil
 	p.decode = nil
 	p.decSrcPad = nil
 	p.sink = nil

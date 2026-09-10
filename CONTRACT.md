@@ -758,6 +758,13 @@ from the network.
 - **The overlay takes CSS pixels *and* the page's `devicePixelRatio` in one call.** Reading the DPI
   on the Go side is a different number measured at a different moment.
 - **`Stop` does not destroy the window.** The window outlives the monitor.
+- **The picture never falls behind** (`catchup.go`, 1.6.5): a probe on `picq`'s src pad drops
+  access units to the next keyframe when the queue holds 15 or more, resuming at a keyframe with
+  the queue at 3 or fewer and flagging it DISCONT. A slow software decoder costs skipped frames,
+  never latency. `WSLCOMMS_PIC_CATCHUP=0` for the A/B.
+- **The kick is reachable from every seat**: `RefreshMonitorPicture` is an event
+  (`EventMonitorRefresh`, link-only, never broadcast) that the monitor page answers by running its
+  own Refresh; `RestartMonitor` is no longer host-only. Both audit-logged.
 - `ErrAbandonedThread` is a sentinel, not a sentence: `App.teardown` tests for it with `errors.Is`
   and ends the process with `TerminateProcess` rather than running DLL detach over a killed thread.
 - **The M2L-X muxer emits a packet tsdemux cannot count, and the picture path repairs it before

@@ -76,6 +76,11 @@ const (
 	// MONITOR lamp now that the connection lives in the other window.
 	EventMonitor = "monitor"
 
+	// EventMonitorRefresh is sent to the MONITOR PROCESS ONLY, over the link,
+	// by RefreshMonitorPicture: its page runs its own Refresh button. It is
+	// never emitted to this window's page or broadcast to remote seats.
+	EventMonitorRefresh = "monitorRefresh"
+
 	monitorReadyTimeout = 30 * time.Second
 	monitorStopBudget   = 3 * time.Second
 
@@ -317,6 +322,30 @@ func (a *App) RestartMonitor() error {
 		log.Print("wslcomms: restarting the PGM monitor window")
 		host.Stop()
 	}
+	a.launchMonitor()
+	return nil
+}
+
+// RefreshMonitorPicture gives the PGM monitor's picture the kick its own
+// Refresh button gives — the mosaic reconnected, the SRT picture restarted,
+// whichever is active — from anywhere else: this window's card, or a remote
+// seat's browser. It is an EVENT to the monitor's page, which runs exactly its
+// onPictureRefresh; nothing about the contribution feed is touched. A monitor
+// that is not running is opened instead, which is the same kick from further
+// back. Reachable from remote seats on purpose (app_remote.go).
+func (a *App) RefreshMonitorPicture() error {
+	if a.closing.Load() {
+		return errShuttingDown
+	}
+	a.monMu.Lock()
+	host := a.mon
+	a.monMu.Unlock()
+	if host != nil && !hostExited(host) {
+		log.Print("wslcomms: refreshing the PGM monitor's picture")
+		host.Send(EventMonitorRefresh, nil)
+		return nil
+	}
+	log.Print("wslcomms: a picture refresh was asked for with no PGM monitor running; opening one")
 	a.launchMonitor()
 	return nil
 }

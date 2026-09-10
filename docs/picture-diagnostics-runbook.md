@@ -70,6 +70,20 @@ frame threading, parser-state resets (the rare bursts are the JOIN before the fi
 and are benign), the 120U's decode (361 fps), Parsec, memory. The one instrument that could see it was
 the continuity counter read by TWO parsers that disagreed about the same bytes.
 
+## 0c. Since 1.6.5: the picture never falls behind, and the kick is remote
+
+- **Catch-up** (`internal/gst/catchup.go`): a probe on `picq`'s src pad reads the queue's fill on
+  every access unit; at 15 queued (0.3 s) it drops everything up to the next keyframe with the
+  queue at 3 or fewer, flags that keyframe DISCONT, and decoding resumes there with no garbage.
+  "We cannot fall behind at all, I would rather drop frames." Log lines: "the decoder is N access
+  units behind; dropping to the next keyframe" / "caught up: skipped N". The srt stats line carries
+  the totals. `WSLCOMMS_PIC_CATCHUP=0` disables; `WSLCOMMS_PIC_CATCHUP_AU=N` moves the mark.
+  Proved on the real GStreamer behind a throttled consumer (`catchup_live_test.go`).
+- **Remote kick**: `RefreshMonitorPicture` (an event to the PGM monitor page: its own Refresh) and
+  `RestartMonitor` are reachable from every seat and audit-logged. Buttons: the application's PGM
+  monitor card and rail group; a remote seat's Picture section ("Refresh desk picture", "Restart
+  desk monitor").
+
 ## 1. What we know (evidence, not theory)
 
 - **Symptom:** COMM-01 (Dell Pro 14, Intel Core 5 120U = 2 P + 8 E cores, no hardware HEVC — Dell fused it off; Parsec remote) tears the software-HEVC picture "on and off indefinitely", persistently, never fully losing picture. The SAME MatchG H.265 1080p50 stream decodes clean on the dev box and under every software-avdec stress test there.

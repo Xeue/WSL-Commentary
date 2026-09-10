@@ -121,9 +121,9 @@ func TestRemoteEventNamesCoversEveryEvent(t *testing.T) {
 // lose that status. The per-client admin methods are gone — there are no clients.
 func TestRemoteHostOnlySet(t *testing.T) {
 	want := map[string]bool{
-		// the PGM monitor's launcher and the SRT-return surface
-		"RestartMonitor": true,
-		"StartReturn":    true, "StopReturn": true,
+		// the SRT-return surface (RestartMonitor left this set on 2026-09-10:
+		// a remote seat may kick the desk's monitor, see remoteAllowlist)
+		"StartReturn": true, "StopReturn": true,
 		// the DeckLink preview's surface: the same argument as the picture's two
 		"SetPreviewRect": true, "SetPreviewVisible": true,
 		// what this position puts ON AIR, and the window on the operator's screen
@@ -310,9 +310,10 @@ func TestRemoteMethodsAreEveryNonHostOnlyMethod(t *testing.T) {
 	// Spot-check the reads, the writes and the arm-gated write are all there —
 	// every connection can reach them now.
 	mustHave(t, "open", got, "GetConfig", "ListPresets", "DisarmMixer",
-		"Start", "SaveConfig", "SetSecret", "ArmMixer", "SendMixerCommands", "SetMixerGolden")
+		"Start", "SaveConfig", "SetSecret", "ArmMixer", "SendMixerCommands", "SetMixerGolden",
+		"RefreshMonitorPicture", "RestartMonitor")
 	// Host-only never appears.
-	mustLack(t, "open", got, "RestartMonitor", "StopReturn", "GetRemoteState", "SetRemoteListener")
+	mustLack(t, "open", got, "StopReturn", "GetRemoteState", "SetRemoteListener")
 }
 
 // ---------------------------------------------------------------------------

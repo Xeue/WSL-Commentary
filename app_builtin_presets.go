@@ -12,6 +12,9 @@
 // sign in with, the status key the lamps read, and the SRT ports. Since 1.6.2
 // the commentary is sent to TWO audio-only mic inputs per instance, ports
 // 40901 and 40902, carrying the same encode; the picture return is unchanged.
+// The status key is therefore the first MIC input's node, "MIC 1" — the
+// switcher_status frame carries the mic inputs as nodes of exactly the router
+// inputs' shape (internal/m2lx/testdata, 2026-07-31) — rather than cam4.
 // That is why the presets carry srtSecondPort and videoSource "none" — the
 // one videoSource value a preset may carry, because it describes the
 // instance's input rather than this PC's hardware (see
@@ -62,7 +65,8 @@ const (
 // still holding one was never edited by the operator and is upgraded; one
 // holding anything else was, and is left alone.
 var builtinPreviousValues = map[string][]json.RawMessage{
-	"srtPort": {jsonRaw(40004)},
+	"srtPort":   {jsonRaw(40004)},
+	"statusKey": {jsonRaw("cam4")},
 }
 
 // builtinFields are the values a built-in preset carries today.

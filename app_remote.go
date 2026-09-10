@@ -121,6 +121,7 @@ func remoteEventNames() []string {
 		EventSender,
 		EventReturn,
 		EventMonitor,
+		EventMonitorRefresh,
 		EventError,
 		EventNote,
 		EventStatusKeys,
@@ -343,12 +344,19 @@ var remoteAllowlist = map[string]methodPolicy{
 	"SendMixerCommands": {mutating: true},
 	"SetMixerGolden":    {mutating: true},
 
+	// ---- the PGM monitor's kick, from anywhere (audit-logged) ----
+	// A seat that sees the desk's picture go wrong can kick it without walking
+	// over: the monitor page's own Refresh (RefreshMonitorPicture, an event to
+	// that page) or the whole monitor process (RestartMonitor). RestartMonitor
+	// was host-only for opening a window on the desk's screen; the operator
+	// ruled a remote kick when "it goes dodgy" worth more than that caution.
+	"RefreshMonitorPicture": {mutating: true},
+	"RestartMonitor":        {mutating: true},
 	// ---- host-only: the native picture/return surface ----
 	// Refused for every connection and omitted from Methods() so the shim never
 	// installs them.
-	"RestartMonitor": {hostOnly: true},
-	"StartReturn":    {hostOnly: true},
-	"StopReturn":     {hostOnly: true},
+	"StartReturn": {hostOnly: true},
+	"StopReturn":  {hostOnly: true},
 	// The DeckLink preview's surface, host-only because they move, resize and
 	// show an OPAQUE native window on the screen of whoever is sitting at this
 	// machine, over whatever they were looking at. A seat in another building
@@ -505,6 +513,10 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetMixerGolden()
 	case "GetMonitorState":
 		return a.GetMonitorState(), nil
+	case "RefreshMonitorPicture":
+		return nil, a.RefreshMonitorPicture()
+	case "RestartMonitor":
+		return nil, a.RestartMonitor()
 	case "GetReturnState":
 		return a.GetReturnState()
 	case "GetCommentaryMute":

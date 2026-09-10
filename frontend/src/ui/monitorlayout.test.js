@@ -53,3 +53,34 @@ test('the panel slider is the decibel taper with a readout', () => {
   assert.ok(panel.includes("levelReadout.className = 'level-readout'"), 'the readout exists');
   assert.ok(!panel.includes("levelSlider.value = '100';"), 'no hard-coded full start');
 });
+
+// --- the remote "Refresh picture" -------------------------------------------
+
+const repoRoot = join(here, '..', '..', '..');
+const goFile = (name) => readFileSync(join(repoRoot, name), 'utf8');
+
+test('the desk kick is one method and one event, spelled the same in Go and JS', () => {
+  const backend = ui('backend.js');
+  assert.ok(backend.includes("refresh: 'RefreshMonitorPicture'"), 'backend.js names the method');
+  assert.ok(backend.includes("EVENT_MONITOR_REFRESH = 'monitorRefresh'"), 'backend.js names the event');
+  const goMonitor = goFile('app_monitor.go');
+  assert.ok(goMonitor.includes('func (a *App) RefreshMonitorPicture() error'), 'the Go method exists');
+  assert.ok(goMonitor.includes('EventMonitorRefresh = "monitorRefresh"'), 'the Go event matches');
+  const goRemote = goFile('app_remote.go');
+  assert.ok(/"RefreshMonitorPicture":\s*\{mutating: true\}/.test(goRemote), 'reachable from a remote seat');
+  assert.ok(/"RestartMonitor":\s*\{mutating: true\}/.test(goRemote), 'and so is the restart');
+});
+
+test('every seat has the kick: the card, the rail group, and the remote Picture section', () => {
+  const home = ui('home.js');
+  assert.equal((home.match(/handlers\.onRefreshDeskPicture\(\)/g) || []).length, 3, 'card + rail group + remote seat');
+  assert.ok(home.includes("makeRailSection('Picture', panel.pictureGroup, deskGroup)"), 'the remote seat gets the desk group beside its own picture');
+  assert.ok(home.includes("deskRestart.addEventListener('click', () => handlers.onRestartMonitor())"), 'and the hard kick');
+});
+
+test('the monitor window runs its own Refresh when the event arrives, and only there', () => {
+  const app = ui('app.js');
+  assert.ok(/if \(monitorMode\) \{\s*backend\.onMonitorRefresh\(\(\) => \{\s*onPictureRefresh\(\);/.test(app), 'subscribed in monitor mode');
+  assert.ok(app.includes('onRefreshDeskPicture: onRefreshDeskPicture,'), 'the button handler is wired');
+  assert.ok(app.includes('await backend.refreshMonitorPicture();'), 'and it calls the method');
+});
