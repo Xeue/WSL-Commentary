@@ -59,6 +59,12 @@ const (
 	nameMuxVideoQueue = "vq"  // the video queue feeding the muxer
 	nameMuxAudioQueue = "aq"  // the audio queue feeding the muxer
 	nameMuxOutput     = "mux" // the muxer itself: the pad that read zero in EVERY failing case
+
+	// The output side, after the muxer. nameOutputTee and nameSRTQueue2 exist
+	// only when SendOpts.SecondOutput builds a second sink slot; nameSRTQueue
+	// is declared with the send pipeline's other element names in gst_cgo.go.
+	nameOutputTee = "out"   // the tee after the muxer, two outputs only
+	nameSRTQueue2 = "srtq2" // the second output's leaky queue
 )
 
 // liveWatchPollInterval is the poller's period. It is the signal watchdog's

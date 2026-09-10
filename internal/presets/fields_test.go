@@ -123,8 +123,8 @@ func TestEveryConfigFieldIsClassified(t *testing.T) {
 // all is argued. The mute is live state, it is false on every path that begins
 // a session, and it is on none of these four tables on purpose.
 func TestClassificationCounts(t *testing.T) {
-	if got := len(InstanceFields); got != 16 {
-		t.Errorf("len(InstanceFields) = %d, want 16", got)
+	if got := len(InstanceFields); got != 17 {
+		t.Errorf("len(InstanceFields) = %d, want 17", got)
 	}
 	if got := len(MachineFields); got != 8 {
 		t.Errorf("len(MachineFields) = %d, want 8", got)
@@ -577,5 +577,51 @@ func TestApplyPartialMonitorTileMergesFieldByField(t *testing.T) {
 	if live.MonitorTile != want {
 		t.Errorf("MonitorTile after a partial merge = %+v, want %+v — w and h absent from the "+
 			"preset must keep their live values", live.MonitorTile, want)
+	}
+}
+
+func TestFilterKeepsVideoSourceNoneAndNothingElseOfIt(t *testing.T) {
+	// "none" describes the INSTANCE's input and travels; "slate" and "decklink"
+	// describe this PC's hardware and do not. The one exception, pinned.
+	for _, c := range []struct {
+		value string
+		kept  bool
+	}{
+		{`"none"`, true},
+		{`"slate"`, false},
+		{`"decklink"`, false},
+		{`"NONE"`, false},
+		{`42`, false},
+	} {
+		kept, ignored := Filter(map[string]json.RawMessage{
+			"srtPort":     json.RawMessage(`40901`),
+			"videoSource": json.RawMessage(c.value),
+		})
+		_, has := kept["videoSource"]
+		if has != c.kept {
+			t.Errorf("videoSource %s: kept = %v, want %v (ignored %v)", c.value, has, c.kept, ignored)
+		}
+		if _, ok := kept["srtPort"]; !ok {
+			t.Errorf("videoSource %s: srtPort was dropped alongside it", c.value)
+		}
+	}
+
+	live := fullConfig()
+	live.VideoSource = config.VideoSourceSlate
+	ignored, err := Apply(live, map[string]json.RawMessage{
+		"videoSource":   json.RawMessage(`"none"`),
+		"srtSecondPort": json.RawMessage(`40902`),
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if len(ignored) != 0 {
+		t.Errorf("Apply() ignored %v, want nothing: both travel", ignored)
+	}
+	if live.VideoSource != config.VideoSourceNone {
+		t.Errorf("videoSource after Apply = %q, want none", live.VideoSource)
+	}
+	if live.SRTSecondPort != 40902 {
+		t.Errorf("srtSecondPort after Apply = %d, want 40902", live.SRTSecondPort)
 	}
 }

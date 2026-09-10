@@ -344,11 +344,15 @@ type StubCounters struct {
 //
 // Stub build only.
 type StubPipeline struct {
-	mu     sync.Mutex
-	state  StubState
-	opts   SendOpts
-	sink   SinkOpts
-	hasSk  bool
+	mu    sync.Mutex
+	state StubState
+	opts  SendOpts
+	sink  SinkOpts
+	hasSk bool
+	// The second slot, present when SendOpts.SecondOutput asked for it. sink
+	// and hasSk above are slot 0.
+	sink2  SinkOpts
+	hasSk2 bool
 	errs   chan error
 	closed bool
 
@@ -467,21 +471,34 @@ func (p *StubPipeline) Start(opts SendOpts) error {
 // ReplaceSink installs a fake sink. It fails, without changing state, while
 // FailNextSinks has failures left to hand out — which is how a caller drives the
 // CONNECTING to BACKOFF edge of the reconnect state machine.
-func (p *StubPipeline) ReplaceSink(opts SinkOpts) error {
+func (p *StubPipeline) ReplaceSink(opts SinkOpts) error { return p.ReplaceSinkOn(0, opts) }
+
+// Outputs is one, or two when Start was asked for a second output; zero
+// before Start, as the contract says.
+func (p *StubPipeline) Outputs() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.state == StubStateStopped {
+		return 0
+	}
+	if p.opts.SecondOutput {
+		return 2
+	}
+	return 1
+}
 
+func (p *StubPipeline) ReplaceSinkOn(output int, opts SinkOpts) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.counters.ReplaceSinks++
-
 	if p.closed || p.state == StubStateStopped {
 		return errStubStopped
 	}
-	// The latch outranks the FailNextSinks ladder, mirroring the real
-	// implementation's fatalError() check on entry: once the (notional)
-	// capture or mux chain has failed, no reconnect can carry media, so every
-	// queued "connection failure" would be a lie about what is wrong.
 	if p.fatal != nil {
 		return p.fatal
+	}
+	if err := p.checkOutputLocked(output); err != nil {
+		return err
 	}
 	if p.sinkFailures > 0 {
 		p.sinkFailures--
@@ -494,15 +511,29 @@ func (p *StubPipeline) ReplaceSink(opts SinkOpts) error {
 	if opts.Host == "" || opts.Port == 0 {
 		return errors.New("gst: SinkOpts.Host and SinkOpts.Port are required")
 	}
-
 	if opts.LatencyMs == 0 {
 		opts.LatencyMs = DefaultSRTLatencyMs
 	}
-
-	p.sink = opts
-	p.hasSk = true
+	if output == 0 {
+		p.sink = opts
+		p.hasSk = true
+	} else {
+		p.sink2 = opts
+		p.hasSk2 = true
+	}
 	p.state = StubStateSinkAttached
 	p.counters.SinksAttached++
+	return nil
+}
+
+func (p *StubPipeline) checkOutputLocked(output int) error {
+	outputs := 1
+	if p.opts.SecondOutput {
+		outputs = 2
+	}
+	if output < 0 || output >= outputs {
+		return fmt.Errorf("gst: no SRT output %d (the pipeline has %d)", output, outputs)
+	}
 	return nil
 }
 
@@ -510,22 +541,34 @@ func (p *StubPipeline) ReplaceSink(opts SinkOpts) error {
 // pipeline running. It is idempotent: removing when nothing is attached is not
 // an error, which is what lets the reconnect loop call it unconditionally on
 // entry to DRAINING.
-func (p *StubPipeline) RemoveSink() error {
+func (p *StubPipeline) RemoveSink() error { return p.RemoveSinkOn(0) }
+
+func (p *StubPipeline) RemoveSinkOn(output int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	p.counters.SinkRemovals++
-
 	if p.closed || p.state == StubStateStopped {
 		return errStubStopped
 	}
-	if !p.hasSk {
-		return nil
+	if err := p.checkOutputLocked(output); err != nil {
+		return err
 	}
-
-	p.sink = SinkOpts{}
-	p.hasSk = false
-	p.state = StubStateRunning
+	if output == 0 {
+		if !p.hasSk {
+			return nil
+		}
+		p.sink = SinkOpts{}
+		p.hasSk = false
+	} else {
+		if !p.hasSk2 {
+			return nil
+		}
+		p.sink2 = SinkOpts{}
+		p.hasSk2 = false
+	}
+	if !p.hasSk && !p.hasSk2 {
+		p.state = StubStateRunning
+	}
 	return nil
 }
 
@@ -567,6 +610,7 @@ func (p *StubPipeline) Stop() error {
 	p.counters.Stops++
 	p.state = StubStateStopped
 	p.hasSk = false
+	p.hasSk2 = false
 
 	// THE SEAM IS RELEASED HERE AND THE CAPTURE IS NOT TOUCHED. The real twin
 	// releases it only after its pipeline has reached NULL, because a proxysink

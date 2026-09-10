@@ -1967,3 +1967,8 @@ func (p *rudePipeline) Errors() <-chan error { return p.errs }
 func (p *rudePipeline) Stop() error          { return nil }
 
 var _ gst.Pipeline = (*rudePipeline)(nil)
+
+// The two-output contract, for a fake that dials nothing.
+func (p *rudePipeline) Outputs() int                          { return 1 }
+func (p *rudePipeline) ReplaceSinkOn(int, gst.SinkOpts) error { return nil }
+func (p *rudePipeline) RemoveSinkOn(int) error                { return nil }

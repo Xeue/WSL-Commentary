@@ -127,6 +127,20 @@ type Config struct {
 	// SRTPort is the port of that SRT listener.
 	SRTPort int `json:"srtPort"`
 
+	// SRTSecondPort is the port of a SECOND listener on the same host that is
+	// sent the SAME transport stream: one encode, one muxer, a tee, two
+	// srtsinks. Zero means there is no second output, which is the default.
+	//
+	// It exists for the audio-only mic inputs on M2L-X: an instance with two
+	// such inputs wants the same commentary on both, and a second machine or a
+	// second encode is a poor way to get it. The second output dials with the
+	// same latency and the same passphrase as the first; it is the port that
+	// differs, and it must — an SRT listener accepts one caller, and dialling
+	// one listener twice from one machine is one connection and one that
+	// never succeeds. Each output reconnects on its own ladder; only the first
+	// drives the SENDING lamp, the second speaks through the alerts.
+	SRTSecondPort int `json:"srtSecondPort"`
+
 	// SRTLatencyMs is srtsink's latency property, in MILLISECONDS (not
 	// microseconds). Default 120.
 	SRTLatencyMs int `json:"srtLatencyMs"`
@@ -1790,6 +1804,19 @@ func (c *Config) Validate() error {
 
 	if c.SRTPort < 1 || c.SRTPort > 65535 {
 		errs = append(errs, fmt.Errorf("srtPort must be between 1 and 65535, got %d", c.SRTPort))
+	}
+
+	// Zero is "no second output"; anything else is a port, and not the same
+	// port — see the field.
+	switch {
+	case c.SRTSecondPort == 0:
+	case c.SRTSecondPort < 1 || c.SRTSecondPort > 65535:
+		errs = append(errs, fmt.Errorf("srtSecondPort must be 0 (no second output) or between 1 and 65535, got %d",
+			c.SRTSecondPort))
+	case c.SRTSecondPort == c.SRTPort:
+		errs = append(errs, fmt.Errorf("srtSecondPort must differ from srtPort (both are %d): an SRT listener "+
+			"accepts one caller, and dialling it twice from one machine is one connection and one that "+
+			"never succeeds", c.SRTPort))
 	}
 
 	if c.PBKeyLen != 0 && c.PBKeyLen != 16 && c.PBKeyLen != 32 {

@@ -329,6 +329,21 @@ export function validateConfig(config) {
     errors.srtPort = 'SRT port must be a whole number from 1 to 65535.';
   }
 
+  // The second SRT output is optional: 0 (or absent) means there is none.
+  // Anything else is a port with srtPort's range — and not srtPort's own
+  // value, since an SRT listener takes one caller and the same stream dialled
+  // twice at one input is the second call refused for ever
+  // (internal/config.Validate says the same).
+  const second = config.srtSecondPort ?? 0;
+  if (second !== 0) {
+    if (!isInt(second) || second < 1 || second > 65535) {
+      errors.srtSecondPort =
+        'Second SRT port must be 0 (no second output) or a whole number from 1 to 65535.';
+    } else if (second === config.srtPort) {
+      errors.srtSecondPort = 'Second SRT port must differ from the SRT port.';
+    }
+  }
+
   if (!isInt(config.srtLatencyMs) || config.srtLatencyMs <= 0) {
     errors.srtLatencyMs = 'Latency must be a whole number of milliseconds greater than 0.';
   }

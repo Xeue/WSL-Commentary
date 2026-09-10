@@ -118,7 +118,7 @@ test('INSTANCE_FIELD_LABELS mirrors the Go whitelist exactly', () => {
   // return: the relay is treated as part of how the venue is reached, shared by
   // everyone who loads the preset, by the operator's decision.
   // Growth is a reviewed decision, in fields.go first and here second.
-  assert.equal(jsTags.length, 16, 'the whitelist is 16 INSTANCE fields; growth is a reviewed decision');
+  assert.equal(jsTags.length, 17, 'the whitelist is 17 INSTANCE fields; growth is a reviewed decision');
   for (const { label } of INSTANCE_FIELD_LABELS) {
     assert.ok(label && typeof label === 'string', 'every whitelisted tag needs a screen label');
   }
@@ -401,4 +401,38 @@ test('the preset name goes to Go; production code never slugifies it', () => {
   // And settings.js sends the prompt result straight through.
   const settings = codeOnly(ui('settings.js'));
   assert.ok(!/slugif|deriveId|toLowerCase\(\)\.replace/.test(settings), 'settings.js must not derive ids');
+});
+
+// ---------------------------------------------------------------------------
+// The one machine value that travels: videoSource "none" (presets.travelsAsInstance)
+// ---------------------------------------------------------------------------
+
+test('filterPresetFields keeps videoSource "none" and nothing else of it, exactly like Go', () => {
+  // Since 1.6.2 the facility presets say "send no picture": two audio-only
+  // SRT outputs. That value is a fact about the venue and Go's Filter keeps
+  // it; this mirror must agree, or the preview would announce that Go will
+  // ignore a key Go is about to apply.
+  const off = filterPresetFields({ srtPort: 40901, videoSource: 'none' });
+  assert.deepEqual(off.kept, { srtPort: 40901, videoSource: 'none' });
+  assert.deepEqual(off.ignored, []);
+
+  // Any other videoSource names a device on some other PC and is dropped.
+  const device = filterPresetFields({ videoSource: 'decklink' });
+  assert.deepEqual(device.kept, {});
+  assert.deepEqual(device.ignored, ['videoSource']);
+});
+
+test('diffPreset shows a preset switching the picture off, and no other videoSource', () => {
+  const rows = diffPreset(
+    { videoSource: 'slate', srtPort: 40004 },
+    { srtPort: 40901, videoSource: 'none' },
+  );
+  assert.deepEqual(
+    rows.map((r) => r.tag),
+    ['srtPort', 'videoSource'],
+    'the whitelist rows come first, then the travelling value',
+  );
+  assert.equal(rows[1].label, 'Video source');
+  assert.deepEqual(diffPreset({ videoSource: 'slate' }, { videoSource: 'decklink' }), []);
+  assert.deepEqual(diffPreset({ videoSource: 'none' }, { videoSource: 'none' }), [], 'no change, no row');
 });

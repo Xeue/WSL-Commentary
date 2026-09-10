@@ -3872,3 +3872,6 @@ func TestLevelsForwarderThrottlesToTheMinInterval(t *testing.T) {
 		t.Fatalf("the forwarder queued %d levels events for four calls in one interval window, want 2", count)
 	}
 }
+
+// OutputStates is unused by these tests: no session here has a second output.
+func (s *fakeSelfStoppingSender) OutputStates() <-chan sender.OutputState { return nil }

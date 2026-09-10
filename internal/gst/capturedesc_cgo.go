@@ -369,10 +369,21 @@ func joinChains(chains []string) string {
 // binds to nil and the muxer waits on a pad that never gets a buffer. So the
 // chain is absent, not idle. Everything about WHAT the picture is stays upstream;
 // this only says whether there is one.
-func sendDescription(encoderName string, audioBitrateBps int, video bool) string {
-	desc := "" +
-		"mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600" +
-		" ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n"
+func sendDescription(encoderName string, audioBitrateBps int, video bool, secondOutput bool) string {
+	// The muxer, then the output side. With ONE output the muxer feeds the
+	// leaky queue directly, as it always has. With TWO, a tee after the muxer
+	// feeds two leaky queues, each the head of its own sink slot: the same
+	// bytes to both, each gated and dropped on its own, so a dead listener on
+	// one port costs the other nothing. The queue names are what the sink
+	// slots find them by.
+	desc := "mpegtsmux name=" + nameMux + " alignment=7 pcr-interval=3600"
+	if secondOutput {
+		desc += " ! tee name=" + nameOutputTee + "\n" +
+			nameOutputTee + ". ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n" +
+			nameOutputTee + ". ! queue name=" + nameSRTQueue2 + " leaky=downstream max-size-buffers=4000\n"
+	} else {
+		desc += " ! queue name=" + nameSRTQueue + " leaky=downstream max-size-buffers=4000\n"
+	}
 
 	if video {
 		desc += "" +

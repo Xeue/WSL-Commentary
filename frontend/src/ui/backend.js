@@ -372,6 +372,7 @@ function defaultFakeConfig() {
     alias: '',
     eventId: '',
     srtPort: 0,
+    srtSecondPort: 0,
     srtLatencyMs: 120, // config.DefaultSRTLatencyMs
     pbkeylen: 0,
     statusKey: '',

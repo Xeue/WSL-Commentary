@@ -788,7 +788,30 @@ type SendOpts struct {
 	// carries nothing. VideoBitrateKbps is ignored when it is set. See
 	// config.VideoSourceNone.
 	NoVideo bool
+
+	// SecondOutput builds the send pipeline with TWO sink slots behind a tee
+	// after the muxer — two leaky queues, two gates, room for two srtsinks —
+	// so the same transport stream can be sent to two listeners from one
+	// encode. Each slot is installed, replaced and removed on its own through
+	// ReplaceSinkOn and RemoveSinkOn, and errs on its own: a sink-sourced
+	// error is delivered wrapped in OutputError naming its slot. See
+	// config.Config.SRTSecondPort.
+	SecondOutput bool
 }
+
+// OutputError is an asynchronous error from ONE sink slot — the srtsink or
+// the leaky queue feeding it — of a pipeline with more than one. It is
+// delivered on Errors so that the caller can restart that output alone: the
+// other output's connection is not affected and must not be dropped for it.
+// Errors that name no slot — the muxer, an encoder, the seam — are delivered
+// unwrapped and concern every output.
+type OutputError struct {
+	Output int
+	Err    error
+}
+
+func (e *OutputError) Error() string { return fmt.Sprintf("output %d: %v", e.Output, e.Err) }
+func (e *OutputError) Unwrap() error { return e.Err }
 
 // PipelineOpts IS DELETED, and this is where it was.
 //
@@ -1048,6 +1071,21 @@ type Pipeline interface {
 	// internal/sender finding 1. It is the one change to this interface since it
 	// was frozen.
 	RemoveSink() error
+
+	// Outputs is how many sink slots the running pipeline has: one, or two
+	// when SendOpts.SecondOutput asked for a tee after the muxer. Zero before
+	// Start and after Stop.
+	Outputs() int
+
+	// ReplaceSinkOn is ReplaceSink for one slot; ReplaceSink is ReplaceSinkOn(0).
+	// A slot the pipeline does not have is an error. Each slot has its own
+	// gate and its own sink, and replacing one never touches the other: the
+	// second output reconnecting costs the first nothing, which is the whole
+	// reason the pipeline has slots rather than a second copy of itself.
+	ReplaceSinkOn(output int, opts SinkOpts) error
+
+	// RemoveSinkOn is RemoveSink for one slot.
+	RemoveSinkOn(output int) error
 
 	// ForceKeyUnit sends a GstForceKeyUnit event upstream so that the encoder
 	// emits an IDR immediately. It is called after a successful ReplaceSink so

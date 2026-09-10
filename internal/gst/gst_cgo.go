@@ -1333,143 +1333,96 @@ type sinkErrRoute struct {
 
 // cgoPipeline is the go-gst backed Pipeline.
 type cgoPipeline struct {
-	// mu serialises Start, ReplaceSink, ForceKeyUnit and Stop against each
-	// other. It is held across GStreamer state changes and is therefore held
-	// for seconds at a time; nothing on a streaming thread may wait for it.
+	// mu serialises Start, ReplaceSinkOn, RemoveSinkOn, ForceKeyUnit and Stop
+	// against each other. It is held for the whole of a sink swap, which is
+	// why nothing that runs on a streaming thread may take it: onBusMessage
+	// and the gate probes read atomics instead.
 	mu sync.Mutex
 
 	started bool
 	stopped bool
 
-	// fatal, once set, is a pipeline-level failure that replacing the sink
-	// cannot repair — see the file comment. ReplaceSink returns it rather than
-	// reporting a connection that would carry no media.
-	//
-	// It is guarded by errMu, not by mu, because it is written by onBusMessage
-	// on a streaming thread and mu is held for the whole of ReplaceSink, which
-	// is exactly when that message arrives.
+	// fatal is the latched pipeline-fatal error, under errMu; see markFatal.
 	fatal error
 
-	// set is the capture layer this send pipeline draws from. It is given at
-	// construction and never changes: a Pipeline is single-use, and a send
-	// pipeline that could be re-pointed at a different capture set would be a
-	// device change under a running feed, which is refused everywhere else in this
-	// design for the reason seam.go's third invariant gives.
-	//
-	// THIS PIPELINE NEVER STOPS IT. The capture pipelines are always-live and
-	// outlive every send session; what Start takes and Stop gives back is the
-	// single-consumer CLAIM on their proxysinks, held through seam below.
-	set CaptureSet
-
-	// seam is this session's hold on that capture set: the claim on every
-	// proxysink and the arming that makes the second START carry media. It is
-	// taken by startBuiltLocked BEFORE the parse and released by teardownLocked
-	// AFTER the pipeline has reached NULL, and both ends of that order are
-	// load-bearing — see SendSeam.
-	//
-	// Nil before Start and after a completed teardown. SendSeam's methods are all
-	// nil-safe, so there is one unconditional call at teardown rather than a guard
-	// a later reader can widen without noticing what it was for.
+	set  CaptureSet
 	seam *SendSeam
-
-	// live is the muxer watchdog: the BUFFER|BUFFER_LIST probes on vq:src, aq:src
-	// and mux:src, and the poller that reads them.
-	//
-	// It is the ONLY detector in this process for a capture pipeline that has died
-	// underneath a running send pipeline. Measured, twice: that failure produces 0
-	// buffers, no EOS, no ERROR and no WARNING on either bus, with this pipeline
-	// still PLAYING and SRT still connected, because proxysink returns
-	// GST_FLOW_OK unconditionally and no back-pressure ever crosses the seam.
 	live *liveWatch
 
-	// pipeline is the GstPipeline built by gst_parse_launch. Held so that it
-	// stays reachable: dropping the Go reference would let the finalizer unref
-	// the last reference to a running pipeline.
 	pipeline gogst.Pipeline
+	clock    gogst.Clock
+	bus      gogst.Bus
 
-	// clock is the pinned system clock. Held for the same reason.
-	clock gogst.Clock
-
-	// bus is the pipeline's bus, held so that Stop can detach the sync handler.
-	bus gogst.Bus
-
-	// aconv, aconvSinkPad and matrixWidth ARE NOT HERE ANY MORE. The mix matrix is
-	// a negotiation constraint written to an audioconvert while the pipeline is still
-	// in NULL, so it belongs to the pipeline that opens the device; there is no
-	// audioconvert in this graph at all. See cgoCapture.
-
-	// The COUGH MUTE is not here either, and its absence is the one worth stating.
-	// It is a volume element between the resampler's capsfilter and the programme
-	// meter, upstream of the proxysink, so a future local foldback tapped off this
-	// side of the seam would NOT be muted by it. Tap upstream of coughmute in the
-	// capture pipeline, or duplicate the mute; do not add a second one here, because
-	// one control with two memories is the failure the read-back discipline exists to
-	// make impossible. See coughmute.go.
-
-	// The VIDEO SIGNAL WATCHDOG is the capture pipeline's, for the same reason: it
-	// polls a decklinkvideosrc's own "signal" property, and there is no decklink
-	// element in this graph. Its readings now start at launch instead of at START,
-	// which is the point of R1 — a cable fault surfaces on the CAMERA lamp when the
-	// application opens, not twenty minutes before kick-off.
-
-	// encoder is the H.264 encoder element, kept for ForceKeyUnit.
-	encoder gogst.Element
-
-	// encoderName is the factory name chosen by selectH264Encoder.
+	// encoder is the H.264 encoder, or nil on an audio-only pipeline
+	// (SendOpts.NoVideo); everything that reads it tolerates nil.
+	encoder     gogst.Element
 	encoderName string
 
-	// srtq is the leaky queue in front of the sink, and its two pads.
-	srtq        gogst.Element
-	srtqSrcPad  gogst.Pad
-	srtqSinkPad gogst.Pad
+	// slots are the SRT outputs: one, or two behind a tee when
+	// SendOpts.SecondOutput asked for it. Each is a leaky queue, its gate, and
+	// whichever srtsink is installed; see sinkSlot. Written under mu by Start
+	// and teardown; the slice itself is not touched between.
+	slots []*sinkSlot
 
-	// gate probe ids, for removal at Stop. sinkEventProbeID is the event half
-	// of the sink-pad gate; see eventGateProbe.
-	srcProbeID       uint32
-	sinkProbeID      uint32
-	sinkEventProbeID uint32
-
-	// eventsDropped counts the downstream events eventGateProbe has kept out of
-	// gst_queue_handle_sink_event. It is diagnostics only — a non-zero value on
-	// a reconnect is the fix in BUILD-NOTES.md section 8.6 doing its job — and
-	// it is atomic because the writer is a GStreamer streaming thread.
-	eventsDropped atomic.Int64
-
-	// sink is the srtsink currently installed, or nil when there is none.
-	sink gogst.Element
-	// sinkSerial numbers the sinks so each gets a unique element name.
+	// sinkSerial numbers every srtsink ever created on this pipeline, across
+	// slots, so element names are unique for the life of the pipeline and a
+	// bus message can be matched to the swap that produced it.
 	sinkSerial int
 
-	// gateClosed is read by the pad probes on streaming threads and written by
-	// ReplaceSink, Stop and onBusMessage. It is the whole of the gate's state;
-	// see the file comment for why a probe drops rather than blocks.
-	gateClosed atomic.Bool
-
-	// route diverts one sink's bus error into the ReplaceSink call in progress.
-	// Written by ReplaceSink under mu, read by onBusMessage without any lock.
-	route atomic.Pointer[sinkErrRoute]
-
-	// BOTH METERS ARE THE CAPTURE PIPELINE'S. alevel and chlevel are upstream of
-	// the proxysinks, so no level message is ever posted on this bus; the callbacks
-	// and the routing between them moved to cgoCapture with the elements. What that
-	// costs is written down in gst.go rather than discovered: OnLevels used to promise
-	// that no meter could move while silence went to air, and between it and the
-	// encoder there is now a leaky queue. The promise holds in normal operation and
-	// NOT during a send-side stall, which is the leak policy the operator chose.
-
-	// busSilenced makes onBusMessage return immediately once the pipeline is
-	// being torn down. It exists because the bus sync handler is NEVER
-	// detached; see teardownLocked.
+	// busSilenced is set by teardown so the sync handler drops everything
+	// posted while the pipeline goes to NULL.
 	busSilenced atomic.Bool
 
-	// errs carries GST_ELEMENT_ERROR bus messages to Errors, and warns carries
-	// GST_ELEMENT_WARNING to the logging goroutine. Both are guarded by errMu,
-	// which exists only so that a streaming thread cannot send on a channel
-	// Stop is closing. errMu is never held across anything that can block.
 	errMu      sync.RWMutex
 	errs       chan error
 	warns      chan string
 	errsClosed bool
+}
+
+// sinkSlot is ONE SRT OUTPUT: the leaky queue behind the muxer (or behind the
+// tee, with two outputs), its gate, and the srtsink installed at the moment.
+//
+// Everything that made the single-sink design safe is per slot: the gate
+// that keeps a dead sink's GST_FLOW_ERROR from reaching the muxer, the route
+// that hands a failing handshake back to the ReplaceSinkOn that provoked it,
+// and the queue re-arm after a sink has stopped its loop. Two slots share the
+// bytes and nothing else, so a listener that is down on one port costs the
+// other nothing — which is the whole point of having two.
+type sinkSlot struct {
+	index     int
+	queueName string
+
+	queue   gogst.Element
+	srcPad  gogst.Pad // the gated pad the sink is linked from
+	sinkPad gogst.Pad // the pad the muxer (or tee) pushes into
+
+	srcProbeID       uint32
+	sinkProbeID      uint32
+	sinkEventProbeID uint32
+
+	// sink is the srtsink currently installed, or nil. Under the pipeline's
+	// mu. sinkName is its element name, readable without the lock, for
+	// onBusMessage to match an error to its slot.
+	sink     gogst.Element
+	sinkName atomic.Pointer[string]
+
+	// gateClosed drops buffers at both of the queue's pads while there is no
+	// sink, or the sink has failed. It is an atomic because the probes read it
+	// on streaming threads.
+	gateClosed atomic.Bool
+
+	// route diverts one sink's bus error into the ReplaceSinkOn in progress.
+	route atomic.Pointer[sinkErrRoute]
+
+	eventsDropped atomic.Int64
+}
+
+// gateProbe is the slot's buffer gate, on both pads of its queue.
+func (sl *sinkSlot) gateProbe(_ gogst.Pad, _ *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	if sl.gateClosed.Load() {
+		return gogst.PadProbeDrop
+	}
+	return gogst.PadProbePass
 }
 
 // Compile-time assertion that the real implementation satisfies the contract.
@@ -1582,7 +1535,7 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 	}
 	p.seam = seam
 
-	desc := sendDescription(encoderName, opts.AudioBitrateBps, !opts.NoVideo)
+	desc := sendDescription(encoderName, opts.AudioBitrateBps, !opts.NoVideo, opts.SecondOutput)
 	log.Printf("gst: gst_parse_launch:\n%s", desc)
 
 	element, err := gogst.ParseLaunch(desc)
@@ -1622,57 +1575,49 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 		applyEncoderProperties(p.encoder, encoderName, opts.VideoBitrateKbps)
 	}
 
-	p.srtq = pipeline.GetByName(nameSRTQueue)
-	if p.srtq == nil {
-		return abort(errors.New("gst: parsed pipeline has no element named " + nameSRTQueue))
+	// THE SINK SLOTS. One leaky queue per output, found by name, each with its
+	// gate closed on both pads until a sink is installed, and its downstream
+	// event probe — see eventGateProbe — so a queue whose loop has stopped
+	// cannot error the muxer out.
+	queueNames := []string{nameSRTQueue}
+	if opts.SecondOutput {
+		queueNames = append(queueNames, nameSRTQueue2)
 	}
-	p.srtqSrcPad = p.srtq.GetStaticPad("src")
-	if p.srtqSrcPad == nil {
-		return abort(errors.New("gst: " + nameSRTQueue + " has no src pad"))
-	}
-	p.srtqSinkPad = p.srtq.GetStaticPad("sink")
-	if p.srtqSinkPad == nil {
-		return abort(errors.New("gst: " + nameSRTQueue + " has no sink pad"))
-	}
-
-	// Close the gate BEFORE the pipeline can produce a buffer. Start installs
-	// no sink, so srtq's src pad has no peer; without the gate the queue's loop
-	// would push into nothing, get GST_FLOW_NOT_LINKED, pause its task and post
-	// an error before the first ReplaceSink ever ran.
-	p.gateClosed.Store(true)
-	p.srcProbeID = p.srtqSrcPad.AddProbe(gateProbeMask, p.gateProbe)
-	if p.srcProbeID == 0 {
-		return abort(errors.New("gst: gst_pad_add_probe failed on " + nameSRTQueue + ":src"))
-	}
-	p.sinkProbeID = p.srtqSinkPad.AddProbe(gateProbeMask, p.gateProbe)
-	if p.sinkProbeID == 0 {
-		return abort(errors.New("gst: gst_pad_add_probe failed on " + nameSRTQueue + ":sink"))
-	}
-
-	// The event half of the sink-pad gate. Separate probe, separate mask and
-	// separate condition from the buffer gate above: it drops a downstream
-	// event only while the queue's loop is stopped with a bad flow return,
-	// which is the one state in which gst_queue_handle_sink_event answers an
-	// event by erroring the capture chain out. See eventGateProbe.
-	//
-	// srtq:src is captured here rather than read from p.srtqSrcPad inside the
-	// callback: the field is cleared by teardownLocked, and a streaming thread
-	// reading it while the caller's goroutine nils it would be a data race on
-	// the very path that is being torn down.
-	srtqSrc := p.srtqSrcPad
-	p.sinkEventProbeID = p.srtqSinkPad.AddProbe(eventGateProbeMask,
-		func(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
-			return p.eventGateProbe(srtqSrc, info)
-		})
-	if p.sinkEventProbeID == 0 {
-		return abort(errors.New("gst: gst_pad_add_probe failed for downstream events on " +
-			nameSRTQueue + ":sink"))
+	p.slots = nil
+	for i, qn := range queueNames {
+		sl := &sinkSlot{index: i, queueName: qn}
+		sl.queue = pipeline.GetByName(qn)
+		if sl.queue == nil {
+			return abort(errors.New("gst: parsed pipeline has no element named " + qn))
+		}
+		sl.srcPad = sl.queue.GetStaticPad("src")
+		if sl.srcPad == nil {
+			return abort(errors.New("gst: " + qn + " has no src pad"))
+		}
+		sl.sinkPad = sl.queue.GetStaticPad("sink")
+		if sl.sinkPad == nil {
+			return abort(errors.New("gst: " + qn + " has no sink pad"))
+		}
+		sl.gateClosed.Store(true)
+		sl.srcProbeID = sl.srcPad.AddProbe(gateProbeMask, sl.gateProbe)
+		if sl.srcProbeID == 0 {
+			return abort(errors.New("gst: gst_pad_add_probe failed on " + qn + ":src"))
+		}
+		sl.sinkProbeID = sl.sinkPad.AddProbe(gateProbeMask, sl.gateProbe)
+		if sl.sinkProbeID == 0 {
+			return abort(errors.New("gst: gst_pad_add_probe failed on " + qn + ":sink"))
+		}
+		slot := sl
+		sl.sinkEventProbeID = sl.sinkPad.AddProbe(eventGateProbeMask,
+			func(_ gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+				return p.eventGateProbe(slot, info)
+			})
+		if sl.sinkEventProbeID == 0 {
+			return abort(errors.New("gst: gst_pad_add_probe failed for downstream events on " + qn + ":sink"))
+		}
+		p.slots = append(p.slots, sl)
 	}
 
-	// The bus sync handler is attached before the first state change so that an
-	// error raised during NULL→PLAYING is captured rather than lost. It is a
-	// sync handler rather than a watch because a watch needs a GLib main loop
-	// and this process does not have one — Wails owns the Windows message loop.
 	p.bus = pipeline.GetBus()
 	if p.bus == nil {
 		return abort(errors.New("gst: pipeline has no bus"))
@@ -1845,7 +1790,7 @@ func (p *cgoPipeline) awaitFirstMediaLocked() error {
 func (p *cgoPipeline) onFeedWentSilent(err error) {
 	log.Printf("gst: %v", err)
 	p.markFatal(err)
-	p.gateClosed.Store(true)
+	p.closeAllGates()
 	p.deliver(err)
 }
 
@@ -2087,11 +2032,32 @@ const gateProbeMask = gogst.PadProbeTypeBlock | gogst.PadProbeTypeBuffer | gogst
 // srcpad task blocks in the srtq:sink probe, aggregator's sink queues fill,
 // wasapi2src stops, and M2L-X reports a connected peer that never locks. Do
 // not "simplify" this back to OK.
-func (p *cgoPipeline) gateProbe(_ gogst.Pad, _ *gogst.PadProbeInfo) gogst.PadProbeReturn {
-	if p.gateClosed.Load() {
-		return gogst.PadProbeDrop
+// closeAllGates drops buffers at every slot: what a fatal error and teardown
+// do, since no sink can carry anything after either.
+func (p *cgoPipeline) closeAllGates() {
+	for _, sl := range p.slots {
+		sl.gateClosed.Store(true)
 	}
-	return gogst.PadProbePass
+}
+
+// slotForSource matches a bus message's source name to the slot it concerns:
+// the sink being installed (its route), the sink installed, or the queue.
+// Nil when the source is none of those — the muxer, an encoder, the seam.
+// It runs on the streaming thread that posted the message and reads only
+// atomics and immutable names.
+func (p *cgoPipeline) slotForSource(source string) *sinkSlot {
+	for _, sl := range p.slots {
+		if r := sl.route.Load(); r != nil && r.name == source {
+			return sl
+		}
+		if n := sl.sinkName.Load(); n != nil && *n == source {
+			return sl
+		}
+		if sl.queueName == source {
+			return sl
+		}
+	}
+	return nil
 }
 
 // eventGateProbeMask is GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM and nothing else.
@@ -2183,12 +2149,11 @@ const eventGateProbeMask = gogst.PadProbeTypeEventDownstream
 // It runs on a GStreamer streaming thread, so it does not log; it counts, and
 // hands a line to the warning goroutine by the same non-blocking route
 // onBusMessage uses.
-func (p *cgoPipeline) eventGateProbe(srtqSrc gogst.Pad, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
-	if srtqSrc == nil || srtqSrc.GetLastFlowReturn() == gogst.FlowOK {
+func (p *cgoPipeline) eventGateProbe(sl *sinkSlot, info *gogst.PadProbeInfo) gogst.PadProbeReturn {
+	if sl.srcPad == nil || sl.srcPad.GetLastFlowReturn() == gogst.FlowOK {
 		return gogst.PadProbeOK
 	}
-
-	p.eventsDropped.Add(1)
+	sl.eventsDropped.Add(1)
 	kind := "event"
 	if info != nil {
 		if ev := info.GetEvent(); ev != nil {
@@ -2198,9 +2163,8 @@ func (p *cgoPipeline) eventGateProbe(srtqSrc gogst.Pad, info *gogst.PadProbeInfo
 	p.deliverWarning(fmt.Sprintf(
 		"gst: dropped a downstream %s at %s:sink: the queue's loop is stopped with %s, and "+
 			"gst_queue_handle_sink_event would have answered it by erroring the capture chain out "+
-			"(BUILD-NOTES.md section 8.6). Total dropped this pipeline: %d",
-		kind, nameSRTQueue, srtqSrc.GetLastFlowReturn(), p.eventsDropped.Load()))
-
+			"(BUILD-NOTES.md section 8.6). Total dropped this slot: %d",
+		kind, sl.queueName, sl.srcPad.GetLastFlowReturn(), sl.eventsDropped.Load()))
 	return gogst.PadProbeDrop
 }
 
@@ -2237,64 +2201,54 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		debug, gerr := msg.ParseError()
 
 		// CLASSIFY BEFORE CLOSING THE GATE, AND CLASSIFY FROM THE NAME ALONE.
-		//
-		// classifySendBusError is THREE STRING COMPARISONS on a string already in
-		// hand: no allocation, no cgo, no GObject lock. That is what lets it run
-		// ahead of the store on the ON-AIR path, where an srtout-N error arrives on
-		// every peer loss and the buffer carrying GST_FLOW_ERROR into srtq is racing
-		// us. That race is not hypothetical: BUILD-NOTES.md section 8.6 is the 21 ms
-		// window in which losing it took the whole capture chain down and the
-		// commentary off air.
-		//
-		// THIS BUS NO LONGER CARRIES ANY CAPTURE ELEMENT, and that is why there is
-		// one stage here where there used to be two. The capture legs, the slate,
-		// the preview branch, both level elements and both DeckLink sources live in
-		// a CapturePipeline with a bus of its own; this graph is two proxysrcs, two
-		// encoders, the muxer and the sink. So the classVideoCapture sparing, the
-		// classPreview sparing and the AudioClockedByVideo upgrade — which needed
-		// captureLegsFor's parent-bin walk, the one cgo call that had to be kept off
-		// the fast path — describe elements that cannot post here. Keeping them
-		// would be worse than dead: capturefault.go's video and audio proxy prefixes
-		// are "vprox" and "aprox", which match THIS graph's vproxsrc and aproxsrc as
-		// well as the capture side's tails, so a vproxsrc error would have been
-		// spared with the gate left open and an aproxsrc error handed to a DeckLink
-		// diagnosis of a graph containing no card.
+		// classifySendBusError is string comparisons on a string already in
+		// hand: no allocation, no cgo, no GObject lock. That is what lets it
+		// run ahead of the store on the ON-AIR path, where an srtout-N error
+		// arrives on every peer loss and the buffer carrying GST_FLOW_ERROR
+		// into the queue is racing us — BUILD-NOTES.md section 8.6 is the 21 ms
+		// window in which losing that race took the commentary off air.
 		class := classifySendBusError(source)
 
-		// Close the gate before building the error value. Everything after this
-		// point is allocation, and the buffer that is about to carry
-		// GST_FLOW_ERROR into the queue is racing us.
-		p.gateClosed.Store(true)
+		// Close the gate before building the error value: everything after
+		// this is allocation. A sink-sourced error closes ITS slot's gate and
+		// no other — the second output must not drop for the first's peer
+		// loss — and anything else closes every gate, since nothing can carry
+		// media after it.
+		sl := p.slotForSource(source)
+		if sl != nil {
+			sl.gateClosed.Store(true)
+		} else {
+			p.closeAllGates()
+		}
 
 		err := fmt.Errorf("gst: %s: %v (%s)", source, gerr, debug)
 
 		// A failure of the sink currently being installed belongs to the
-		// ReplaceSink call that is installing it, not on the asynchronous
+		// ReplaceSinkOn call that is installing it, not on the asynchronous
 		// channel.
-		if r := p.route.Load(); r != nil && r.name == source {
-			select {
-			case r.ch <- err:
-			default:
+		if sl != nil {
+			if r := sl.route.Load(); r != nil && r.name == source {
+				select {
+				case r.ch <- err:
+				default:
+				}
+				return gogst.BusDrop
 			}
-			return gogst.BusDrop
 		}
 
 		switch class {
 		case classSinkSourced:
-			// Unchanged, and tested first so the on-air path cannot move:
-			// replacing the sink can repair it, so it goes to internal/sender
-			// on Errors() and the connection ladder handles it.
-
+			// Replacing the sink can repair it, so it goes to internal/sender
+			// on Errors() — named with its slot, so only that output's ladder
+			// runs.
+			if sl != nil {
+				err = &OutputError{Output: sl.index, Err: err}
+			}
 		default:
-			// Not the sink: replacing the sink cannot repair this, so mark it and
-			// let ReplaceSink refuse rather than report a connection that carries
-			// no media.
-			//
-			// The wrap puts ErrPipelineFatal — whose text is "gst:
-			// pipeline-fatal", so the rendered message is unchanged and
-			// anything still grepping for the substring keeps matching — at
-			// the head of the chain, which is what lets internal/sender use
-			// errors.Is to stop retrying a failure no reconnect can fix.
+			// Not a sink: replacing one cannot repair this, so mark it and let
+			// ReplaceSinkOn refuse rather than report a connection that
+			// carries no media. ErrPipelineFatal heads the chain so
+			// internal/sender can errors.Is it and stop retrying.
 			p.markFatal(fmt.Errorf("%w: %w "+
 				"(the encode or mux chain has failed; recover with Stop, New, Start)",
 				ErrPipelineFatal, err))
@@ -2307,34 +2261,13 @@ func (p *cgoPipeline) onBusMessage(_ gogst.Bus, msg *gogst.Message) gogst.BusSyn
 		if src := msg.Source(); src != nil {
 			source = src.GetName()
 		}
-		// Warnings are logged and NOT delivered on Errors(). A GStreamer
-		// warning is not a pipeline failure, and putting it there would make
-		// internal/sender treat it as one.
-		//
-		// The log call itself happens on logWarnings' goroutine, not here.
-		// log.Printf takes a process-global mutex and blocks on stderr; a
-		// marginal SRT link produces warnings in bursts, and this function runs
-		// on a GStreamer streaming thread. Serialising the streaming threads
-		// behind Go's log mutex during an outage would add latency to the
-		// capture chain at the one moment it must not have any.
 		p.deliverWarning(fmt.Sprintf("gst: warning: %s: %v (%s)", source, gerr, debug))
 
 	case gogst.MessageElement:
-		// NOTHING. THE METERS ARE UPSTREAM OF THE SEAM and this handler used to route
-		// them, so the absence is written down rather than left as a missing case.
-		//
-		// alevel and chlevel sit in the capture pipeline, above the proxysinks, so no
-		// level message is ever posted on THIS bus; cgoCapture.onBusMessage carries the
-		// routing, the two-tier match on structure name then source element, and the
-		// measurement that made the second tier necessary — 39 level messages a second,
-		// every one of them named "level", which without attribution would have fed the
-		// programme meter a sixteen-entry frame and a two-entry frame alternately.
-		//
-		// Do not re-add a level element here. A meter measuring what has crossed the
-		// seam would read the encoder's input rather than the microphone, which on a
-		// send-side stall is exactly the reassurance nobody should be given.
+		// Nothing on this bus is a level element any more; the meters read the
+		// capture pipelines. Kept as a case so a future element message has a
+		// home.
 	}
-
 	return gogst.BusDrop
 }
 
@@ -2388,7 +2321,8 @@ func anyList(v any) []any {
 // ReplaceSink re-arms it. Anything else is upstream of the gate and is
 // pipeline-fatal.
 func isSinkSourced(source string) bool {
-	return source == nameSRTQueue || strings.HasPrefix(source, srtSinkNamePrefix)
+	// Both queues share the prefix: srtq and srtq2.
+	return strings.HasPrefix(source, nameSRTQueue) || strings.HasPrefix(source, srtSinkNamePrefix)
 }
 
 // markFatal records the first pipeline-fatal error. It is called from a
@@ -2451,10 +2385,27 @@ func (p *cgoPipeline) deliverWarning(line string) {
 // succeeded and media is flowing; a non-nil error means it did not, and
 // internal/sender is responsible for backing off and trying again. Nothing
 // upstream of srtq leaves PLAYING either way.
-func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
+func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error { return p.ReplaceSinkOn(0, opts) }
+
+// Outputs is the number of sink slots: one, or two behind the tee. Zero
+// before Start and after Stop.
+func (p *cgoPipeline) Outputs() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return len(p.slots)
+}
 
+// slotLocked is the slot for an output index, under mu.
+func (p *cgoPipeline) slotLocked(output int) (*sinkSlot, error) {
+	if output < 0 || output >= len(p.slots) {
+		return nil, fmt.Errorf("gst: no SRT output %d (the pipeline has %d)", output, len(p.slots))
+	}
+	return p.slots[output], nil
+}
+
+func (p *cgoPipeline) ReplaceSinkOn(output int, opts SinkOpts) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.stopped {
 		return errors.New("gst: pipeline is stopped")
 	}
@@ -2462,6 +2413,10 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 		return errors.New("gst: pipeline has not been started")
 	}
 	if err := p.fatalError(); err != nil {
+		return err
+	}
+	sl, err := p.slotLocked(output)
+	if err != nil {
 		return err
 	}
 	if opts.Host == "" || opts.Port == 0 {
@@ -2485,56 +2440,21 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 		}
 	}
 
-	// 1. Resolve the host to IP literals, BEFORE anything is torn down.
-	//
-	//    A hostname in the srtsink URI aborts the whole process on the next
-	//    RemoveSink — a GLib assertion inside GResolver, from which there is no
-	//    return. resolveSinkHost carries the measurement and the reasoning; the
-	//    only thing that ever reaches srtsink is a literal.
-	//
-	//    It is done here, ahead of removeSinkLocked, for two reasons. A lookup
-	//    failure then leaves a working sink working instead of trading a live
-	//    feed for a DNS hiccup, and the up-to-three seconds it can cost are
-	//    spent while the old socket is still carrying commentary rather than
-	//    added to the time off air.
+	// The DNS lookup happens BEFORE the old sink is removed, so a name that
+	// no longer resolves leaves the old sink in place rather than nothing.
 	addrs, err := resolveSinkHost(opts.Host, hostResolveTimeout)
 	if err != nil {
 		return err
 	}
 
-	// 2. Tear out whatever is there. This is the SAME teardown path RemoveSink
-	//    uses — close the gate, unlink, NULL, remove, re-arm the queue — and it
-	//    is the only one in this file. When internal/sender has honoured
-	//    specification section 6.2 and already called RemoveSink on entry to
-	//    DRAINING, this is a cheap no-op: there is no sink to detach and the
-	//    queue's last flow return is already GST_FLOW_OK.
-	if err := p.removeSinkLocked(); err != nil {
+	if err := p.removeSinkLocked(sl); err != nil {
 		return err
 	}
 
-	// 3. Backstop for the early returns below ONLY. The success path clears the
-	//    route explicitly at step 7 and must keep doing so: a deferred clear
-	//    runs after the function body has finished, which would leave the route
-	//    installed across the final drain, across the gate opening and across
-	//    the log line — and an error arriving in that window would be swallowed
-	//    by a channel nobody ever reads again. That is the false green this
-	//    whole package exists to prevent. Do not delete step 7 and lean on this.
-	//
-	//    It is declared once, outside the loop, rather than once per attempt:
-	//    each attempt installs its own route over the previous one, so a single
-	//    clear at return is enough and a defer inside the loop would stack.
-	defer p.route.Store(nil)
+	defer sl.route.Store(nil)
 
-	// A name may front several addresses — an SRT listener is one host, but DNS
-	// does not know that. Try them in the order resolveSinkHost returned, IPv4
-	// first, and report which one answered. lastErr carries the most recent
-	// failure so that a caller who runs out of addresses is told why the last
-	// one did not work rather than "no addresses left".
 	var lastErr error
 	for i, addr := range addrs {
-		// 4. Build the new sink. The URI gets the literal; every log line and
-		//    every error message below gets opts.Host, the name the operator
-		//    typed.
 		p.sinkSerial++
 		name := srtSinkNamePrefix + strconv.Itoa(p.sinkSerial)
 		where := dialledEndpointForLog(opts, addr)
@@ -2549,10 +2469,6 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 		if err := configureSRTSink(sink, opts, addr); err != nil {
 			return err
 		}
-
-		// 5. Add and link. Adding before linking is required: gst_pad_link
-		//    across a bin boundary on an element with no parent does not give
-		//    it the pipeline's clock or base time.
 		if !p.pipeline.Add(sink) {
 			return fmt.Errorf("gst: could not add %s to the pipeline", name)
 		}
@@ -2561,122 +2477,55 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 			p.pipeline.Remove(sink)
 			return fmt.Errorf("gst: %s has no sink pad", name)
 		}
-		if ret := p.srtqSrcPad.Link(sinkPad); ret != gogst.PadLinkOK {
+		if ret := sl.srcPad.Link(sinkPad); ret != gogst.PadLinkOK {
 			p.pipeline.Remove(sink)
-			return fmt.Errorf("gst: could not link %s:src to %s:sink (%s)", nameSRTQueue, name, ret)
+			return fmt.Errorf("gst: could not link %s:src to %s:sink (%s)", sl.queueName, name, ret)
 		}
 
-		// 6. Divert this sink's bus errors into this call, then bring it up.
-		//    The route is installed before the state change because srtsink
-		//    posts the error and returns STATE_CHANGE_FAILURE from the same
-		//    call.
+		// The route is installed BEFORE the state change, so a handshake that
+		// fails inside it comes back from this call and not on Errors().
 		route := &sinkErrRoute{name: name, ch: make(chan error, 1)}
-		p.route.Store(route)
+		sl.route.Store(route)
 
 		stopWatchdog := stateChangeWatchdog(name + ": SRT caller handshake to " + where)
 		if !sink.SyncStateWithParent() {
 			stopWatchdog()
-			p.abandonSinkLocked(sink, sinkPad)
+			p.abandonSinkLocked(sl, sink, sinkPad)
 			lastErr = fmt.Errorf("gst: %s: SRT caller handshake to %s failed: %v",
 				name, where, routeErrOr(route, errors.New("gst_element_sync_state_with_parent returned FALSE")))
-			p.route.Store(nil)
+			sl.route.Store(nil)
 			continue
 		}
 		ret := sink.BlockSetState(gogst.StatePlaying, gogst.ClockTime(sinkStateChangeTimeout))
 		stopWatchdog()
 		if !stateChangeOK(ret) {
-			p.abandonSinkLocked(sink, sinkPad)
+			p.abandonSinkLocked(sl, sink, sinkPad)
 			lastErr = fmt.Errorf("gst: %s: SRT caller handshake to %s failed (%s): %v",
 				name, where, ret, routeErrOr(route, errors.New("no bus error was posted")))
-			p.route.Store(nil)
+			sl.route.Store(nil)
 			continue
 		}
-
-		// 7. Clear the route BEFORE the last drain, and drain after clearing.
-		//
-		//    Order is the whole point. From the instant this store lands,
-		//    onBusMessage stops diverting srtout-N's errors into a channel that
-		//    is about to be abandoned and starts putting them on Errors(),
-		//    where internal/sender reads them and reconnects. The drain that
-		//    follows catches anything that arrived before the store.
-		//
-		//    Doing this with `defer` instead — which is what was here — leaves
-		//    the route installed through the drain, through the gate opening
-		//    and through the success log. srtsink accepting the socket and then
-		//    failing its first write is M2L-X's ordinary one-peer / re-accept
-		//    behaviour, not an exotic case; such an error would be matched by
-		//    name, pushed into r.ch, and read by nobody. It would reach neither
-		//    Errors() nor p.fatal, while onBusMessage had already set
-		//    gateClosed. ReplaceSink would return nil, sender would go
-		//    CONNECTED, the lamp would go green, and no reconnect would ever be
-		//    triggered: commentary off air with every indicator healthy.
-		p.route.Store(nil)
+		sl.route.Store(nil)
 		if err := routeErr(route); err != nil {
-			p.abandonSinkLocked(sink, sinkPad)
+			p.abandonSinkLocked(sl, sink, sinkPad)
 			lastErr = fmt.Errorf("gst: %s: SRT connection to %s failed immediately: %w",
 				name, where, err)
 			continue
 		}
-
-		// 8. A pipeline-fatal error — one whose source is mux or the capture
-		//    chain rather than the sink — can have been posted by the churn of
-		//    adding and starting an element. fatal is checked on entry to this
-		//    function; check it again before promising success, so that the
-		//    synchronous answer and the asynchronous one cannot disagree.
-		//    Without this a caller can be told the connection came up in the
-		//    same instant Errors() is told the muxer has stopped.
-		//
-		//    This one returns rather than trying the next address: no address
-		//    can repair a broken capture chain.
 		if err := p.fatalError(); err != nil {
-			p.abandonSinkLocked(sink, sinkPad)
+			p.abandonSinkLocked(sl, sink, sinkPad)
 			return err
 		}
 
-		// 9. Open the gate. From this instant media flows to the new sink; the
-		//    sticky events left pending by the gated pushes are delivered ahead
-		//    of the first buffer by gst_pad_push_data's check_sticky.
-		//
-		//    A residual window remains and is deliberate: an error posted
-		//    between step 7 and here sets gateClosed true, and this store then
-		//    reopens a gate onto a sink that has already failed. That is not a
-		//    false green, and the reason is a property of the CALLER, not of
-		//    this file: the error is on Errors() by construction, and
-		//    internal/sender's state machine performs no drain of its error
-		//    queue after ReplaceSink returns — it drains only immediately
-		//    BEFORE the call, where a queued message can only belong to the
-		//    sink DRAINING already removed. Given that, the message survives,
-		//    the sender tears the sink down, and the worst case is a few
-		//    milliseconds of buffers pushed into a dead socket.
-		//
-		//    The dependency is stated because it has already been broken once.
-		//    If a drain is ever reinstated on the far side of ReplaceSink, this
-		//    window stops being harmless and becomes a PERMANENT false green:
-		//    the discarded message is the only one there will ever be.
-		//    onBusMessage has already set gateClosed, and the gate probe drops
-		//    rather than blocks — a dropped probe returns GST_FLOW_OK, as the
-		//    file comment on the gate explains — so srtq never takes a bad flow
-		//    return, mpegtsmux never notices, and no further bus error is
-		//    posted. The lamp stays green with nothing on the wire and no
-		//    reconnect, and nothing in this file would say so.
-		//
-		//    Closing the window here instead would need the gate to be a
-		//    compare-and-swap against a generation counter, which is more
-		//    machinery than a microsecond window on a path that already
-		//    recovers correctly.
-		p.sink = sink
-		p.gateClosed.Store(false)
-
-		log.Printf("gst: %s connected to %s, latency %d ms, encryption %s",
-			name, where, opts.LatencyMs, encryptionForLog(opts))
+		sl.sink = sink
+		n := name
+		sl.sinkName.Store(&n)
+		sl.gateClosed.Store(false)
+		log.Printf("gst: output %d: %s connected to %s, latency %d ms, encryption %s",
+			sl.index, name, where, opts.LatencyMs, encryptionForLog(opts))
 		return nil
 	}
-
 	if lastErr == nil {
-		// resolveSinkHost never returns an empty list without an error, so this
-		// is unreachable. It is here because the alternative to an unreachable
-		// error is a nil return on a call that installed no sink, which is the
-		// false green this package exists to prevent.
 		return fmt.Errorf("gst: no address to dial for %s", endpointForLog(opts))
 	}
 	return lastErr
@@ -2694,17 +2543,22 @@ func (p *cgoPipeline) ReplaceSink(opts SinkOpts) error {
 // It is idempotent. Removing when no sink is installed is not an error — it
 // still closes the gate and re-arms the queue, which is exactly what a caller
 // entering DRAINING after a failed connect attempt needs.
-func (p *cgoPipeline) RemoveSink() error {
+func (p *cgoPipeline) RemoveSink() error { return p.RemoveSinkOn(0) }
+
+func (p *cgoPipeline) RemoveSinkOn(output int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	if p.stopped {
 		return errors.New("gst: pipeline is stopped")
 	}
 	if !p.started {
 		return errors.New("gst: pipeline has not been started")
 	}
-	return p.removeSinkLocked()
+	sl, err := p.slotLocked(output)
+	if err != nil {
+		return err
+	}
+	return p.removeSinkLocked(sl)
 }
 
 // removeSinkLocked is the ONE teardown path in this file. p.mu must be held.
@@ -2712,28 +2566,12 @@ func (p *cgoPipeline) RemoveSink() error {
 // ReplaceSink is this followed by an install, rather than a second copy of the
 // same three steps, so that there is a single place where the ordering of gate,
 // unlink, NULL, remove and queue re-arm can be got right or wrong.
-func (p *cgoPipeline) removeSinkLocked() error {
-	// 1. Close the gate. Both probes now drop buffers, which isolates srtq from
-	//    the sink about to be removed and isolates mpegtsmux from srtq.
-	p.gateClosed.Store(true)
-
-	// 2. Detach and destroy the sink, in the order unlink, NULL, remove.
-	//    Removing an element that is not in NULL is what produces the
-	//    "removing element in state PLAYING" warnings and leaks its resources.
-	if err := p.detachSinkLocked(); err != nil {
+func (p *cgoPipeline) removeSinkLocked(sl *sinkSlot) error {
+	sl.gateClosed.Store(true)
+	if err := p.detachSinkLocked(sl); err != nil {
 		return err
 	}
-
-	// 3. Re-arm srtq if its loop was poisoned by the failure that got us here.
-	//    A queue that took GST_FLOW_ERROR or GST_FLOW_NOT_LINKED from
-	//    downstream stores it in srcresult, pauses its task, and thereafter
-	//    returns that same error upstream from gst_queue_chain — so a sink swap
-	//    alone would reconnect SRT and still deliver nothing.
-	//
-	//    Nothing upstream of srtq is touched. wasapi2src, both encoders and
-	//    mpegtsmux stay in PLAYING, which is the single most important property
-	//    of this file.
-	p.rearmQueueLocked()
+	p.rearmQueueLocked(sl)
 	return nil
 }
 
@@ -2761,20 +2599,17 @@ func routeErrOr(route *sinkErrRoute, fallback error) error {
 
 // detachSinkLocked unlinks, stops and removes the currently installed sink, if
 // there is one. p.mu must be held and the gate must already be closed.
-func (p *cgoPipeline) detachSinkLocked() error {
-	if p.sink == nil {
+func (p *cgoPipeline) detachSinkLocked(sl *sinkSlot) error {
+	if sl.sink == nil {
 		return nil
 	}
-	sink := p.sink
-	p.sink = nil
-
+	sink := sl.sink
+	sl.sink = nil
+	sl.sinkName.Store(nil)
 	if pad := sink.GetStaticPad("sink"); pad != nil {
-		p.srtqSrcPad.Unlink(pad)
+		sl.srcPad.Unlink(pad)
 	}
 	if ret := sink.BlockSetState(gogst.StateNull, gogst.ClockTime(elementShutdownTimeout)); !stateChangeOK(ret) {
-		// Report it but carry on removing: an srtsink that will not go to NULL
-		// is not a reason to abandon the reconnect, and leaving it in the
-		// pipeline would be worse.
 		log.Printf("gst: %s would not go to NULL (%s); removing it anyway", sink.GetName(), ret)
 	}
 	if !p.pipeline.Remove(sink) {
@@ -2787,9 +2622,9 @@ func (p *cgoPipeline) detachSinkLocked() error {
 // held. Errors here are logged rather than returned: the caller already has the
 // error that matters, and losing it behind a cleanup failure would hide the
 // reason the connection did not come up.
-func (p *cgoPipeline) abandonSinkLocked(sink gogst.Element, sinkPad gogst.Pad) {
+func (p *cgoPipeline) abandonSinkLocked(sl *sinkSlot, sink gogst.Element, sinkPad gogst.Pad) {
 	if sinkPad != nil {
-		p.srtqSrcPad.Unlink(sinkPad)
+		sl.srcPad.Unlink(sinkPad)
 	}
 	if ret := sink.BlockSetState(gogst.StateNull, gogst.ClockTime(elementShutdownTimeout)); !stateChangeOK(ret) {
 		log.Printf("gst: %s would not go to NULL after a failed connect (%s)", sink.GetName(), ret)
@@ -2878,34 +2713,35 @@ const maxStickyEventsPerType = 8
 //
 // It is a no-op on the healthy path, which is every first connect and every
 // reconnect where the gate closed before the queue saw the failure.
-func (p *cgoPipeline) rearmQueueLocked() {
-	last := p.srtqSrcPad.GetLastFlowReturn()
+func (p *cgoPipeline) rearmQueueLocked(sl *sinkSlot) {
+	last := sl.srcPad.GetLastFlowReturn()
 	if last == gogst.FlowOK {
 		return
 	}
-	log.Printf("gst: %s stopped with %s; re-arming its loop", nameSRTQueue, last)
+	log.Printf("gst: %s stopped with %s; re-arming its loop", sl.queueName, last)
 
-	// Snapshot BEFORE the deactivation destroys them.
-	saved := stickyEventsOf(p.srtqSrcPad)
-	for _, ev := range stickyEventsOf(p.srtqSinkPad) {
+	// The sticky events on the src pad — STREAM_START, CAPS, SEGMENT — are
+	// what the NEXT sink is told about the stream. Deactivating the pad
+	// discards them; they are saved first and restored after, so a
+	// reconnected sink is not told timestamps start from zero.
+	saved := stickyEventsOf(sl.srcPad)
+	for _, ev := range stickyEventsOf(sl.sinkPad) {
 		if _, have := saved[ev.key]; !have {
 			saved[ev.key] = ev
 		}
 	}
 	if _, have := saved[stickyKey{gogst.EventSegment, 0}]; !have {
 		log.Printf("gst: WARNING: %s has no sticky SEGMENT event to preserve across the re-arm; "+
-			"the next sink will be told timestamps start from zero", nameSRTQueue)
+			"the next sink will be told timestamps start from zero", sl.queueName)
 	}
-
-	if !p.srtqSrcPad.SetActive(false) {
-		log.Printf("gst: could not deactivate %s:src while re-arming", nameSRTQueue)
+	if !sl.srcPad.SetActive(false) {
+		log.Printf("gst: could not deactivate %s:src while re-arming", sl.queueName)
 	}
-	if !p.srtqSrcPad.SetActive(true) {
+	if !sl.srcPad.SetActive(true) {
 		log.Printf("gst: could not reactivate %s:src while re-arming; "+
-			"media will not flow until the pipeline is rebuilt", nameSRTQueue)
+			"media will not flow until the pipeline is rebuilt", sl.queueName)
 	}
-
-	restoreStickyEvents(p.srtqSrcPad, saved)
+	restoreStickyEvents(sl.srcPad, saved, sl.queueName)
 }
 
 // stickyKey identifies one sticky event on a pad: its type and, for the types
@@ -2953,13 +2789,11 @@ func stickyEventsOf(pad gogst.Pad) map[stickyKey]stickyEvent {
 // pushes each one to the peer ahead of the next buffer. A failure is logged
 // rather than returned: the caller is mid-reconnect and there is nothing better
 // to do than continue and let the resulting bus error be the report.
-func restoreStickyEvents(pad gogst.Pad, saved map[stickyKey]stickyEvent) {
+func restoreStickyEvents(pad gogst.Pad, saved map[stickyKey]stickyEvent, queueName string) {
 	if pad == nil || len(saved) == 0 {
 		return
 	}
 	restored := 0
-	// Iterate stickyEventTypes rather than the map so the log line is stable
-	// and the store order matches gstpad.c's own sticky ordering.
 	for _, typ := range stickyEventTypes {
 		for idx := uint(0); idx < maxStickyEventsPerType; idx++ {
 			ev, ok := saved[stickyKey{typ: typ, idx: idx}]
@@ -2968,13 +2802,13 @@ func restoreStickyEvents(pad gogst.Pad, saved map[stickyKey]stickyEvent) {
 			}
 			if ret := pad.StoreStickyEvent(ev.event); ret != gogst.FlowOK {
 				log.Printf("gst: could not restore the sticky %s event on %s:src after re-arming (%s); "+
-					"the next sink may see buffers with no segment", typ, nameSRTQueue, ret)
+					"the next sink may see buffers with no segment", typ, queueName, ret)
 				continue
 			}
 			restored++
 		}
 	}
-	log.Printf("gst: restored %d sticky event(s) on %s:src after re-arming", restored, nameSRTQueue)
+	log.Printf("gst: restored %d sticky event(s) on %s:src after re-arming", restored, queueName)
 }
 
 // configureSRTSink applies every srtsink property from specification section 5.
@@ -3283,30 +3117,23 @@ func (p *cgoPipeline) Errors() <-chan error {
 func (p *cgoPipeline) Stop() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	if p.stopped {
 		return nil
 	}
 	p.stopped = true
-	p.gateClosed.Store(true)
-	p.route.Store(nil)
+
+	// Every gate shut and every route dropped BEFORE the state change: a bus
+	// error posted while the pipeline goes to NULL must find nothing to
+	// divert into, and no buffer may reach a sink that is being torn down.
+	for _, sl := range p.slots {
+		sl.gateClosed.Store(true)
+		sl.route.Store(nil)
+	}
 
 	err := p.teardownLocked()
 
-	// Close the channels last, after teardownLocked has silenced the bus
-	// handler and the pipeline has reached NULL. errMu is taken for writing
-	// here; a streaming thread inside deliver or deliverWarning holds it for
-	// reading only for the duration of a non-blocking channel send, so this
-	// cannot wait long.
-	//
-	// It does not deadlock against a message posted by the state change on this
-	// same goroutine either: errMu is NOT held during teardownLocked, so a
-	// re-entrant deliver would take it for reading and return. (An earlier
-	// comment here claimed the opposite and used it to justify detaching the
-	// bus sync handler. That justification was wrong; see teardownLocked.)
-	//
-	// errsClosed guards both channels: nothing sends on either without holding
-	// errMu for reading and checking it first.
+	// The channels close AFTER teardown, so a consumer ranging over Errors
+	// sees every error the teardown itself produced before the close.
 	p.errMu.Lock()
 	if !p.errsClosed {
 		p.errsClosed = true
@@ -3314,7 +3141,6 @@ func (p *cgoPipeline) Stop() error {
 		close(p.warns)
 	}
 	p.errMu.Unlock()
-
 	return err
 }
 
@@ -3352,36 +3178,28 @@ func (p *cgoPipeline) Stop() error {
 func (p *cgoPipeline) teardownLocked() error {
 	p.busSilenced.Store(true)
 
-	// gst_pad_remove_probe waits for a running callback to return. gateProbe
-	// never blocks, so this cannot wait meaningfully, and removing the probes
-	// before the state change keeps callbacks out of the teardown entirely.
-	if p.srtqSrcPad != nil && p.srcProbeID != 0 {
-		p.srtqSrcPad.RemoveProbe(p.srcProbeID)
-		p.srcProbeID = 0
-	}
-	if p.srtqSinkPad != nil && p.sinkProbeID != 0 {
-		p.srtqSinkPad.RemoveProbe(p.sinkProbeID)
-		p.sinkProbeID = 0
-	}
-	if p.srtqSinkPad != nil && p.sinkEventProbeID != 0 {
-		p.srtqSinkPad.RemoveProbe(p.sinkEventProbeID)
-		p.sinkEventProbeID = 0
+	// The probes come off before the state change: a probe still installed
+	// on a pad being deactivated is a callback into Go from inside NULL.
+	for _, sl := range p.slots {
+		if sl.srcPad != nil && sl.srcProbeID != 0 {
+			sl.srcPad.RemoveProbe(sl.srcProbeID)
+			sl.srcProbeID = 0
+		}
+		if sl.sinkPad != nil && sl.sinkProbeID != 0 {
+			sl.sinkPad.RemoveProbe(sl.sinkProbeID)
+			sl.sinkProbeID = 0
+		}
+		if sl.sinkPad != nil && sl.sinkEventProbeID != 0 {
+			sl.sinkPad.RemoveProbe(sl.sinkEventProbeID)
+			sl.sinkEventProbeID = 0
+		}
 	}
 
-	// THE MUXER WATCHDOG GOES BEFORE THE STATE CHANGE, and Stop joins its poller
-	// before removing the probes. Both halves matter and in this order: the poller
-	// reads the pads, the probes write them, and a teardown that removed the probes
-	// first would leave the poller reading a counter nothing can update while the
-	// pipeline it is about to indict is already on its way to NULL. Nil-safe, and
-	// it joins only a poller that was actually started — every failure between
-	// attachLiveWatch and PLAYING reaches here with no goroutine to wait for.
 	p.live.Stop()
 	p.live = nil
 
 	var err error
 	if p.pipeline != nil {
-		// The whole pipeline goes to NULL in one call; there is no need to take
-		// the sink down separately, and doing so would only add a way to fail.
 		stopWatchdog := stateChangeWatchdog("send pipeline to NULL (releasing the capture seam)")
 		ret := p.pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(pipelineStartTimeout))
 		stopWatchdog()
@@ -3390,30 +3208,21 @@ func (p *cgoPipeline) teardownLocked() error {
 		}
 	}
 
-	// Drop the element references so their finalizers can unref. The pipeline
-	// reference is dropped last because everything else is one of its children.
-	p.sink = nil
+	for _, sl := range p.slots {
+		sl.sink = nil
+		sl.sinkName.Store(nil)
+		sl.queue = nil
+		sl.srcPad = nil
+		sl.sinkPad = nil
+	}
+	p.slots = nil
 	p.encoder = nil
-	p.srtq = nil
-	p.srtqSrcPad = nil
-	p.srtqSinkPad = nil
 	p.bus = nil
 	p.clock = nil
 	p.pipeline = nil
 
-	// THE SEAM IS RELEASED LAST, AFTER THE PIPELINE HAS REACHED NULL, and that is
-	// not tidiness. gst_proxy_src_dispose clears only the src's weak reference on
-	// the sink; the SINK's reference on the old src survives until the old src is
-	// finalised, which Go may not do promptly. If the claim were given back while
-	// this pipeline were still PAUSED or PLAYING, the next session's arming could
-	// not repair it — gst_proxy_sink_sink_chain would re-store the sticky events on
-	// the old proxysrc's still-active pad, sent_stream_start and sent_caps would go
-	// TRUE before the new proxysrc bound, and the new session would carry ZERO
-	// BYTES with SRT connected and every lamp green. SendSeam.Stop names the
-	// violation in the log if anyone ever reverses these lines.
 	p.seam.Stop()
 	p.seam = nil
-
 	return err
 }
 

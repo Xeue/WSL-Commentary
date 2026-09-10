@@ -184,7 +184,7 @@ func TestSendDescriptionIsInvariant(t *testing.T) {
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! mux."
 
-	if got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true); got != want {
+	if got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true, false); got != want {
 		t.Errorf("sendDescription is not the specified string.\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -205,7 +205,7 @@ func TestSendDescriptionAudioOnlyHasNoVideoChain(t *testing.T) {
 		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
 		" ! queue name=aq max-size-time=1000000000 ! mux."
 
-	got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, false)
+	got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, false, false)
 	if got != want {
 		t.Errorf("audio-only sendDescription is not the specified string.\n got: %s\nwant: %s", got, want)
 	}
@@ -221,8 +221,8 @@ func TestSendDescriptionAudioOnlyHasNoVideoChain(t *testing.T) {
 // as an assertion rather than as prose: the string for one seat and the string
 // for another differ in exactly the encoder name and the bitrate.
 func TestSendDescriptionVariesOnlyByItsTwoParameters(t *testing.T) {
-	base := sendDescription("vtenc_h264", 128000, true)
-	other := sendDescription("mfh264enc", 96000, true)
+	base := sendDescription("vtenc_h264", 128000, true, false)
+	other := sendDescription("mfh264enc", 96000, true, false)
 
 	normalised := strings.Replace(other, "mfh264enc", "vtenc_h264", 1)
 	normalised = strings.Replace(normalised, "bitrate=96000", "bitrate=128000", 1)
@@ -319,7 +319,7 @@ func TestEveryProxysinkHasALeakyQueueInFrontOfIt(t *testing.T) {
 // rather than a failure.
 func TestTheSeamCapsAreIdenticalOnBothSides(t *testing.T) {
 	capture := captureDescription(CaptureLegs{Commentary: CommentaryNative}, goldenConform(), "")
-	send := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true)
+	send := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true, false)
 
 	if strings.Count(capture, seamAudioCaps) != 1 {
 		t.Errorf("the commentary capture description does not pin the seam caps exactly once:\n%s",
@@ -366,5 +366,37 @@ func everyCaptureShape() []CaptureLegs {
 		{Commentary: CommentaryCard},
 		{Picture: PictureCard, Commentary: CommentaryCard},
 		{Picture: PictureCard, Commentary: CommentaryCard, Preview: true},
+	}
+}
+
+func TestSendDescriptionWithASecondOutputTeesTheMuxerIntoTwoQueues(t *testing.T) {
+	// One encode, one muxer, two SRT outputs: a tee after the muxer feeds two
+	// leaky queues, each the head of its own sink slot. Everything upstream of
+	// the muxer is byte-identical to the single-output description.
+	want := "mpegtsmux name=mux alignment=7 pcr-interval=3600" +
+		" ! tee name=out\n" +
+		"out. ! queue name=srtq leaky=downstream max-size-buffers=4000\n" +
+		"out. ! queue name=srtq2 leaky=downstream max-size-buffers=4000\n" +
+
+		"proxysrc name=aproxsrc" +
+		" ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved" +
+		" ! " + aacEncoderFactory + " bitrate=128000" +
+		" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts" +
+		" ! queue name=aq max-size-time=1000000000 ! mux."
+
+	got := sendDescription("vtenc_h264", DefaultAudioBitrateBps, false, true)
+	if got != want {
+		t.Errorf("two-output sendDescription is not the specified string.\n got: %s\nwant: %s", got, want)
+	}
+
+	one := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true, false)
+	two := sendDescription("vtenc_h264", DefaultAudioBitrateBps, true, true)
+	oneTail := one[strings.Index(one, "proxysrc"):]
+	twoTail := two[strings.Index(two, "proxysrc"):]
+	if oneTail != twoTail {
+		t.Errorf("the second output changed something upstream of the muxer:\n one: %s\n two: %s", oneTail, twoTail)
+	}
+	if strings.Count(two, "leaky=downstream") != 2 || strings.Count(one, "leaky=downstream") != 1 {
+		t.Errorf("want one leaky queue per output; one=%q two=%q", one, two)
 	}
 }

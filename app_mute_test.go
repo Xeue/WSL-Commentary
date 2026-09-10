@@ -857,3 +857,6 @@ var _ interface {
 	SetCommentaryMute(bool) error
 	CommentaryMuted() bool
 } = gst.CapturePipeline(nil)
+
+// OutputStates is unused by these tests: no session here has a second output.
+func (s *pipelineStartingSender) OutputStates() <-chan sender.OutputState { return nil }

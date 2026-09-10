@@ -907,16 +907,16 @@ func TestCgoPipelineImplementsEveryPipelineMethod(t *testing.T) {
 // then drain, then open the gate.
 func TestReplaceSinkClearsTheRouteBeforeOpeningTheGate(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "ReplaceSink"), "\n")
+	lines := strings.Split(funcBody(t, fset, file, "cgoPipeline", "ReplaceSinkOn"), "\n")
 
 	// A DEFERRED clear does not count and must not be allowed to satisfy this
 	// guard — it is the exact defect. Deferred statements run after the
 	// function body has finished, which is after the gate has been opened.
 	clear := lastLineMatching(lines, func(s string) bool {
-		return s == "p.route.Store(nil)"
+		return s == "sl.route.Store(nil)"
 	})
 	open := lastLineMatching(lines, func(s string) bool {
-		return strings.Contains(s, "p.gateClosed.Store(false)")
+		return strings.Contains(s, "sl.gateClosed.Store(false)")
 	})
 	drain := lastLineMatching(lines, func(s string) bool {
 		return strings.Contains(s, "routeErr(route)") && !strings.HasPrefix(s, "defer ")
@@ -969,14 +969,14 @@ func lastLineMatching(lines []string, pred func(string) bool) int {
 // alongside a pipeline-fatal error on Errors().
 func TestReplaceSinkRechecksFatalBeforeSucceeding(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
-	body := funcBody(t, fset, file, "cgoPipeline", "ReplaceSink")
+	body := funcBody(t, fset, file, "cgoPipeline", "ReplaceSinkOn")
 
 	if n := strings.Count(body, "p.fatalError()"); n < 2 {
 		t.Fatalf("ReplaceSink checks p.fatalError() %d time(s), want at least 2: once on entry "+
 			"and once before promising success", n)
 	}
 	last := strings.LastIndex(body, "p.fatalError()")
-	open := strings.Index(body, "p.gateClosed.Store(false)")
+	open := strings.Index(body, "sl.gateClosed.Store(false)")
 	if open < 0 {
 		t.Fatal("ReplaceSink never opens the gate")
 	}
@@ -2284,7 +2284,7 @@ func TestTheSendStartClaimsAndArmsTheSeamBeforeTheParse(t *testing.T) {
 	seam := at("claims and arms the capture seam", "NewSend(p.set)")
 	parse := at("parses a pipeline", "gogst.ParseLaunch(")
 	bind := at("binds the proxysrcs", "p.seam.Bind(")
-	gate := at("closes the gate", "p.gateClosed.Store(true)")
+	gate := at("closes the gate", "sl.gateClosed.Store(true)")
 	watch := at("attaches the muxer watchdog", "attachLiveWatch(")
 	play := at("goes to PLAYING", "BlockSetState(gogst.StatePlaying")
 	verdict := at("gates on media having arrived", "p.awaitFirstMediaLocked()")
@@ -2463,7 +2463,7 @@ func TestBusHandlerClosesTheGateBeforeAnyCgoCall(t *testing.T) {
 	fset, file := parseSource(t, cgoSourceFile)
 	body := funcBody(t, fset, file, "cgoPipeline", "onBusMessage")
 
-	gate := strings.Index(body, "p.gateClosed.Store(true)")
+	gate := strings.Index(body, "sl.gateClosed.Store(true)")
 	if gate < 0 {
 		t.Fatal("onBusMessage no longer closes the gate on a bus error; a failing sink now keeps " +
 			"receiving media and BUILD-NOTES.md section 8.6 is back")

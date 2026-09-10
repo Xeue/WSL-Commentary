@@ -111,8 +111,22 @@ type Opts struct {
 	// for a device here.
 	Pipeline gst.SendOpts
 
-	// Sink configures the srtsink, which is rebuilt on every reconnect.
+	// Sink configures the srtsink, which is rebuilt on every reconnect. It is
+	// output 0 — the primary — and is used when Sinks is empty.
 	Sink gst.SinkOpts
+
+	// Sinks configures every output, in slot order, when the pipeline has more
+	// than one (gst.SendOpts.SecondOutput). Sinks[0] is the primary; when Sinks
+	// is set, Sink is ignored. Each output gets its own reconnect loop, its own
+	// ladder and its own transitions on OutputStates; only output 0's reach
+	// States and the lamp.
+	Sinks []gst.SinkOpts
+
+	// OnOutputConnectError, if set, is OnConnectError for every output: called
+	// with the output's index and the reason each of ITS failed attempts
+	// failed. Output 0's failures reach both callbacks. Same rules as
+	// OnConnectError: it runs on the loop's goroutine and must not block.
+	OnOutputConnectError func(output int, err error)
 
 	// OnConnectError, if set, is called with the reason every failed connection
 	// attempt failed — immediately before the transition to StateBackoff for a
@@ -179,6 +193,25 @@ type Sender interface {
 	//
 	// The channel is closed by Stop, after StateStopped has been sent.
 	States() <-chan State
+
+	// OutputStates returns every output's transitions, tagged with the output.
+	// Output 0's appear here AND on States. Same buffering and same closing
+	// as States. A caller with one output may ignore it.
+	OutputStates() <-chan OutputState
+}
+
+// OutputState is one output's transition.
+type OutputState struct {
+	Output int
+	State  State
+}
+
+// sinks is the outputs to dial: Sinks, or Sink alone.
+func (o Opts) sinks() []gst.SinkOpts {
+	if len(o.Sinks) > 0 {
+		return o.Sinks
+	}
+	return []gst.SinkOpts{o.Sink}
 }
 
 // New returns a Sender that drives p.

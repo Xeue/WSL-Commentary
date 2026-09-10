@@ -80,6 +80,10 @@ var InstanceFields = []string{
 	// That instance's commentary ingest port. (There is no srtHost field: the
 	// SRT host is always derived from m2lxHost — see config.EffectiveSRTHost.)
 	"srtPort",
+	// That instance's SECOND ingest port, when it has one: the same stream is
+	// sent to both. Zero — the default — means it has not. As much a property
+	// of the deployment as srtPort is.
+	"srtSecondPort",
 	// Retransmission budget for the path to that instance.
 	"srtLatencyMs",
 	// How much of the circuit to that instance the feed may take. The same kind
@@ -435,7 +439,7 @@ func Extract(cfg *config.Config) (map[string]json.RawMessage, error) {
 func Filter(fields map[string]json.RawMessage) (kept map[string]json.RawMessage, ignored []string) {
 	kept = make(map[string]json.RawMessage, len(fields))
 	for k, v := range fields {
-		if IsInstanceField(k) {
+		if IsInstanceField(k) || travelsAsInstance(k, v) {
 			kept[k] = v
 			continue
 		}
@@ -443,6 +447,24 @@ func Filter(fields map[string]json.RawMessage) (kept map[string]json.RawMessage,
 	}
 	sort.Strings(ignored)
 	return kept, ignored
+}
+
+// travelsAsInstance is the ONE value-dependent exception to the classes.
+//
+// videoSource is a MACHINE field — see its row above — because "slate" and
+// "decklink" say what hardware THIS PC has. Its third value, "none", says
+// something else: that the INSTANCE's input takes no video at all. That is a
+// deployment fact, the same kind of fact as the port beside it; it is true for
+// anyone who plugs into that input, startable on any machine, and the built-in
+// presets for a facility whose inputs are audio-only carry it. So a preset may
+// say "none" and be believed, and may not say "slate" or "decklink", which are
+// still ignored exactly as before.
+func travelsAsInstance(tag string, v json.RawMessage) bool {
+	if tag != "videoSource" {
+		return false
+	}
+	var s string
+	return json.Unmarshal(v, &s) == nil && s == config.VideoSourceNone
 }
 
 // Apply merges fields onto the LIVE struct: filter, re-marshal the kept map,

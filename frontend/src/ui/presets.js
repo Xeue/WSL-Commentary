@@ -46,6 +46,7 @@ export const INSTANCE_FIELD_LABELS = Object.freeze([
   // that Go no longer honours is a diff row — and now a green preview box — for
   // a change the apply will not make.
   Object.freeze({ tag: 'srtPort', label: 'SRT port' }),
+  Object.freeze({ tag: 'srtSecondPort', label: 'Second SRT port' }),
   Object.freeze({ tag: 'srtLatencyMs', label: 'SRT latency (ms)' }),
   // The two video-leg fields sit between the circuit and the encryption because
   // that is where internal/presets.InstanceFields puts them, and this list is
@@ -127,14 +128,41 @@ export function diffPreset(currentConfig, fields, labels = INSTANCE_FIELD_LABELS
   const cfg = currentConfig || {};
   const preset = fields || {};
   const out = [];
-  for (const { tag, label } of labels) {
-    if (!Object.prototype.hasOwnProperty.call(preset, tag)) continue;
+  const row = (tag, label) => {
     const from = formatValue(cfg[tag]);
     const to = formatValue(preset[tag]);
-    if (from === to) continue;
+    if (from === to) return;
     out.push({ tag, label, from, to });
+  };
+  for (const { tag, label } of labels) {
+    if (!Object.prototype.hasOwnProperty.call(preset, tag)) continue;
+    row(tag, label);
+  }
+  // The one machine field that may travel, with the one value that may; a
+  // preset carrying any other value of it gets no row, because Go drops it.
+  for (const { tag, label } of TRAVELLING_VALUE_LABELS) {
+    if (!Object.prototype.hasOwnProperty.call(preset, tag)) continue;
+    if (!travelsAsInstance(tag, preset[tag])) continue;
+    row(tag, label);
   }
   return out;
+}
+
+/**
+ * TRAVELLING_VALUE_LABELS mirrors internal/presets.travelsAsInstance: the ONE
+ * value-dependent exception to the classes. videoSource is MACHINE — a device
+ * name must never travel — except the value "none", which says the instance
+ * takes no picture at all. That is a fact about the venue rather than about
+ * this PC, so a preset may carry it (the facility's built-in presets do, since
+ * 1.6.2: two audio-only SRT outputs). It is not on INSTANCE_FIELD_LABELS
+ * because that list is the whitelist of TAGS, checked against Go's exactly.
+ */
+export const TRAVELLING_VALUE_LABELS = Object.freeze([
+  Object.freeze({ tag: 'videoSource', label: 'Video source', value: 'none' }),
+]);
+
+function travelsAsInstance(tag, value) {
+  return TRAVELLING_VALUE_LABELS.some((t) => t.tag === tag && t.value === value);
 }
 
 /**
@@ -156,7 +184,7 @@ export function filterPresetFields(fields) {
   const ignored = [];
   const whitelist = new Set(INSTANCE_FIELD_LABELS.map((f) => f.tag));
   for (const key of Object.keys(fields || {})) {
-    if (whitelist.has(key)) {
+    if (whitelist.has(key) || travelsAsInstance(key, (fields || {})[key])) {
       kept[key] = fields[key];
     } else {
       ignored.push(key);

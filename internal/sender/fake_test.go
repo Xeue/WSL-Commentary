@@ -2,6 +2,7 @@ package sender
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -170,6 +171,11 @@ type fakePipeline struct {
 	counts   fakeCounts
 	pipeOpts gst.SendOpts
 	sinkOpts []gst.SinkOpts
+
+	// Per-output bookkeeping, for the two-output tests. sinkOpts above is
+	// output 0's, so the single-output tests read exactly what they always did.
+	sinkOptsOn    map[int][]gst.SinkOpts
+	sinkResultsOn map[int][]error
 }
 
 // fakeErrorBuffer matches the "drop, never block" discipline the gst.Pipeline
@@ -196,17 +202,32 @@ func (p *fakePipeline) Start(opts gst.SendOpts) error {
 // requires of DRAINING. It is idempotent — a removal with nothing attached is
 // not an error — so the fake, like the real thing, does not care whether a sink
 // was ever installed; it counts the call, which is the thing under test.
-func (p *fakePipeline) RemoveSink() error {
+func (p *fakePipeline) RemoveSink() error { return p.RemoveSinkOn(0) }
+
+func (p *fakePipeline) RemoveSinkOn(output int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.counts.removeSinks++
-	p.log.add("removeSink")
-
+	if output == 0 {
+		p.log.add("removeSink")
+	} else {
+		p.log.add(fmt.Sprintf("removeSink#%d", output))
+	}
 	if p.removeErrN > 0 {
 		p.removeErrN--
 		return p.removeErr
 	}
 	return nil
+}
+
+// Outputs is what the fake was started with: one, or two.
+func (p *fakePipeline) Outputs() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pipeOpts.SecondOutput {
+		return 2
+	}
+	return 1
 }
 
 // failRemovals makes the next n RemoveSink calls return err. It is how the
@@ -222,24 +243,60 @@ func (p *fakePipeline) failRemovals(n int, err error) {
 // is installed — blocks until the test releases it. The lock is released before
 // blocking so that Stop and the counter accessors stay usable while the call is
 // parked.
-func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error {
+func (p *fakePipeline) ReplaceSink(opts gst.SinkOpts) error { return p.ReplaceSinkOn(0, opts) }
+
+func (p *fakePipeline) ReplaceSinkOn(output int, opts gst.SinkOpts) error {
 	p.mu.Lock()
 	p.counts.replaceSinks++
-	p.log.add("replaceSink")
-	p.sinkOpts = append(p.sinkOpts, opts)
-
-	err := p.sinkDefault
-	if len(p.sinkResults) > 0 {
-		err = p.sinkResults[0]
-		p.sinkResults = p.sinkResults[1:]
+	if output == 0 {
+		p.log.add("replaceSink")
+		p.sinkOpts = append(p.sinkOpts, opts)
+	} else {
+		p.log.add(fmt.Sprintf("replaceSink#%d", output))
+	}
+	if p.sinkOptsOn == nil {
+		p.sinkOptsOn = map[int][]gst.SinkOpts{}
+	}
+	p.sinkOptsOn[output] = append(p.sinkOptsOn[output], opts)
+	var err error
+	if queued := p.sinkResultsOn[output]; len(queued) > 0 {
+		err = queued[0]
+		p.sinkResultsOn[output] = queued[1:]
+	} else if output == 0 {
+		err = p.sinkDefault
+		if len(p.sinkResults) > 0 {
+			err = p.sinkResults[0]
+			p.sinkResults = p.sinkResults[1:]
+		}
 	}
 	gate := p.sinkGate
 	p.mu.Unlock()
-
 	if gate != nil {
 		<-gate
 	}
 	return err
+}
+
+// queueSinkResultsOn queues ReplaceSinkOn results for one output.
+func (p *fakePipeline) queueSinkResultsOn(output int, results ...error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sinkResultsOn == nil {
+		p.sinkResultsOn = map[int][]error{}
+	}
+	p.sinkResultsOn[output] = append(p.sinkResultsOn[output], results...)
+}
+
+// sinksOn is every SinkOpts handed to one output.
+func (p *fakePipeline) sinksOn(output int) []gst.SinkOpts {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]gst.SinkOpts(nil), p.sinkOptsOn[output]...)
+}
+
+// injectOutputError delivers an error the pipeline attributes to ONE output.
+func (p *fakePipeline) injectOutputError(output int, err error) bool {
+	return p.injectError(&gst.OutputError{Output: output, Err: err})
 }
 
 // THE ROUTING AND THE COUGH MUTE USED TO BE FAKED HERE and are not gone: they

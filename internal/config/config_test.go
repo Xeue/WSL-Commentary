@@ -358,6 +358,34 @@ func TestValidate(t *testing.T) {
 			wantSub: "srtPort",
 		},
 		{
+			name:    "srtSecondPort zero means no second output and is valid",
+			modify:  func(c *Config) { c.SRTSecondPort = 0 },
+			wantErr: false,
+		},
+		{
+			name:    "srtSecondPort negative",
+			modify:  func(c *Config) { c.SRTSecondPort = -1 },
+			wantErr: true,
+			wantSub: "srtSecondPort",
+		},
+		{
+			name:    "srtSecondPort too large",
+			modify:  func(c *Config) { c.SRTSecondPort = 65536 },
+			wantErr: true,
+			wantSub: "srtSecondPort",
+		},
+		{
+			name:    "srtSecondPort equal to srtPort is one listener dialled twice",
+			modify:  func(c *Config) { c.SRTSecondPort = c.SRTPort },
+			wantErr: true,
+			wantSub: "srtSecondPort must differ from srtPort",
+		},
+		{
+			name:    "srtSecondPort distinct is valid",
+			modify:  func(c *Config) { c.SRTSecondPort = c.SRTPort + 1 },
+			wantErr: false,
+		},
+		{
 			name:    "srtPort at lower bound is valid",
 			modify:  func(c *Config) { c.SRTPort = 1 },
 			wantErr: false,

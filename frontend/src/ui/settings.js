@@ -129,6 +129,7 @@ function blankConfig() {
     alias: '',
     eventId: '',
     srtPort: 0,
+    srtSecondPort: 0,
     srtLatencyMs: 120,
     pbkeylen: 0,
     videoBitrateKbps: 2000,
@@ -1273,6 +1274,12 @@ export function createSettingsView(handlers) {
   // and nothing to drift out of step when an instance is switched. Removed at
   // the operator's request.
   addField('srtPort', 'SRT port', numberInput('f-srtPort'));
+  addField(
+    'srtSecondPort',
+    'Second SRT port',
+    numberInput('f-srtSecondPort'),
+    '0 = no second output. Otherwise the same stream is sent to this M2L-X input as well.',
+  );
   addField('srtLatencyMs', 'SRT latency (ms)', numberInput('f-srtLatencyMs'), 'Default 120.');
   addField(
     'pbkeylen',
@@ -2784,6 +2791,7 @@ export function createSettingsView(handlers) {
     fields.alias.input.value = config.alias || '';
     fields.eventId.input.value = config.eventId || '';
     fields.srtPort.input.value = String(config.srtPort ?? 0);
+    fields.srtSecondPort.input.value = String(config.srtSecondPort ?? 0);
     fields.srtLatencyMs.input.value = String(config.srtLatencyMs ?? 120);
     fields.pbkeylen.input.value = String(config.pbkeylen ?? 0);
     // `||`, not `??`, for the reason given at srtReturnPort below: 0 is what
@@ -2942,6 +2950,7 @@ export function createSettingsView(handlers) {
       alias: fields.alias.input.value.trim(),
       eventId: fields.eventId.input.value.trim(),
       srtPort: Number(fields.srtPort.input.value),
+      srtSecondPort: Number(fields.srtSecondPort.input.value),
       srtLatencyMs: Number(fields.srtLatencyMs.input.value),
       pbkeylen: Number(fields.pbkeylen.input.value),
       videoBitrateKbps: Number(fields.videoBitrateKbps.input.value),

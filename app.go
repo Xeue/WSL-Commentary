@@ -2780,6 +2780,17 @@ func (a *App) startSession() error {
 	}
 
 	sess := &session{snd: snd, pipe: pipe, cap: capSet}
+	// The second output's transitions, when there is one. Its failures go to
+	// the alerts through its reporter (senderOpts); this is the good news —
+	// connected again after a drop — and the log of the rest. It is on
+	// sess.wg like the primary's forwarder, so Stop joins it.
+	if cfg.SRTSecondPort != 0 {
+		sess.wg.Add(1)
+		go func() {
+			defer sess.wg.Done()
+			a.forwardSecondOutputStates(snd.OutputStates(), cfg.EffectiveSRTHost(), cfg.SRTSecondPort)
+		}()
+	}
 
 	// THE CAPTURE'S FAULTS ARE NOT DRAINED HERE ANY MORE, and the deletion is the
 	// change rather than an omission. The two goroutines that read Faults() and
@@ -5084,40 +5095,49 @@ func (a *App) deviceChannels(cfg *config.Config) int {
 // with g_object_set rather than in the URI, and must not be logged or returned
 // across the Wails boundary.
 func (a *App) senderOpts(cfg *config.Config, passphrase string) sender.Opts {
-	// EffectiveSRTHost, not SRTHost: an empty srtHost means "the same host as
-	// M2L-X" (config.Config's field comment). The reporter is given the same
-	// resolved host, so the operator is told the name that was actually dialled
-	// rather than a blank.
 	srtHost := cfg.EffectiveSRTHost()
 	reporter := newConnectErrorReporter(a.emitError, srtHost, cfg.SRTPort, time.Now)
 
+	primary := gst.SinkOpts{
+		Host:       srtHost,
+		Port:       cfg.SRTPort,
+		LatencyMs:  cfg.SRTLatencyMs,
+		Passphrase: passphrase,
+		PBKeyLen:   cfg.PBKeyLen,
+	}
+	sinks := []gst.SinkOpts{primary}
+
+	// THE SECOND OUTPUT: the same stream to a second listener on the same
+	// host — same latency, same passphrase, a different port. It gets its own
+	// reporter so its failures are named as its own on the alerts, and only
+	// output 1's failures reach it: output 0's already have the reporter above.
+	var onOutput func(int, error)
+	if cfg.SRTSecondPort != 0 {
+		second := primary
+		second.Port = cfg.SRTSecondPort
+		sinks = append(sinks, second)
+		secondReporter := newOutputConnectErrorReporter(a.emitError, "the second SRT output",
+			srtHost, cfg.SRTSecondPort, time.Now)
+		onOutput = func(output int, err error) {
+			if output == 1 {
+				secondReporter.report(err)
+			}
+		}
+	}
+
 	return sender.Opts{
 		Pipeline: gst.SendOpts{
-			// The AUDIO bitrate is left at zero so that internal/gst applies
-			// its own documented constant of 128000 bps (specification section
-			// 5); the codec is likewise not exposed to the user. The VIDEO
-			// bitrate no longer is: the owner has ruled 2000 kbps — chosen for
-			// a still slate — far too low for a leg carrying live video, and
-			// config.EffectiveVideoBitrateKbps substitutes the same 2000 for an
-			// unset field, so a configuration nobody has touched still encodes
-			// exactly what the on-air build encodes.
 			VideoBitrateKbps: cfg.EffectiveVideoBitrateKbps(),
-			// Audio-only: the send pipeline is built without its video chain, to
-			// match the capture plan that built no picture leg. The bitrate above
-			// is then unused. See config.VideoSourceNone.
-			NoVideo: !cfg.SendsVideo(),
+			// No video chain at all on an audio-only seat; see
+			// config.VideoSourceNone and the capture plan's NoVideo, which this
+			// must match.
+			NoVideo:      !cfg.SendsVideo(),
+			SecondOutput: cfg.SRTSecondPort != 0,
 		},
-		Sink: gst.SinkOpts{
-			Host:       srtHost,
-			Port:       cfg.SRTPort,
-			LatencyMs:  cfg.SRTLatencyMs,
-			Passphrase: passphrase,
-			PBKeyLen:   cfg.PBKeyLen,
-		},
-		// A fresh reporter per session, so that its memory of what it has
-		// already said dies with the session it said it about. An operator who
-		// presses STOP and START has told us they want to be told again.
-		OnConnectError: reporter.report,
+		Sink:                 primary,
+		Sinks:                sinks,
+		OnConnectError:       reporter.report,
+		OnOutputConnectError: onOutput,
 	}
 }
 
@@ -5201,6 +5221,11 @@ func nativeAudioDeviceID(cfg *config.Config) string {
 // bookkeeping and never across emit, so the state machine cannot be stalled
 // behind a log write either.
 type connectErrorReporter struct {
+	// what names the output in the message — "the commentary feed" for the
+	// primary, "the second SRT output" for the second; see
+	// newOutputConnectErrorReporter.
+	what string
+
 	// emit publishes one error to the operator. It is App.emitError in the
 	// application and a recorder in the tests.
 	emit func(error)
@@ -5229,10 +5254,17 @@ type connectErrorReporter struct {
 // host and port as the endpoint the feed was going to. now supplies the clock; a
 // nil now means time.Now, which is what the application passes.
 func newConnectErrorReporter(emit func(error), host string, port int, now func() time.Time) *connectErrorReporter {
+	return newOutputConnectErrorReporter(emit, "the commentary feed", host, port, now)
+}
+
+// newOutputConnectErrorReporter is newConnectErrorReporter with the output
+// named: "the commentary feed" for the primary, "the second SRT output" for
+// the second, so the operator can tell which listener is refusing.
+func newOutputConnectErrorReporter(emit func(error), what, host string, port int, now func() time.Time) *connectErrorReporter {
 	if now == nil {
 		now = time.Now
 	}
-	return &connectErrorReporter{emit: emit, host: host, port: port, now: now}
+	return &connectErrorReporter{emit: emit, what: what, host: host, port: port, now: now}
 }
 
 // report is the sender.Opts.OnConnectError callback. It decides whether this
@@ -5292,13 +5324,13 @@ func (r *connectErrorReporter) report(err error) {
 
 	if changed {
 		r.emit(fmt.Errorf(
-			"wslcomms: the commentary feed to %s:%d is not connected and is retrying: %w",
-			r.host, r.port, err))
+			"wslcomms: %s to %s:%d is not connected and is retrying: %w",
+			r.what, r.host, r.port, err))
 		return
 	}
 	r.emit(fmt.Errorf(
-		"wslcomms: the commentary feed to %s:%d is still not connected after %d further attempts: %w",
-		r.host, r.port, suppressed, err))
+		"wslcomms: %s to %s:%d is still not connected after %d further attempts: %w",
+		r.what, r.host, r.port, suppressed, err))
 }
 
 // ---------------------------------------------------------------------------
@@ -6178,6 +6210,31 @@ func (a *App) forgetSignal() {
 	a.sigMu.Unlock()
 
 	a.events.send(EventSignal, signalPayloadFrom(cleared))
+}
+
+// forwardSecondOutputStates follows the SECOND SRT output's transitions
+// (sender.Opts.Sinks[1]). They do not drive the SENDING lamp — that is the
+// primary's, the feed the switcher is receiving — but a commentator whose
+// second input has dropped is told, and told again when it is back. The
+// failure reasons come from the output's own reporter; this carries the
+// recoveries. It ranges until the sender closes the channel.
+func (a *App) forwardSecondOutputStates(states <-chan sender.OutputState, host string, port int) {
+	wasDown := false
+	for st := range states {
+		if st.Output != 1 {
+			continue
+		}
+		log.Printf("wslcomms: second SRT output (%s:%d): %s", host, port, st.State)
+		switch st.State {
+		case sender.StateConnected:
+			if wasDown {
+				a.emitNote(fmt.Sprintf("the second SRT output to %s:%d is connected again", host, port))
+			}
+			wasDown = false
+		case sender.StateBackoff:
+			wasDown = true
+		}
+	}
 }
 
 // forwardSenderStates republishes the sender's transitions on the "sender"

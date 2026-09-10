@@ -654,7 +654,11 @@ transcription. A second parser here would be a second grammar that drifts.
 Two contract points that are easy to get wrong and cost a day each:
 
 - **`Start` installs no sink.** It plays the encode/mux chain with the `srtq` src pad blocked. The
-  first `ReplaceSink` installs the first sink. That is what lets the chain stay in PLAYING for the
+  first `ReplaceSink` installs the first sink. (With `SendOpts.SecondOutput` there are two sink
+  slots — `srtq` and `srtq2` behind `tee name=out` — each with its own gate and route;
+  `ReplaceSinkOn(i)` / `RemoveSinkOn(i)` address one, `ReplaceSink` is slot 0, and a sink-sourced
+  bus error arrives on `Errors()` as `*OutputError` naming its slot so `internal/sender` restarts
+  that output alone. An error naming no slot closes every gate.) That is what lets the chain stay in PLAYING for the
   life of the process, which is the structural fix for the backwards-DTS bug. It DOES open a
   device — it has none to open; the capture layer opened it at `domReady` — and it refuses unless
   media has reached `vq:src`, `aq:src` and `mux:src` within two seconds of PLAYING, which is the

@@ -1,48 +1,36 @@
 //go:build dev || production || bindings
 
-// The seven fixed facility instances, baked into the build.
+// app_builtin_presets.go seeds the facility's seven M2L-X instance presets and
+// their passwords, and keeps the built-in values current across upgrades.
 //
-// Owner: presets work package (same as app_presets.go). WSL Studios runs seven
-// permanent M2L-X deployments — match<letter> for g, h, i, j, k, l and t (the
-// set skips m..s and jumps to t) — and every install should find all seven
-// waiting in the instance picker without anyone typing a host, a username or a
-// password. This file bakes them in and seeds them at startup.
+// Owner: WP-5b/presets.
 //
-// # What is baked, and what is not
+// # What a built-in preset says
 //
-// Each preset carries only the instance coordinates the operator specified: the
-// host, the sign-in name, and "commentary input number 4" expressed three ways
-// — statusKey cam4, the SRT contribution port 40004, and the SRT return port
-// 40504. The event id is not baked, and could not be even if somebody wanted it
-// to be: it is a DISCOVERED field (internal/presets.DiscoveredFields), changes
-// per live event, and is auto-selected after sign-in (App.ListEvents and
-// events.js). A preset that named one would be stripped on load. Everything
-// else stays at config defaults, so applying a match changes only these five
-// fields and leaves an operator's other settings untouched.
+// Each of the seven instances — Match G, H, I, J, K, L and T — is one M2L-X
+// deployment with the same shape: a host named after its letter, an alias to
+// sign in with, the status key the lamps read, and the SRT ports. Since 1.6.2
+// the commentary is sent to TWO audio-only mic inputs per instance, ports
+// 40901 and 40902, carrying the same encode; the picture return is unchanged.
+// That is why the presets carry srtSecondPort and videoSource "none" — the
+// one videoSource value a preset may carry, because it describes the
+// instance's input rather than this PC's hardware (see
+// internal/presets.travelsAsInstance).
 //
-// # The passwords
+// # Seeding, and the upgrade rule
 //
-// These are real credentials for the facility's own private instances, baked in
-// at the owner's explicit request. Each preset's M2L-X password is seeded into
-// the OS credential store — Windows Credential Manager, or the login Keychain on
-// macOS; internal/secrets picks — under that preset's OWN scope
-// (WSLComms/match<letter>/m2lx), exactly where the scoped credential path reads
-// it at sign-in — so applying "Match G" and pressing START just works. They are
-// per-instance and never collide. The target string is the same on both
-// platforms, so a preset seeded on one machine is looked for under the same name
-// on the other; only the vault it lands in differs.
-//
-// # Idempotency: "always present" without clobbering
-//
-// Seeding runs on every launch. A preset FILE is created only if it is missing,
-// so a later hand-edit survives and a deleted one reappears next launch (which
-// is what "always present" means). The password is (re)written only when it is
-// not already the baked value, so a normal launch touches Credential Manager
-// not at all.
-
+// A preset that does not exist is written whole. One that does exist is the
+// operator's: an edit they made survives every re-seed (the test pins it). But
+// the built-in VALUES change — the ports did — and an operator who never
+// touched a preset should get the new ones without re-installing. So a field
+// is rewritten only when it is ABSENT, or still holds a PREVIOUS built-in
+// value; a field holding anything else was edited and is left alone. The
+// password is re-asserted every launch: it is the facility's, not the
+// operator's.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,75 +38,85 @@ import (
 	"strings"
 	"time"
 
+	"wslcomms/internal/config"
 	"wslcomms/internal/presets"
 	"wslcomms/internal/secrets"
 )
 
-// builtinPresetLetters names the seven always-present instances: match<letter>.
-// The set is g..l then t — it is NOT a contiguous range, so it is listed rather
-// than generated from a start/end pair.
+// builtinPresetLetters are the seven instances' letters. The preset id is
+// "match<letter>", the host "m2lx-wslstudios-match<letter>.etapsiota.com".
 var builtinPresetLetters = []string{"g", "h", "i", "j", "k", "l", "t"}
 
 const (
-	// The commentary input is "number 4" on every instance, spelled three ways:
-	// the switcher_status node, the SRT contribution ingest port, and the SRT
-	// return (output) port.
 	builtinStatusKey     = "cam4"
-	builtinSRTPort       = 40004
+	builtinSRTPort       = 40901
+	builtinSRTSecondPort = 40902
 	builtinSRTReturnPort = 40504
+	builtinVideoSource   = config.VideoSourceNone
 
-	// builtinHostFmt and builtinPasswordFmt are the per-instance host and
-	// password patterns. The password's letter is upper-cased.
 	builtinHostFmt     = "m2lx-wslstudios-match%s.etapsiota.com"
 	builtinPasswordFmt = "WSLStud10sM4tch%s"
 )
 
+// builtinPreviousValues are values a built-in field used to hold. A preset
+// still holding one was never edited by the operator and is upgraded; one
+// holding anything else was, and is left alone.
+var builtinPreviousValues = map[string][]json.RawMessage{
+	"srtPort": {jsonRaw(40004)},
+}
+
+// builtinFields are the values a built-in preset carries today.
+func builtinFields(letter string) map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		"m2lxHost":      jsonRaw(fmt.Sprintf(builtinHostFmt, letter)),
+		"alias":         jsonRaw("match" + letter),
+		"statusKey":     jsonRaw(builtinStatusKey),
+		"srtPort":       jsonRaw(builtinSRTPort),
+		"srtSecondPort": jsonRaw(builtinSRTSecondPort),
+		"srtReturnPort": jsonRaw(builtinSRTReturnPort),
+		"videoSource":   jsonRaw(builtinVideoSource),
+	}
+}
+
 // seedBuiltinPresets ensures the seven facility presets and their M2L-X
-// passwords exist. It is called from startup BEFORE the active-preset record is
-// read, so a machine that already has one applied signs in on this launch.
-//
-// Every failure is logged and stepped over rather than fatal: a machine that
-// cannot write one preset file must still open, and the other six must still
-// seed.
+// passwords exist, and upgrades built-in values the operator never edited.
+// It runs at every startup and is idempotent.
 func (a *App) seedBuiltinPresets() {
 	for _, letter := range builtinPresetLetters {
 		upper := strings.ToUpper(letter)
 		id := "match" + letter
-		host := fmt.Sprintf(builtinHostFmt, letter)
-		alias := "match" + letter
 		password := fmt.Sprintf(builtinPasswordFmt, upper)
+		fields := builtinFields(letter)
 
-		// The preset file: create only if missing, so edits survive and a
-		// deleted one comes back.
-		if _, err := presets.Load(id); errors.Is(err, presets.ErrNotFound) {
-			p := presets.Preset{
+		p, err := presets.Load(id)
+		switch {
+		case errors.Is(err, presets.ErrNotFound):
+			p = presets.Preset{
 				Version:         presets.Version,
 				ID:              id,
 				Name:            "Match " + upper,
 				CredentialScope: id,
 				SavedAt:         time.Now().UTC(),
-				Fields: map[string]json.RawMessage{
-					"m2lxHost":      jsonRaw(host),
-					"alias":         jsonRaw(alias),
-					"statusKey":     jsonRaw(builtinStatusKey),
-					"srtPort":       jsonRaw(builtinSRTPort),
-					"srtReturnPort": jsonRaw(builtinSRTReturnPort),
-				},
+				Fields:          fields,
 			}
 			if err := presets.Save(p); err != nil {
 				log.Printf("wslcomms: seeding built-in preset %q: %v", id, err)
 			} else {
-				log.Printf("wslcomms: seeded built-in preset %q (%s)", id, host)
+				log.Printf("wslcomms: seeded built-in preset %q (%s)", id, string(fields["m2lxHost"]))
 			}
-		} else if err != nil {
-			// A file that exists but will not load (corrupt, wrong version) is
-			// left alone — overwriting it could destroy an operator's edit — but
-			// the password below is still ensured so the instance is usable.
+		case err != nil:
 			log.Printf("wslcomms: built-in preset %q is present but unreadable (%v); leaving the file as is", id, err)
+		default:
+			if changed := upgradeBuiltinFields(p.Fields, fields); len(changed) > 0 {
+				p.SavedAt = time.Now().UTC()
+				if err := presets.Save(p); err != nil {
+					log.Printf("wslcomms: upgrading built-in preset %q: %v", id, err)
+				} else {
+					log.Printf("wslcomms: upgraded built-in preset %q: %s", id, strings.Join(changed, ", "))
+				}
+			}
 		}
 
-		// The password, under this preset's own scope. Written only when it is
-		// not already correct, so a steady-state launch does not touch the vault.
 		key, err := secrets.ScopedKey(id, secrets.KeyM2LX)
 		if err != nil {
 			log.Printf("wslcomms: scoping the built-in password for %q: %v", id, err)
@@ -132,10 +130,34 @@ func (a *App) seedBuiltinPresets() {
 	}
 }
 
-// jsonRaw marshals a compile-time-constant value into a preset field. The
-// inputs here are always string or int constants, so a marshal error is
-// impossible; it is guarded rather than ignored only so a future caller with a
-// richer value fails loudly.
+// upgradeBuiltinFields writes the current built-in values into an existing
+// preset's fields where a field is absent or still holds a previous built-in
+// value, and returns the tags it changed. An edited field is left alone.
+func upgradeBuiltinFields(have, want map[string]json.RawMessage) []string {
+	var changed []string
+	for tag, value := range want {
+		cur, present := have[tag]
+		if present && bytes.Equal(bytes.TrimSpace(cur), bytes.TrimSpace(value)) {
+			continue
+		}
+		if present && !isPreviousBuiltinValue(tag, cur) {
+			continue
+		}
+		have[tag] = value
+		changed = append(changed, tag)
+	}
+	return changed
+}
+
+func isPreviousBuiltinValue(tag string, cur json.RawMessage) bool {
+	for _, old := range builtinPreviousValues[tag] {
+		if bytes.Equal(bytes.TrimSpace(cur), bytes.TrimSpace(old)) {
+			return true
+		}
+	}
+	return false
+}
+
 func jsonRaw(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {

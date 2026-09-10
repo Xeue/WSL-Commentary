@@ -83,8 +83,13 @@ func TestSeedBuiltinPresets_CreatesTheSevenFacilityInstances(t *testing.T) {
 		presetFieldString(t, p, "m2lxHost", tc.host)
 		presetFieldString(t, p, "alias", tc.alias)
 		presetFieldString(t, p, "statusKey", "cam4")
-		presetFieldInt(t, p, "srtPort", 40004)
+		// Two audio-only outputs per instance since 1.6.2: the same encode to
+		// 40901 and 40902. videoSource "none" is the one machine-classed value
+		// a preset may carry (presets.travelsAsInstance).
+		presetFieldInt(t, p, "srtPort", 40901)
+		presetFieldInt(t, p, "srtSecondPort", 40902)
 		presetFieldInt(t, p, "srtReturnPort", 40504)
+		presetFieldString(t, p, "videoSource", "none")
 
 		// The password is under WSLComms/<id>/m2lx, exactly where sign-in reads
 		// it once the preset is applied.
@@ -116,9 +121,18 @@ func TestSeedBuiltinPresets_NeverCarriesAMachineField(t *testing.T) {
 	}
 	for _, p := range list {
 		for _, tag := range presets.MachineFields {
-			if _, ok := p.Fields[tag]; ok {
-				t.Errorf("built-in preset %q carries machine field %q", p.ID, tag)
+			raw, ok := p.Fields[tag]
+			if !ok {
+				continue
 			}
+			// The one exception, with the one value: videoSource "none" says the
+			// instance takes no picture, which is a fact about the venue and not
+			// about this PC's hardware (presets.travelsAsInstance). Any other
+			// videoSource names a device and must not be here.
+			if tag == "videoSource" && string(raw) == `"none"` {
+				continue
+			}
+			t.Errorf("built-in preset %q carries machine field %q (%s)", p.ID, tag, raw)
 		}
 	}
 }
@@ -152,4 +166,52 @@ func TestSeedBuiltinPresets_IsIdempotentAndPreservesEdits(t *testing.T) {
 		t.Fatalf("Load after re-seed: %v", err)
 	}
 	presetFieldString(t, again, "m2lxHost", "edited.example.com")
+}
+
+func TestSeedBuiltinPresets_UpgradesUneditedBuiltinValuesAndKeepsEdits(t *testing.T) {
+	// A preset seeded by a build before 1.6.2 says srtPort 40004 and knows
+	// nothing of a second output or of videoSource. The re-seed brings a field
+	// that still holds the OLD built-in value up to date and adds the fields
+	// that did not exist — but a port the operator set to something of their
+	// own is theirs, and is left exactly as they set it.
+	a, _ := newTestApp(t)
+	a.seedBuiltinPresets()
+
+	old, err := presets.Load("matchg")
+	if err != nil {
+		t.Fatalf("Load matchg: %v", err)
+	}
+	old.Fields["srtPort"] = json.RawMessage(`40004`)
+	delete(old.Fields, "srtSecondPort")
+	delete(old.Fields, "videoSource")
+	if err := presets.Save(old); err != nil {
+		t.Fatalf("Save matchg as a pre-1.6.2 preset: %v", err)
+	}
+
+	edited, err := presets.Load("matchh")
+	if err != nil {
+		t.Fatalf("Load matchh: %v", err)
+	}
+	edited.Fields["srtPort"] = json.RawMessage(`41234`)
+	delete(edited.Fields, "srtSecondPort")
+	if err := presets.Save(edited); err != nil {
+		t.Fatalf("Save matchh with an operator's port: %v", err)
+	}
+
+	a.seedBuiltinPresets()
+
+	g, err := presets.Load("matchg")
+	if err != nil {
+		t.Fatalf("Load matchg after re-seed: %v", err)
+	}
+	presetFieldInt(t, g, "srtPort", 40901)
+	presetFieldInt(t, g, "srtSecondPort", 40902)
+	presetFieldString(t, g, "videoSource", "none")
+
+	h, err := presets.Load("matchh")
+	if err != nil {
+		t.Fatalf("Load matchh after re-seed: %v", err)
+	}
+	presetFieldInt(t, h, "srtPort", 41234)
+	presetFieldInt(t, h, "srtSecondPort", 40902)
 }

@@ -229,6 +229,14 @@ reconnect machines, separate locks, and no code path from a monitor into the sen
 One `gst_parse_launch` string, built once at Start. `srtsink` properties are set with `g_object_set`
 rather than in the URI, so the passphrase is never percent-encoded and never appears in a log line.
 
+Two variations on the string below, both used by the facility presets since 1.6.2. With
+`srtSecondPort` set, the muxer feeds `tee name=out` and TWO leaky queues, `srtq` and `srtq2`: one
+encode, two `srtsink`s, each queue a sink *slot* with its own gate probe, its own `ReplaceSinkOn(i)`
+/ `RemoveSinkOn(i)` and its own reconnect loop in `internal/sender`, so one listener's peer loss
+never drops the other's media (a sink-sourced bus error is delivered as `*gst.OutputError` naming
+its slot). Output 0 alone drives the SENDING lamp. And with `videoSource` `"none"` the video chain
+is not built at all: an audio-only transport stream, the same encode to both ports.
+
 ```
 mpegtsmux name=mux alignment=7 pcr-interval=3600
   ! queue name=srtq leaky=downstream max-size-buffers=4000
@@ -765,6 +773,7 @@ file does not silently acquire Go zero values.
 | `m2lxHost`, `alias`, `eventId` | — | required. `m2lxHost` may carry an explicit `http://` for the mock only — a visible, logged, dev-only downgrade |
 | `srtHost` | empty | optional. Empty means "the same host as M2L-X"; read through `EffectiveSRTHost` |
 | `srtPort` | — | required |
+| `srtSecondPort` | 0 | optional. A second SRT output carrying the SAME encode to another M2L-X input on the same host (a tee after the muxer, two `srtsink`s, two independent reconnect loops). 0 = no second output; must differ from `srtPort`. The facility presets set 40901 and 40902 |
 | `srtLatencyMs` | 120 | send path, milliseconds |
 | `pbkeylen` | 0 | send path: 0, 16 or 32 |
 | `statusKey` | empty | **not required to send.** Empty means the three WebSocket lamps read NO STATUS, which is honest. It cannot be derived from any REST endpoint, so requiring it would make the app unstartable until the operator had guessed a value nothing in the API can tell them |
