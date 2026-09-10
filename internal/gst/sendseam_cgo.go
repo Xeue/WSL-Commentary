@@ -12,7 +12,11 @@ import (
 )
 
 // Bind points a parsed send pipeline's vproxsrc and aproxsrc at the proxysinks
-// this seam has claimed, and reads each pointer back.
+// this seam has claimed, and reads each pointer back. noVideo is the audio-only
+// send (SendOpts.NoVideo): sendDescription rendered no video chain, so there is
+// no vproxsrc to bind and Bind must not go looking for one — the first field
+// run of an audio-only seat failed at exactly that lookup, with the pipeline
+// parsed and never played. The audio proxysrc is bound in either case.
 //
 // It must be called AFTER NewSend (which arms the sinks) and BEFORE the send
 // pipeline leaves NULL. Both orderings matter and neither is recoverable
@@ -34,7 +38,7 @@ import (
 // connects, the lamps go green, and the feed carries zero bytes, which is the exact
 // hazard this seam exists to prevent. seamSinks also refuses a capture that is
 // stopped, unstarted or already failed, which the field read could not.
-func (s *SendSeam) Bind(pipeline gogst.Pipeline) error {
+func (s *SendSeam) Bind(pipeline gogst.Pipeline, noVideo bool) error {
 	if s == nil {
 		return errors.New("gst: SendSeam.Bind was called on a nil seam")
 	}
@@ -70,20 +74,32 @@ func (s *SendSeam) Bind(pipeline gogst.Pipeline) error {
 		}
 	}
 
-	for _, pair := range []struct {
+	type pair struct {
 		srcName string
 		sink    gogst.Element
-	}{
-		{nameVideoProxySrc, video},
-		{nameAudioProxySrc, audio},
-	} {
+	}
+	pairs := []pair{{nameAudioProxySrc, audio}}
+	if noVideo {
+		// Audio-only: the description carries no video chain. A vproxsrc that
+		// IS there means the description and SendOpts.NoVideo disagree, which is
+		// a planning error — refused, since binding it to nothing would be the
+		// silent zero-byte hazard this seam exists to prevent.
+		if pipeline.GetByName(nameVideoProxySrc) != nil {
+			return errors.New("gst: the send pipeline is audio-only (SendOpts.NoVideo) yet carries " +
+				nameVideoProxySrc + "; the description and the options disagree")
+		}
+	} else {
+		pairs = append([]pair{{nameVideoProxySrc, video}}, pairs...)
+	}
+
+	for _, pair := range pairs {
 		src := pipeline.GetByName(pair.srcName)
 		if src == nil {
 			return errNoElement(pair.srcName, "there is nothing to attach to the capture seam")
 		}
 		if pair.sink == nil {
 			return fmt.Errorf("gst: no capture pipeline in this set owns the proxysink %s needs. "+
-				"The send description is invariant — it always has both legs — so a capture set "+
+				"The send description has both legs unless it is audio-only, so a capture set "+
 				"missing one is a planning error and not a seat with a shorter feed",
 				pair.srcName)
 		}

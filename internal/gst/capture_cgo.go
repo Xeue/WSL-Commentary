@@ -489,7 +489,11 @@ func (c *cgoCapture) buildLocked(conform ConformTarget, preview string) error {
 			// resolved to an integer before osxaudiosrc will take it, and this is
 			// the only record of which id the resolution was asked to find.
 			log.Printf("gst: capture: %s device id: %s", captureSourceFactory, c.opts.AudioDeviceID)
-			if err := configureCaptureSource(asrc, c.opts.AudioDeviceID); err != nil {
+			if captureSourceOverride != "" {
+				// The test hook's tone generator: nothing to point at a device.
+				log.Printf("gst: capture: the commentary source is %q (test hook); no device is opened",
+					captureSourceOverride)
+			} else if err := configureCaptureSource(asrc, c.opts.AudioDeviceID); err != nil {
 				return abort(err)
 			}
 		}

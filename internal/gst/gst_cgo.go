@@ -1559,7 +1559,7 @@ func (p *cgoPipeline) startBuiltLocked(opts SendOpts, encoderName string) error 
 	// would leave this pipeline attached to NOTHING, which at the pipeline level is
 	// indistinguishable from a healthy one right up to the moment the switcher
 	// hears silence.
-	if err := p.seam.Bind(pipeline); err != nil {
+	if err := p.seam.Bind(pipeline, opts.NoVideo); err != nil {
 		return abort(err)
 	}
 

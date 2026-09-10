@@ -61,6 +61,14 @@ import "strconv"
 // the life of the process and the encoder never sees a caps change at all. With
 // conform in the send pipeline it would be a mid-stream renegotiation of the
 // on-air path, every time somebody touched a cable.
+// captureSourceOverride, when non-empty, replaces the platform microphone
+// element in the commentary leg — "audiotestsrc is-live=true" — so a live test
+// can run the shipped graph on a machine with no input device at all. It is a
+// TEST HOOK: production never sets it, the card source is never substituted,
+// and cgoCapture.Start skips pointing the source at a device when it is set,
+// since a tone generator has no device to be pointed at.
+var captureSourceOverride string
+
 func captureDescription(legs CaptureLegs, conform ConformTarget, preview string) string {
 	chains := make([]string, 0, 4)
 
@@ -216,6 +224,9 @@ func captureDescription(legs CaptureLegs, conform ConformTarget, preview string)
 		// deckLinkAudioChannels says why 2 — which would negotiate a positioned
 		// pair and need no matrix — is the wrong answer.
 		audioSource := captureSourceFactory + " name=" + nameAudioSrc
+		if captureSourceOverride != "" {
+			audioSource = captureSourceOverride + " name=" + nameAudioSrc
+		}
 		if legs.Commentary == CommentaryCard {
 			audioSource = audioCaptureFactory + " name=" + nameAudioSrc +
 				" channels=" + strconv.Itoa(deckLinkAudioChannels)
