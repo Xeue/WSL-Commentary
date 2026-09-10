@@ -27,6 +27,7 @@ import { createLampRow } from './lamps.js';
 import { LAMP_NAMES } from './home.js';
 import { createErrorLog, describeEntry, formatErrorTime } from './errorlog.js';
 import { SEVERITY, normaliseSeverity } from './alerts.js';
+import { readPref, writePref, PREF_MONITOR_RAIL_COLLAPSED } from './prefs.js';
 
 export const MONITOR_WINDOW_TITLE = 'PGM Monitor';
 
@@ -53,11 +54,19 @@ export function createMonitorView(handlers) {
   });
   alertsRegion.append(alertsClear, alertsList);
 
+  // The count on the collapsed strip: an alert that arrives while the column
+  // is folded away must still be visible as a number, as in the application.
+  const railStripCount = document.createElement('span');
+  railStripCount.className = 'rail-strip-attention';
+  railStripCount.hidden = true;
+
   function renderAlerts() {
     const entries = errorLog.entries;
     alertsList.textContent = '';
     alertsRegion.hidden = entries.length === 0;
     alertsClear.hidden = entries.length === 0;
+    railStripCount.hidden = entries.length === 0;
+    railStripCount.textContent = String(entries.length);
     for (const entry of entries) {
       const li = document.createElement('li');
       li.className = `alert-row alert-row--${entry.severity}`;
@@ -156,14 +165,67 @@ export function createMonitorView(handlers) {
   controls.className = 'controls';
   controls.append(panel.headphoneRow, panel.returnGroup, panel.channelGroup, panel.levelGroup);
 
+  // --- the column collapses, exactly as the application's does ------------
+  //
+  // Same classes, same CSS (this view carries .view-home for that reason):
+  // a header with the fold button, a strip with the unfold button that is the
+  // only thing laid out while folded, and the picture takes the space — the
+  // ResizeObserver on the tile re-places the SRT overlay by itself. The
+  // choice is remembered per machine (prefs.js), because a monitor that is
+  // restarted for a kick should come back the way it was left.
+  const railHeader = document.createElement('div');
+  railHeader.className = 'rail-header';
+  const railTitle = document.createElement('span');
+  railTitle.className = 'rail-title';
+  railTitle.textContent = 'PICTURE & RETURN';
+  const railCollapse = document.createElement('button');
+  railCollapse.type = 'button';
+  railCollapse.className = 'btn btn-ghost rail-collapse';
+  railCollapse.textContent = '›';
+  railCollapse.title = 'Hide the controls (the picture gets the space)';
+  railCollapse.setAttribute('aria-label', 'Hide the controls');
+  railHeader.append(railTitle, railCollapse);
+
+  const railStrip = document.createElement('div');
+  railStrip.className = 'rail-strip';
+  const railExpand = document.createElement('button');
+  railExpand.type = 'button';
+  railExpand.className = 'btn btn-ghost rail-expand';
+  railExpand.textContent = '‹';
+  railExpand.title = 'Show the controls';
+  railExpand.setAttribute('aria-label', 'Show the controls');
+  const railStripLabel = document.createElement('span');
+  railStripLabel.className = 'rail-strip-label';
+  railStripLabel.textContent = 'CONTROLS';
+  railStrip.append(railExpand, railStripCount, railStripLabel);
+
   const rail = document.createElement('aside');
   rail.className = 'home-rail monitor-rail';
   rail.setAttribute('aria-label', 'Picture and return audio');
   rail.append(
+    railHeader,
     alertsRegion,
     makeRailSection('Picture', panel.pictureGroup),
     makeRailSection('Return audio', controls),
+    railStrip,
   );
+
+  let railCollapsed = readPref(PREF_MONITOR_RAIL_COLLAPSED) === true;
+  function renderRail() {
+    el.classList.toggle('home-rail-collapsed', railCollapsed);
+    rail.setAttribute('aria-expanded', railCollapsed ? 'false' : 'true');
+  }
+  railCollapse.addEventListener('click', () => {
+    railCollapsed = true;
+    writePref(PREF_MONITOR_RAIL_COLLAPSED, true);
+    renderRail();
+  });
+  railExpand.addEventListener('click', () => {
+    railCollapsed = false;
+    writePref(PREF_MONITOR_RAIL_COLLAPSED, false);
+    renderRail();
+  });
+  renderRail();
 
   const homeBody = document.createElement('div');
   homeBody.className = 'home-body';

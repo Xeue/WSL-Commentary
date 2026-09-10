@@ -72,6 +72,7 @@ import {
   normalisePictureState,
 } from './picturesource.js';
 import { createBackoffEpisode } from './errorlog.js';
+import { sliderToLevel, levelToSlider, describeLevelPosition, DEFAULT_LEVEL_POSITION } from './levelmap.js';
 import { meterZones, zoneFills, dbToFraction, isSilentFrame, createPeakHold } from './meters.js';
 
 /**
@@ -370,20 +371,39 @@ export function createPgmPanel(handlers, opts = {}) {
   channelLabel.textContent = 'Return Channel';
   channelGroup.append(channelLabel, channelSegmented.el);
 
+  // THE LEVEL SLIDER READS IN DECIBELS — levelmap.js. It used to be linear
+  // into the gain multiplier, which with +18 dB of make-up gain put a
+  // comfortable level at 5–10 % of its travel. The readout beside the label
+  // says what the position means; what leaves here is still the 0..1 linear
+  // multiplier the monitor takes. Where it STARTS is app.js's business (the
+  // remembered level); this default is only the shape of a never-set slider.
   const levelGroup = document.createElement('div');
   levelGroup.className = 'control-group control-group-level';
+  const levelHead = document.createElement('div');
+  levelHead.className = 'level-head';
   const levelLabel = document.createElement('label');
   levelLabel.htmlFor = 'level-slider';
   levelLabel.textContent = 'Return Level';
+  const levelReadout = document.createElement('span');
+  levelReadout.className = 'level-readout';
+  levelReadout.setAttribute('aria-live', 'off');
+  levelHead.append(levelLabel, levelReadout);
   const levelSlider = document.createElement('input');
   levelSlider.type = 'range';
   levelSlider.id = 'level-slider';
   levelSlider.min = '0';
   levelSlider.max = '100';
   levelSlider.step = '1';
-  levelSlider.value = '100';
-  levelSlider.addEventListener('input', () => handlers.onLevelChange(Number(levelSlider.value) / 100));
-  levelGroup.append(levelLabel, levelSlider);
+  levelSlider.value = String(DEFAULT_LEVEL_POSITION);
+  function paintLevel() {
+    levelReadout.textContent = describeLevelPosition(Number(levelSlider.value));
+  }
+  levelSlider.addEventListener('input', () => {
+    paintLevel();
+    handlers.onLevelChange(sliderToLevel(Number(levelSlider.value)));
+  });
+  paintLevel();
+  levelGroup.append(levelHead, levelSlider);
 
   // --- the picture switch and Refresh ----------------------------------------
   //
@@ -511,7 +531,12 @@ export function createPgmPanel(handlers, opts = {}) {
     channelSegmented.set(normaliseChannelMode(mode));
   }
   function setLevel(fraction) {
-    levelSlider.value = String(Math.round(Math.max(0, Math.min(1, fraction)) * 100));
+    levelSlider.value = String(levelToSlider(fraction));
+    paintLevel();
+  }
+  /** getLevel is the slider's current 0..1 linear multiplier. */
+  function getLevel() {
+    return sliderToLevel(Number(levelSlider.value));
   }
 
   renderPicture();
@@ -537,6 +562,7 @@ export function createPgmPanel(handlers, opts = {}) {
     setReturnMid,
     setReturnChannel,
     setLevel,
+    getLevel,
   };
 }
 

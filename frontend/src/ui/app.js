@@ -2,6 +2,8 @@ import * as backend from './backend.js';
 import { deriveSenderLamp, deriveStatusLamps, deriveMonitorLamp, deriveMonitorProcessLamp } from './lamps.js';
 import { createHomeView } from './home.js';
 import { createMonitorView } from './monitorview.js';
+import { readPref, writePref, PREF_RETURN_LEVEL } from './prefs.js';
+import { sliderToLevel, DEFAULT_LEVEL_POSITION } from './levelmap.js';
 import { createSettingsView } from './settings.js';
 // The mixer host. Imported STATICALLY: it is the only module that imports
 // ./mixer/index.js, which is the only module that imports mixer.css, so this
@@ -160,6 +162,14 @@ export function mountApp(root) {
    * exists to remove.
    */
   let currentReturnSource = DEFAULT_RETURN_SOURCE;
+
+  // THE RETURN LEVEL — the slider's 0..1 multiplier — remembered per machine
+  // and handed to EVERY monitor this page builds. Before this it was neither:
+  // it started at full on every launch, and a Refresh or a monitor restart
+  // rebuilt the return audio at full level while the slider still showed
+  // where the operator had left it. With +18 dB of make-up gain, "full" is
+  // what "stupidly loud" meant.
+  let currentLevel = restoreLevel();
 
   /**
    * The gst.ReturnOpts fingerprint the RUNNING SRT return was started with.
@@ -1580,7 +1590,20 @@ export function mountApp(root) {
   }
 
   function onLevelChange(fraction) {
+    currentLevel = fraction;
+    writePref(PREF_RETURN_LEVEL, fraction);
     safeMonitorCall((m) => m.setLevel(fraction));
+  }
+
+  /**
+   * restoreLevel is the remembered return level, or the slider's default
+   * (levelmap.js: -10 dB) on a machine that has never set one. Anything
+   * unusable in storage is the default too — never full.
+   */
+  function restoreLevel() {
+    const v = readPref(PREF_RETURN_LEVEL);
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1) return v;
+    return sliderToLevel(DEFAULT_LEVEL_POSITION);
   }
 
   /**
@@ -1899,6 +1922,9 @@ export function mountApp(root) {
         // the default device.
         sinkId: currentReturnSource === RETURN_SOURCE_SRT ? '' : selectedHeadphoneId(),
         gainDb: config.returnGainDb,
+        // The remembered level, applied at construction so the return audio
+        // is never built at full and turned down a tick later.
+        level: currentLevel,
         // The PAGE owns the crop, not the monitor. Both implement it — the
         // monitor with inline pixel sizes and a scale factor, home.js with
         // percentages of the tile box — and running both is what put the
@@ -1941,6 +1967,9 @@ export function mountApp(root) {
       console.error('wslcomms: monitor.on() threw — MONITOR lamp will not update', err);
     }
 
+    // And again by the setter, so a monitor module that ignored the option
+    // still starts where the slider is.
+    safeMonitorCall((m) => m.setLevel(currentLevel));
     Promise.resolve()
       .then(() => monitor.start())
       .catch((err) => {
@@ -2036,7 +2065,7 @@ export function mountApp(root) {
     home.setTile(currentConfig.monitorTile || { x: 0, y: 360, w: 640, h: 360 });
     home.setReturnMid(currentConfig.returnMid || 2);
     home.setReturnChannel(normaliseChannelMode(currentConfig.returnChannel));
-    home.setLevel(1);
+    home.setLevel(currentLevel);
 
     // Which cough behaviour is primary, from the operator's saved preference.
     // Both the model and the picker are told, from ONE normalisation, so a

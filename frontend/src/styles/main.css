@@ -922,6 +922,22 @@ input[type='range'] {
   width: 100%;
 }
 
+/* The level slider's label row: "Return Level" and what the position means,
+   in decibels (levelmap.js), on one line. */
+.level-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.level-readout {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 /* .control-hint is gone with the sentence under the Return dropdown, which the
    operator removed. Settings' own hints use .field-hint and are unaffected. */
 
