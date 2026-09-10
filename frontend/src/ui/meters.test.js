@@ -235,12 +235,13 @@ test('home.js draws the meters OUTSIDE the tile, beside the picture', () => {
   // of the tile, outside that rectangle, as .pgm-stage was.
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, metersEl, previewTile\)/,
-    'the meters must stand in the stack beside the picture, with the preview',
+    /pgmStage\.append\(panel\.tileEl, panel\.metersEl, previewTile\)/,
+    'the meters must stand in the stack beside the picture, with the preview (both are the ' +
+      'panel\'s now — pgmpanel.js — placed here when a remote seat gets the panel inline)',
   );
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, metersEl, previewTile\)/,
+    /pgmStage\.append\(panel\.tileEl, panel\.metersEl, previewTile\)/,
     'and that stack must be a SIBLING of the tile inside the stage',
   );
   // AND NOTHING ELSE IS IN THAT STACK. There was an explanatory line under the

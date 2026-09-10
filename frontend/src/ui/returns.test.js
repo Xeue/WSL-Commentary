@@ -103,7 +103,8 @@ test('both screens import the one table instead of restating it', () => {
   // This is the actual regression. Two hand-written copies is how mids 3 to 7
   // came to be wrong in two places at once, and a test on the table alone would
   // not have caught it.
-  for (const file of ['home.js', 'settings.js']) {
+  // The Return dropdown lives in the panel (pgmpanel.js) now, not in home.js.
+  for (const file of ['pgmpanel.js', 'settings.js']) {
     const src = read(file);
     assert.match(src, /from '\.\/returns\.js'/, `${file} imports the shared table`);
     assert.ok(

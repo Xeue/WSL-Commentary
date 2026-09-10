@@ -787,10 +787,91 @@ input[type='range'] {
   color: var(--amber);
 }
 
-/* There is no rule that hides the mosaic <video>. There used to be one —
-   .pgm-tile-overlaid — set while the native SRT picture was painted over the
-   tile. The SRT picture is a window of its own now, in its own process, and
-   the mosaic in this tile is always showing. */
+/* THE CLASS MEANS "THE NATIVE WINDOW IS ON SCREEN" AND NOTHING ELSE. It is
+   set from the overlay controller's own visibility, through the panel's
+   setPictureOverlaid, in the PGM monitor window where the SRT picture is a
+   native window painted over the tile. It must never mean "SRT is the chosen
+   source": the overlay is hidden whenever something must appear above it, and
+   suppressing the mosaic then leaves the commentator with black. Whenever the
+   overlay is not visible, the mosaic is. */
+.pgm-tile-overlaid video {
+  visibility: hidden;
+}
+
+/* ------------------------------------------------------------------ */
+/* The PGM monitor: the card in the application's window, and the      */
+/* monitor window's own chrome                                          */
+/* ------------------------------------------------------------------ */
+
+/* Where the picture went. It sits in the stage where the tile used to be:
+   a plain card, not a black rectangle pretending to be a picture. */
+.monitor-card {
+  max-width: 34rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.monitor-card-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.monitor-card-state {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.monitor-card-down .monitor-card-state {
+  color: var(--red);
+}
+
+.monitor-card-text {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.monitor-card .monitor-restart {
+  align-self: flex-start;
+}
+
+.control-group-monitor {
+  flex: 1 1 100%;
+}
+
+.monitor-group-state {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+/* The monitor window: the same two-column shape as the home view, with the
+   picture as large as the window allows and a narrow column of controls. */
+.view-monitor .monitor-refresh {
+  min-height: 44px;
+  padding: 0.5rem 1.2rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.view-monitor .monitor-lamp {
+  margin-right: 0.75rem;
+}
+
+.view-monitor .monitor-alerts[hidden] {
+  display: none;
+}
+
+.view-monitor .monitor-rail {
+  flex-basis: min(var(--rail-w), 30vw);
+}
 
 /* ------------------------------------------------------------------ */
 /* Controls: input / headphones / return + level                       */

@@ -402,7 +402,7 @@ test('what is CONSULTED is in the column', () => {
   for (const [what, token] of [
     ['the six lamps', 'lampsEl'],
     ['the device and return controls', 'controls'],
-    ['the picture selector', 'sourceGroup'],
+    ['the picture selector, or the PGM monitor section in its place', 'monitorGroup'],
     ['the preset picker', 'presetIndicator'],
   ]) {
     assert.ok(railAppend.includes(token), `${what} must be in the column (${token})`);
@@ -441,10 +441,11 @@ test('picture, meters, preview — one row, in that order', () => {
   const src = codeOnly(home);
   assert.match(
     src,
-    /pgmStage\.append\(pgmTile, metersEl, previewTile\)/,
-    'one stack beside the picture, so the meters are there whether or not the preview is',
+    /pgmStage\.append\(panel\.tileEl, panel\.metersEl, previewTile\)/,
+    'one stack beside the picture, so the meters are there whether or not the preview is ' +
+      '(the tile and the meters are the panel\'s now, and are placed here for a remote seat)',
   );
-  assert.match(src, /pgmStage\.append\(pgmTile, metersEl, previewTile\)/);
+  assert.match(src, /pgmStage\.append\(panel\.tileEl, panel\.metersEl, previewTile\)/);
 
   // Neither may take width from the picture on its own initiative.
   const preview = rule('.preview-tile');
@@ -470,11 +471,14 @@ test('picture, meters, preview — one row, in that order', () => {
   // And the ratio has to reach them: a custom property set on .pgm-tile is
   // readable by the tile and its descendants only, and the meters are its
   // sibling.
+  // The crop is the panel's now (pgmpanel.js); it publishes the ratio on the
+  // stage it is attached to, which is this stage when the panel is inline.
   assert.match(
-    codeOnly(home),
-    /pgmStage\.style\.setProperty\('--tile-ar-num'/,
+    codeOnly(ui('pgmpanel.js')),
+    /stageAspectTarget\.style\.setProperty\('--tile-ar-num'/,
     'applyCrop must publish the ratio on the stage, not only on the tile',
   );
+  assert.match(codeOnly(home), /panel\.attachStage\(pgmStage\)/, 'and home.js attaches its stage');
 });
 
 test('the muted state is drawn with an outline, which costs no layout', () => {

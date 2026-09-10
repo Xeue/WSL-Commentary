@@ -118,8 +118,8 @@ connects. That is the whole handshake.
 Every connection gets the SAME set of methods — there are no tiers. What a connection can do is bounded
 by exactly two things:
 
-1. **The host-only set.** The five picture/return methods
-   (`StartPicture`/`StopPicture`/`RefreshPicture`/`StartReturn`/`StopReturn`) and
+1. **The host-only set.** The three picture/return methods
+   (`RestartMonitor`/`StartReturn`/`StopReturn`) and
    the two remote-admin methods (`GetRemoteState`/`SetRemoteListener`) are refused for every remote
    connection and omitted from the method list the remote page ever sees. The picture ones are
    host-only because the picture is physics (below); the admin ones because a remote connection must
@@ -146,7 +146,7 @@ physics.
 
 | Capability | Remote behaviour | Why |
 |---|---|---|
-| **The SRT programme picture** | **Impossible.** The remote page shows the WebRTC multiviewer mosaic and an honest message; the high-quality SRT picture is never sent. | It is a separate process on the host, decoding on the host GPU into a native window of its own (`app_picture_child.go`). No transport that carries the DOM can carry it, and starting, stopping or refreshing it opens and closes a window on the operator's screen and takes the M2L-X output's one fan-out slot. The picture/return methods are host-only and refused. |
+| **The SRT programme picture** | **Impossible.** The remote page shows the WebRTC multiviewer mosaic and an honest message; the high-quality SRT picture is never sent. | It is decoded on the host GPU into a native window over the PGM monitor window, in the monitor process (`monitor_picture.go`). No transport that carries the DOM can carry it. `RestartMonitor` — kill and reopen that process, a window on the operator's screen — is host-only and refused; the monitor process itself calls in through this same allowlist as the client `pgm-monitor` and reaches exactly what a remote seat can. |
 | **The commentary INPUT device list** | Correct and useful. | `ListInputDevices` enumerates the HOST's WASAPI endpoints; picking host hardware from a remote seat is the intended behaviour. |
 | **The headphone (output) picker** | Works only over the HTTPS URL. | `navigator.mediaDevices` needs a secure context; over the plain-HTTP URL the dropdown is empty. Use `https://`. |
 | **Return audio** | Plays on the REMOTE machine's speakers/headphones, via `setSinkId`. | Useful for a remote producer, but it is NOT what the commentator is hearing. The SRT audio return to the HOST's headphones is host-only and refused. |

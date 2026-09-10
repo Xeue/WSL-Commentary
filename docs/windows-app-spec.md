@@ -424,19 +424,25 @@ the deltas overshoot the nominal setting differences. The *negotiated* latency w
 `GST_DEBUG=srtobject:7` prints it — so this is inferred from end-to-end timing rather than read off
 the socket. See §14.
 
-**The picture window, in its own process (1.6.0).** The decoded picture goes into a top-level window
-owned by a CHILD PROCESS — this same executable relaunched with `WSLCOMMS_PICTURE_CHILD` set — not
-into the application's window. The application hands the child its options (host, port, latency,
-key length, and the passphrase, which travels on stdin and nowhere else) and reads its states back
-as lines; closing the child's stdin ends it, so a parent that dies cannot orphan it. A decoder, a
-GPU driver or a libsrt socket that wedges inside the child is one `TerminateProcess` away from gone,
-with the contribution feed and the audio untouched: the **Refresh** button on the home screen is
-exactly that — stop, kill if it will not stop, start a fresh process. The window is movable,
-resizable and closable by the operator, and it comes back where it was left, because the child
-remembers its placement in `%APPDATA%WSLCommspicture-window.json` on every move, resize,
-maximise and restore. The page never covers or positions it. (Before 1.6.0 the picture was a native
-child window painted over the WebView2, positioned by the page in CSS pixels plus its device pixel
-ratio; that mechanism survives only for the DeckLink preview.)
+**The PGM monitor window, in its own process (1.6.1).** The programme picture, the WebRTC mosaic,
+the return audio in the commentator's headphones and the input meters live in a SECOND WINDOW run by
+a SECOND PROCESS — this same executable relaunched with `WSLCOMMS_MONITOR` set, running its own
+Wails window on the same embedded frontend, bound to `MonitorApp` rather than `App`. The application
+launches it at start-up, relays it every event its own page hears (levels, config, status, …) over
+the child's stdin, answers its calls (`GetConfig`, `SaveConfig`, `GetKVSCredentials`,
+`ListOutputDevices`) through the LAN bridge's allowlist, and answers one link-only call,
+`PictureOpts`, which carries the SRT passphrase. Closing the child's stdin ends it, so a parent that
+dies cannot orphan it.
+
+Inside the monitor window the SRT picture is decoded on the GPU into a native child window painted
+over the mosaic tile — positioned by the page in CSS pixels plus its device pixel ratio, shown only
+when the page asked AND the pipeline is SHOWING AND the rectangle has area — exactly the mechanism
+the application's own window used before, moved wholesale. The window's **Refresh** button gives
+whichever picture is active a kick: the mosaic's WebRTC connection is torn down and rebuilt (the
+return audio rides on it and drops for a moment), or the SRT pipeline is restarted. The application's
+window shows a card in the picture's place with **Restart monitor**: the monitor process is killed if
+it will not stop and a fresh one opened, with the contribution feed untouched. A monitor that crashes
+is reopened by itself, up to three times a minute; one the operator closed stays closed.
 
 **The mosaic remains, as the fallback.** SRT is a real network stream to a native decoder; it takes a
 moment to dial, it can be refused, and the M2L-X output can be switched off by somebody else. When it
@@ -829,9 +835,13 @@ describes an encrypted audio return also describes the picture.
 
 ## 10. UI
 
-One application window, plus the picture process's own window when SRT is up. The application
-window's tile always shows the CSS-cropped mosaic, with a badge saying whether the high-resolution
-SRT picture is up in its own window or the mosaic is all there is. Below it, the device and return
+Two windows: the application's, and the PGM monitor's. The monitor window holds the picture (the
+CSS-cropped mosaic, with the SRT picture painted over it when it is showing and a badge saying
+which), the input meters beside it, and the picture and return-audio controls, with one large
+Refresh button. The application window holds everything else — START/STOP, the lamps, the
+commentary input, the cough mute, presets, alerts, Settings and the mixer drawer — and, where the
+picture used to be, a card saying so with a Restart monitor button. A remote seat's browser gets the
+picture panel inline, since it cannot open a window on the host. Below it, the device and return
 controls, the START/STOP button and the five lamps. A Settings screen (same window, swapped view)
 holds §9 and the mixer drawer.
 

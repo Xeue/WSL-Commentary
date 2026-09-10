@@ -140,6 +140,8 @@ test('the header switch reuses the ONE apply path — no second applyPreset call
 
 test('home is given the onPresetChange handler', () => {
   const js = ui('app.js');
-  const home = js.slice(js.indexOf('const home = createHomeView('), js.indexOf('});', js.indexOf('const home = createHomeView(')));
+  // The handlers are one object now, handed to whichever view this window
+  // mounts — the home view or the PGM monitor's.
+  const home = js.slice(js.indexOf('const viewHandlers = {'), js.indexOf('  };', js.indexOf('const viewHandlers = {')));
   assert.match(home, /onPresetChange:\s*onHomePresetChange/, 'app.js must wire the header switch handler');
 });

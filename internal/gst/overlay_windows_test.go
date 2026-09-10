@@ -48,7 +48,7 @@ func TestOverlayWindowIsCreatedWithNoParentNotify(t *testing.T) {
 	// and a cross-thread SendMessage blocks with no timeout until that thread
 	// pumps. During teardown the Wails thread is inside OnShutdown → teardown,
 	// parked in a select and NOT pumping — so DestroyWindow blocks for the whole
-	// shutdown, the picture step overruns pictureStopBudget and is abandoned.
+	// shutdown, the preview step overruns previewStopBudget and is abandoned.
 	//
 	// The window itself is unreachable from here (see the file header), so what
 	// is asserted is the style word CreateWindowExW is given, plus the fact that

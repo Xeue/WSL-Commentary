@@ -237,16 +237,17 @@ func main() {
 			"the bundled GStreamer in %s could not be initialised, so audio cannot be sent: %w", dir, gstInitErr)
 	}
 
-	// THE PICTURE PROCESS. When the application launches the SRT programme
-	// picture it launches THIS SAME EXECUTABLE with pictureChildEnv set, and that
-	// process runs the picture pipeline in a window of its own and nothing else:
-	// no Wails, no window of the application's, no capture, no single-instance
-	// lock. It takes its options on stdin, reports its states on stdout, and
-	// exits when its stdin closes or its window does. It runs here, AFTER
-	// gst.Init so it uses the bundled GStreamer, and BEFORE anything that would
-	// make it a second copy of the application. See app_picture_child.go.
-	if os.Getenv(pictureChildEnv) != "" {
-		runPictureChildAndExit(gstInitErr)
+	// THE PGM MONITOR PROCESS. When the application opens the monitor window it
+	// launches THIS SAME EXECUTABLE with monitorEnv set, and that process runs
+	// a second Wails window — the programme picture, the mosaic, the return
+	// audio and the meters — and nothing else: no capture, no send, no remote
+	// listener, no single-instance lock. It talks to the application over its
+	// stdin and stdout and exits when its stdin closes or its window does. It
+	// runs here, AFTER gst.Init so it uses the bundled GStreamer, and BEFORE
+	// anything that would make it a second copy of the application. See
+	// monitor_main.go and app_monitor.go.
+	if os.Getenv(monitorEnv) != "" {
+		runMonitorAndExit(gstInitErr)
 	}
 
 	// Headless pipeline diagnostic. When WSLCOMMS_DIAGNOSE names an SRT target the

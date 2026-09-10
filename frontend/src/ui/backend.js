@@ -175,12 +175,36 @@ export const STREAM_STATE = Object.freeze({
   STOPPED: 'stopped',
 });
 
+/**
+ * boundApp is the object Go bound into this window: App in the application's
+ * own window (and, on a remote tab, the shim's stand-in for it), MonitorApp in
+ * the PGM MONITOR window — a second Wails window in a second process that
+ * shows the picture, the return audio and the meters. Both expose the same
+ * method names for what they have in common (GetConfig, SaveConfig,
+ * GetKVSCredentials, ListOutputDevices, the picture methods), so everything
+ * below reads the method off whichever one is present, fresh on every call.
+ */
+function boundApp() {
+  if (typeof window === 'undefined' || !window.go || !window.go.main) return null;
+  return window.go.main.App || window.go.main.MonitorApp || null;
+}
+
 function hasWails() {
+  return !!boundApp();
+}
+
+/**
+ * isMonitorWindow reports whether this page is the PGM monitor window rather
+ * than the application's. app.js mounts a different view on it; backend.js
+ * itself treats the two alike.
+ */
+export function isMonitorWindow() {
   return (
     typeof window !== 'undefined' &&
-    window.go &&
-    window.go.main &&
-    window.go.main.App
+    !!window.go &&
+    !!window.go.main &&
+    !!window.go.main.MonitorApp &&
+    !window.go.main.App
   );
 }
 
@@ -198,7 +222,7 @@ function hasRuntimeEvents() {
 // promise whose value is sometimes a string and sometimes an Error-like
 // object depending on runtime version, so both are normalised here.
 async function callGo(method, ...args) {
-  const fn = window.go.main.App[method];
+  const fn = (boundApp() || {})[method];
   if (typeof fn !== 'function') {
     throw new Error(`wslcomms: App.${method} is not bound`);
   }
@@ -1261,7 +1285,8 @@ export class BindingMissingError extends Error {
 }
 
 function hasBinding(method) {
-  return hasWails() && typeof window.go.main.App[method] === 'function';
+  const app = boundApp();
+  return !!app && typeof app[method] === 'function';
 }
 
 /** callGoBound is callGo with the missing-method case named. */
@@ -1519,6 +1544,8 @@ const PICTURE_METHODS = Object.freeze({
   start: 'StartPicture',
   stop: 'StopPicture',
   refresh: 'RefreshPicture',
+  rect: 'SetPictureRect',
+  visible: 'SetPictureVisible',
   state: 'GetPictureState',
 });
 
@@ -1566,6 +1593,8 @@ export function pictureAvailable() {
 
 let fakePictureState = PICTURE_STATE.STOPPED;
 let fakePictureTimer = null;
+let fakePictureRect = null;
+let fakePictureVisible = false;
 
 function setFakePictureState(next) {
   fakePictureState = next;
@@ -1632,6 +1661,40 @@ export async function refreshPicture() {
 }
 
 /**
+ * Positions the overlay: the native window the SRT picture is painted into,
+ * over the mosaic tile of the PGM monitor window.
+ *
+ * IT SENDS CSS PIXELS AND THE RATIO, IN ONE CALL. gst.PictureRect is physical
+ * pixels and gst.ScaleRect multiplies on the Go side, because the factor Go
+ * could read for itself — GetDpiForWindow, the monitor's scale — equals the
+ * WebView's device pixel ratio only at 100% zoom, and Ctrl+scroll changes one
+ * and not the other. The ratio travels WITH the rectangle so the two can never
+ * be measured at different moments. overlay.js owns the one conversion rule.
+ *
+ * @param {{x: number, y: number, width: number, height: number}} cssRect
+ * @param {number} devicePixelRatio  window.devicePixelRatio, as measured
+ */
+export async function setPictureRect(cssRect, devicePixelRatio) {
+  const { x, y, width, height } = cssRect || {};
+  if (hasWails()) {
+    return callGoBound(PICTURE_METHODS.rect, x, y, width, height, devicePixelRatio);
+  }
+  fakePictureRect = { x, y, width, height, devicePixelRatio };
+}
+
+/**
+ * Shows or hides the overlay without stopping the receiver. The overlay is
+ * opaque and on top of its rectangle whatever the page does, so anything drawn
+ * over that rectangle needs it hidden first.
+ *
+ * @param {boolean} visible
+ */
+export async function setPictureVisible(visible) {
+  if (hasWails()) return callGoBound(PICTURE_METHODS.visible, visible === true);
+  fakePictureVisible = visible === true;
+}
+
+/**
  * Reads the picture receiver's state now, for a page that has just loaded and
  * has not yet seen a "picture" event. One of PICTURE_STATE.
  *
@@ -1645,6 +1708,90 @@ export async function getPictureState() {
 /** Subscribes to the "picture" event. Returns an unsubscribe function. */
 export function onPicture(cb) {
   return subscribe(EVENT_PICTURE, cb);
+}
+
+/**
+ * The fake overlay's last known geometry, for a dev session in the browser
+ * where there is no native window to look at. Diagnostics only; nothing reads it.
+ */
+export function fakePictureOverlay() {
+  return { rect: fakePictureRect, visible: fakePictureVisible, state: fakePictureState };
+}
+
+// ---------------------------------------------------------------------------
+// The PGM monitor process
+// ---------------------------------------------------------------------------
+//
+// The picture, the mosaic, the return audio and the meters live in a SEPARATE
+// PROCESS with a window of its own (app_monitor.go). From the application's
+// window there are two things to say to it: what state it is in — for the
+// MONITOR lamp, now that the KVS connection lives over there — and "restart",
+// which kills the process and opens a fresh one. From INSIDE the monitor
+// window there is one thing to say back: what the KVS connection is doing.
+
+/** The Go method names this adapter binds to, in the application's window. */
+const MONITOR_METHODS = Object.freeze({
+  state: 'GetMonitorState',
+  restart: 'RestartMonitor',
+});
+const MONITOR_METHOD_NAMES = Object.freeze(Object.values(MONITOR_METHODS));
+
+/** The method the monitor window reports its KVS state through. */
+const MONITOR_REPORT_METHOD = 'ReportMonitorState';
+
+// EventMonitor: the monitor process's state. The payload is
+// { process: 'starting' | 'running' | 'closed' | 'failed', kvs: <KVS state>, pid }.
+export const EVENT_MONITOR = 'monitor';
+
+/** The monitor process's states, as app_monitor.go names them. */
+export const MONITOR_PROCESS = Object.freeze({
+  STARTING: 'starting',
+  RUNNING: 'running',
+  CLOSED: 'closed',
+  FAILED: 'failed',
+});
+
+/**
+ * monitorAvailable reports whether this window can drive the monitor process:
+ * true in the application's own window, false on a remote tab (RestartMonitor
+ * is host-only and pruned) and false in the monitor window itself.
+ */
+export function monitorAvailable() {
+  return MONITOR_METHOD_NAMES.every(hasBinding);
+}
+
+let fakeMonitorProcess = MONITOR_PROCESS.RUNNING;
+
+/** The monitor process's state now, for a page that has just loaded. */
+export async function getMonitorState() {
+  if (hasWails()) return callGoBound(MONITOR_METHODS.state);
+  return { process: fakeMonitorProcess, kvs: '' };
+}
+
+/**
+ * Restarts the PGM monitor process: it is ended — killed, if its page or its
+ * decoder has wedged — and a fresh one opened. A monitor that was closed is
+ * simply opened. Nothing about the contribution feed is touched.
+ */
+export async function restartMonitor() {
+  if (hasWails()) return callGoBound(MONITOR_METHODS.restart);
+  fakeMonitorProcess = MONITOR_PROCESS.RUNNING;
+  fakeEmit(EVENT_MONITOR, { process: fakeMonitorProcess, kvs: '' });
+}
+
+/** Subscribes to the "monitor" event. Returns an unsubscribe function. */
+export function onMonitor(cb) {
+  return subscribe(EVENT_MONITOR, cb);
+}
+
+/**
+ * reportMonitorState is the monitor window telling the application what its
+ * KVS connection is doing. A no-op anywhere else: the binding only exists on
+ * MonitorApp.
+ */
+export async function reportMonitorState(state) {
+  if (!hasBinding(MONITOR_REPORT_METHOD)) return;
+  return callGo(MONITOR_REPORT_METHOD, String(state));
 }
 
 // ---------------------------------------------------------------------------

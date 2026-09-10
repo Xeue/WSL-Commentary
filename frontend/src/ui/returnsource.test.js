@@ -757,7 +757,8 @@ test('the Headphones dropdown is plainly labelled, and never swaps lists', () =>
   // was engineering trivia on the screen of somebody about to commentate. The
   // invariant it advertised is still enforced here: one list, never the WASAPI
   // one, whose field lives on the Settings screen.
-  const src = ui('home.js');
+  // The dropdown is the panel's (pgmpanel.js); the negatives hold for home.js too.
+  const src = ui('pgmpanel.js') + ui('home.js');
   assert.match(
     src,
     /headphoneLabel\.textContent = 'Headphones\/output'/,

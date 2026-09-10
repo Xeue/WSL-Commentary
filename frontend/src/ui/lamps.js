@@ -436,6 +436,27 @@ const MONITOR_TRANSITIONAL = new Set(['new', 'connecting', 'disconnected']);
  *   deriveMonitorLamp('closed')       -> red   "DOWN"
  *   deriveMonitorLamp('unavailable')  -> grey  "UNAVAILABLE" (module failed to load, see app.js)
  */
+/**
+ * deriveMonitorProcessLamp is the MONITOR lamp in the APPLICATION's window,
+ * where the KVS connection no longer lives: it is in the PGM monitor process,
+ * whose state — and whose report of the connection's state — arrive on the
+ * "monitor" event as { process, kvs }. A process that is not running is a red
+ * lamp whatever the connection last said, because nothing is playing.
+ */
+export function deriveMonitorProcessLamp(payload) {
+  const process = payload && typeof payload.process === 'string' ? payload.process : '';
+  switch (process) {
+    case 'running':
+      return deriveMonitorLamp(payload.kvs ? payload.kvs : undefined);
+    case 'starting':
+      return { level: LEVEL.AMBER, text: 'OPENING' };
+    case 'failed':
+      return { level: LEVEL.RED, text: 'WINDOW FAILED' };
+    default:
+      return { level: LEVEL.RED, text: 'WINDOW CLOSED' };
+  }
+}
+
 export function deriveMonitorLamp(state) {
   if (state === undefined || state === null) {
     return { level: LEVEL.GREY, text: 'NOT STARTED' };

@@ -80,11 +80,13 @@ func TestRemoteAllowlistCoversEveryBoundMethod(t *testing.T) {
 // is covered by the guard the moment it is declared.
 func TestRemoteEventNamesCoversEveryEvent(t *testing.T) {
 	// Every file the bound object is spread over, because the constants are not
-	// all in one of them: EventPicture lives beside the picture path and
-	// EventConfig and EventRemote beside the bridge that emits them.
+	// all in one of them: EventMonitor lives beside the monitor's launcher and
+	// EventConfig and EventRemote beside the bridge that emits them. NOT
+	// monitor_picture.go: EventPicture is declared there but emitted only by
+	// the monitor process, to its own page.
 	pattern := regexp.MustCompile(`Event[A-Za-z]+ += +"([a-zA-Z]+)"`)
 	var declared [][]string
-	for _, name := range []string{"app.go", "app_picture.go", "app_remote.go"} {
+	for _, name := range []string{"app.go", "app_monitor.go", "app_remote.go"} {
 		raw, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("reading %s: %v", name, err)
@@ -119,9 +121,9 @@ func TestRemoteEventNamesCoversEveryEvent(t *testing.T) {
 // lose that status. The per-client admin methods are gone — there are no clients.
 func TestRemoteHostOnlySet(t *testing.T) {
 	want := map[string]bool{
-		// the picture process and the SRT-return surface
-		"StartPicture": true, "StopPicture": true, "RefreshPicture": true,
-		"StartReturn": true, "StopReturn": true,
+		// the PGM monitor's launcher and the SRT-return surface
+		"RestartMonitor": true,
+		"StartReturn":    true, "StopReturn": true,
 		// the DeckLink preview's surface: the same argument as the picture's two
 		"SetPreviewRect": true, "SetPreviewVisible": true,
 		// what this position puts ON AIR, and the window on the operator's screen
@@ -310,7 +312,7 @@ func TestRemoteMethodsAreEveryNonHostOnlyMethod(t *testing.T) {
 	mustHave(t, "open", got, "GetConfig", "ListPresets", "DisarmMixer",
 		"Start", "SaveConfig", "SetSecret", "ArmMixer", "SendMixerCommands", "SetMixerGolden")
 	// Host-only never appears.
-	mustLack(t, "open", got, "StartPicture", "StopReturn", "GetRemoteState", "SetRemoteListener")
+	mustLack(t, "open", got, "RestartMonitor", "StopReturn", "GetRemoteState", "SetRemoteListener")
 }
 
 // ---------------------------------------------------------------------------

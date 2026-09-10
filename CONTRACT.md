@@ -81,7 +81,7 @@ these are the ones that change what a package may assume:
 | `CONTRACT.md` | **WP-0** | this file |
 | `main.go`, `main_nocgo.go`, `app.go`, `exit_windows.go` | **WP-8** | Wails bindings, wire-up, events, lifecycle, the hard-exit path |
 | `app_remote.go` (and `app_remote_test.go`) | **WP-8 — added 2026-08-12, reworked to the fully-open posture 2026-08-12** | the App-side of the LAN bridge: the hand-written allowlist that implements `remote.Dispatcher` (method → host-only; no capability tiers, the listener is unauthenticated), the audit log, mixer arm-ownership routing, the two host-only remote-admin bound methods (`GetRemoteState`, `SetRemoteListener`), and the listener's startup/teardown wiring. The transport it drives is `internal/remote` (WP-REMOTE). |
-| `app_picture.go`, `app_picture_child.go` | **WP-P** | the SRT picture's bound surface, the picture PROCESS (parent and child halves), the `picture` event |
+| `app_monitor.go`, `monitor_app.go`, `monitor_picture.go`, `monitor_main.go`, `app_preview.go` | **WP-P** | the PGM MONITOR process (the application's launcher half; the monitor's bound object, its in-process SRT picture and its main), the `monitor` event, and the DeckLink preview's surface |
 | `app_return.go` | **WP-R** | the SRT audio return's bound surface and the `return` event |
 | `app_mixer.go` | **WP-8** | the mixer drawer's bound surface: snapshot, arm/disarm, send, golden |
 | `app_presets.go`, `internal/presets/`, `frontend/src/ui/presets.js` (and their tests) | **WP-PRESETS** | the M2L-X instance presets: whitelist, file store, credential-scope decorator, bound surface, picker model |
@@ -89,7 +89,7 @@ these are the ones that change what a package may assume:
 | `internal/secrets/` | **WP-1** | Windows Credential Manager: `WSLComms/m2lx`, `WSLComms/srt`, `WSLComms/srtreturn` |
 | `internal/m2lx/` | **WP-2** | sign-in, token refresh, status WebSocket, the snapshot/delta document, 4 s debounce, 15 s staleness |
 | `internal/gst/gst*.go` | **WP-3a** | the contribution pipeline, device monitor, sink swap, **and the stub twin** |
-| `internal/gst/picture*.go`, `picturewindow_*.go`, `overlay_*.go` | **WP-P** | the SRT picture pipeline, the picture process's own window, and the preview's native child window |
+| `internal/gst/picture*.go`, `overlay_*.go`; `internal/monitorlink` | **WP-P** | the SRT picture pipeline, the native child window (the picture's in the monitor window, the preview's in the application's), and the wire between the application and the monitor process |
 | `internal/gst/return*.go` | **WP-R** | the SRT audio return pipeline and `ListOutputDevices` |
 | `internal/sender/` | **WP-3b** | spec §6 in full: timestamp pinning, reconnect state machine, backoff ladder |
 | `internal/kvs/` | **WP-4** | M2L-X → Cognito credential chain |
@@ -739,9 +739,13 @@ take the width from `CaptureOpts.OnInputChannels(deviceKey, width)` and must not
 `PictureMonitor` with `Start(PictureOpts)` / `Stop()` / `States()`, `NewPictureMonitor()`,
 `PictureState` (`stopped` / `connecting` / `showing` / `backoff` — **lowercase**, and those strings
 reach the page), `PictureRect` and `ScaleRect`, `PictureBackoffLadder` / `PictureBackoffCap`, and
-the `PictureWindow` top-level window the picture process renders into (with `PictureWindowPlacement`,
-remembered across processes so a Refresh puts the window back where it was). `PictureOverlay` is the
-native child window the DeckLink PREVIEW still uses; the picture no longer does.
+the `PictureOverlay` native child window. The picture renders into one over the PGM MONITOR
+window, in the monitor process (`monitor_picture.go`); the DeckLink PREVIEW renders into one over
+the application's window (`app_preview.go`). The application and the monitor talk over
+`internal/monitorlink` — JSON lines on the child's stdin/stdout: `ready`, `call`/`result`, `event` —
+and the monitor's calls are answered through the LAN bridge's allowlist as the client `pgm-monitor`,
+plus one link-only method, `PictureOpts`, which carries the SRT passphrase and is never reachable
+from the network.
 
 - **A monitor is single-use.** After `Stop` its state channel is closed; build another.
 - **`Play` waits for a decoded frame, not for `PLAYING`.** `srtsrc` connects lazily on a streaming
@@ -885,7 +889,7 @@ Contract points that are load-bearing rather than detail:
   is gone; the reserved routes are `/__wslremote/ws` and `/__wslremote/shim.js`.
 - **The hello frame's `methods` list is authoritative** — the shim installs exactly those functions
   on `window.go.main.App`, so **host-only methods degrade by OMISSION**, not by a refusal the
-  frontend must be taught. `StartPicture`/`StopPicture`/`RefreshPicture`/
+  frontend must be taught. `RestartMonitor`/
   `StartReturn`/`StopReturn` are host-only: absent from `Methods()` and refused by `Call` for every
   connection (enforced in `app_remote.go`; the package's fake dispatcher mirrors it).
 - **The fan-out never blocks a producer.** Each session has a bounded, drop-oldest event queue with
@@ -938,9 +942,8 @@ about WHICH seat holds the open window, not authentication), shown as `open + ar
 | `Start()` / `Stop()` | `error` | WP-5b | open |
 | `GetKVSCredentials()` | `kvs.Credentials` | WP-5a | open |
 | `GetStatusKeyCandidates()` | `[]m2lx.StatusKeyCandidate` | WP-5b | open |
-| `StartPicture()` / `StopPicture()` | `error` | WP-5b | **host-only** |
-| `GetPictureState()` | `gst.PictureState` | WP-5b | open |
-| `RefreshPicture()` | `error` | WP-5b | **host-only** |
+| `RestartMonitor()` | `error` | WP-5b | **host-only** |
+| `GetMonitorState()` | `monitorPayload` | WP-5b | open |
 | `IsSRTReturnSelected()` | `bool` | WP-5b | open |
 | `StartReturn()` / `StopReturn()` | `error` | WP-5b | **host-only** |
 | `GetReturnState()` | `gst.ReturnState` | WP-5b | open |

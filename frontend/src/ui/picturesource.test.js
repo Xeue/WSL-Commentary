@@ -242,7 +242,7 @@ test('the note under the control says the audio does not move', () => {
   assert.match(PICTURE_NOTE, /audio/i);
   assert.match(PICTURE_NOTE, /kinesis/i, 'and says where it comes from instead');
   assert.match(PICTURE_NOTE, /discard/i, "and that the SRT stream's own audio is thrown away");
-  assert.ok(ui('home.js').includes('PICTURE_NOTE'), 'home.js must render it');
+  assert.ok(ui('pgmpanel.js').includes('PICTURE_NOTE'), 'the panel, where the control lives, must account for it');
 });
 
 test('the picture handler in app.js touches nothing audible', () => {
@@ -288,16 +288,20 @@ test('the picture is persisted under its own config key, not over the audio one'
 });
 
 test('the home screen no longer offers an audio-path control', () => {
-  const src = ui('home.js');
-  for (const gone of ['RETURN_SOURCES', 'setReturnSource', 'onReturnSourceChange', 'deriveReturnSourceEffects']) {
-    assert.ok(!src.includes(gone), `home.js must not still build the old audio control (${gone})`);
+  for (const file of ['home.js', 'pgmpanel.js']) {
+    const src = ui(file);
+    for (const gone of ['RETURN_SOURCES', 'setReturnSource', 'onReturnSourceChange', 'deriveReturnSourceEffects']) {
+      assert.ok(!src.includes(gone), `${file} must not still build the old audio control (${gone})`);
+    }
   }
   // And the audio controls that REMAIN are untouched: the bus and the channel.
   // The operator needs left-only to hear FX now that CLN carries FX hard-left
-  // and comms hard-right, and this work must not have cost them that.
-  assert.match(src, /handlers\.onReturnChange\(Number\(returnSelect\.value\)\)/, 'the bus dropdown stays');
-  assert.match(src, /handlers\.onReturnChannelChange\(mode\)/, 'and the stereo/left/right selector stays');
-  assert.match(src, /'return-channel'/, 'as a segmented control of its own');
+  // and comms hard-right, and this work must not have cost them that. They are
+  // the panel's now (pgmpanel.js), which the PGM monitor window mounts.
+  const panel = ui('pgmpanel.js');
+  assert.match(panel, /handlers\.onReturnChange\(Number\(returnSelect\.value\)\)/, 'the bus dropdown stays');
+  assert.match(panel, /handlers\.onReturnChannelChange\(mode\)/, 'and the stereo/left/right selector stays');
+  assert.match(panel, /'return-channel'/, 'as a segmented control of its own');
 });
 
 test('backend.js binds the picture calls in one table, separate from the audio one', () => {

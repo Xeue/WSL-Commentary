@@ -1,6 +1,7 @@
 import * as backend from './backend.js';
-import { deriveSenderLamp, deriveStatusLamps, deriveMonitorLamp } from './lamps.js';
+import { deriveSenderLamp, deriveStatusLamps, deriveMonitorLamp, deriveMonitorProcessLamp } from './lamps.js';
 import { createHomeView } from './home.js';
+import { createMonitorView } from './monitorview.js';
 import { createSettingsView } from './settings.js';
 // The mixer host. Imported STATICALLY: it is the only module that imports
 // ./mixer/index.js, which is the only module that imports mixer.css, so this
@@ -96,13 +97,33 @@ const LOCAL_CLIENT_ID = 'local-webview2';
  * The comparison against it is the whole mechanism that stops a page reacting to
  * the echo of its own save.
  */
+/** The id the PGM monitor window's saves carry; app_monitor.go names it the same. */
+const MONITOR_CLIENT_ID = 'pgm-monitor';
+
 function ownClientId() {
+  if (backend.isMonitorWindow()) return MONITOR_CLIENT_ID;
   const remote = typeof window !== 'undefined' ? window.__wslcommsRemote : null;
   return (remote && remote.client) || LOCAL_CLIENT_ID;
 }
 
 /** Mounts the whole application into root (the #app div from index.html). */
 export function mountApp(root) {
+  // ======================= WHICH WINDOW IS THIS? ==============================
+  //
+  // The same bundle mounts in THREE places: the application's own window, the
+  // PGM MONITOR window (a second process, bound to MonitorApp), and a remote
+  // seat's browser tab. The picture, the mosaic, the return audio and the
+  // meters — the PGM panel — are drawn in the monitor window and, because a
+  // remote tab cannot open a window on the host, inline on a remote tab. The
+  // application's own window shows a card and a Restart button in their place.
+  //
+  // So: pgmHere says whether this page OWNS a panel and must therefore run the
+  // KVS monitor, the return handlers and the picture; monitorMode says whether
+  // it is the monitor window, which has nothing else.
+  const monitorMode = backend.isMonitorWindow();
+  const pgmHere = monitorMode || backend.isRemoteClient();
+  if (monitorMode && typeof document !== 'undefined') document.title = 'WSL Commentary — PGM Monitor';
+
   let currentConfig = null;
   let currentSenderState = undefined;
   let currentStatus = undefined;
@@ -167,7 +188,7 @@ export function mountApp(root) {
     onApplyPreset: applyPresetAndRefresh,
   });
 
-  const home = createHomeView({
+  const viewHandlers = {
     onSettings: showSettings,
     onMixer: () => toggleMixer(),
     onStartStop: onStartStopClick,
@@ -189,7 +210,11 @@ export function mountApp(root) {
     onMuteRelease: () => coughMute.release(),
     onMuteLatchToggle: () => coughMute.toggleLatch(),
     onCoughModeChange: onCoughModeChange,
-  });
+    onRestartMonitor: onRestartMonitor,
+  };
+  const home = monitorMode
+    ? createMonitorView(viewHandlers)
+    : createHomeView(viewHandlers, { pgm: pgmHere ? 'inline' : 'external' });
 
   // --- the cough mute -------------------------------------------------------
   //
@@ -284,7 +309,8 @@ export function mountApp(root) {
   mixerMount.className = 'mixer-mount';
 
   root.textContent = '';
-  root.append(home.el, settings.el, mixerMount);
+  if (monitorMode) root.append(home.el);
+  else root.append(home.el, settings.el, mixerMount);
   home.setDevBadge(backend.usingFakeBackend);
 
   // --- the picture ----------------------------------------------------------
@@ -310,6 +336,51 @@ export function mountApp(root) {
   let currentPictureState = null;
   /** Whether this build has the four native picture bindings at all. */
   let pictureBindingsPresent = false;
+
+  /**
+   * pictureFault reports a failure of the native picture ONCE, to the console,
+   * and not as a banner: the mosaic is still on screen, so this is a
+   * degradation and not an outage.
+   */
+  let lastPictureFault = '';
+  function pictureFault(err) {
+    const message = String(err?.message || err);
+    if (message === lastPictureFault) return;
+    lastPictureFault = message;
+    console.info('wslcomms: the native picture overlay is not answering:', message);
+  }
+
+  /**
+   * overlay owns the SRT picture's rectangle and its visibility rule — it is
+   * the native window painted over the mosaic tile in the PGM monitor window.
+   * It is pure; everything effectful is here. In a window with no tile
+   * (the application's own, the panel being elsewhere) measure answers null
+   * and the controller does nothing.
+   *
+   * setRect and setVisible are fire-and-forget with a catch: they are driven
+   * from a ResizeObserver and a chain of awaited IPC calls behind a resize is
+   * how a window drag turns into a queue of stale rectangles.
+   */
+  const overlay = createOverlay({
+    measure: () => home.measurePictureRect(),
+    dpr: () => (typeof window !== 'undefined' && window.devicePixelRatio) || 1,
+    setRect: (css, dpr) => {
+      Promise.resolve()
+        .then(() => backend.setPictureRect(css, dpr))
+        .catch(pictureFault);
+    },
+    setVisible: (on) => {
+      Promise.resolve()
+        .then(() => backend.setPictureVisible(on))
+        .catch(pictureFault);
+    },
+    // THE MOSAIC FOLLOWS THE WINDOW, NOT THE SOURCE SELECTION: the panel
+    // suppresses the mosaic <video> only while the native overlay actually
+    // covers it, and this — the same decision that drives setVisible — is
+    // the only thing that tells it to.
+    onVisible: (on) => home.setPictureOverlaid(on),
+    log: (message) => console.info(message),
+  });
 
   // --- the card's confidence preview ---------------------------------------
   //
@@ -573,6 +644,8 @@ export function mountApp(root) {
     // This fires for a drawer closed from inside itself as well — its Close
     // button, the scrim, Escape — none of which app.js is otherwise told about.
     onOpenChange: (open) => {
+      if (open) overlay.block(BLOCK_MIXER);
+      else overlay.unblock(BLOCK_MIXER);
       if (open) previewOverlay.block(BLOCK_MIXER);
       else previewOverlay.unblock(BLOCK_MIXER);
     },
@@ -654,6 +727,8 @@ export function mountApp(root) {
     // the rectangle the surface was measured against — is not. Hiding on one
     // reason and showing on the other's release is precisely the bug the reason
     // SET exists to make unwritable.
+    overlay.block(BLOCK_SETTINGS);
+    overlay.block(BLOCK_HIDDEN);
     previewOverlay.block(BLOCK_SETTINGS);
     previewOverlay.block(BLOCK_HIDDEN);
     home.el.hidden = true;
@@ -664,11 +739,14 @@ export function mountApp(root) {
   function showHome() {
     settings.el.hidden = true;
     home.el.hidden = false;
+    overlay.unblock(BLOCK_SETTINGS);
+    overlay.unblock(BLOCK_HIDDEN);
     previewOverlay.unblock(BLOCK_SETTINGS);
     previewOverlay.unblock(BLOCK_HIDDEN);
     // Re-measure before painting: the window may have been resized while
     // Settings was up, and a surface restored at yesterday's rectangle is a
     // picture in the wrong place for as long as nothing else moves.
+    overlay.sync();
     previewOverlay.sync();
   }
 
@@ -743,6 +821,7 @@ export function mountApp(root) {
    * way of not knowing arrives as null and the lamp falls back.
    */
   async function refreshConformTarget() {
+    if (monitorMode) return; // the monitor window has no switcher lamps
     currentConformTarget = await backend.getConformTarget();
     renderStatusLamps();
   }
@@ -759,6 +838,38 @@ export function mountApp(root) {
   // refines itself when Go answers. Blocking the mount on it would let a slow
   // binding delay the whole page to improve one lamp.
   refreshConformTarget();
+
+  // THE MONITOR LAMP, in the application's window, follows the PGM monitor
+  // PROCESS: whether it is running and, relayed from its page, what its KVS
+  // connection is doing. A window that owns the panel (the monitor window, a
+  // remote tab) drives the lamp from its own KVS monitor instead, in
+  // setUpMonitor.
+  if (!pgmHere) {
+    const paintMonitor = (payload) => {
+      home.setMonitorState(payload);
+      home.lamps.MONITOR.update(deriveMonitorProcessLamp(payload));
+    };
+    backend.onMonitor(paintMonitor);
+    if (backend.usingFakeBackend || backend.monitorAvailable()) {
+      backend
+        .getMonitorState()
+        .then(paintMonitor)
+        .catch((err) => console.info('wslcomms: could not read the monitor state:', err?.message || err));
+    }
+  }
+
+  /**
+   * onRestartMonitor is the Restart button in the application's window: the
+   * PGM monitor process is ended — killed, if it will not stop — and a fresh
+   * one opened. A closed monitor is simply opened.
+   */
+  async function onRestartMonitor() {
+    try {
+      await backend.restartMonitor();
+    } catch (err) {
+      home.showError(`Could not restart the PGM monitor: ${err?.message || err}`);
+    }
+  }
 
   backend.onSender((state) => {
     const wasRunning = !!currentSenderState && currentSenderState !== backend.SENDER_STATE.STOPPED;
@@ -1260,6 +1371,11 @@ export function mountApp(root) {
     const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
     home.setPictureSource(effects.source);
     home.setPictureState(effects.wantSRT ? currentPictureState : null);
+    // The overlay is wanted only while SRT is chosen AND delivering: a
+    // receiver in CONNECTING or BACKOFF painting an opaque window over the
+    // mosaic would replace a soft picture of the match with a black one.
+    overlay.setWanted(effects.showingSRT);
+    overlay.sync();
   }
 
   /**
@@ -1407,14 +1523,16 @@ export function mountApp(root) {
     // the setting changes — is synced explicitly by renderPreview, which is
     // where it happens.
     const sync = () => {
+      overlay.sync();
       previewOverlay.sync();
     };
 
     window.addEventListener('resize', sync);
 
-    if (typeof ResizeObserver === 'function' && home.pictureEl) {
+    const box = home.pictureEl || home.previewEl;
+    if (typeof ResizeObserver === 'function' && box) {
       try {
-        new ResizeObserver(sync).observe(home.pictureEl);
+        new ResizeObserver(sync).observe(box);
       } catch (err) {
         console.info('wslcomms: could not observe the picture box for resizes:', err?.message || err);
       }
@@ -1757,6 +1875,10 @@ export function mountApp(root) {
   }
 
   function setUpMonitor(config) {
+    // Only the window that OWNS the panel runs the KVS monitor: the PGM
+    // monitor window, or a remote tab. The application's own window has no
+    // tile, no audio element and no business dialling Kinesis.
+    if (!pgmHere) return;
     try {
       monitor = createMonitor({
         videoEl: home.videoEl,
@@ -1798,7 +1920,12 @@ export function mountApp(root) {
     }
 
     try {
-      monitor.on('state', (state) => home.lamps.MONITOR.update(deriveMonitorLamp(state)));
+      monitor.on('state', (state) => {
+        home.lamps.MONITOR.update(deriveMonitorLamp(state));
+        // The monitor window tells the application, so the lamp in THAT
+        // window keeps telling the truth. A no-op anywhere else.
+        backend.reportMonitorState(state).catch(() => {});
+      });
       monitor.on('error', (err) => {
         console.error('wslcomms: monitor error event', err);
         // CLASSIFIED, not all shouted. The one the operator screenshotted — the
@@ -1973,7 +2100,13 @@ export function mountApp(root) {
     currentReturnSource = RETURN_SOURCE_WEBRTC;
     const savedAudioSource = currentConfig.returnSource;
 
-    await Promise.all([loadInputDevices(), loadHeadphoneDevices(), loadOutputDevices()]);
+    await Promise.all([
+      // The monitor window has no commentary input control and no binding to
+      // list them; asking would put a red row in its alerts for nothing.
+      monitorMode ? Promise.resolve() : loadInputDevices(),
+      loadHeadphoneDevices(),
+      loadOutputDevices(),
+    ]);
     renderHeadphoneList();
 
     // The monitor is built BEFORE the SRT return is started, and built silent

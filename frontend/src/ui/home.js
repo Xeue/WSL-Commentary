@@ -2,20 +2,8 @@ import { createLampRow, GLYPH } from './lamps.js';
 // The dropdowns' pure logic: display order and the saved-but-missing marker.
 // It lives in its own module so `node --test` can drive it without a DOM —
 // this file is wiring, devices.test.js is where the behaviour is proved.
-import { sortDevices, labelDevices, describeDeviceSelection } from './devices.js';
-import { effectiveCrop, describeCrop, REFERENCE_MOSAIC } from './tile.js';
-import { RETURN_BUSES, DEFAULT_RETURN_MID, isValidReturnMid } from './returns.js';
-import {
-  PICTURE_SOURCES,
-  PICTURE_SOURCE_SRT,
-  DEFAULT_PICTURE_SOURCE,
-  normalisePictureSource,
-  derivePictureSourceEffects,
-  describePictureShowing,
-  PICTURE_BACKOFF_ERROR,
-  normalisePictureState,
-} from './picturesource.js';
-import { createErrorLog, createBackoffEpisode, describeEntry, formatErrorTime } from './errorlog.js';
+import { createPgmPanel, makeSegmented, fillDeviceSelect } from './pgmpanel.js';
+import { createErrorLog, describeEntry, formatErrorTime } from './errorlog.js';
 // The severity vocabulary and the judgements about what is worth an operator's
 // attention mid-match. This file decides where a message is DRAWN; alerts.js
 // decides how loud it is, and records why the switcher-status banner is gone.
@@ -50,20 +38,12 @@ import { LAMP_CAMERA } from './videosource.js';
 // disagree is the two-tables bug), plus the peak-hold. This file only builds
 // the bars and paints what meters.js computes; meters.test.js is where the
 // behaviour is proved.
-import {
-  meterZones,
-  zoneFills,
-  dbToFraction,
-  isSilentFrame,
-  createPeakHold,
-} from './meters.js';
 // The channel table comes from the monitor module because that is where it is
 // ENFORCED — it is the wiring of a ChannelSplitter to a ChannelMerger, and the
 // words here have to be the words for that wiring. It is pure data with no
 // browser API in it. Writing a second copy of "Stereo / Left only / Right only"
 // on this side is precisely the bug ./returns.js exists to record: two tables
 // that agree with each other and are both wrong.
-import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../monitor/channels.js';
 
 // The main screen: the PGM tile, the three device/return controls, the
 // START/STOP button and the five lamps. Specification section 10 layout, less
@@ -135,7 +115,7 @@ import { CHANNEL_MODES, DEFAULT_CHANNEL_MODE, normaliseChannelMode } from '../mo
 // These strings are the KEYS app.js paints through (home.lamps['SWITCHER
 // VIDEO']) and the labels drawn on the pills, so renaming one is one edit here
 // and one at its call site; videosource.test.js pins the list and its order.
-const LAMP_NAMES = [
+export const LAMP_NAMES = [
   'SENDING',
   LAMP_CAMERA,
   'SWITCHER SEES FEED',
@@ -170,9 +150,14 @@ const LAMP_NAMES = [
  *   setReturnMid(mid)                   selects one of the seven buses, 1..7
  *   setReturnChannel(mode)              stereo / left / right
  *   setPictureSource(source)            srt / mosaic — WHICH PICTURE, not audio
- *   setPictureAvailable(available, why) disables the SRT option with a reason,
- *                                       and the Refresh button with it
+ *   setPictureAvailable(available, why) disables the SRT option with a reason
  *   setPictureState(state)              the native receiver's own status
+ *   setPictureOverlaid(on)              whether the native window covers the
+ *                                       tile (inline panel only)
+ *   measurePictureRect()                the tile's box, or null when there is
+ *                                       no tile in this window
+ *   setMonitorState(payload)            the PGM monitor process's state, for
+ *                                       the card and the Restart button
  *   setPreviewReserved(on)              whether the card's confidence preview
  *                                       box exists in the layout at all
  *   setPreviewCaption(text)             the words drawn inside that box, which
@@ -210,7 +195,7 @@ const LAMP_NAMES = [
  *   onSettings(), onMixer(), onStartStop(),
  *   onInputChange(deviceId), onHeadphoneChange(deviceId),
  *   onReturnChange(mid), onReturnChannelChange(mode), onPictureSourceChange(src),
- *   onPictureRefresh(), onLevelChange(fraction), onPresetChange(id),
+ *   onPictureRefresh(), onRestartMonitor(), onLevelChange(fraction), onPresetChange(id),
  *   onMutePress(), onMuteRelease(), onMuteLatchToggle(),
  * }
  *
@@ -230,19 +215,21 @@ const LAMP_NAMES = [
  * and the operator collapsing the column, both of which are that operator's own
  * hand. See main.css and homelayout.test.js.
  *
- * ===================== THE TILE IS THE MOSAIC, ALWAYS =======================
+ * ===================== THE PICTURE IS IN ANOTHER WINDOW =====================
  *
- * The high-quality SRT picture is decoded in Go, in a SEPARATE PROCESS, and
- * shown in a top-level window of its own that the commentator puts wherever
- * they like. It is never painted over this page. `.pgm-tile` is the mosaic's
- * crop box and nothing else, and the badge over it says whether the SRT
- * picture is up in its own window or the mosaic here is all there is.
+ * The programme picture, the return audio and the input meters live in the PGM
+ * MONITOR window — a second process the application launches (app_monitor.go)
+ * — and this view shows a CARD in their place: where they went, and a button
+ * that restarts that process when it has stopped answering. The pieces
+ * themselves are ./pgmpanel.js, which monitorview.js mounts in that window.
  *
- * The card's confidence PREVIEW is still a native child window painted over
- * this page — `.preview-tile` reserves its rectangle, measurePreviewRect()
- * measures it, and app.js does the rest.
+ * A REMOTE seat cannot open a window on the host, so for a remote client this
+ * view mounts the panel INLINE, where the card would be — the same mosaic,
+ * meters and controls as before, minus the SRT picture. viewOpts.pgm says
+ * which: 'inline' or 'external' (the default).
  */
-export function createHomeView(handlers) {
+export function createHomeView(handlers, viewOpts = {}) {
+  const pgmInline = viewOpts.pgm === 'inline';
   const el = document.createElement('section');
   el.className = 'view view-home';
 
@@ -460,7 +447,6 @@ export function createHomeView(handlers) {
   // first. Dismissing a row means "I have seen this", not "unhappen it": the
   // history stays until it is cleared.
   const errorLog = createErrorLog();
-  const backoffEpisode = createBackoffEpisode();
 
   const alertsRegion = document.createElement('div');
   alertsRegion.className = 'rail-alerts';
@@ -585,173 +571,45 @@ export function createHomeView(handlers) {
 
   renderAlerts();
 
-  // --- the picture area -------------------------------------------------
+  // --- the picture area, or where it went -----------------------------------
   //
-  // The picture is the main thing a commentator looks at, so it gets every
-  // pixel left after the controls: .pgm-stage is the flex child that grows,
-  // and .pgm-tile is sized inside it from the tile's own aspect ratio — height
-  // -limited on a wide window, width-limited on a narrow one. See main.css.
-  //
-  // ONE PICTURE IN THIS BOX. The <video> inside it is the WebRTC mosaic,
-  // cropped to the PGM tile, and it is always showing. The high-quality SRT
-  // picture is a separate window in a separate process and never covers it,
-  // so a commentator who loses SRT loses nothing on this page.
+  // The PGM tile, the meters and the return controls are ./pgmpanel.js. A
+  // remote seat gets them here, inline; the application's own window gets a
+  // card instead, because they are in the PGM Monitor window — and the card
+  // carries the one thing that window cannot do for itself: restart it.
   const pgmStage = document.createElement('div');
   pgmStage.className = 'pgm-stage';
-  const pgmTile = document.createElement('div');
-  pgmTile.className = 'pgm-tile';
-  const videoEl = document.createElement('video');
-  videoEl.autoplay = true;
-  videoEl.playsInline = true;
-  videoEl.muted = true; // the mosaic video track carries no audio we want; return audio is separate
-  pgmTile.appendChild(videoEl);
 
-  // WHETHER THE SRT PICTURE IS UP, said permanently, over the mosaic.
-  //
-  // The SRT picture is in its own window, so the question this answers is
-  // whether that window has the good picture in it or whether the mosaic here
-  // is all there is — which is what somebody will ask out loud during a match
-  // when the other window goes dark.
-  const pictureBadge = document.createElement('div');
-  pictureBadge.className = 'picture-badge';
-  pgmTile.appendChild(pictureBadge);
+  const panel = pgmInline
+    ? createPgmPanel(handlers, {
+        showError: (message, severity) => showError(message, severity),
+        clearErrorIf: (message) => clearErrorIf(message),
+      })
+    : null;
+  if (panel) panel.attachStage(pgmStage);
 
-  // --- the input meters, at the right edge of the picture area -------------
-  //
-  // A slim vertical stereo pair fed from the "levels" event: the level of the
-  // commentary as it leaves the capture pipeline, measured immediately before
-  // the queue that feeds the encoder. It is the one meter that goes quiet when
-  // the wrong device is selected, and it is downstream of the cough mute, so a
-  // muted commentator has a flat meter as well as a mute banner.
-  //
-  // ================= THEY ARE LIVE FROM LAUNCH, NOT FROM START ===============
-  //
-  // They used to be the SEND pipeline's own measurement, so they began at START
-  // and fell to silence at STOP. Capture is a pipeline of its own now, built at
-  // launch and held until the application quits, so the meters move while the
-  // operator is still setting up and go on moving after STOP. That is the point
-  // of the change — a commentator finds out that their microphone is dead while
-  // there is still time to fix it — and it is why the note under them exists.
-  //
-  // ONE PROMISE IS WEAKER THAN IT WAS, and it is written down here because it
-  // cannot be seen from the screen: what this meter shows is what reaches the
-  // encoder IN NORMAL OPERATION, and not during a send-side stall. The queue in
-  // front of the proxysink is leaky=downstream, deliberately (a non-leaky one
-  // was measured dragging the preview to 7.2 fps and the meters to 7.2 msg/s and
-  // making the card itself drop frames), so a stall of more than about a second
-  // DROPS that second of commentary rather than delaying it. The meter can move
-  // over audio the far end never receives. A stall that long is already a
-  // reconnect-class event and the SENDING lamp is the thing that says so.
-  //
-  // ============= OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING =================
-  //
-  // The tile is the commentator's picture. A meter drawn inside it is a meter
-  // over the match, and the SRT picture was for a long time an opaque native
-  // window over exactly that rectangle, under which anything drawn was
-  // invisible. The picture has its own window now; the meters stay out of the
-  // tile all the same, because the mosaic is what the commentator falls back
-  // to and it must not be behind anything.
-  //
-  // THEY NOW LIVE IN THE COLUMN, not beside the tile in .pgm-stage. The operator
-  // asked for a main area holding the picture, one overall indicator and the
-  // cough controls, with everything else in the tray: "During the match we only
-  // really need an overall status, single green/red indicator and the cough mute
-  // buttons. The rest can live in some form of settings tray or something like
-  // that." The column is outside .pgm-tile exactly as .pgm-stage was, so the
-  // reason above is satisfied by the new home as well as by the old one.
-  //
-  // The bar is the RMS — the loudness a listener would report — and the thin
-  // marker riding above it is the peak-hold, ~1.5 s of the highest recent
-  // peak. Zone segments are fixed slices of the scale (green to -18, amber to
-  // -6, red above, from meters.js via the mixer's own constants) and only the
-  // fill inside each moves, for the reason mixer.css documents: a gradient on
-  // a moving fill drags its colour stops with the level.
-  const metersEl = document.createElement('div');
-  metersEl.className = 'input-meters input-meters-idle';
-  metersEl.title =
-    'Commentary input level, measured where the capture pipeline hands the audio to the encoder — ' +
-    'live from launch, whether or not you are sending. Green to -18 dBFS, amber to -6, red above.';
-  const meterChannels = ['L', 'R'].map((name) => {
-    const channel = document.createElement('div');
-    channel.className = 'input-meter';
-    const bar = document.createElement('div');
-    bar.className = 'input-meter-bar';
-    // Bottom-first zones drawn bottom-up: the bar is a column-reverse flex, so
-    // the first (green) segment sits at the bottom without this file doing
-    // coordinate arithmetic.
-    const fills = meterZones().map(({ zone, from, to }) => {
-      const seg = document.createElement('div');
-      seg.className = `input-meter-seg input-meter-seg--${zone}`;
-      // The segment's share of the bar comes from the dB boundaries, so the
-      // paint cannot drift from the scale it claims to show — the same
-      // derive-don't-restate rule as the mixer's meterStageWidths.
-      seg.style.flexBasis = `${((to - from) * 100).toFixed(1)}%`;
-      const fill = document.createElement('div');
-      fill.className = `input-meter-fill input-meter-fill--${zone}`;
-      seg.appendChild(fill);
-      bar.appendChild(seg);
-      return fill;
-    });
-    const peakMark = document.createElement('div');
-    peakMark.className = 'input-meter-peak';
-    peakMark.hidden = true;
-    bar.appendChild(peakMark);
-    const label = document.createElement('span');
-    label.className = 'input-meter-label';
-    label.textContent = name;
-    channel.append(bar, label);
-    metersEl.appendChild(channel);
-    return { fills, peakMark };
-  });
+  const monitorCard = document.createElement('div');
+  monitorCard.className = 'monitor-card';
+  monitorCard.hidden = pgmInline;
+  const monitorCardTitle = document.createElement('div');
+  monitorCardTitle.className = 'monitor-card-title';
+  monitorCardTitle.textContent = 'PGM MONITOR';
+  const monitorCardState = document.createElement('div');
+  monitorCardState.className = 'monitor-card-state';
+  monitorCardState.setAttribute('role', 'status');
+  const monitorCardText = document.createElement('p');
+  monitorCardText.className = 'monitor-card-text';
+  monitorCardText.textContent =
+    'The programme picture, the return audio and the input meters are in the PGM Monitor window, ' +
+    'with its own Refresh button. If that window has frozen or stopped answering, restart it here: ' +
+    'it is closed and reopened, and the feed going to air is not touched.';
+  const restartBtn = document.createElement('button');
+  restartBtn.type = 'button';
+  restartBtn.className = 'btn btn-primary monitor-restart';
+  restartBtn.textContent = 'Restart monitor';
+  restartBtn.addEventListener('click', () => handlers.onRestartMonitor());
+  monitorCard.append(monitorCardTitle, monitorCardState, monitorCardText, restartBtn);
 
-  // The line beside the meters, and it is not a decoration: on a CoreAudio seat
-  // the operating system's microphone indicator — the orange dot in the menu bar
-  // — is now lit from launch to quit rather than only while sending, because the
-  // input really is open the whole time. A commentator who has learnt to read
-  // that dot as "I am live" would read it wrong on every seat, all day, and no
-  // lamp in this application would contradict them.
-  //
-  // It is STATIC. It says the same words in every state, so it can never appear,
-  // change or clear — the column's rule — and it names the one control that does
-  // answer the question it is about.
-  // NO EXPLANATORY LINE UNDER THE METERS, and this is the second time one has
-  // been removed from this application. There was a sentence here saying the
-  // input is open from launch and that the SENDING lamp is what says you are on
-  // air. The operator: "This doesn't need to be there at all."
-  //
-  // He is right. The meters MOVE or they do not; the SENDING lamp is lit or it
-  // is not. Both facts are already on the screen, permanently, in the two
-  // controls the sentence was describing — so the prose added nothing except
-  // something to read at a commentary position mid-match. If the distinction
-  // between "my microphone is open" and "I am on air" is ever genuinely unclear,
-  // the fix is a clearer lamp, not a paragraph next to it.
-
-  // --- the card's confidence preview, at the right edge --------------------
-  //
-  // A SECOND RESERVED RECTANGLE, and the same mechanism as the first: the
-  // preview is decoded and drawn in Go and painted by a NATIVE CHILD WINDOW
-  // over this page, because the frames never leave that process and a <video>
-  // element cannot be handed a GStreamer sink. So this file's whole job is
-  // identical to its job for the SRT picture — reserve a box, expose a way to
-  // measure it — and app.js reports it through a createOverlay of its own.
-  //
-  // ================ IT IS OUTSIDE .pgm-tile, AND THAT IS LOAD-BEARING ========
-  //
-  // The preview is an opaque native window. Over the tile it would erase the
-  // mosaic — the fallback picture — and neither the page nor Go would report
-  // anything wrong. So it sits BESIDE the tile in .pgm-stage: the same
-  // reasoning, and the same place, as the input meters above.
-  //
-  // ================ THE CAPTION NEEDS NO VISIBILITY FLAG =====================
-  //
-  // It is drawn INSIDE the reserved box and is never hidden by this file. The
-  // native surface is opaque and on top, so the caption is visible exactly when
-  // there is no picture over it — which is the one thing this page genuinely
-  // cannot learn from Go: the preview branch is built with the picture capture
-  // at launch, the build retries without it if the surface will not attach, and
-  // no event reports the branch itself. A box showing a caption is a box
-  // explaining itself; a box showing a picture needs no caption. app.js supplies
-  // the words (videosource.js's describePreviewBox, from the capture state).
   const previewTile = document.createElement('div');
   previewTile.className = 'preview-tile';
   // HIDDEN UNTIL SOMETHING SAYS OTHERWISE, so that a seat which has never
@@ -791,7 +649,8 @@ export function createHomeView(handlers) {
   // covered by an opaque native child window, so anything drawn inside it is
   // invisible exactly when a commentator is mid-match, and two native windows
   // told to occupy overlapping rectangles simply erase one another.
-  pgmStage.append(pgmTile, metersEl, previewTile);
+  if (panel) pgmStage.append(panel.tileEl, panel.metersEl, previewTile);
+  else pgmStage.append(monitorCard, previewTile);
 
   const audioEl = document.createElement('audio');
   audioEl.autoplay = true;
@@ -799,81 +658,10 @@ export function createHomeView(handlers) {
 
   // The tile as configured, and the mosaic as it actually arrived. Neither is
   // authoritative on its own: the crop is what they produce together.
-  let configuredTile = { x: 0, y: 360, w: 640, h: 360 };
-  let liveMosaic = null;
-  let lastDescription = '';
-
-  function applyCrop() {
-    const crop = effectiveCrop(configuredTile, liveMosaic, REFERENCE_MOSAIC);
-
-    pgmTile.style.setProperty('--mosaic-w', String(crop.mosaic.w));
-    pgmTile.style.setProperty('--mosaic-h', String(crop.mosaic.h));
-    pgmTile.style.setProperty('--tile-x', String(crop.tile.x));
-    pgmTile.style.setProperty('--tile-y', String(crop.tile.y));
-    pgmTile.style.setProperty('--tile-w', String(crop.tile.w));
-    pgmTile.style.setProperty('--tile-h', String(crop.tile.h));
-    // Two forms of the same ratio: `aspect-ratio` wants "640 / 360", and the
-    // width calculation against the container's height wants a bare number.
-    pgmTile.style.setProperty('--tile-ar', `${crop.tile.w} / ${crop.tile.h}`);
-    pgmTile.style.setProperty('--tile-ar-num', String(crop.aspect));
-    // AND ON THE STAGE, because the meters are told to match the picture's
-    // height and that height is a function of this ratio. A custom property set
-    // on .pgm-tile is readable by the tile and its descendants only; the meters
-    // are its SIBLING. Setting it on the shared parent is what lets one number
-    // drive both, so the two can never disagree about how tall the picture is.
-    pgmStage.style.setProperty('--tile-ar-num', String(crop.aspect));
-
-    // Logged, not swallowed: "the picture is in the wrong place" is
-    // undiagnosable from a screenshot without both mosaic sizes, and this is
-    // the only place both are known. Only on a change, so a track that renews
-    // its metadata every few seconds does not fill the console.
-    const line = describeCrop(crop, configuredTile);
-    if (line !== lastDescription) {
-      lastDescription = line;
-      console.info(line);
-    }
-  }
-
-  /**
-   * readMosaic takes the intrinsic size off the element. A <video> with no
-   * track yet reports 0x0, which tile.js reads as "not known" rather than as a
-   * mosaic of zero size.
-   */
-  function readMosaic() {
-    const w = videoEl.videoWidth;
-    const h = videoEl.videoHeight;
-    if (!(w > 0 && h > 0)) return;
-    if (liveMosaic && liveMosaic.w === w && liveMosaic.h === h) return;
-    liveMosaic = { w, h };
-    applyCrop();
-  }
-
-  // loadedmetadata fires when the first track's size is known; resize fires if
-  // it CHANGES mid-session, which is what a mid-match renegotiation or a
-  // reconnect to a differently-configured multiviewer looks like. Both are
-  // needed: with only the first, a track that changes size leaves the crop
-  // pointing at the old geometry for the rest of the match.
-  videoEl.addEventListener('loadedmetadata', readMosaic);
-  videoEl.addEventListener('resize', readMosaic);
-
-  // Write the custom properties once at construction, so the tile has a shape
-  // before any config has loaded and a failed getConfig cannot leave it at
-  // whatever the stylesheet's fallbacks happen to be.
-  applyCrop();
-
   function setTile(tile) {
-    if (tile && typeof tile === 'object') configuredTile = tile;
-    // The element may already have a track — a Settings save mid-session does
-    // not restart the monitor — so re-read rather than waiting for an event
-    // that has already happened.
-    readMosaic();
-    applyCrop();
+    if (panel) panel.setTile(tile);
   }
 
-  // --- controls ----------------------------------------------------------
-  //
-  // One compact row that wraps, not three stacked full-width rows: every
-  // vertical pixel these do not use goes to the picture above them.
   const controls = document.createElement('div');
   controls.className = 'controls';
 
@@ -887,237 +675,30 @@ export function createHomeView(handlers) {
     return row;
   }
 
-  /**
-   * makeSegmented builds a radio group drawn as a row of buttons.
-   *
-   * Radios rather than a <select> because both of these controls have two or
-   * three options that are chosen mid-match, sometimes in the ten seconds before
-   * kick-off, and every option being visible without opening anything is worth
-   * the width. Radios rather than <button>s because a radio group is what a
-   * screen reader and a keyboard already understand, and because exactly-one-
-   * selected is then enforced by the platform rather than by this file.
-   *
-   * Returns { el, set(value), setOptionEnabled(value, enabled, reason) }.
-   */
-  function makeSegmented(name, options, onChange) {
-    const group = document.createElement('div');
-    group.className = 'segmented';
-    group.setAttribute('role', 'radiogroup');
-    const inputs = new Map();
-
-    for (const opt of options) {
-      const id = `${name}-${opt.value}`;
-      const label = document.createElement('label');
-      label.className = 'segment';
-      label.htmlFor = id;
-      const input = document.createElement('input');
-      input.type = 'radio';
-      input.name = name;
-      input.id = id;
-      input.value = opt.value;
-      if (opt.hint) label.title = opt.hint;
-      input.addEventListener('change', () => {
-        paint();
-        if (input.checked) onChange(input.value);
-      });
-      const text = document.createElement('span');
-      text.textContent = opt.label;
-      label.append(input, text);
-      group.appendChild(label);
-      inputs.set(opt.value, { input, label });
-    }
-
-    // The selected segment is marked with a CLASS as well as being styled from
-    // :has(:checked). :has() is a recent selector and this is the difference
-    // between a control that shows which option is live and one that looks
-    // like nothing is selected — which, on a control that decides what the
-    // commentator hears, is worth not depending on a browser version for.
-    function paint() {
-      for (const { input, label } of inputs.values()) {
-        label.classList.toggle('segment-checked', input.checked);
-      }
-    }
-
-    return {
-      el: group,
-      set(value) {
-        const entry = inputs.get(value);
-        if (entry) entry.input.checked = true;
-        paint();
-      },
-      setOptionEnabled(value, enabled, reason) {
-        const entry = inputs.get(value);
-        if (!entry) return;
-        entry.input.disabled = !enabled;
-        entry.label.classList.toggle('segment-disabled', !enabled);
-        // The reason goes on the control itself. A disabled option with no
-        // explanation is read as "this is broken", and the most likely reason —
-        // the binding is not in this build — is not something anyone can fix by
-        // clicking harder.
-        if (!enabled && reason) entry.label.title = reason;
-      },
-    };
-  }
-
   const inputSelect = document.createElement('select');
   inputSelect.id = 'input-select';
   inputSelect.addEventListener('change', () => handlers.onInputChange(inputSelect.value));
 
-  const headphoneSelect = document.createElement('select');
-  headphoneSelect.id = 'headphone-select';
-  headphoneSelect.addEventListener('change', () => handlers.onHeadphoneChange(headphoneSelect.value));
-
-  // All seven audio transceivers, honestly labelled. The monitor already
-  // subscribes to every one of them (~8.4 kbps idle for the lot), so switching
-  // is a Web Audio source swap: immediate, and the peer connection — and the
-  // programme picture riding on it — is untouched.
-  const returnSelect = document.createElement('select');
-  returnSelect.id = 'return-select';
-  for (const bus of RETURN_BUSES) {
-    const opt = document.createElement('option');
-    opt.value = String(bus.mid);
-    opt.textContent = bus.label;
-    returnSelect.appendChild(opt);
+  controls.append(makeRow('Commentary input', 'input-select', inputSelect));
+  if (panel) {
+    controls.append(panel.headphoneRow, panel.returnGroup, panel.channelGroup, panel.levelGroup);
   }
-  returnSelect.value = String(DEFAULT_RETURN_MID); // mid 4, MIC1 / "Monitor 1"
-  returnSelect.addEventListener('change', () => handlers.onReturnChange(Number(returnSelect.value)));
 
-  const returnGroup = document.createElement('div');
-  returnGroup.className = 'control-group control-group-return';
-  const returnLabel = document.createElement('label');
-  returnLabel.htmlFor = 'return-select';
-  returnLabel.textContent = 'Return Audio';
-  returnGroup.append(returnLabel, returnSelect);
-
-  // --- return CHANNEL, beside the bus -------------------------------------
+  // --- the PGM monitor's section in the column ---------------------------------
   //
-  // Choosing a bus is no longer enough. FX and comms are mixed on PGM but hard-
-  // panned left and right on CLN — M2L-X pans per input strip, not per bus, so
-  // the operator got there with double router inputs — and a commentator who
-  // wants the effects on their own needs one CHANNEL of that bus.
-  //
-  // "Left only" is the LEFT SOURCE CHANNEL IN BOTH EARS. It is not "audio in
-  // the left ear": half the commentators are wearing one-ear cans and this
-  // application does not know which ear. That is enforced in the Web Audio
-  // graph, not here — see frontend/src/monitor/channels.js.
-  const channelSegmented = makeSegmented(
-    'return-channel',
-    CHANNEL_MODES.map((m) => ({ value: m.value, label: m.label, hint: m.hint })),
-    (mode) => handlers.onReturnChannelChange(mode),
-  );
-  channelSegmented.set(DEFAULT_CHANNEL_MODE);
+  // The status line and the restart button again, beside the other controls,
+  // for the operator who is looking at the column rather than the main area.
+  const monitorGroup = document.createElement('div');
+  monitorGroup.className = 'control-group control-group-monitor';
+  const monitorGroupState = document.createElement('span');
+  monitorGroupState.className = 'control-label monitor-group-state';
+  const monitorGroupBtn = document.createElement('button');
+  monitorGroupBtn.type = 'button';
+  monitorGroupBtn.className = 'btn btn-ghost btn-small monitor-restart';
+  monitorGroupBtn.textContent = 'Restart monitor';
+  monitorGroupBtn.addEventListener('click', () => handlers.onRestartMonitor());
+  monitorGroup.append(monitorGroupState, monitorGroupBtn);
 
-  const channelGroup = document.createElement('div');
-  channelGroup.className = 'control-group control-group-channel';
-  const channelLabel = document.createElement('span');
-  channelLabel.className = 'control-label';
-  channelLabel.textContent = 'Return Channel';
-  channelGroup.append(channelLabel, channelSegmented.el);
-
-  // --- PICTURE source: which picture the commentator is looking at ---------
-  //
-  // THIS IS NOT THE CONTROL THAT USED TO BE HERE. There was a "Return Source"
-  // segmented control in this position that switched the HEADPHONES between
-  // WebRTC and SRT, and it was backwards: the operator asked for SRT PICTURES
-  // with the audio staying on Kinesis, and selecting "SRT" silenced them.
-  //
-  // Audio is not switchable from this screen any more. The bus dropdown and the
-  // channel selector above are the audio controls, and they are unchanged.
-  const sourceSegmented = makeSegmented(
-    'picture-source',
-    PICTURE_SOURCES.map((s) => ({ value: s.value, label: s.label, hint: s.summary })),
-    (source) => handlers.onPictureSourceChange(source),
-  );
-  sourceSegmented.set(DEFAULT_PICTURE_SOURCE);
-
-  // REFRESH: the picture has frozen, or the return sounds wrong. This gives
-  // WHICHEVER PICTURE IS ACTIVE a kick from nothing: the mosaic's WebRTC
-  // connection is torn down and rebuilt with fresh credentials — and the
-  // return audio rides on that same connection, so it drops for a moment and
-  // comes back clean — or the SRT picture process is ended (killed, if it has
-  // wedged) and a fresh one started. The contribution feed is never touched,
-  // which is why this is safe to have on the main screen mid-match. app.js
-  // decides which half to kick; see onPictureRefresh there.
-  const refreshBtn = document.createElement('button');
-  refreshBtn.type = 'button';
-  refreshBtn.className = 'btn btn-ghost btn-small picture-refresh';
-  refreshBtn.textContent = 'Refresh';
-  refreshBtn.title =
-    'Give the picture a kick. Mosaic: reconnects the multiviewer and the return audio with it ' +
-    '(a moment of silence). SRT: closes the picture window and opens a fresh one, dialling M2L-X ' +
-    'again. The feed going to air is never touched.';
-  refreshBtn.addEventListener('click', () => handlers.onPictureRefresh());
-
-  const sourceGroup = document.createElement('div');
-  sourceGroup.className = 'control-group control-group-source';
-  const sourceLabel = document.createElement('span');
-  sourceLabel.className = 'control-label';
-  sourceLabel.textContent = 'Picture';
-  const sourceRow = document.createElement('div');
-  sourceRow.className = 'picture-source-row';
-  sourceRow.append(sourceSegmented.el, refreshBtn);
-  sourceGroup.append(sourceLabel, sourceRow);
-
-  // THE NOTES UNDER THE CONTROLS ARE GONE, at the operator's request — the
-  // paragraph explaining the selected picture (describePictureSource +
-  // PICTURE_NOTE + LATENCY_NOTE) and the separate SRT status line under it.
-  // The words themselves are untouched in ./picturesource.js and
-  // ./returnsource.js, where Settings and the option tooltips still use them;
-  // what changed is that this screen no longer renders a paragraph of them.
-  // The one state that mattered from the status line — BACKOFF, the picture
-  // failing and retrying — now speaks through the error banner instead, once
-  // per episode; see setPictureState below and errorlog.js.
-
-  const levelGroup = document.createElement('div');
-  levelGroup.className = 'control-group control-group-level';
-  const levelLabel = document.createElement('label');
-  levelLabel.htmlFor = 'level-slider';
-  levelLabel.textContent = 'Return Level';
-  const levelSlider = document.createElement('input');
-  levelSlider.type = 'range';
-  levelSlider.id = 'level-slider';
-  levelSlider.min = '0';
-  levelSlider.max = '100';
-  levelSlider.step = '1';
-  levelSlider.value = '100';
-  levelSlider.addEventListener('input', () => handlers.onLevelChange(Number(levelSlider.value) / 100));
-  levelGroup.append(levelLabel, levelSlider);
-
-  // The Headphones label is plain "Headphones/output", at the operator's
-  // request. It used to say whose identifier space the list came from — the
-  // browser's — which mattered when a control swapped the dropdown between
-  // the browser's list and Windows'. That control is gone — this is always
-  // the browser's list, always writing config.headphoneDeviceId — so the
-  // qualifier was engineering trivia on the operator's screen. The
-  // distinction itself still matters and still lives in ./returnsource.js and
-  // on the Settings screen's WASAPI field.
-  const headphoneRow = document.createElement('div');
-  headphoneRow.className = 'control-group';
-  const headphoneLabel = document.createElement('label');
-  headphoneLabel.htmlFor = 'headphone-select';
-  headphoneLabel.textContent = 'Headphones/output';
-  headphoneRow.append(headphoneLabel, headphoneSelect);
-
-  // The AUDIO controls only. sourceGroup — which PICTURE — gets its own block in
-  // the column, because it is not an audio control and grouping it with four of
-  // them is how a commentator came to believe the old "Return Source" selector
-  // changed what they could see rather than what they could hear.
-  controls.append(
-    makeRow('Commentary input', 'input-select', inputSelect),
-    headphoneRow,
-    returnGroup,
-    channelGroup,
-    levelGroup,
-  );
-
-  // --- start/stop + lamps -------------------------------------------------
-  //
-  // These two no longer travel together and there is no .action-row any more.
-  // START goes to the match bar beside the overall indicator, the lamp row goes
-  // to the column's Status section, and each is appended where it lands rather
-  // than into a shared wrapper — a wrapper appended in one place while its
-  // children are appended in another is how an element silently ends up in
-  // whichever DOM position ran last.
   const startStopBtn = document.createElement('button');
   startStopBtn.type = 'button';
   startStopBtn.className = 'btn btn-primary btn-start';
@@ -1442,7 +1023,7 @@ export function createHomeView(handlers) {
     makeRailSection('Session', presetIndicator),
     makeRailSection('Status', lampsEl),
     makeRailSection('Audio', controls),
-    makeRailSection('Picture', sourceGroup),
+    panel ? makeRailSection('Picture', panel.pictureGroup) : makeRailSection('PGM monitor', monitorGroup),
     railStrip,
   );
 
@@ -1495,159 +1076,67 @@ export function createHomeView(handlers) {
 
   // --- setters --------------------------------------------------------
 
-  function fillDeviceSelect(select, devices, selectedId, emptyLabel) {
-    const previousValue = selectedId ?? select.value;
-    select.textContent = '';
-    if (!devices || devices.length === 0) {
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = emptyLabel;
-      select.appendChild(opt);
-      select.disabled = true;
-      return;
-    }
-    select.disabled = false;
-    // Display order, not arrival order: real microphones above the NDI/webcam
-    // virtual sources, the Dante wall last, numbers compared as numbers. The
-    // measured machine offers eight "DVS Receive N-M" pairs, and byte order
-    // both interleaves 1-2 with 10-11 and files them above the one Focusrite
-    // the commentator actually uses. sortDevices copies; the caller's array
-    // (app.js's currentInputDevices) is not reordered under it.
-    //
-    // labelDevices then adds the DISAMBIGUATING SUFFIX, and it has to run after
-    // the sort because what it adds depends on which entries share a name. One
-    // Blackmagic card enumerates TWICE — once through the platform's audio
-    // stack and once through GStreamer's decklink provider — under names an
-    // operator cannot tell apart, and the native twin measures -96 dBFS on all
-    // sixteen channels with the mic live. Rendering d.name here would put those
-    // two on adjacent lines as equals, which is exactly the choice the operator
-    // cannot be asked to make. labelDevices copies too, so the caller's array
-    // is still untouched, and .id is unchanged on every entry — the option
-    // VALUE and describeDeviceSelection below both still read the real id.
-    const ordered = labelDevices(sortDevices(devices));
-    for (const d of ordered) {
-      const opt = document.createElement('option');
-      opt.value = d.id;
-      opt.textContent = d.label;
-      select.appendChild(opt);
-    }
-    const selection = describeDeviceSelection(ordered, previousValue);
-    if (selection.present) {
-      if (selection.savedId !== '') select.value = selection.savedId;
-      return;
-    }
-    // The saved id is not in today's list — a docked USB interface, a stopped
-    // Dante Virtual Soundcard, a config.json from another machine. This used
-    // to fall through silently, leaving device #1 showing as selected: the
-    // operator reads a plausible device on screen while Start refuses the id
-    // actually saved, and cannot reconcile the two. Show the truth instead —
-    // a marker option that cannot be chosen, selected, with the missing id in
-    // it. The control is left VISIBLY WRONG on purpose; picking any real
-    // device is the way out, and that gesture overwrites the stale id.
-    const missing = document.createElement('option');
-    missing.value = selection.savedId;
-    missing.textContent = selection.label;
-    missing.disabled = true;
-    select.insertBefore(missing, select.firstChild);
-    select.value = selection.savedId;
-  }
-
   function setInputDevices(devices, selectedId) {
     fillDeviceSelect(inputSelect, devices, selectedId, 'No input devices found');
   }
 
   function setHeadphoneDevices(devices, selectedId) {
-    fillDeviceSelect(headphoneSelect, devices, selectedId, 'No output devices found');
+    if (panel) panel.setHeadphoneDevices(devices, selectedId);
   }
-
   function setReturnMid(mid) {
-    // A mid outside 1..7 — a hand-edited config.json, an older file — would
-    // leave the <select> showing nothing at all, which reads as "no return" to
-    // somebody who is about to commentate. Fall back to the documented default.
-    returnSelect.value = isValidReturnMid(mid) ? String(mid) : String(DEFAULT_RETURN_MID);
+    if (panel) panel.setReturnMid(mid);
   }
-
   function setReturnChannel(mode) {
-    channelSegmented.set(normaliseChannelMode(mode));
+    if (panel) panel.setReturnChannel(mode);
   }
 
-  let currentPictureSource = DEFAULT_PICTURE_SOURCE;
-  let currentPictureState = null;
-  let currentPictureAvailable = true;
-
-  /**
-   * renderPicture draws what the SELECTION and the RECEIVER'S STATE mean: the
-   * badge over the tile, the segmented control and the Refresh button.
-   *
-   * Both feed it, because neither alone says what is on screen: "SRT selected"
-   * with the receiver in BACKOFF is a commentator watching the mosaic, and
-   * saying "SRT" over the top of that would be a lie told in large letters.
-   *
-   * The status LINE it also used to draw is gone; BACKOFF — the only state on
-   * it that demanded attention — is raised through the error banner by
-   * setPictureState instead, and the badge over the tile already reports which
-   * picture is actually showing.
-   *
-   * THE MOSAIC IS NEVER SUPPRESSED. The SRT picture is in a window of its own;
-   * nothing on this page is ever covered by it, and there is no class, flag or
-   * rule that hides the <video>.
-   */
-  function renderPicture() {
-    const effects = derivePictureSourceEffects(currentPictureSource, currentPictureState);
-    sourceSegmented.set(effects.source);
-
-    const showing = describePictureShowing(effects, currentPictureState);
-    pictureBadge.textContent = showing.text;
-    pictureBadge.title = showing.detail;
-    pictureBadge.classList.toggle('picture-badge-fallback', !showing.good);
-
-    // Refresh kicks whichever picture is active, and the mosaic is always
-    // there to be kicked, so the button is always live. The one thing it
-    // cannot do is restart an SRT picture this build cannot drive; app.js
-    // then kicks the mosaic alone.
-    refreshBtn.disabled = false;
-  }
-
-  /** setPictureSource selects which picture the application should try for. */
   function setPictureSource(source) {
-    currentPictureSource = normalisePictureSource(source);
-    renderPicture();
+    if (panel) panel.setPictureSource(source);
   }
-
-  /**
-   * setPictureAvailable disables the SRT option, with the reason on the control.
-   * Used when the build has no native picture bindings — a real possibility
-   * while the Go side lands — so the option is visibly unavailable rather than
-   * silently failing when it is pressed.
-   */
   function setPictureAvailable(available, reason) {
-    currentPictureAvailable = available !== false;
-    sourceSegmented.setOptionEnabled(PICTURE_SOURCE_SRT, currentPictureAvailable, reason);
-    renderPicture();
+    if (panel) panel.setPictureAvailable(available, reason);
+  }
+  function setPictureState(state) {
+    if (panel) panel.setPictureState(state);
+  }
+  function setPictureOverlaid(overlaid) {
+    if (panel) panel.setPictureOverlaid(overlaid);
+  }
+  function measurePictureRect() {
+    return panel ? panel.measurePictureRect() : null;
   }
 
   /**
-   * setPictureState records the native receiver's own state, one of the four
-   * strings on the "picture" event.
-   *
-   * It also feeds the backoff-episode tracker: the first failure of an
-   * unbroken failing run raises the error banner, the retry cycling inside
-   * that run stays silent, and recovery takes the banner down again — but only
-   * if the banner is still showing THIS message, because a different error
-   * arriving mid-episode must not be cleared by the picture getting better.
+   * setMonitorState paints the card and the column's line from the "monitor"
+   * event's payload: whether the PGM monitor process is running, and what its
+   * KVS connection is doing. The button reads "Open" when there is nothing to
+   * restart.
    */
-  function setPictureState(state) {
-    currentPictureState = state ? String(state) : null;
-    switch (backoffEpisode.track(normalisePictureState(currentPictureState))) {
-      case 'raise':
-        showError(PICTURE_BACKOFF_ERROR);
+  function setMonitorState(payload) {
+    const process = payload && typeof payload.process === 'string' ? payload.process : 'closed';
+    const kvs = payload && typeof payload.kvs === 'string' ? payload.kvs : '';
+    let line;
+    switch (process) {
+      case 'running':
+        line = kvs ? `Monitor window open — mosaic ${kvs}` : 'Monitor window open';
         break;
-      case 'clear':
-        clearErrorIf(PICTURE_BACKOFF_ERROR);
+      case 'starting':
+        line = 'Monitor window opening…';
         break;
+      case 'failed':
+        line = 'Monitor window could not be opened — see the alerts';
+        break;
+      default:
+        line = 'Monitor window closed';
     }
-    renderPicture();
+    monitorCardState.textContent = line;
+    monitorGroupState.textContent = line;
+    monitorCard.classList.toggle('monitor-card-down', process !== 'running');
+    const label = process === 'running' || process === 'starting' ? 'Restart monitor' : 'Open monitor';
+    restartBtn.textContent = label;
+    monitorGroupBtn.textContent = label;
   }
+  setMonitorState(null);
 
   /**
    * setPreviewReserved decides whether the preview box exists in the layout at
@@ -1692,64 +1181,16 @@ export function createHomeView(handlers) {
 
   // Draw the note and the badge once at construction so neither is blank before
   // any config has loaded.
-  renderPicture();
 
   // Peak-hold state for the input meters. One instance for the view's life:
   // the zero-frame emitted when capture goes down resets it below, so the next
   // device comes up with no ghost of the last one's peaks.
-  const inputPeakHold = createPeakHold();
-
-  /**
-   * setLevels paints the input meters from one "levels" frame
-   * ({peak: number[], rms: number[]}, dBFS per channel).
-   *
-   * Called on every event, ~20 Hz — no rAF loop, deliberately: at that rate
-   * the event IS the frame clock, and the peak-hold ticks with it, so capture
-   * going down (which stops the events after its zero-frame) also stops all
-   * meter work rather than leaving a timer painting nothing.
-   *
-   * The bar is the RMS; the marker is the held peak. An all-silence frame — the
-   * zero-frame app.go emits when a capture pipeline goes away, which is a device
-   * change, a restart or the application quitting and NOT the end of a session —
-   * or a null/malformed one dims the whole assembly and resets the hold: empty
-   * and dimmed, no text clutter, because "nothing is arriving" is not a level
-   * and must not look like one.
-   */
   function setLevels(frame) {
-    const silent = isSilentFrame(frame);
-    metersEl.classList.toggle('input-meters-idle', silent);
-    if (silent) {
-      inputPeakHold.reset();
-      for (const ch of meterChannels) {
-        ch.fills.forEach((fill) => {
-          fill.style.height = '0%';
-        });
-        ch.peakMark.hidden = true;
-      }
-      return;
-    }
-
-    const peaks = Array.isArray(frame.peak) ? frame.peak : [];
-    const rms = Array.isArray(frame.rms) ? frame.rms : [];
-    const marks = inputPeakHold.update(peaks);
-    meterChannels.forEach((ch, i) => {
-      const fills = zoneFills(rms[i]);
-      ch.fills.forEach((fill, z) => {
-        // Rounded to 0.1% for the same reason the mixer's meterPercent
-        // rounds: a 20 Hz update must not rewrite the style attribute with a
-        // seventeen-digit float.
-        fill.style.height = `${(Math.round(fills[z] * 1000) / 10).toFixed(1)}%`;
-      });
-      const frac = dbToFraction(marks[i]);
-      ch.peakMark.hidden = !(frac > 0);
-      ch.peakMark.style.bottom = `${(Math.round(frac * 1000) / 10).toFixed(1)}%`;
-    });
+    if (panel) panel.setLevels(frame);
   }
-
   function setLevel(fraction) {
-    levelSlider.value = String(Math.round(Math.max(0, Math.min(1, fraction)) * 100));
+    if (panel) panel.setLevel(fraction);
   }
-
   function setRunning(running) {
     startStopBtn.textContent = running ? 'STOP' : 'START';
     startStopBtn.classList.toggle('btn-stop', running);
@@ -1918,11 +1359,11 @@ export function createHomeView(handlers) {
 
   return {
     el,
-    videoEl,
+    videoEl: panel ? panel.videoEl : null,
     audioEl,
     // The mosaic's box. app.js observes it for resizes, because the preview
     // box beside it is sized from the same stage; nothing here knows that.
-    pictureEl: pgmTile,
+    pictureEl: panel ? panel.tileEl : null,
     // The element whose box the native preview surface is told to occupy. It
     // is a separate element from the tile precisely so the two rectangles can
     // never overlap, which would erase the mosaic under the surface and report
@@ -1941,6 +1382,9 @@ export function createHomeView(handlers) {
     setPictureSource,
     setPictureAvailable,
     setPictureState,
+    setPictureOverlaid,
+    measurePictureRect,
+    setMonitorState,
     setPreviewReserved,
     setPreviewCaption,
     measurePreviewRect,

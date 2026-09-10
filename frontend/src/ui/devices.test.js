@@ -518,9 +518,9 @@ test('fillDeviceSelect sorts through sortDevices and populates from the sorted l
   // Matched loosely enough to survive labelDevices being composed around it —
   // the load-bearing facts are that the raw list goes through sortDevices and
   // that the options are built from the RESULT, not from the argument.
-  const src = codeOnly(ui('home.js'));
+  const src = codeOnly(ui('pgmpanel.js'));
   const fn = src.slice(src.indexOf('function fillDeviceSelect('));
-  const body = fn.slice(0, fn.indexOf('\n  }'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
   assert.match(body, /sortDevices\(devices\)/, 'the list must go through sortDevices');
   assert.match(body, /const ordered =/, 'into a local the rest of the function reads');
   assert.match(body, /for \(const d of ordered\)/, 'and the options must be built from the SORTED list');
@@ -545,9 +545,9 @@ test('fillDeviceSelect shows the LABEL, so the silent twin is not offered as an 
   //
   // home.js is still not this file's work package. An assertion that fails is
   // how that gets reported.
-  const src = codeOnly(ui('home.js'));
+  const src = codeOnly(ui('pgmpanel.js'));
   const fn = src.slice(src.indexOf('function fillDeviceSelect('));
-  const body = fn.slice(0, fn.indexOf('\n  }'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
   assert.match(
     body,
     /labelDevices\(sortDevices\(devices\)\)/,
@@ -563,9 +563,9 @@ test('fillDeviceSelect shows the LABEL, so the silent twin is not offered as an 
 });
 
 test('fillDeviceSelect handles the absent-id branch with a disabled marker', () => {
-  const src = codeOnly(ui('home.js'));
+  const src = codeOnly(ui('pgmpanel.js'));
   const fn = src.slice(src.indexOf('function fillDeviceSelect('));
-  const body = fn.slice(0, fn.indexOf('\n  }'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
   assert.match(body, /describeDeviceSelection\(/, 'presence is decided by the pure module, not re-derived');
   assert.match(body, /missing\.disabled = true/, 'the marker must not be choosable');
   assert.match(
@@ -584,9 +584,9 @@ test('the empty-list behaviour is unchanged, and runs before any sorting', () =>
   // Empty list: one option carrying the emptyLabel ("No input devices
   // found"), control disabled, early return. The marker logic must never
   // reach it — an empty list already tells the truth.
-  const src = codeOnly(ui('home.js'));
+  const src = codeOnly(ui('pgmpanel.js'));
   const fn = src.slice(src.indexOf('function fillDeviceSelect('));
-  const body = fn.slice(0, fn.indexOf('\n  }'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
   const emptyBranch = body.indexOf('devices.length === 0');
   const sortCall = body.indexOf('sortDevices(');
   assert.ok(emptyBranch > -1, 'the empty branch must still exist');

@@ -167,13 +167,14 @@ func newTestApp(t *testing.T) (*App, *fakeStore) {
 	// installs its own recorder over this one.
 	a.exitProcess = func() {}
 
-	// The real picture monitor LAUNCHES THIS EXECUTABLE as the picture process
-	// (app_picture_child.go), and under `go test` this executable is the test
-	// binary: a StartPicture reached from any test — a reflective sweep of the
-	// bound surface did it — would run the whole suite again in a child, which
-	// would do the same, without end. Every App a test builds therefore gets a
-	// fake monitor by default; the picture tests install their own over it.
-	a.pictureDial = func() gst.PictureMonitor { return newFakePictureMonitor() }
+	// The real monitor host LAUNCHES THIS EXECUTABLE as the PGM monitor
+	// (app_monitor.go), and under `go test` this executable is the test
+	// binary: a launch reached from any test — domReady does one, and a
+	// reflective sweep of the bound surface once reached the picture's — would
+	// run the whole suite again in a child, which would do the same, without
+	// end. Every App a test builds therefore gets a fake host by default; the
+	// monitor tests install their own over it.
+	a.monitorDial = func() monitorHost { return newFakeMonitorHost() }
 
 	a.cfgMu.Lock()
 	a.cfg = validConfig()
@@ -637,10 +638,10 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	// the feed is up. The sender only emits on transitions, so the current state
 	// is replayed here instead.
 	//
-	// domReady replays FIVE, not one: the return monitor and the picture monitor
+	// domReady replays FIVE, not one: the return monitor and the PGM monitor
 	// both emit only on transitions for the same reason, and a reloaded page
 	// would otherwise show the RETURN lamp grey with audio in the commentator's
-	// ears, and draw the fallback mosaic over a working high-resolution picture.
+	// ears, and show the MONITOR lamp grey with the monitor window open beside it.
 	// The count is asserted exactly so that a sixth replay has to be a decision
 	// — every event queued here is delivered to a page that has just loaded, and
 	// the ones the status lamps would need are deliberately NOT replayed because
@@ -672,7 +673,7 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 
 	queued := drainPump(a)
 	if len(queued) != 8 {
-		t.Fatalf("domReady queued %d events, want the sender, return, picture, signal, "+
+		t.Fatalf("domReady queued %d events, want the sender, return, monitor, signal, "+
 			"channel-map, mute, preview and capture replays: %+v", len(queued), queued)
 	}
 	if queued[0].name != EventSender || queued[0].data != sender.StateConnected {
@@ -681,8 +682,10 @@ func TestDomReadyReplaysTheCurrentSenderState(t *testing.T) {
 	if queued[1].name != EventReturn || queued[1].data != gst.ReturnStateStopped {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[1], EventReturn, gst.ReturnStateStopped)
 	}
-	if queued[2].name != EventPicture || queued[2].data != gst.PictureStateStopped {
-		t.Fatalf("domReady queued %+v, want %s = %s", queued[2], EventPicture, gst.PictureStateStopped)
+	if mon, ok := queued[2].data.(monitorPayload); queued[2].name != EventMonitor || !ok ||
+		(mon.Process != monitorProcessStarting && mon.Process != monitorProcessRunning) {
+		t.Fatalf("domReady queued %+v, want %s with the monitor process starting or running (it is "+
+			"launched from domReady; the start itself runs on its own goroutine)", queued[2], EventMonitor)
 	}
 	if queued[3].name != EventSignal || queued[3].data != (signalPayload{State: gst.SignalUnknown}) {
 		t.Fatalf("domReady queued %+v, want %s = %s", queued[3], EventSignal, gst.SignalUnknown)
@@ -761,7 +764,7 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 
 	queued := drainPump(a)
 	if len(queued) != 8 {
-		t.Fatalf("domReady queued %+v, want a sender, a return, a picture, a signal, a "+
+		t.Fatalf("domReady queued %+v, want a sender, a return, a monitor, a signal, a "+
 			"channel-map, a mute, a preview and a capture replay", queued)
 	}
 	if queued[0].data != sender.StateStopped {
@@ -771,9 +774,8 @@ func TestDomReadyReplaysStoppedBeforeAnySession(t *testing.T) {
 		t.Fatalf("domReady queued %+v, want %s before any return monitor has run",
 			queued, gst.ReturnStateStopped)
 	}
-	if queued[2].data != gst.PictureStateStopped {
-		t.Fatalf("domReady queued %+v, want %s before any picture monitor has run",
-			queued, gst.PictureStateStopped)
+	if queued[2].name != EventMonitor {
+		t.Fatalf("domReady queued %+v, want the monitor's state third", queued)
 	}
 	// UNKNOWN and not LOST. Before any session has run there is no capture
 	// element to poll, and on a machine with no card there never will be — the
@@ -988,13 +990,12 @@ func TestSetSecretWritesThroughAndHasNoGetter(t *testing.T) {
 // the same reason the mixer six are listed second: so that each group stays
 // legible as one decision.
 //
-// The four picture methods are the next group, added when SRT became the
-// PICTURE path and documented in the same header. The picture is a SEPARATE
-// PROCESS with a window of its own, so there is no rectangle or visibility
-// method for it (there were two while it was an overlay over the page), and
-// RefreshPicture — kill the process, start a fresh one — is the operator's
-// answer to a frozen picture. They are listed fourth so that group stays
-// legible too.
+// The two PGM monitor methods are the next group. The picture, the mosaic, the
+// return audio and the meters live in a SEPARATE PROCESS with a window of its
+// own (app_monitor.go), so the picture methods that used to be here — start,
+// stop, refresh, rectangle, visibility — are bound in THAT process instead;
+// what this surface keeps is the launcher: RestartMonitor, kill it and start a
+// fresh one, and GetMonitorState for the lamp.
 //
 // The seven preset methods are the next group, added with the M2L-X instance
 // presets and documented in the same header. Four are read-only or rename a
@@ -1073,10 +1074,8 @@ func assertBoundSurface(t *testing.T) {
 		"GetReturnState":      true,
 		"IsSRTReturnSelected": true,
 
-		"StartPicture":    true,
-		"StopPicture":     true,
-		"RefreshPicture":  true,
-		"GetPictureState": true,
+		"RestartMonitor":  true,
+		"GetMonitorState": true,
 
 		"ListPresets":               true,
 		"SavePreset":                true,
@@ -2400,7 +2399,7 @@ func TestTeardownEndsTheProcessEvenOnACleanShutdown(t *testing.T) {
 // first, teardown is cut off mid-sequence again, and the steps behind the cut
 // stop running — which is exactly the defect the per-step budgets removed.
 //
-// pictureStopBudget is the sixth. It was added with the SRT picture, and adding
+// previewStopBudget is the sixth. It was added with the SRT picture, and adding
 // it is what took shutdownTimeout from twenty seconds to twenty-four: the sum
 // is the bound, so a new step is a new term on both sides or this test fails,
 // which is the whole point of it being written as a sum rather than a constant.
@@ -2410,7 +2409,7 @@ func TestTeardownEndsTheProcessEvenOnACleanShutdown(t *testing.T) {
 // it is a step of its own, and adding it took shutdownTimeout from twenty-five to
 // twenty-nine.
 func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
-	total := senderStopBudget + captureStopBudget + returnStopBudget + pictureStopBudget +
+	total := senderStopBudget + captureStopBudget + returnStopBudget + previewStopBudget +
 		mixerCloseBudget + controlPlaneStopBudget + rootJoinBudget
 	if total > shutdownTimeout {
 		t.Fatalf("the per-step budgets total %v, over shutdownTimeout's %v: the overall bound would "+
@@ -2422,7 +2421,7 @@ func TestTeardownStepBudgetsFitInsideTheOverallBound(t *testing.T) {
 	for name, budget := range map[string]time.Duration{
 		"captureStopBudget":      captureStopBudget,
 		"returnStopBudget":       returnStopBudget,
-		"pictureStopBudget":      pictureStopBudget,
+		"previewStopBudget":      previewStopBudget,
 		"mixerCloseBudget":       mixerCloseBudget,
 		"controlPlaneStopBudget": controlPlaneStopBudget,
 		"rootJoinBudget":         rootJoinBudget,

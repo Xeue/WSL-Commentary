@@ -78,16 +78,14 @@
 //	GetReturnState()            gst.ReturnState            caller: WP-5b
 //	IsSRTReturnSelected()       bool                       caller: WP-5b
 //
-// and the four for the SRT PICTURE, which live in app_picture.go. The picture
-// is a SEPARATE PROCESS with a window of its own (app_picture_child.go), so
-// there is no rectangle or visibility method for it — there used to be two,
-// when it was an overlay painted over the page — and RefreshPicture is the
-// operator's "the picture has frozen" button: kill the process, start a fresh
-// one:
+// and the two for the PGM MONITOR, which live in app_monitor.go. The picture,
+// the mosaic, the return audio and the meters live in a SEPARATE PROCESS with
+// a window of its own; this process launches it, relays it events, answers
+// its calls, and can kill and relaunch it. RestartMonitor is that last thing
+// as a button — the operator's answer to a monitor that has wedged:
 //
-//	StartPicture() / StopPicture()      error              caller: WP-5b
-//	RefreshPicture()                    error              caller: WP-5b
-//	GetPictureState()                   gst.PictureState   caller: WP-5b
+//	RestartMonitor()                    error                   caller: WP-5b
+//	GetMonitorState()                   monitorPayload          caller: WP-5b
 //
 // and the seven added for the M2L-X INSTANCE PRESETS, which live in
 // app_presets.go — the TWENTIETH to TWENTY-SIXTH, recorded in CONTRACT.md's
@@ -754,7 +752,7 @@ const (
 	// synchronous state change, and the paragraph above applies to it in full.
 	// The overlay window's Close does guarantee it — it posts a quit to its own
 	// message thread and waits gst's overlayCloseBudget, two seconds, before
-	// abandoning that thread and saying so. pictureStopBudget is four seconds,
+	// abandoning that thread and saying so. previewStopBudget is four seconds,
 	// which is that pair with room. See the Bounding note on
 	// stopPictureForTeardown, which sets out which half is bounded by what and
 	// why the timeout in picture_cgo.go is not the bound it looks like.
@@ -779,7 +777,7 @@ const (
 
 	// captureStopBudget bounds the capture step: every distinct pipeline in the
 	// set taken to NULL. It is FOUR seconds, on the same arithmetic
-	// pictureStopBudget uses: internal/gst bounds one element's shutdown at
+	// previewStopBudget uses: internal/gst bounds one element's shutdown at
 	// elementShutdownTimeout, and a fused card seat is one pipeline while the
 	// worst ordinary seat is two.
 	//
@@ -795,16 +793,15 @@ const (
 	// accounted for above.
 	returnStopBudget = 2 * time.Second
 
-	// pictureStopBudget bounds the picture step: stop the monitor, then destroy
-	// the overlay window. Four seconds is two for the pipeline and two for the
-	// window's message thread; see the arithmetic above shutdownTimeout.
-	//
-	// The window half is the unusual one. Everything else in this teardown is
-	// releasing a socket or a device, which the process exit would release
-	// anyway. A window is on the operator's SCREEN, so an abandoned one is
-	// visible until the process goes — which is why gst's overlay Close says in
-	// its error that it abandoned the thread rather than returning a bare nil.
-	pictureStopBudget = 4 * time.Second
+	// previewStopBudget bounds the preview-surface step: destroying the
+	// DeckLink preview's overlay window as a belt after the capture step. It
+	// is the unusual step in this teardown: everything else releases a socket
+	// or a device, which the process exit would release anyway, but a window
+	// is on the operator's SCREEN, so an abandoned one is visible until the
+	// process goes — which is why gst's overlay Close says in its error that
+	// it abandoned the thread rather than returning a bare nil. The monitor
+	// step before it has its own budget, monitorStopBudget.
+	previewStopBudget = 4 * time.Second
 
 	// mixerCloseBudget bounds step 4, closeMixerController. Closing a
 	// switcher_controller socket is a Close and a goroutine join, both prompt.
@@ -1318,48 +1315,34 @@ type App struct {
 	// show the RETURN lamp grey while audio was in the commentator's ears.
 	lastReturn gst.ReturnState
 
-	// The SRT PICTURE path takes TWO locks, in this order and never the other:
-	//
-	//	picMu  →  picStateMu
-	//
-	// picMu is the only one ever held across something that blocks.
-	//
-	// picMu guards pic, the running session. It is held for the whole of
-	// StartPicture and StopPicture, INCLUDING the blocking wait inside
-	// gst.PictureMonitor.Stop — which for the picture PROCESS is a wait for the
-	// child to exit, bounded and then a kill — and the join of the
-	// state-forwarding goroutine.
-	//
-	// It is a THIRD subsystem lock, not a reuse of retMu, for the reason that
-	// made retMu a second lock rather than a reuse of sessMu: the picture and the
-	// audio return reach different hardware — a GPU decoder and a window against
-	// an audio endpoint — and either can wedge without the other. One lock over
-	// both would mean a StartPicture waiting on a wedged headphone endpoint.
-	//
-	// There used to be a third, picViewMu, guarding an overlay window the
-	// picture was painted into over the page. The picture has its own window in
-	// its own process now and this process holds nothing of its geometry; the
-	// preview's prevViewMu below is the last of that kind.
-	picMu sync.Mutex
+	// THE PGM MONITOR is a separate process — the programme picture, the
+	// mosaic, the return audio and the meters, in a window of their own — and
+	// these fields are its launcher's. monMu guards all of them and is never
+	// held across anything that blocks: Start and Stop of the process happen
+	// outside it. See app_monitor.go.
+	monMu sync.Mutex
 
-	// pic is the running picture session, or nil when the picture is stopped.
-	pic *pictureSession
+	// mon is the running monitor process's link, or nil before the first
+	// launch. A host whose Done has closed is a process that has gone; it is
+	// kept so its exit code can be read.
+	mon monitorHost
 
-	// pictureSoftwareNoteOnce fires the "this machine is decoding the picture in
-	// software" note at most once for the life of the process. The decoder's
-	// availability is a fixed property of the GPU and driver, so telling the
-	// operator again on every StartPicture would be noise; see maybeNotePictureSoftwareDecode.
-	pictureSoftwareNoteOnce sync.Once
+	// monGen counts launches, so a goroutine following a superseded process
+	// stops updating the shared state the moment it notices.
+	monGen int
 
-	// picStateMu guards lastPicture. It is the innermost of the three and it is a
-	// leaf: nothing is taken while it is held.
-	picStateMu sync.Mutex
+	// monStopping is set when THIS side asked the monitor to stop — a restart,
+	// or teardown — so its exit is not mistaken for a crash and relaunched.
+	monStopping bool
 
-	// lastPicture is the most recent gst.PictureState forwarded to the frontend,
-	// replayed by domReady for the same reason lastSender and lastReturn are: the
-	// monitor emits only on transitions, so a page that reloaded mid-match would
-	// otherwise draw the fallback mosaic over a working high-resolution picture.
-	lastPicture gst.PictureState
+	// monProcess and monKVS are the "monitor" event's payload: the process's
+	// state and, relayed from its page, the KVS connection's.
+	monProcess string
+	monKVS     string
+
+	// monRelaunches records recent automatic relaunches after a crash, so a
+	// monitor that keeps dying is left down rather than relaunched for ever.
+	monRelaunches []time.Time
 
 	// THE DECKLINK PREVIEW — the operator's own confidence monitor — is the one
 	// native overlay left in this process's window: an opaque child HWND (an
@@ -1462,14 +1445,15 @@ type App struct {
 	muteSeq   float64
 	muteSeqAt time.Time
 
-	// pictureDial builds the picture monitor, and overlayDial builds the
-	// DeckLink preview's native overlay window. Both are real constructors in
-	// the application — the picture process's parent half, and gst's overlay —
-	// and fakes in the tests, which is the only way to exercise the wire-up
-	// without a GPU, without a window and without launching a process. Nil means
-	// the real one; see App.newPictureMonitor and App.newPreviewOverlay.
-	pictureDial func() gst.PictureMonitor
+	// overlayDial builds the DeckLink preview's native overlay window, and
+	// monitorDial builds the link to a monitor process. Both are the real
+	// constructors in the application — gst's overlay, and monitorlink's host
+	// over a freshly launched process — and fakes in the tests, which is the
+	// only way to exercise the wire-up without a window and without launching
+	// a process. Nil means the real one; see App.newPreviewOverlay and
+	// App.newMonitorHost.
 	overlayDial func() (gst.PictureOverlay, error)
+	monitorDial func() monitorHost
 
 	// returnDial builds the return monitor. It is gst.NewReturnMonitor in the
 	// application and a fake in the tests, which is how the wire-up is exercised
@@ -1638,14 +1622,13 @@ type session struct {
 func NewApp(appDir string, gstInitErr error) *App {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		appDir:      appDir,
-		gstInitErr:  gstInitErr,
-		rootCtx:     ctx,
-		rootCancel:  cancel,
-		events:      newEventPump(),
-		lastSender:  sender.StateStopped,
-		lastReturn:  gst.ReturnStateStopped,
-		lastPicture: gst.PictureStateStopped,
+		appDir:     appDir,
+		gstInitErr: gstInitErr,
+		rootCtx:    ctx,
+		rootCancel: cancel,
+		events:     newEventPump(),
+		lastSender: sender.StateStopped,
+		lastReturn: gst.ReturnStateStopped,
 		// UNKNOWN and not OK. Nothing has been measured yet, and on every machine
 		// without a capture card in it nothing ever will be; claiming a locked
 		// input from an absence of evidence is the exact dishonesty the watchdog
@@ -1666,7 +1649,7 @@ func NewApp(appDir string, gstInitErr error) *App {
 	// consumer goroutine can exist (that starts in domReady), and reads the
 	// remote server pointer lazily on each call, so it is safe even though the
 	// server is not built until startup.
-	a.events.tee = a.broadcastRemote
+	a.events.tee = a.teeEvents
 	return a
 }
 
@@ -1769,13 +1752,12 @@ func (a *App) domReady(ctx context.Context) {
 	a.retStateMu.Unlock()
 	a.events.send(EventReturn, lastRet)
 
-	// The picture, for the same reason: the picture process is still running
-	// in its own window across a page reload, and the badge over the mosaic
-	// tile would otherwise say the SRT picture was stopped while it was showing.
-	a.picStateMu.Lock()
-	lastPic := a.lastPicture
-	a.picStateMu.Unlock()
-	a.events.send(EventPicture, lastPic)
+	// The PGM monitor: its state for the lamp, and — the first time — the
+	// process itself. It is launched from HERE rather than from startup so
+	// that the application's window is on screen before the monitor's, and
+	// so that a page reload does not launch a second one: while one is
+	// running launchMonitor only replays its state.
+	a.launchMonitor()
 
 	// The video signal lamp, and this replay does MORE work than the three above
 	// it. A sender reconnects and a return monitor retries, so both of those
@@ -2078,7 +2060,8 @@ func (a *App) teardownOrdered() int {
 	// whole teardown that the operator can see, so it goes as late as it can
 	// while still going before the control plane — and it goes after both audio
 	// paths, because a commentator would rather lose the picture last.
-	step("the picture", pictureStopBudget, a.stopPictureForTeardown)
+	step("the PGM monitor", monitorStopBudget, a.stopMonitorForTeardown)
+	step("the preview surface", previewStopBudget, a.stopPreviewForTeardown)
 
 	step("the mixer write path", mixerCloseBudget, a.closeMixerController)
 

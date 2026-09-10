@@ -48,14 +48,15 @@
 //
 // ===================== HOST-ONLY, AND WHY IT IS PHYSICS =====================
 //
-// The SRT picture is a separate process on the host, decoding on the host GPU
-// into a native window of its own (app_picture_child.go). No transport that
-// carries the DOM can carry it, and starting, stopping or refreshing it opens
-// and closes a window on the operator's screen and takes or releases the M2L-X
-// output's one fan-out slot. So the picture and SRT-return methods are
-// HostOnly: refused for every remote connection. The remote page gets the
-// WebRTC mosaic and an honest message; it never gets these methods, because the
-// hello frame omits them.
+// The SRT picture is decoded on the host GPU into a native window over the PGM
+// monitor's own window, in the monitor process (monitor_picture.go). No
+// transport that carries the DOM can carry it, and the monitor process itself
+// is a window on the operator's screen: RestartMonitor kills and reopens it.
+// So RestartMonitor and the SRT-return methods are HostOnly: refused for every
+// remote connection. The remote page gets the WebRTC mosaic and an honest
+// message; it never gets these methods, because the hello frame omits them.
+// The monitor process itself calls in through this same allowlist as the
+// client "pgm-monitor", and reaches exactly what a remote seat can.
 //
 // The two remote-admin methods (GetRemoteState, SetRemoteListener) are HostOnly
 // for a blunter reason: they change WHETHER the listener runs and on WHAT
@@ -119,7 +120,7 @@ func remoteEventNames() []string {
 		EventStatus,
 		EventSender,
 		EventReturn,
-		EventPicture,
+		EventMonitor,
 		EventError,
 		EventNote,
 		EventStatusKeys,
@@ -202,7 +203,7 @@ var remoteAllowlist = map[string]methodPolicy{
 	"CredentialStoreName":    {},
 	"GetMixerSnapshot":       {},
 	"GetMixerGolden":         {},
-	"GetPictureState":        {},
+	"GetMonitorState":        {},
 	"GetReturnState":         {},
 	// GetCommentaryMute and GetPreviewState are reads, and both are reachable for
 	// the same shape of reason GetConformTarget is: a remote seat draws the same
@@ -345,9 +346,7 @@ var remoteAllowlist = map[string]methodPolicy{
 	// ---- host-only: the native picture/return surface ----
 	// Refused for every connection and omitted from Methods() so the shim never
 	// installs them.
-	"StartPicture":   {hostOnly: true},
-	"StopPicture":    {hostOnly: true},
-	"RefreshPicture": {hostOnly: true},
+	"RestartMonitor": {hostOnly: true},
 	"StartReturn":    {hostOnly: true},
 	"StopReturn":     {hostOnly: true},
 	// The DeckLink preview's surface, host-only because they move, resize and
@@ -504,8 +503,8 @@ func (a *App) remoteInvoke(ctx context.Context, client remote.ClientInfo, method
 		return a.GetMixerSnapshot()
 	case "GetMixerGolden":
 		return a.GetMixerGolden()
-	case "GetPictureState":
-		return a.GetPictureState()
+	case "GetMonitorState":
+		return a.GetMonitorState(), nil
 	case "GetReturnState":
 		return a.GetReturnState()
 	case "GetCommentaryMute":

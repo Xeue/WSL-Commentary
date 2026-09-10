@@ -591,28 +591,46 @@ test('a page report that throws is logged, not propagated', () => {
 // The wiring
 // --------------------------------------------------------------------------
 
-test('the SRT picture has no overlay in the page, and the mosaic is never suppressed', () => {
-  // The picture is a separate PROCESS with a window of its own. This page has
-  // exactly one native overlay left — the card's preview — and nothing that
-  // could hide the mosaic <video>: no class, no rule, no setter. A commentator
-  // who loses SRT loses nothing on this page.
+test('the picture overlay lives in the panel, and the mosaic follows the OVERLAY', () => {
+  // The SRT picture is a native window painted over the mosaic tile — in the
+  // PGM MONITOR window, where the panel is. app.js builds TWO overlay
+  // controllers, one for the picture and one for the card's preview, and the
+  // page underneath the picture suppresses the mosaic ONLY from the overlay's
+  // own visibility — never from the source selection, which is the regression
+  // this test was written for. In the application's own window the panel is
+  // elsewhere, home.js has no tile, and the controller measures null.
   const app = codeOnly(ui('app.js'));
-  assert.equal((app.match(/createOverlay\(/g) || []).length, 1, 'app.js must build exactly one overlay controller: the preview');
-  assert.ok(app.includes('const previewOverlay = createOverlay('), 'and it must be the preview');
-  for (const gone of ['setPictureRect', 'setPictureVisible', 'setPictureOverlaid', 'measurePictureRect']) {
-    assert.ok(!app.includes(gone), `app.js must not call ${gone}: the picture is not painted over the page`);
-  }
+  assert.equal((app.match(/createOverlay\(/g) || []).length, 2, 'app.js builds two overlay controllers');
+  assert.ok(app.includes('const overlay = createOverlay('), 'the picture\'s');
+  assert.ok(app.includes('const previewOverlay = createOverlay('), 'and the preview\'s');
+  assert.match(
+    app,
+    /onVisible:\s*\(on\)\s*=>\s*home\.setPictureOverlaid\(on\)/,
+    'app.js must drive setPictureOverlaid from the overlay controller, which is where visibility ' +
+      'is decided — any other source is a second opinion about what is on screen',
+  );
 
+  // The panel may only set the class from the flag it is given, and nowhere
+  // else may touch it.
+  const panel = codeOnly(ui('pgmpanel.js'));
+  const setter = panel.slice(panel.indexOf('function setPictureOverlaid('));
+  assert.ok(setter.length > 0, 'pgmpanel.js must expose setPictureOverlaid');
+  assert.match(
+    setter.slice(0, setter.indexOf('\n  }')),
+    /classList\.toggle\('pgm-tile-overlaid', overlaid/,
+    'setPictureOverlaid must toggle the class from its argument',
+  );
+  assert.equal((panel.match(/pgm-tile-overlaid/g) || []).length, 1, 'exactly one call site in the panel');
+  assert.ok(!/showingSRT/.test(setter.slice(0, setter.indexOf('\n  }'))), 'and it must not consult the selection');
   const home = codeOnly(ui('home.js'));
-  for (const gone of ['pgm-tile-overlaid', 'setPictureOverlaid', 'measurePictureRect']) {
-    assert.ok(!home.includes(gone), `home.js must not contain ${gone}: nothing may suppress the mosaic`);
-  }
+  assert.ok(!home.includes('pgm-tile-overlaid'), 'home.js has no tile of its own to suppress');
   const css = read(here, '..', 'styles', 'main.css').replace(/\/\*[\s\S]*?\*\//g, '');
-  assert.ok(!css.includes('pgm-tile-overlaid'), 'main.css must have no rule that hides the mosaic');
+  assert.match(css, /\.pgm-tile-overlaid video\s*\{[^}]*visibility:\s*hidden/, 'main.css hides the mosaic under the overlay');
 
   // And the Refresh button kicks WHICHEVER picture is active: the SRT process
   // through the backend's refresh, the mosaic by rebuilding the KVS monitor.
-  assert.match(home, /handlers\.onPictureRefresh\(\)/, 'home.js must wire the Refresh button');
+  assert.match(panel, /handlers\.onPictureRefresh\(\)/, 'the panel wires its Refresh button');
+  assert.match(codeOnly(ui('monitorview.js')), /handlers\.onPictureRefresh\(\)/, 'and so does the monitor window\'s header');
   const refresh = app.slice(app.indexOf('async function onPictureRefresh()'));
   const refreshBody = refresh.slice(0, refresh.indexOf('\n  }'));
   assert.match(refreshBody, /await backend\.refreshPicture\(\)/, 'the SRT half: the refresh binding');
@@ -679,7 +697,8 @@ test('the overlay rectangle is re-reported on resize, on a box change and on a D
   const fn = src.slice(src.indexOf('function watchPreviewRect()'));
   const body = fn.slice(0, fn.indexOf('\n  }'));
   assert.match(body, /window\.addEventListener\('resize'/, 'the window changing size');
-  assert.match(body, /new ResizeObserver\(sync\)\.observe\(home\.pictureEl\)/, 'the box itself changing size');
+  assert.match(body, /const box = home\.pictureEl \|\| home\.previewEl/, 'the tile where there is one, else the preview box');
+  assert.match(body, /new ResizeObserver\(sync\)\.observe\(box\)/, 'the box itself changing size');
   assert.match(body, /watchDevicePixelRatio\(sync\)/, 'and the display scaling changing');
 
   // The DPI watch has to RE-ARM: a media query pinned to the current ratio stops
