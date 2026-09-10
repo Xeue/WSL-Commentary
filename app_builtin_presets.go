@@ -51,7 +51,7 @@ import (
 var builtinPresetLetters = []string{"g", "h", "i", "j", "k", "l", "t"}
 
 const (
-	builtinStatusKey     = "cam4"
+	builtinStatusKey     = "MIC 1"
 	builtinSRTPort       = 40901
 	builtinSRTSecondPort = 40902
 	builtinSRTReturnPort = 40504
