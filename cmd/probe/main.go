@@ -1,13 +1,14 @@
 // Command probe is a standalone SRT caller that dials an M2L-X output, receives
 // the transport stream the app's picture path would receive, and reports what is
 // actually in it -- per-PID continuity, and an HEVC NAL census -- ending in a
-// verdict (see analyze.go). It exists to end a day of "every log reframes it" by
-// measuring the received bytes directly, on both the machine that tears and one
-// that does not, so the difference is a diffable number rather than a theory.
+// verdict. It exists to end a day of "every log reframes it" by measuring the
+// received bytes directly, on both the machine that tears and one that does
+// not, so the difference is a diffable number rather than a theory.
 //
-// It is pure Go over github.com/datarhei/gosrt -- no GStreamer, no cgo, no
-// bundle. Build it with CGO_ENABLED=0 and it is one small exe that runs anywhere.
-// gosrt is used HERE (a cmd/, not internal/), exactly as cmd/mockm2lx uses it.
+// The dissector itself lives in internal/tsprobe, because the field rig (the
+// application's WSLCOMMS_RIG mode) runs the same capture; this is the
+// standalone, pure-Go, no-GStreamer shell around it. Build it with
+// CGO_ENABLED=0 and it is one small exe that runs anywhere.
 //
 // # Capture and replay -- the point when the stream is expensive to keep up
 //
@@ -15,9 +16,9 @@
 // live minute is banked for offline work: that file can be re-analysed here with
 // -file, and -- because it is a plain MPEG-TS -- replayed through the FULL
 // GStreamer pipeline dissector offline (cmd/gstprobe capture.ts, which uses
-// filesrc). That replay is the crux experiment: if COMM-01's captured bytes tear
-// the pipeline HERE too, the fault travels with the bytes; if they are clean
-// here, the fault is the field machine's decode/timing.
+// filesrc). That replay is the crux experiment: if the field machine's captured
+// bytes tear the pipeline HERE too, the fault travels with the bytes; if they
+// are clean here, the fault is the field machine's decode/timing.
 //
 // Usage:
 //
@@ -37,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	srt "github.com/datarhei/gosrt"
+	"wslcomms/internal/tsprobe"
 )
 
 func main() {
@@ -60,24 +61,11 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
-	addr := normalizeAddr(target)
-
-	cfg := srt.DefaultConfig()
-	cfg.Latency = time.Duration(*latency) * time.Millisecond
-	cfg.StreamId = *streamid
-	cfg.Passphrase = *passphrase
-
-	fmt.Printf("probe: dialing %s as a caller (latency %dms)...\n", addr, *latency)
-	conn, err := srt.Dial("srt", addr, cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "probe: dial failed: %v\n", err)
-		fmt.Fprintln(os.Stderr, "       (is the app or another probe already holding the one SRT peer? stop it first.)")
-		os.Exit(1)
-	}
-	defer conn.Close()
+	addr := tsprobe.NormalizeAddr(target)
 
 	var capFile *os.File
 	if *save != "" {
+		var err error
 		capFile, err = os.Create(*save)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "probe: could not create %s: %v\n", *save, err)
@@ -86,42 +74,34 @@ func main() {
 		defer capFile.Close()
 		fmt.Printf("probe: saving the raw transport stream to %s\n", *save)
 	}
-	fmt.Printf("probe: connected; capturing for %ds (Ctrl+C to stop early)...\n", *secs)
-
-	start := time.Now()
-	an := newAnalyzer(func() time.Duration { return time.Since(start) })
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	timer := time.AfterFunc(time.Duration(*secs)*time.Second, cancel)
-	defer timer.Stop()
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
 
-	buf := make([]byte, 64*1024)
-	for {
-		n, rerr := conn.Read(buf)
-		if n > 0 {
-			an.Write(buf[:n])
-			if capFile != nil {
-				capFile.Write(buf[:n])
-			}
-		}
-		if rerr != nil {
-			break
+	opts := tsprobe.CaptureOpts{
+		LatencyMs:  *latency,
+		Passphrase: *passphrase,
+		StreamID:   *streamid,
+		Duration:   time.Duration(*secs) * time.Second,
+		Progress:   func(s string) { fmt.Println("probe:", s) },
+	}
+	if capFile != nil {
+		opts.Save = capFile
+	}
+	fmt.Printf("probe: capturing for %ds (Ctrl+C to stop early)...\n", *secs)
+	an, dur, err := tsprobe.Capture(ctx, addr, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "probe: %v\n", err)
+		if an == nil {
+			os.Exit(1)
 		}
 	}
-
-	dur := time.Since(start)
-	emit(an.report(addr, dur), hostSlug(addr))
+	emit(an.Report(addr, dur), hostSlug(addr))
 }
 
 // analyseFile runs the analyzer over a previously captured .ts file. The clock is
-// byte position rather than wall time -- there is no reception timing in a file
-// -- so the timeline is in "stream seconds" derived from the nominal bitrate is
-// not attempted; timing-derived lines simply read from the file's own order.
+// wall time over the read, so timing-derived lines simply read from the file's
+// own order.
 func analyseFile(path string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -129,14 +109,14 @@ func analyseFile(path string) {
 		os.Exit(1)
 	}
 	defer f.Close()
-	fmt.Printf("probe: analysing captured stream %s...\n", path)
 
+	fmt.Printf("probe: analysing captured stream %s...\n", path)
 	start := time.Now()
-	an := newAnalyzer(func() time.Duration { return time.Since(start) })
-	if _, err := io.Copy(writerFunc(an.Write), f); err != nil {
+	an := tsprobe.NewAnalyzer(func() time.Duration { return time.Since(start) })
+	if _, err := io.Copy(an, f); err != nil {
 		fmt.Fprintf(os.Stderr, "probe: read error on %s: %v\n", path, err)
 	}
-	emit(an.report(path, time.Since(start)), fileSlug(path))
+	emit(an.Report(path, time.Since(start)), fileSlug(path))
 }
 
 // emit prints a report and writes it beside the working directory.
@@ -148,25 +128,6 @@ func emit(report, slug string) {
 	} else {
 		fmt.Printf("probe: report written to %s\n", name)
 	}
-}
-
-// writerFunc adapts a Write method to io.Writer for io.Copy.
-type writerFunc func([]byte) (int, error)
-
-func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
-
-// normalizeAddr turns "srt://host:port?query", "host:port" or a bare host into a
-// dialable host:port, defaulting the port to M2L-X's return port when omitted.
-func normalizeAddr(s string) string {
-	s = strings.TrimPrefix(s, "srt://")
-	if i := strings.IndexByte(s, '?'); i >= 0 {
-		s = s[:i]
-	}
-	s = strings.TrimRight(s, "/")
-	if !strings.Contains(s, ":") {
-		s += ":40504"
-	}
-	return s
 }
 
 func hostSlug(addr string) string {

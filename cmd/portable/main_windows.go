@@ -87,6 +87,12 @@ func runtimeBase() (string, error) {
 // it either.
 func launch(exe string) error {
 	cmd := exec.Command(exe, os.Args[1:]...)
+	// A copy of this launcher whose file name says "rig" starts the FIELD RIG
+	// rather than the application (rig.go in the app): one exe to send to a
+	// laptop, with nothing to type. The application reads WSLCOMMS_RIG.
+	if rigLauncherName(os.Args[0]) {
+		cmd.Env = append(os.Environ(), "WSLCOMMS_RIG=1")
+	}
 
 	// The application resolves its GStreamer bundle relative to its own
 	// executable, so the working directory does not strictly matter - but

@@ -260,6 +260,13 @@ func main() {
 		runDiagnosticAndExit(target, gstInitErr)
 	}
 
+	// THE FIELD RIG: every picture-path measurement in one double-click, into
+	// one zip. Same placement and for the same reasons as the diagnostic above.
+	// See rig.go.
+	if rigRequested(os.Args[1:], os.Getenv) {
+		runRigAndExit(dir, gstInitErr)
+	}
+
 	app := NewApp(dir, gstInitErr)
 
 	err = wails.Run(&options.App{

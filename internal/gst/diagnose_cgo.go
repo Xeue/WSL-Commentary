@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +106,18 @@ type diag struct {
 // "avdec_h265" (software) is the comparable default. gogst.Init is idempotent, so
 // this is safe whether or not the app already initialised GStreamer.
 func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string) (string, error) {
+	res, err := RunPipelineDiagnosticResult(uri, dur, decoderFactory, DiagnosticOpts{})
+	if err != nil {
+		return "", err
+	}
+	return res.Report, nil
+}
+
+// RunPipelineDiagnosticResult is RunPipelineDiagnostic with the numbers as
+// well as the text, and with the return's SRT options, for the field rig
+// (rig.go) which reasons over a live run and a file replay side by side.
+func RunPipelineDiagnosticResult(uri string, dur time.Duration, decoderFactory string, opts DiagnosticOpts) (DiagnosticResult, error) {
+	var none DiagnosticResult
 	gogst.Init()
 	if decoderFactory == "" {
 		decoderFactory = "avdec_h265"
@@ -114,11 +127,11 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 
 	element := gogst.NewPipeline("wslcomms-diagnose")
 	if element == nil {
-		return "", fmt.Errorf("gst: diagnose: could not create the pipeline")
+		return none, fmt.Errorf("gst: diagnose: could not create the pipeline")
 	}
 	pipeline, ok := element.(gogst.Pipeline)
 	if !ok {
-		return "", fmt.Errorf("gst: diagnose: NewPipeline returned a %T, not a GstPipeline", element)
+		return none, fmt.Errorf("gst: diagnose: NewPipeline returned a %T, not a GstPipeline", element)
 	}
 
 	mk := func(factory, name string) (gogst.Element, error) {
@@ -142,43 +155,58 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 
 	src, err := mk(srcFactory, "d-src")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	demux, err := mk("tsdemux", "d-demux")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	queue, err := mk("queue", "d-queue")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	parse, err := mk("h265parse", "d-parse")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	dec, err := mk(decoderFactory, "d-dec")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	sink, err := mk("fakesink", "d-sink")
 	if err != nil {
-		return "", err
+		return none, err
 	}
 
 	if isFile {
 		if err := setStringProperty(src, "location", uri); err != nil {
-			return "", fmt.Errorf("gst: diagnose: %w", err)
+			return none, fmt.Errorf("gst: diagnose: %w", err)
 		}
 	} else {
 		// srtsrc configured as the app configures it, so reception is comparable.
 		if err := setStringProperty(src, "uri", uri); err != nil {
-			return "", fmt.Errorf("gst: diagnose: %w", err)
+			return none, fmt.Errorf("gst: diagnose: %w", err)
 		}
 		if hasProperty(src, "mode") {
 			gogst.UtilSetObjectArg(src, "mode", "caller")
 		}
+		latency := opts.LatencyMs
+		if latency <= 0 {
+			latency = 2000
+		}
 		if hasProperty(src, "latency") {
-			src.SetObjectProperty("latency", int32(2000))
+			src.SetObjectProperty("latency", int32(latency))
+		}
+		// The return's own encryption, when it has any: set the way the picture
+		// path sets it — as properties, never in the URI, so the passphrase is
+		// neither percent-encoded nor logged.
+		if opts.PBKeyLen != 0 && opts.Passphrase != "" {
+			if err := setStringProperty(src, "passphrase", opts.Passphrase); err != nil {
+				return none, fmt.Errorf("gst: diagnose: %w", err)
+			}
+			if hasProperty(src, "pbkeylen") {
+				gogst.UtilSetObjectArg(src, "pbkeylen", strconv.Itoa(opts.PBKeyLen))
+			}
 		}
 		if hasProperty(src, "auto-reconnect") {
 			src.SetObjectProperty("auto-reconnect", false)
@@ -190,10 +218,10 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 	// Static links: srtsrc -> tsdemux, and queue -> parse -> dec -> sink. The
 	// demuxer -> queue link is dynamic (onPadAdded below).
 	if !src.Link(demux) {
-		return "", fmt.Errorf("gst: diagnose: could not link srtsrc to tsdemux")
+		return none, fmt.Errorf("gst: diagnose: could not link srtsrc to tsdemux")
 	}
 	if !queue.Link(parse) || !parse.Link(dec) || !dec.Link(sink) {
-		return "", fmt.Errorf("gst: diagnose: could not link the video branch")
+		return none, fmt.Errorf("gst: diagnose: could not link the video branch")
 	}
 
 	// Stage taps. queue:sink is what tsdemux hands the parser -- the NAL census
@@ -218,16 +246,16 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 		return nil
 	}
 	if err := tap(src, "src", sRaw); err != nil {
-		return "", err
+		return none, err
 	}
 	if err := tap(queue, "sink", sDemux); err != nil {
-		return "", err
+		return none, err
 	}
 	if err := tap(parse, "src", sParse); err != nil {
-		return "", err
+		return none, err
 	}
 	if err := tap(dec, "src", sDec); err != nil {
-		return "", err
+		return none, err
 	}
 
 	// Optional: exercise the shipping parameter re-injection surgery on real
@@ -275,25 +303,125 @@ func RunPipelineDiagnostic(uri string, dur time.Duration, decoderFactory string)
 	// no GMainLoop, and it sees WARNING/INFO/ELEMENT as well as ERROR.
 	bus := pipeline.GetBus()
 	if bus == nil {
-		return "", fmt.Errorf("gst: diagnose: pipeline has no bus")
+		return none, fmt.Errorf("gst: diagnose: pipeline has no bus")
 	}
 	bus.SetSyncHandler(func(_ gogst.Bus, msg *gogst.Message) gogst.BusSyncReply {
 		d.record(msg)
 		return gogst.BusDrop
 	})
 
+	started := time.Now()
 	if ret := pipeline.BlockSetState(gogst.StatePlaying, gogst.ClockTime(10*time.Second)); !stateChangeOK(ret) {
-		return "", fmt.Errorf("gst: diagnose: pipeline would not reach PLAYING (%s)", ret)
+		return none, fmt.Errorf("gst: diagnose: pipeline would not reach PLAYING (%s)", ret)
 	}
 
-	// Run for dur, or until EOS (a file replay ending) closes done.
+	// Run for dur, or until EOS (a file replay ending) or an error closes done.
+	endedEarly := false
 	select {
 	case <-time.After(dur):
 	case <-d.done:
+		endedEarly = true
 	}
-
+	elapsed := time.Since(started)
 	pipeline.BlockSetState(gogst.StateNull, gogst.ClockTime(5*time.Second))
-	return d.report(uri, dur, decoderFactory), nil
+	return d.result(uri, dur, elapsed, endedEarly, decoderFactory), nil
+}
+
+// DiagnosticOpts carries the return's SRT options into the dissector. The zero
+// value is the historical behaviour: 2000 ms latency, no encryption.
+type DiagnosticOpts struct {
+	LatencyMs  int
+	PBKeyLen   int
+	Passphrase string
+}
+
+// DiagnosticStage is one tapped pad's totals.
+type DiagnosticStage struct {
+	Name    string
+	Buffers uint64
+	Bytes   uint64
+	Flags   map[string]uint64 // buffer-flag name -> count (DISCONT, CORRUPTED, GAP, ...)
+	Events  map[string]uint64
+	Caps    string
+}
+
+// DiagnosticResult is the dissection as numbers and as the text report.
+type DiagnosticResult struct {
+	Report string
+
+	// Requested is dur; Elapsed is how long the pipeline actually ran, which is
+	// shorter when a file reached EOS or the pipeline failed (EndedEarly).
+	Requested  time.Duration
+	Elapsed    time.Duration
+	EndedEarly bool
+
+	// Stages in pipeline order: raw transport stream, demuxed video into the
+	// parser, parsed access units into the decoder, decoded frames.
+	Stages []DiagnosticStage
+
+	// Bus is the bus-message census: normalised text -> count.
+	Bus map[string]uint64
+
+	// Errors are the bus ERROR messages, verbatim, at most twenty.
+	Errors []string
+}
+
+// Decoded is the decoded-frame count (the last stage), or 0.
+func (r DiagnosticResult) Decoded() uint64 {
+	if len(r.Stages) == 0 {
+		return 0
+	}
+	return r.Stages[len(r.Stages)-1].Buffers
+}
+
+// Corrupted is the CORRUPTED flag count on the decoded frames, or 0.
+func (r DiagnosticResult) Corrupted() uint64 {
+	if len(r.Stages) == 0 {
+		return 0
+	}
+	return r.Stages[len(r.Stages)-1].Flags["CORRUPTED"]
+}
+
+// BusMatching sums the census rows whose text contains sub, case-insensitively:
+// "CONTINUITY" for tsdemux's mismatches, "broken/invalid" for h265parse's drops.
+func (r DiagnosticResult) BusMatching(sub string) uint64 {
+	sub = strings.ToLower(sub)
+	var n uint64
+	for k, v := range r.Bus {
+		if strings.Contains(strings.ToLower(k), sub) {
+			n += v
+		}
+	}
+	return n
+}
+
+func (d *diag) result(uri string, dur, elapsed time.Duration, endedEarly bool, decoder string) DiagnosticResult {
+	report := d.report(uri, dur, elapsed, endedEarly, decoder)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res := DiagnosticResult{
+		Report:     report,
+		Requested:  dur,
+		Elapsed:    elapsed,
+		EndedEarly: endedEarly,
+		Bus:        make(map[string]uint64, len(d.msgs)),
+		Errors:     append([]string(nil), d.errs...),
+	}
+	for k, v := range d.msgs {
+		res.Bus[k] = v
+	}
+	for _, st := range d.stages {
+		s := DiagnosticStage{Name: st.name, Buffers: st.buffers, Bytes: st.bytes, Caps: st.caps,
+			Flags: make(map[string]uint64, len(st.flags)), Events: make(map[string]uint64, len(st.events))}
+		for k, v := range st.flags {
+			s.Flags[k] = v
+		}
+		for k, v := range st.events {
+			s.Events[k] = v
+		}
+		res.Stages = append(res.Stages, s)
+	}
+	return res
 }
 
 // bufferProbe returns a per-buffer probe that tallies one stage.
@@ -443,14 +571,18 @@ func (d *diag) record(msg *gogst.Message) {
 	d.mu.Unlock()
 }
 
-func (d *diag) report(uri string, dur time.Duration, decoder string) string {
+func (d *diag) report(uri string, dur, elapsed time.Duration, endedEarly bool, decoder string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== WSLComms pipeline dissection ===\n")
 	fmt.Fprintf(&b, "target : %s\n", uri)
-	fmt.Fprintf(&b, "ran    : %s\n", dur.Round(time.Millisecond))
+	how := "ran to the requested time"
+	if endedEarly {
+		how = "ended early: end of stream or a pipeline error"
+	}
+	fmt.Fprintf(&b, "ran    : %s of %s requested (%s)\n", elapsed.Round(time.Millisecond), dur.Round(time.Millisecond), how)
 	fmt.Fprintf(&b, "decoder: %s\n\n", decoder)
 
 	fmt.Fprintf(&b, "--- per-stage buffer flow ---\n")

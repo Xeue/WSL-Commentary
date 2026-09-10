@@ -1,4 +1,4 @@
-package main
+package tsprobe
 
 import (
 	"testing"
@@ -94,7 +94,7 @@ func cat(chunks ...[]byte) []byte {
 }
 
 func TestPMTNamesTheHEVCVideoPID(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 
@@ -107,7 +107,7 @@ func TestPMTNamesTheHEVCVideoPID(t *testing.T) {
 }
 
 func TestContinuityRealErrorWhenCCSkips(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	// CC 0,1,2 in sequence, then 4 -- 3 is missing, no discontinuity_indicator.
 	for _, cc := range []int{0, 1, 2, 4} {
 		a.Write(tsPacket(0x0041, cc, false, []byte{0x01, 0x02}))
@@ -122,7 +122,7 @@ func TestContinuityRealErrorWhenCCSkips(t *testing.T) {
 }
 
 func TestContinuityFlaggedDiscontinuityIsNotAnError(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(0x0041, 0, false, []byte{0x01}))
 	a.Write(tsPacket(0x0041, 1, false, []byte{0x01}))
 	// CC jumps 1 -> 6 but the packet flags the discontinuity: legal.
@@ -137,7 +137,7 @@ func TestContinuityFlaggedDiscontinuityIsNotAnError(t *testing.T) {
 }
 
 func TestContinuityDuplicateIsTolerated(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	// CC 0,1,1,2 -- the one repeat the standard permits.
 	for _, cc := range []int{0, 1, 1, 2} {
 		a.Write(tsPacket(0x0041, cc, false, []byte{0x01}))
@@ -152,7 +152,7 @@ func TestContinuityDuplicateIsTolerated(t *testing.T) {
 }
 
 func TestNALCensusCountsTypesAndIDRs(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 
@@ -193,7 +193,7 @@ func TestNALCensusCountsTypesAndIDRs(t *testing.T) {
 // TestPESStartCodeNotCountedAsNAL guards the top-bit test that separates a PES
 // packet-start (00 00 01 then stream_id 0xE0, top bit set) from a real NAL.
 func TestNALCensusIgnoresPESStartCodes(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 
@@ -214,7 +214,7 @@ func TestNALCensusIgnoresPESStartCodes(t *testing.T) {
 // 00 00, so no stuffing separates the halves -- exactly how a real muxer splits
 // a NAL across TS packets; the 01 that completes the start code leads the next.
 func TestNALCensusFindsStartCodeSpanningPackets(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 
@@ -254,7 +254,7 @@ func pesWithDTS(pts, dts uint64) []byte {
 }
 
 func TestDTSBackwardsDetected(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 	// Two PES on the video PID with DESCENDING DTS: one backward step of 50000.
@@ -270,7 +270,7 @@ func TestDTSBackwardsDetected(t *testing.T) {
 }
 
 func TestDTSForwardIsMonotonic(t *testing.T) {
-	a := newAnalyzer(zeroClock)
+	a := NewAnalyzer(zeroClock)
 	a.Write(tsPacket(tsPATPID, 0, true, patPayload(0x0100)))
 	a.Write(tsPacket(0x0100, 0, true, pmtPayload(0x0041, streamTypeHEVC)))
 	a.Write(tsPacket(0x0041, 0, true, pesWithDTS(50000, 50000)))

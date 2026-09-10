@@ -1,6 +1,42 @@
 # Picture-return tearing — diagnostics runbook
 
-Everything needed to nail the COMM-01 software-HEVC tearing in one session. Built 2026-08-25. Read top to bottom; the morning procedure is section 3.
+Everything needed to nail the software-HEVC tearing in one session. Built 2026-08-25; the rig
+(section 0) added 2026-09-10 after the tear was seen on several different laptops. Read top to
+bottom; sections 3–4 are what the rig automates and how to read what it brings back.
+
+## 0. The field rig — run this first (2026-09-10)
+
+One exe, nothing to type. `wslcomms-rig-v<version>.exe` is the portable launcher under a file name
+containing "rig": the same build as `wslcomms-portable-v<version>.exe`, started in rig mode
+(`WSLCOMMS_RIG=1`; see `rig.go`). On the laptop that tears, with M2L-X on:
+
+1. **Close WSL Commentary** — the main window and the PGM monitor. The rig looks for them and waits.
+2. **Double-click `wslcomms-rig-v1.6.2.exe`.** A console opens and narrates. About three minutes.
+3. **A zip appears on the Desktop**, `WSLComms-rig-<computer>-<stamp>.zip`, and Explorer opens on it.
+   Send it. It is ~120 MB, most of it the captured stream.
+
+The target comes from the **matchg** preset on that laptop (host, return port 40504, latency, the
+return's encryption and its stored passphrase — used, never written); `WSLCOMMS_RIG_PRESET` names
+another. The four readings of section 4, in one run, over ONE set of bytes:
+
+| # | reading | file | says |
+|---|---|---|---|
+| 1 | `internal/tsprobe` capture, 60 s, **no decoder**; bytes banked to `cap.ts` | `probe-live.txt` | REAL holes vs FLAGGED discontinuities on the video PID, DTS monotonicity, NAL census |
+| 2 | live dissection, `avdec_h265`, real time | `dissect-live-avdec_h265.txt` | the app's own receive path under pressure; CORRUPTED frames counted at the decoder; tsdemux CONTINUITY; demux DISCONT |
+| 3 | `cap.ts` replayed, `avdec_h265`, flat out | `dissect-file-avdec_h265.txt` | the same bytes with no clock: **decoded fps = this laptop's software decode ceiling** against the 50 it needs |
+| 4 | `cap.ts` replayed, `d3d11h265dec` | `dissect-file-d3d11h265dec.txt` | whether the laptop has a usable hardware HEVC decoder, and whether it is clean |
+
+Plus `machine.txt` (OS build, CPU, memory, every display adapter and driver, battery/mains, remote
+session, power plan, any `WSLCOMMS_*` A/B variables), `target.txt`, the app's last week of logs
+under `logs/`, `config/` (config.json and the preset), `rig.log`, and **`summary.txt`**, which states
+what the numbers support (section 4's rules, applied) and nothing more — the cross-machine step,
+replaying `cap.ts` on the dev box, is the next step and is why `cap.ts` is in the zip.
+
+Overrides, all optional: `WSLCOMMS_RIG_SECS` (60), `WSLCOMMS_RIG_TARGET=host:port` (the bench: a
+local listener; skips the "close the app" wait), `WSLCOMMS_RIG_OUT` (folder instead of the Desktop),
+`WSLCOMMS_RIG_NOWAIT` (no Enter at the end). Verified end to end on the bench 2026-09-10 against a
+local `gst-launch-1.0 ... srtsink mode=listener` replaying a real HEVC capture: all four readings,
+the zip, Explorer.
 
 ## 1. What we know (evidence, not theory)
 

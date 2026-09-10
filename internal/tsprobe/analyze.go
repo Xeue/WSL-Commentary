@@ -26,7 +26,7 @@
 //
 // Pure Go, no GStreamer: it reads the same SRT the app's srtsrc reads, so what
 // it sees is what the pipeline was handed.
-package main
+package tsprobe
 
 import (
 	"fmt"
@@ -143,7 +143,7 @@ func newPIDStat(pid int) *pidStat {
 // analyzer incrementally parses the TS stream fed to it via Write, in whatever
 // chunk sizes the SRT reader returns. now() is the receive clock, injected so
 // tests are deterministic.
-type analyzer struct {
+type Analyzer struct {
 	mu    sync.Mutex
 	now   func() time.Duration // elapsed since the first byte
 	start bool
@@ -162,8 +162,8 @@ type analyzer struct {
 	lastAt     time.Duration
 }
 
-func newAnalyzer(now func() time.Duration) *analyzer {
-	return &analyzer{
+func NewAnalyzer(now func() time.Duration) *Analyzer {
+	return &Analyzer{
 		now:      now,
 		pmtPID:   -1,
 		videoPID: -1,
@@ -172,7 +172,7 @@ func newAnalyzer(now func() time.Duration) *analyzer {
 	}
 }
 
-func (a *analyzer) stat(pid int) *pidStat {
+func (a *Analyzer) stat(pid int) *pidStat {
 	ps := a.pids[pid]
 	if ps == nil {
 		ps = newPIDStat(pid)
@@ -184,7 +184,7 @@ func (a *analyzer) stat(pid int) *pidStat {
 // Write feeds the next slice of the SRT byte stream. Like the mock's analyzer it
 // never errors: a resyncing or holed stream is precisely what it exists to
 // measure, not to fail on.
-func (a *analyzer) Write(p []byte) (int, error) {
+func (a *Analyzer) Write(p []byte) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -217,7 +217,7 @@ func (a *analyzer) Write(p []byte) (int, error) {
 
 // processPacket parses one 188-byte packet (pkt[0] == 0x47) and updates the
 // per-PID continuity and, for the video PID, the NAL census.
-func (a *analyzer) processPacket(pkt []byte, now time.Duration) {
+func (a *Analyzer) processPacket(pkt []byte, now time.Duration) {
 	pid := int(pkt[1]&0x1F)<<8 | int(pkt[2])
 	ps := a.stat(pid)
 	ps.packets++
@@ -297,7 +297,7 @@ func (a *analyzer) processPacket(pkt []byte, now time.Duration) {
 // monotonic one; PTS reorders around B-frames); a stream carrying only PTS is
 // tracked on PTS, where the bug being hunted -- a pipeline-restart DTS jumping
 // back by seconds -- still dwarfs any legitimate reorder.
-func (a *analyzer) parsePES(ps *pidStat, payload []byte, pusi bool) {
+func (a *Analyzer) parsePES(ps *pidStat, payload []byte, pusi bool) {
 	if !pusi || len(payload) < 9 {
 		return
 	}
@@ -351,7 +351,7 @@ func decodeTimestamp(b []byte) uint64 {
 }
 
 // parsePAT records the first program's PMT PID.
-func (a *analyzer) parsePAT(payload []byte, pusi bool) {
+func (a *Analyzer) parsePAT(payload []byte, pusi bool) {
 	if !pusi || len(payload) < 1 {
 		return
 	}
@@ -375,7 +375,7 @@ func (a *analyzer) parsePAT(payload []byte, pusi bool) {
 
 // parsePMT records every elementary stream's PID and stream_type, and marks the
 // HEVC (or H.264) one as the video PID.
-func (a *analyzer) parsePMT(payload []byte, pusi bool) {
+func (a *Analyzer) parsePMT(payload []byte, pusi bool) {
 	if !pusi || len(payload) < 1 {
 		return
 	}
@@ -468,7 +468,7 @@ func (v *videoStream) feed(payload []byte, now time.Duration) {
 
 // report renders everything the analyzer has learned as a stable, diffable text
 // block, ending in a verdict that reads the numbers so a human does not have to.
-func (a *analyzer) report(target string, dur time.Duration) string {
+func (a *Analyzer) Report(target string, dur time.Duration) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -567,7 +567,7 @@ func (a *analyzer) report(target string, dur time.Duration) string {
 }
 
 // verdict reads the numbers into the one sentence the whole exercise is for.
-func (a *analyzer) verdict() string {
+func (a *Analyzer) verdict() string {
 	vps := a.pids[a.videoPID]
 	switch {
 	case a.videoPID < 0 || vps == nil:
